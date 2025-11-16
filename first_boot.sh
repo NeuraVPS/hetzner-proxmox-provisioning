@@ -111,6 +111,20 @@ systemctl enable pve-guests-hooks.service
 # Allow replacement of disks
 apt-get install -y pv
 
+# Add Swap for security
+zfs create -V 32G \
+  -b 16384 \
+  -o compression=off \
+  -o primarycache=metadata \
+  -o logbias=throughput \
+  -o sync=always \
+  -o redundant_metadata=most \
+  rpool/swapvol
+
+mkswap /dev/zvol/rpool/swapvol
+swapon /dev/zvol/rpool/swapvol
+echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
+
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
 echo "==> Configuring Proxmox firewall (datacenter baseline)"
