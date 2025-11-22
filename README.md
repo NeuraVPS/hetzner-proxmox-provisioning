@@ -1,7 +1,12 @@
 Execute this on a new server to prepare it for Proxmox:
 
 ```bash
-screen -d -m bash -c "curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh | bash -s -- 1 AX162-R; exec bash"
+screen -d -m bash -c "curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh | bash -s -- 1000 AX162-R; exec bash"
+screen -r
+```
+
+```bash
+screen -d -m bash -c "curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh | bash -s -- 1000 EX44; exec bash"
 screen -r
 ```
 
@@ -18,6 +23,8 @@ The server ID can be any number between 1 and 1,048,574.
 - /etc/firebase-credentials.json
 - /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
 - Add server IPv6 CDIR to Proxmox firewall
+- Add to firestore
+- Re add snippets to shared storage
 
 # Prepare Windows Template
 
