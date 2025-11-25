@@ -112,18 +112,18 @@ systemctl enable pve-guests-hooks.service
 apt-get install -y pv
 
 # Add Swap for security
-zfs create -V 32G \
-  -b 16384 \
-  -o compression=off \
-  -o primarycache=metadata \
-  -o logbias=throughput \
-  -o sync=always \
-  -o redundant_metadata=most \
-  rpool/swapvol
+# zfs create -V 32G \
+#   -b 16384 \
+#   -o compression=off \
+#   -o primarycache=metadata \
+#   -o logbias=throughput \
+#   -o sync=always \
+#   -o redundant_metadata=most \
+#   rpool/swapvol
 
-mkswap /dev/zvol/rpool/swapvol
-swapon /dev/zvol/rpool/swapvol
-echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
+# mkswap /dev/zvol/rpool/swapvol
+# swapon /dev/zvol/rpool/swapvol
+# echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
 
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
@@ -236,5 +236,5 @@ systemctl restart pveproxy
 systemctl restart pvedaemon
 
 # manually add with: qm set 100 --hookscript shared:snippets/sync-dnat.py
-sleep 120 # wait for the system to be ready
+#sleep 120 # wait for the system to be ready
 reboot
