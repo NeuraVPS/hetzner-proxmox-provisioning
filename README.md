@@ -25,7 +25,6 @@ The server ID can be any number between 1 and 1,048,574.
 - Add server IPv6 CDIR to Proxmox firewall
 - Add to firestore
 - Re add snippets to shared storage
-- Add Swap
 
 # Prepare Windows Template
 

@@ -112,18 +112,27 @@ systemctl enable pve-guests-hooks.service
 apt-get install -y pv
 
 # Add Swap for security
-# zfs create -V 32G \
-#   -b 16384 \
-#   -o compression=off \
-#   -o primarycache=metadata \
-#   -o logbias=throughput \
-#   -o sync=always \
-#   -o redundant_metadata=most \
-#   rpool/swapvol
+zfs create -V 32G \
+  -b 16384 \
+  -o compression=off \
+  -o primarycache=metadata \
+  -o logbias=throughput \
+  -o sync=always \
+  -o redundant_metadata=most \
+  rpool/swapvol
 
-# mkswap /dev/zvol/rpool/swapvol
-# swapon /dev/zvol/rpool/swapvol
-# echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
+# Esperar a que udev cree el dispositivo
+for i in {1..30}; do
+    if [ -e /dev/zvol/rpool/swapvol ]; then
+        break
+    fi
+    udevadm settle
+    sleep 0.2
+done
+
+mkswap /dev/zvol/rpool/swapvol
+swapon /dev/zvol/rpool/swapvol
+echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
 
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
