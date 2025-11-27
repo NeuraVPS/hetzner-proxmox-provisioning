@@ -245,5 +245,5 @@ systemctl restart pveproxy
 systemctl restart pvedaemon
 
 # manually add with: qm set 100 --hookscript shared:snippets/sync-dnat.py
-#sleep 120 # wait for the system to be ready
+sleep 120 # wait for the system to be ready
 reboot
