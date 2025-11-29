@@ -144,7 +144,8 @@ root-password-hashed = "\$6\$snErXYs0ZtgB1odl\$1SfK3X4p59VX9wQ1S8xi.nt1qfjzrdRtf
 root-ssh-keys = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPCYjhDnZ75U3sP/TlGyjZspvpu21/xDpZmtMfVYw93+",
     "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBIRhXfZRMCa59LULUYTYCwgNX6FG3TZailI+7oVxwBe3kW1eyyoOaZZZyUqAav4Ja0ilF95G6s7mhV/mAoOXKTU=",
-    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBM7fqUPJXbY7TkCmIjDZ7L+tR5F1iUqUMfqcp4wh2uQKQGo5zxxgQh+HNnijXjaa/jTTzdbq6hlvUtS40nWVoDQ="
+    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBM7fqUPJXbY7TkCmIjDZ7L+tR5F1iUqUMfqcp4wh2uQKQGo5zxxgQh+HNnijXjaa/jTTzdbq6hlvUtS40nWVoDQ=",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOOE6gYT2jDMJhKgQ7O1A8lsrLz5apOMlNDK2iSIMVpI"
 ]
 reboot-mode = "power-off"
 

@@ -256,8 +256,14 @@ def wait_for_vm_ip(vmid, max_wait=600, initial_wait=1):
 # iptables management
 # ---------------------------------------------------------------
 
-def parse_iptables_rules():
-    """Return dict of tables with only our managed rules."""
+def parse_iptables_rules(vmid_filter=None):
+    """Return dict of tables with only our managed rules.
+    
+    Args:
+        vmid_filter: Optional VM ID to filter rules. If provided, only rules
+                    with comments containing -vmid-{vmid_filter} will be included.
+                    If None, all managed rules are included.
+    """
     rules = {"nat": set(), "filter": set()}
     current_table = None
     for line in run(["iptables-save"]).splitlines():
@@ -265,6 +271,10 @@ def parse_iptables_rules():
             current_table = line[1:]
         elif line.startswith("-A") and current_table in rules:
             if "ssh-vmid-" in line or "rdp-vmid-" in line or "samba-vmid-" in line:
+                # If filtering by vmid, check that the rule belongs to this VM
+                if vmid_filter is not None:
+                    if f"-vmid-{vmid_filter}" not in line:
+                        continue
                 rules[current_table].add(normalize_rule(line))
     return rules
 
@@ -462,6 +472,7 @@ def main():
     # Handle arguments from Proxmox hook
     triggered_vmid = None
     phase = None
+    hook_mode = False
 
     if is_running_under_backup():
         #logger.info(f"Detected vzdump/backup context (parent process). Skipping execution for VM {triggered_vmid}.")
@@ -470,6 +481,7 @@ def main():
     if len(sys.argv) >= 3:
         triggered_vmid = int(sys.argv[1])
         phase = sys.argv[2]
+        hook_mode = True
         
         # Exit immediately for anything other than post-stop and post-start
         if phase not in ["post-stop", "post-start"]:
@@ -484,10 +496,23 @@ def main():
     vmids = get_running_vms()
     logger.info(f"Running VMs: {vmids}")
 
+    # In hook mode, only process the triggered VM
+    if hook_mode:
+        if phase == "post-start":
+            # For post-start, only process the triggered VM if it's running
+            if triggered_vmid not in vmids:
+                logger.warning(f"VM {triggered_vmid} is not running, skipping post-start hook")
+                return
+            vmids = [triggered_vmid]
+        elif phase == "post-stop":
+            # For post-stop, VM won't be in running list, so we'll handle it separately
+            # by only processing iptables rules removal
+            vmids = []
+
     vm_infos = {}
     for vmid in vmids:
         # For post-start, wait for the triggered VM to get an IP
-        if phase == "post-start" and vmid == triggered_vmid:
+        if hook_mode and phase == "post-start" and vmid == triggered_vmid:
             logger.info(f"Waiting for triggered VM {vmid} to get IP...")
             try:
                 info = wait_for_vm_ip(vmid)
@@ -519,14 +544,20 @@ def main():
 
     # Build expected rules (only NAT rules - group rules handle FORWARD filtering)
     expected_nat, expected_filter = build_expected_rules(vm_infos, wan_if)
-    actual = parse_iptables_rules()
+    
+    # In hook mode, filter actual rules to only include the triggered VM's rules
+    if hook_mode:
+        actual = parse_iptables_rules(vmid_filter=triggered_vmid)
+    else:
+        actual = parse_iptables_rules()
 
     # Sync iptables rules
     sync_iptables_rules(expected_nat, actual["nat"], "nat")
     sync_iptables_rules(expected_filter, actual["filter"], "filter")
 
     # Sync IPv6 addresses to Firestore
-    if vm_infos:
+    # In hook mode, skip this if already done (post-start) or not needed (post-stop)
+    if not hook_mode and vm_infos:
         sync_ipv6_to_firestore(vm_infos)
 
     logger.info("Sync complete.")
