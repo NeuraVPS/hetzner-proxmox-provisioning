@@ -95,10 +95,17 @@ def initialize_firebase():
         logger.warning(f"Failed to initialize Firebase Admin SDK: {e}, continuing without Firestore sync")
         return False
 
-# Initialize Firebase (if available)
+# Firebase initialization flag (lazy initialization - only when needed)
 FIREBASE_INITIALIZED = False
-if FIREBASE_AVAILABLE:
-    FIREBASE_INITIALIZED = initialize_firebase()
+
+def ensure_firebase_initialized():
+    """Lazy initialization of Firebase - only when actually needed."""
+    global FIREBASE_INITIALIZED
+    if FIREBASE_INITIALIZED:
+        return True
+    if FIREBASE_AVAILABLE:
+        FIREBASE_INITIALIZED = initialize_firebase()
+    return FIREBASE_INITIALIZED
 
 # ---------------------------------------------------------------
 # Helper utils
@@ -376,7 +383,7 @@ def sync_ipv6_to_firestore(vm_infos):
     Args:
         vm_infos: Dict mapping vmid to VM info (ip, ipv6, ostype)
     """
-    if not FIREBASE_INITIALIZED:
+    if not ensure_firebase_initialized():
         return
     
     if not vm_infos:
@@ -406,15 +413,35 @@ def sync_ipv6_to_firestore(vm_infos):
                 if len(docs) > 1:
                     logger.warning(f"Multiple Firestore documents found for VM {vmid} (proxmoxId={vmid}), updating all")
                 
-                # Update each matching document
+                # Update each matching document only if IPv6 has changed
                 for doc_snapshot in docs:
                     server_id = doc_snapshot.id
-                    update_data = {'ipv6': ipv6_address} if ipv6_address else {'ipv6': None}
+                    doc_data = doc_snapshot.to_dict()
+                    current_ipv6 = doc_data.get('ipv6')
                     
-                    # Get document reference and update
+                    # Normalize values for comparison: convert to string, strip whitespace, treat empty/None as None
+                    if current_ipv6:
+                        current_str = str(current_ipv6).strip()
+                        current_normalized = current_str if current_str else None
+                    else:
+                        current_normalized = None
+                    
+                    new_ipv6_raw = ipv6_address if ipv6_address else None
+                    if new_ipv6_raw:
+                        new_str = str(new_ipv6_raw).strip()
+                        new_normalized = new_str if new_str else None
+                    else:
+                        new_normalized = None
+                    
+                    # Check if IPv6 address has changed (both normalized to None or same string value)
+                    if current_normalized == new_normalized:
+                        continue
+                    
+                    # IPv6 has changed, update it
+                    update_data = {'ipv6': new_ipv6_raw}
                     server_doc_ref = db.collection('servers').document(server_id)
                     server_doc_ref.update(update_data)
-                    logger.info(f"Updated Firestore server {server_id} (VM {vmid}): ipv6={ipv6_address}")
+                    logger.info(f"Updated Firestore server {server_id} (VM {vmid}): ipv6 changed from {current_normalized} to {new_normalized}")
                     
             except Exception as e:
                 logger.warning(f"Failed to sync IPv6 for VM {vmid} to Firestore: {e}")
@@ -429,7 +456,7 @@ def update_last_started_in_firestore(vmid):
     Args:
         vmid: VM ID (proxmoxId)
     """
-    if not FIREBASE_INITIALIZED:
+    if not ensure_firebase_initialized():
         return
     
     try:
