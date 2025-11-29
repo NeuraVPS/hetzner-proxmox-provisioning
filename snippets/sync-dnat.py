@@ -490,46 +490,51 @@ def main():
         
         logger.info(f"Hook triggered: VM {triggered_vmid}, phase {phase}")
     
+    # Handle post-stop hook: just remove DNAT rules for this VM
+    if hook_mode and phase == "post-stop":
+        logger.info(f"Removing DNAT rules for VM {triggered_vmid}")
+        actual = parse_iptables_rules(vmid_filter=triggered_vmid)
+        # Delete all rules for this VM
+        for rule in sorted(actual["nat"]):
+            m = re.search(r"--comment\s+(\S+)", rule)
+            if m:
+                comment = m.group(1)
+                delete_rule_by_comment(comment, "nat")
+        logger.info("Sync complete.")
+        return
+    
+    # Get WAN interface (needed for building rules)
     wan_if = get_default_wan_if()
     logger.info(f"WAN interface: {wan_if}")
 
-    vmids = get_running_vms()
-    logger.info(f"Running VMs: {vmids}")
-
+    vm_infos = {}
+    
     # In hook mode, only process the triggered VM
     if hook_mode:
         if phase == "post-start":
-            # For post-start, only process the triggered VM if it's running
-            if triggered_vmid not in vmids:
-                logger.warning(f"VM {triggered_vmid} is not running, skipping post-start hook")
-                return
-            vmids = [triggered_vmid]
-        elif phase == "post-stop":
-            # For post-stop, VM won't be in running list, so we'll handle it separately
-            # by only processing iptables rules removal
-            vmids = []
-
-    vm_infos = {}
-    for vmid in vmids:
-        # For post-start, wait for the triggered VM to get an IP
-        if hook_mode and phase == "post-start" and vmid == triggered_vmid:
-            logger.info(f"Waiting for triggered VM {vmid} to get IP...")
+            # For post-start, wait for the triggered VM to get an IP
+            logger.info(f"Waiting for triggered VM {triggered_vmid} to get IP...")
             try:
-                info = wait_for_vm_ip(vmid)
+                info = wait_for_vm_ip(triggered_vmid)
                 if info:
-                    vm_infos[vmid] = info
+                    vm_infos[triggered_vmid] = info
                     # Sync IPv6 first (before lastStarted update, as functions triggered by lastStarted need the updated IP)
-                    sync_ipv6_to_firestore({vmid: info})
+                    sync_ipv6_to_firestore({triggered_vmid: info})
                     # Update lastStarted timestamp when VM receives an IP
-                    update_last_started_in_firestore(vmid)
+                    update_last_started_in_firestore(triggered_vmid)
                 else:
-                    logger.warning(f"VM {vmid} did not get an IP, skipping")
+                    logger.warning(f"VM {triggered_vmid} did not get an IP, skipping")
             except Exception as e:
                 if "no guest agent" in str(e).lower():
-                    logger.error(f"VM {vmid} has no guest agent - exiting immediately")
+                    logger.error(f"VM {triggered_vmid} has no guest agent - exiting immediately")
                     return
                 raise
-        else:
+    else:
+        # Manual mode: process all running VMs
+        vmids = get_running_vms()
+        logger.info(f"Running VMs: {vmids}")
+        
+        for vmid in vmids:
             try:
                 info = get_vm_info(vmid)
                 if info:
@@ -545,7 +550,7 @@ def main():
     # Build expected rules (only NAT rules - group rules handle FORWARD filtering)
     expected_nat, expected_filter = build_expected_rules(vm_infos, wan_if)
     
-    # In hook mode, filter actual rules to only include the triggered VM's rules
+    # Get actual rules (filtered for hook mode)
     if hook_mode:
         actual = parse_iptables_rules(vmid_filter=triggered_vmid)
     else:
@@ -555,8 +560,7 @@ def main():
     sync_iptables_rules(expected_nat, actual["nat"], "nat")
     sync_iptables_rules(expected_filter, actual["filter"], "filter")
 
-    # Sync IPv6 addresses to Firestore
-    # In hook mode, skip this if already done (post-start) or not needed (post-stop)
+    # Sync IPv6 addresses to Firestore (only in manual mode)
     if not hook_mode and vm_infos:
         sync_ipv6_to_firestore(vm_infos)
 
