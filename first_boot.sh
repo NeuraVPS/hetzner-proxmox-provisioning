@@ -134,6 +134,19 @@ mkswap /dev/zvol/rpool/swapvol
 swapon /dev/zvol/rpool/swapvol
 echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
 
+# Server optimizations
+zfs set reservation=50G rpool
+echo 34359738368 > /sys/module/zfs/parameters/zfs_arc_max
+echo "options zfs zfs_arc_max=34359738368" > /etc/modprobe.d/zfs.conf
+update-initramfs -u
+zfs set compression=zstd-3 rpool/data
+zfs set compression=zstd-3 rpool/ROOT
+zfs set compression=off rpool/swapvol
+zfs set sync=disabled rpool/data
+zfs set recordsize=16K rpool/ROOT
+zpool set autotrim=on rpool
+zfs set logbias=throughput rpool/data
+
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
 echo "==> Configuring Proxmox firewall (datacenter baseline)"
