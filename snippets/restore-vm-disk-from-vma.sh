@@ -34,11 +34,11 @@ log() {
   timestamp=$(date '+%Y-%m-%d %H:%M:%S')
   local log_entry="[${timestamp}] [${level}] ${message}"
   
-  # Write to log file
-  echo "$log_entry" >> "$LOG_FILE"
+  # Write to log file (ignore errors to prevent script failure on disk full)
+  echo "$log_entry" >> "$LOG_FILE" 2>/dev/null || true
   
   # Also write to stdout (for real-time monitoring)
-  echo "$log_entry"
+  echo "$log_entry" 2>/dev/null || true
 }
 
 # Wrapper for getting VM status using pvesh API
@@ -195,7 +195,7 @@ log "INFO" "VM $VMID current status: $STATUS"
 if [[ "$STATUS" == "running" ]]; then
   log "INFO" "VM $VMID is running, stopping..."
   set +e  # Temporarily disable exit on error for pipe
-  pvesh create "/nodes/${NODE}/qemu/${VMID}/status/stop" 2>&1 | tee -a "$LOG_FILE"
+  pvesh create "/nodes/${NODE}/qemu/${VMID}/status/stop" 2>&1 | tee -a "$LOG_FILE" 2>/dev/null || true
   stop_exit_code=${PIPESTATUS[0]}  # Get exit code of pvesh
   set -e  # Re-enable exit on error
   if [[ $stop_exit_code -ne 0 ]]; then
@@ -256,8 +256,10 @@ if [[ "$BACKUP" == *.zst ]]; then
   fi
   # Stream decompress directly into vma extract
   log "INFO" "Decompressing and extracting backup (this may take a while)..."
+  log "INFO" "Progress output will be shown on stdout only to avoid filling log file"
   set +e  # Temporarily disable exit on error for pipe
-  zstd -dc "$BACKUP" 2>&1 | vma extract -v - "$EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE"
+  # Only show progress on stdout, don't write to log file (to avoid disk full issues)
+  zstd -dc "$BACKUP" 2>&1 | vma extract -v - "$EXTRACT_DIR" 2>&1
   extract_exit_code=${PIPESTATUS[0]}  # Get exit code of zstd
   set -e  # Re-enable exit on error
   if [[ $extract_exit_code -ne 0 ]]; then
@@ -268,8 +270,10 @@ if [[ "$BACKUP" == *.zst ]]; then
 else
   log "INFO" "Detected uncompressed .vma"
   log "INFO" "Extracting backup (this may take a while)..."
+  log "INFO" "Progress output will be shown on stdout only to avoid filling log file"
   set +e  # Temporarily disable exit on error for pipe
-  vma extract -v "$BACKUP" "$EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE"
+  # Only show progress on stdout, don't write to log file (to avoid disk full issues)
+  vma extract -v "$BACKUP" "$EXTRACT_DIR" 2>&1
   extract_exit_code=${PIPESTATUS[0]}  # Get exit code of vma extract
   set -e  # Re-enable exit on error
   if [[ $extract_exit_code -ne 0 ]]; then
@@ -307,16 +311,73 @@ if [[ -z "$RAW_DISK" || ! -f "$RAW_DISK" ]]; then
 fi
 log "INFO" "Found disk file: $RAW_DISK"
 
+# Clean up unnecessary files from extracted backup to save space before restore
+log "INFO" "Cleaning up unnecessary files from extracted backup to save space..."
+RAW_DISK_BASENAME="$(basename "$RAW_DISK")"
+FILES_TO_DELETE=0
+
+# Helper function to format bytes
+format_bytes() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "${bytes} bytes"
+  else
+    # Simple formatting without numfmt (integer division)
+    if [[ $bytes -gt 1073741824 ]]; then
+      echo "$((bytes / 1073741824)) GB"
+    elif [[ $bytes -gt 1048576 ]]; then
+      echo "$((bytes / 1048576)) MB"
+    elif [[ $bytes -gt 1024 ]]; then
+      echo "$((bytes / 1024)) KB"
+    else
+      echo "${bytes} bytes"
+    fi
+  fi
+}
+
+# Calculate space before cleanup
+SPACE_BEFORE="0"
+if command -v du >/dev/null 2>&1; then
+  SPACE_BEFORE=$(du -sb "$EXTRACT_DIR" 2>/dev/null | awk '{print $1}' || echo "0")
+fi
+
+# Delete all files except the one we need
+for file in "$EXTRACT_DIR"/*; do
+  if [[ -f "$file" && "$(basename "$file")" != "$RAW_DISK_BASENAME" ]]; then
+    FILE_SIZE="0"
+    if command -v stat >/dev/null 2>&1; then
+      FILE_SIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "0")
+    fi
+    if rm -f "$file" 2>/dev/null; then
+      FILES_TO_DELETE=$((FILES_TO_DELETE + 1))
+      if [[ "$FILE_SIZE" != "0" ]]; then
+        log "DEBUG" "Deleted: $(basename "$file") ($(format_bytes "$FILE_SIZE"))"
+      fi
+    fi
+  fi
+done
+
+# Calculate and report space freed
+if [[ "$SPACE_BEFORE" != "0" ]] && command -v du >/dev/null 2>&1; then
+  SPACE_AFTER=$(du -sb "$EXTRACT_DIR" 2>/dev/null | awk '{print $1}' || echo "0")
+  if [[ "$SPACE_AFTER" != "0" ]]; then
+    ACTUAL_SPACE_FREED=$((SPACE_BEFORE - SPACE_AFTER))
+    log "INFO" "Cleanup complete: freed $(format_bytes "$ACTUAL_SPACE_FREED") ($FILES_TO_DELETE files deleted)"
+  else
+    log "INFO" "Cleanup complete: deleted $FILES_TO_DELETE unnecessary files"
+  fi
+else
+  log "INFO" "Cleanup complete: deleted $FILES_TO_DELETE unnecessary files"
+fi
+
 log "INFO" "Starting disk restore: $RAW_DISK → $ZVOL_PATH"
 DISK_SIZE="$(stat -f%z "$RAW_DISK" 2>/dev/null || stat -c%s "$RAW_DISK" 2>/dev/null || echo "unknown")"
 log "INFO" "Disk size: $DISK_SIZE bytes"
 if command -v pv >/dev/null 2>&1; then
   log "INFO" "Using pv for progress display..."
-  # Use pv for progress display, log both pv output and dd status
+  # Use pv for progress display, show on stdout only (to avoid disk full issues)
   set +e  # Temporarily disable exit on error for pipe
-  {
-    pv "$RAW_DISK" 2>&1 | dd of="$ZVOL_PATH" bs=4M conv=fsync 2>&1
-  } | tee -a "$LOG_FILE"
+  pv "$RAW_DISK" 2>&1 | dd of="$ZVOL_PATH" bs=4M conv=fsync 2>&1
   restore_exit_code=${PIPESTATUS[0]}  # Get exit code of pv
   set -e  # Re-enable exit on error
   if [[ $restore_exit_code -ne 0 ]]; then
@@ -325,9 +386,9 @@ if command -v pv >/dev/null 2>&1; then
   fi
 else
   log "INFO" "Using dd with status=progress..."
-  # Use dd with status=progress, capture output to log
+  # Use dd with status=progress, show on stdout only (to avoid disk full issues)
   set +e  # Temporarily disable exit on error for pipe
-  dd if="$RAW_DISK" of="$ZVOL_PATH" bs=4M conv=fsync status=progress 2>&1 | tee -a "$LOG_FILE"
+  dd if="$RAW_DISK" of="$ZVOL_PATH" bs=4M conv=fsync status=progress 2>&1
   restore_exit_code=${PIPESTATUS[0]}  # Get exit code of dd
   set -e  # Re-enable exit on error
   if [[ $restore_exit_code -ne 0 ]]; then
@@ -343,7 +404,7 @@ log "INFO" "Filesystem sync completed"
 # --- restart VM ---
 log "INFO" "Starting VM $VMID..."
 set +e  # Temporarily disable exit on error for pipe
-pvesh create "/nodes/${NODE}/qemu/${VMID}/status/start" 2>&1 | tee -a "$LOG_FILE"
+pvesh create "/nodes/${NODE}/qemu/${VMID}/status/start" 2>&1 | tee -a "$LOG_FILE" 2>/dev/null || true
 start_exit_code=${PIPESTATUS[0]}  # Get exit code of pvesh
 set -e  # Re-enable exit on error
 if [[ $start_exit_code -ne 0 ]]; then
