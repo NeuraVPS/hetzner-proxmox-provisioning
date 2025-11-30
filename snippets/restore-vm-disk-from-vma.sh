@@ -8,53 +8,122 @@ set -euo pipefail
 #   VMA path: /var/lib/svz/dump/vzdump-qemu-100.vma.zst
 #   Disk: scsi0 on ZFS rpool/data (local-zfs:vm-<vmid>-disk-1)
 
+# Logging configuration (similar to sync-dnat.py)
+LOG_FILE="/var/log/restore-vm-disk.log"
+MAX_LOG_SIZE=$((1024 * 1024))  # 1 MB
+
+# Clean log if it exceeds MAX_LOG_SIZE
+clean_log_if_needed() {
+  if [[ -f "$LOG_FILE" ]]; then
+    local size
+    size=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [[ $size -gt $MAX_LOG_SIZE ]]; then
+      rm -f "$LOG_FILE"
+      return 0  # Indicates cleanup happened
+    fi
+  fi
+  return 1
+}
+
+# Logging function that writes to both file and stdout
+log() {
+  local level="$1"
+  shift
+  local message="$*"
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  local log_entry="[${timestamp}] [${level}] ${message}"
+  
+  # Write to log file
+  echo "$log_entry" >> "$LOG_FILE"
+  
+  # Also write to stdout (for real-time monitoring)
+  echo "$log_entry"
+}
+
+# Initialize logging
+if clean_log_if_needed; then
+  log "INFO" "Log file deleted due to size limit (> 1 MB)"
+fi
+
 VMID="${1:-}"
 BACKUP="${2:-/var/lib/svz/dump/vzdump-qemu-100.vma.zst}"
 
 if [[ -z "$VMID" ]]; then
-  echo "Usage: $0 <vmid> [path_to_vma(.zst)]" >&2
+  log "ERROR" "Usage: $0 <vmid> [path_to_vma(.zst)]"
   exit 1
 fi
 
 if [[ ! -f "$BACKUP" ]]; then
-  echo "[ERROR] Backup file not found: $BACKUP" >&2
+  log "ERROR" "Backup file not found: $BACKUP"
   exit 1
 fi
 
 NODE="$(hostname)"
 
-echo "[INFO] Running on node: $NODE"
-echo "[INFO] VMID: $VMID"
-echo "[INFO] Backup: $BACKUP"
+log "INFO" "Running on node: $NODE"
+log "INFO" "VMID: $VMID"
+log "INFO" "Backup: $BACKUP"
 
 # --- sanity checks ---
+log "INFO" "Checking if VM $VMID exists..."
 if ! qm status "$VMID" >/dev/null 2>&1; then
-  echo "[ERROR] VM $VMID does not exist on this node" >&2
+  log "ERROR" "VM $VMID does not exist on this node"
   exit 1
 fi
+log "INFO" "VM $VMID exists"
 
+log "INFO" "Reading VM $VMID disk configuration..."
 DISK_ENTRY="$(qm config "$VMID" | awk -F': ' '/^scsi0:/ {print $2}')"
 if [[ -z "${DISK_ENTRY}" ]]; then
-  echo "[ERROR] VM $VMID has no scsi0 disk configured" >&2
+  log "ERROR" "VM $VMID has no scsi0 disk configured"
   exit 1
 fi
+log "INFO" "Found disk entry: $DISK_ENTRY"
 
 VOLID="${DISK_ENTRY%%,*}"            # local-zfs:vm-201-disk-1
 VOLNAME="${VOLID#*:}"                # vm-201-disk-1
 ZVOL_PATH="/dev/zvol/rpool/data/${VOLNAME}"
 
+log "INFO" "Checking ZFS volume: $ZVOL_PATH"
 if [[ ! -b "$ZVOL_PATH" ]]; then
-  echo "[ERROR] ZFS volume not found: $ZVOL_PATH" >&2
+  log "ERROR" "ZFS volume not found: $ZVOL_PATH"
   exit 1
 fi
+log "INFO" "ZFS volume exists: $ZVOL_PATH"
 
 # --- stop VM if running ---
+log "INFO" "Checking VM $VMID status..."
 STATUS="$(qm status "$VMID" | awk '{print $2}')"
+log "INFO" "VM $VMID current status: $STATUS"
 if [[ "$STATUS" == "running" ]]; then
-  echo "[INFO] VM $VMID is running, stopping..."
-  pvesh create "/nodes/${NODE}/qemu/${VMID}/status/stop" --timeout 120
+  log "INFO" "VM $VMID is running, stopping..."
+  set +e  # Temporarily disable exit on error for pipe
+  pvesh create "/nodes/${NODE}/qemu/${VMID}/status/stop" --timeout 120 2>&1 | tee -a "$LOG_FILE"
+  stop_exit_code=${PIPESTATUS[0]}  # Get exit code of pvesh
+  set -e  # Re-enable exit on error
+  if [[ $stop_exit_code -ne 0 ]]; then
+    log "ERROR" "Failed to stop VM $VMID (exit code: $stop_exit_code)"
+    exit 1
+  fi
+  log "INFO" "Waiting for VM $VMID to stop..."
+  # Wait for VM to actually stop
+  wait_count=0
+  while [[ $wait_count -lt 60 ]]; do
+    sleep 2
+    CURRENT_STATUS="$(qm status "$VMID" | awk '{print $2}')"
+    if [[ "$CURRENT_STATUS" != "running" ]]; then
+      log "INFO" "VM $VMID stopped (status: $CURRENT_STATUS)"
+      break
+    fi
+    wait_count=$((wait_count + 1))
+  done
+  if [[ $wait_count -ge 60 ]]; then
+    log "ERROR" "VM $VMID did not stop within 120 seconds"
+    exit 1
+  fi
 else
-  echo "[INFO] VM $VMID is not running (status: $STATUS)"
+  log "INFO" "VM $VMID is not running (status: $STATUS)"
 fi
 
 # --- temp dir & cleanup ---
@@ -62,57 +131,120 @@ TMPROOT="$(mktemp -d /var/tmp/restore-${VMID}-XXXXXX)"
 EXTRACT_DIR="${TMPROOT}/vma"
 rm -rf "$EXTRACT_DIR"
 mkdir -p "$(dirname "$EXTRACT_DIR")"
-echo "[INFO] Using temp dir: $TMPROOT"
+log "INFO" "Using temp dir: $TMPROOT"
 
 cleanup() {
-  echo "[INFO] Cleaning up $TMPROOT"
+  log "INFO" "Cleaning up $TMPROOT"
   rm -rf "$TMPROOT"
 }
 trap cleanup EXIT
 
 # --- extract .vma or .vma.zst ---
-echo "[INFO] Extracting backup..."
+log "INFO" "Starting backup extraction..."
+log "INFO" "Extract directory: $EXTRACT_DIR"
 
 if [[ "$BACKUP" == *.zst ]]; then
-  echo "[INFO] Detected compressed backup (.zst)"
+  log "INFO" "Detected compressed backup (.zst)"
   if ! command -v zstd >/dev/null 2>&1; then
-    echo "[ERROR] zstd is not installed" >&2
+    log "ERROR" "zstd is not installed"
     exit 1
   fi
   # Stream decompress directly into vma extract
-  zstd -dc "$BACKUP" | vma extract -v - "$EXTRACT_DIR"
+  log "INFO" "Decompressing and extracting backup (this may take a while)..."
+  set +e  # Temporarily disable exit on error for pipe
+  zstd -dc "$BACKUP" 2>&1 | vma extract -v - "$EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE"
+  extract_exit_code=${PIPESTATUS[0]}  # Get exit code of zstd
+  set -e  # Re-enable exit on error
+  if [[ $extract_exit_code -ne 0 ]]; then
+    log "ERROR" "Backup extraction failed (zstd exit code: $extract_exit_code)"
+    exit 1
+  fi
+  log "INFO" "Backup extraction completed"
 else
-  echo "[INFO] Detected uncompressed .vma"
-  vma extract -v "$BACKUP" "$EXTRACT_DIR"
+  log "INFO" "Detected uncompressed .vma"
+  log "INFO" "Extracting backup (this may take a while)..."
+  set +e  # Temporarily disable exit on error for pipe
+  vma extract -v "$BACKUP" "$EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE"
+  extract_exit_code=${PIPESTATUS[0]}  # Get exit code of vma extract
+  set -e  # Re-enable exit on error
+  if [[ $extract_exit_code -ne 0 ]]; then
+    log "ERROR" "Backup extraction failed (vma extract exit code: $extract_exit_code)"
+    exit 1
+  fi
+  log "INFO" "Backup extraction completed"
 fi
 
 # Try to match disk type (scsi0, virtio0, sata0, ide0, etc.)
+log "INFO" "Looking for extracted disk file..."
 DISK_NAME="$(echo "$DISK_ENTRY" | awk -F: '{print $1}')"
 RAW_DISK="${EXTRACT_DIR}/disk-drive-${DISK_NAME}.raw"
+log "INFO" "Expected disk file: $RAW_DISK"
 
 if [[ ! -f "$RAW_DISK" ]]; then
-  echo "[WARN] Could not find disk for $DISK_NAME, searching fallback..."
+  log "WARN" "Could not find disk for $DISK_NAME, searching fallback..."
   RAW_DISK="$(find "$EXTRACT_DIR" -type f -name '*scsi0*.raw' | head -n1 || true)"
+  if [[ -n "$RAW_DISK" ]]; then
+    log "INFO" "Found fallback disk: $RAW_DISK"
+  fi
 fi
 
 if [[ -z "$RAW_DISK" || ! -f "$RAW_DISK" ]]; then
-  echo "[ERROR] Could not find the expected .raw disk for $DISK_NAME in $EXTRACT_DIR" >&2
-  echo "[DEBUG] Available .raw files:"
-  ls -1 "$EXTRACT_DIR"/*.raw 2>/dev/null || true
+  log "ERROR" "Could not find the expected .raw disk for $DISK_NAME in $EXTRACT_DIR"
+  log "DEBUG" "Available files in extract directory:"
+  ls -la "$EXTRACT_DIR" 2>/dev/null | while IFS= read -r line; do
+    log "DEBUG" "$line"
+  done || true
+  log "DEBUG" "Available .raw files:"
+  ls -1 "$EXTRACT_DIR"/*.raw 2>/dev/null | while IFS= read -r file; do
+    log "DEBUG" "  $file"
+  done || true
   exit 1
 fi
+log "INFO" "Found disk file: $RAW_DISK"
 
-echo "[INFO] Restoring $RAW_DISK → $ZVOL_PATH"
+log "INFO" "Starting disk restore: $RAW_DISK → $ZVOL_PATH"
+DISK_SIZE="$(stat -f%z "$RAW_DISK" 2>/dev/null || stat -c%s "$RAW_DISK" 2>/dev/null || echo "unknown")"
+log "INFO" "Disk size: $DISK_SIZE bytes"
 if command -v pv >/dev/null 2>&1; then
-  pv "$RAW_DISK" | dd of="$ZVOL_PATH" bs=4M conv=fsync status=progress
+  log "INFO" "Using pv for progress display..."
+  # Use pv for progress display, log both pv output and dd status
+  set +e  # Temporarily disable exit on error for pipe
+  {
+    pv "$RAW_DISK" 2>&1 | dd of="$ZVOL_PATH" bs=4M conv=fsync 2>&1
+  } | tee -a "$LOG_FILE"
+  restore_exit_code=${PIPESTATUS[0]}  # Get exit code of pv
+  set -e  # Re-enable exit on error
+  if [[ $restore_exit_code -ne 0 ]]; then
+    log "ERROR" "Disk restore failed (pv exit code: $restore_exit_code)"
+    exit 1
+  fi
 else
-  dd if="$RAW_DISK" of="$ZVOL_PATH" bs=4M conv=fsync status=progress
+  log "INFO" "Using dd with status=progress..."
+  # Use dd with status=progress, capture output to log
+  set +e  # Temporarily disable exit on error for pipe
+  dd if="$RAW_DISK" of="$ZVOL_PATH" bs=4M conv=fsync status=progress 2>&1 | tee -a "$LOG_FILE"
+  restore_exit_code=${PIPESTATUS[0]}  # Get exit code of dd
+  set -e  # Re-enable exit on error
+  if [[ $restore_exit_code -ne 0 ]]; then
+    log "ERROR" "Disk restore failed (dd exit code: $restore_exit_code)"
+    exit 1
+  fi
 fi
 
+log "INFO" "Disk restore completed, syncing filesystem..."
 sync
+log "INFO" "Filesystem sync completed"
 
 # --- restart VM ---
-echo "[INFO] Starting VM $VMID..."
-pvesh create "/nodes/${NODE}/qemu/${VMID}/status/start"
+log "INFO" "Starting VM $VMID..."
+set +e  # Temporarily disable exit on error for pipe
+pvesh create "/nodes/${NODE}/qemu/${VMID}/status/start" 2>&1 | tee -a "$LOG_FILE"
+start_exit_code=${PIPESTATUS[0]}  # Get exit code of pvesh
+set -e  # Re-enable exit on error
+if [[ $start_exit_code -ne 0 ]]; then
+  log "ERROR" "Failed to start VM $VMID (exit code: $start_exit_code)"
+  exit 1
+fi
+log "INFO" "VM $VMID start command completed"
 
-echo "[INFO] Done."
+log "INFO" "Done."
