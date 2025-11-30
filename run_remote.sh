@@ -23,7 +23,7 @@ for ((i=1; i<=20; i++)); do
     echo "Connecting to $IP"
 
     # Send function and execute it
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$IP" \
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$IP" \
         "$FUNC_CONTENT; remote_task" \
         || echo "❌ Failed to connect to $IP"
 done
