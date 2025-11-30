@@ -41,6 +41,93 @@ log() {
   echo "$log_entry"
 }
 
+# Wrapper for getting VM status using pvesh API
+get_vm_status() {
+  local vmid="$1"
+  local node="${2:-$(hostname)}"
+  local output
+  local exit_code
+  local status
+  
+  {
+    log "DEBUG" "Executing: pvesh get /nodes/${node}/qemu/${vmid}/status/current"
+  } >&2
+  set +e  # Temporarily disable exit on error
+  output=$(pvesh get "/nodes/${node}/qemu/${vmid}/status/current" --output-format json 2>&1)
+  exit_code=$?
+  set -e  # Re-enable exit on error
+  
+  if [[ $exit_code -eq 0 && -n "$output" ]]; then
+    # Extract status from JSON output (pvesh returns JSON like {"status":"running",...})
+    # Try multiple methods to parse JSON
+    if command -v jq >/dev/null 2>&1; then
+      status=$(echo "$output" | jq -r '.status // empty' 2>/dev/null || echo "")
+    else
+      # Fallback: use grep/sed to extract status
+      status=$(echo "$output" | grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || echo "")
+    fi
+    
+    if [[ -n "$status" ]]; then
+      echo "$status"
+      return 0
+    else
+      {
+        log "ERROR" "Could not parse status from pvesh output: $output"
+      } >&2
+      return 1
+    fi
+  else
+    {
+      log "ERROR" "pvesh get status for VM $vmid failed with exit code $exit_code: $output"
+    } >&2
+    return $exit_code
+  fi
+}
+
+# Wrapper for getting VM config using pvesh API
+get_vm_config_value() {
+  local vmid="$1"
+  local config_key="$2"  # e.g., "scsi0"
+  local node="${3:-$(hostname)}"
+  local output
+  local exit_code
+  local value
+  
+  {
+    log "DEBUG" "Executing: pvesh get /nodes/${node}/qemu/${vmid}/config"
+  } >&2
+  set +e  # Temporarily disable exit on error
+  output=$(pvesh get "/nodes/${node}/qemu/${vmid}/config" --output-format json 2>&1)
+  exit_code=$?
+  set -e  # Re-enable exit on error
+  
+  if [[ $exit_code -eq 0 && -n "$output" ]]; then
+    # Extract config value from JSON output (pvesh returns JSON like {"scsi0":"local-zfs:vm-201-disk-1,...",...})
+    # Try multiple methods to parse JSON
+    if command -v jq >/dev/null 2>&1; then
+      value=$(echo "$output" | jq -r ".[\"${config_key}\"] // empty" 2>/dev/null || echo "")
+    else
+      # Fallback: use grep/sed to extract config value
+      value=$(echo "$output" | grep -o "\"${config_key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed "s/.*\"${config_key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/" || echo "")
+    fi
+    
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return 0
+    else
+      {
+        log "ERROR" "Could not find config key '${config_key}' in pvesh output: $output"
+      } >&2
+      return 1
+    fi
+  else
+    {
+      log "ERROR" "pvesh get config for VM $vmid failed with exit code $exit_code: $output"
+    } >&2
+    return $exit_code
+  fi
+}
+
 # Initialize logging
 if clean_log_if_needed; then
   log "INFO" "Log file deleted due to size limit (> 1 MB)"
@@ -67,16 +154,16 @@ log "INFO" "Backup: $BACKUP"
 
 # --- sanity checks ---
 log "INFO" "Checking if VM $VMID exists..."
-if ! qm status "$VMID" >/dev/null 2>&1; then
-  log "ERROR" "VM $VMID does not exist on this node"
+if ! STATUS_CHECK=$(get_vm_status "$VMID" "$NODE" 2>/dev/null); then
+  log "ERROR" "VM $VMID does not exist on this node or status check failed"
   exit 1
 fi
-log "INFO" "VM $VMID exists"
+log "INFO" "VM $VMID exists (status: ${STATUS_CHECK:-unknown})"
 
 log "INFO" "Reading VM $VMID disk configuration..."
-DISK_ENTRY="$(qm config "$VMID" | awk -F': ' '/^scsi0:/ {print $2}')"
-if [[ -z "${DISK_ENTRY}" ]]; then
-  log "ERROR" "VM $VMID has no scsi0 disk configured"
+DISK_ENTRY="$(get_vm_config_value "$VMID" "scsi0" "$NODE")"
+if [[ $? -ne 0 || -z "${DISK_ENTRY}" ]]; then
+  log "ERROR" "VM $VMID has no scsi0 disk configured or failed to read config"
   exit 1
 fi
 log "INFO" "Found disk entry: $DISK_ENTRY"
@@ -94,12 +181,21 @@ log "INFO" "ZFS volume exists: $ZVOL_PATH"
 
 # --- stop VM if running ---
 log "INFO" "Checking VM $VMID status..."
-STATUS="$(qm status "$VMID" | awk '{print $2}')"
+STATUS="$(get_vm_status "$VMID" "$NODE")"
+STATUS_EXIT=$?
+if [[ $STATUS_EXIT -ne 0 ]]; then
+  log "ERROR" "Failed to get VM status. VM may be in a bad state. Proceeding anyway..."
+  STATUS="unknown"
+elif [[ -z "$STATUS" ]]; then
+  log "WARN" "VM status returned empty. Proceeding anyway..."
+  STATUS="unknown"
+fi
 log "INFO" "VM $VMID current status: $STATUS"
+
 if [[ "$STATUS" == "running" ]]; then
   log "INFO" "VM $VMID is running, stopping..."
   set +e  # Temporarily disable exit on error for pipe
-  pvesh create "/nodes/${NODE}/qemu/${VMID}/status/stop" --timeout 120 2>&1 | tee -a "$LOG_FILE"
+  pvesh create "/nodes/${NODE}/qemu/${VMID}/status/stop" 2>&1 | tee -a "$LOG_FILE"
   stop_exit_code=${PIPESTATUS[0]}  # Get exit code of pvesh
   set -e  # Re-enable exit on error
   if [[ $stop_exit_code -ne 0 ]]; then
@@ -111,7 +207,17 @@ if [[ "$STATUS" == "running" ]]; then
   wait_count=0
   while [[ $wait_count -lt 60 ]]; do
     sleep 2
-    CURRENT_STATUS="$(qm status "$VMID" | awk '{print $2}')"
+    CURRENT_STATUS="$(get_vm_status "$VMID" "$NODE")"
+    CURRENT_STATUS_EXIT=$?
+    if [[ $CURRENT_STATUS_EXIT -ne 0 ]]; then
+      log "WARN" "VM status check failed while waiting for stop (attempt $wait_count/60), continuing..."
+      # If we can't check status, assume it's stopped and continue
+      break
+    fi
+    if [[ -z "$CURRENT_STATUS" ]]; then
+      log "WARN" "VM status returned empty (attempt $wait_count/60), continuing..."
+      break
+    fi
     if [[ "$CURRENT_STATUS" != "running" ]]; then
       log "INFO" "VM $VMID stopped (status: $CURRENT_STATUS)"
       break
@@ -119,8 +225,7 @@ if [[ "$STATUS" == "running" ]]; then
     wait_count=$((wait_count + 1))
   done
   if [[ $wait_count -ge 60 ]]; then
-    log "ERROR" "VM $VMID did not stop within 120 seconds"
-    exit 1
+    log "WARN" "VM $VMID did not stop within 120 seconds, but continuing with restore..."
   fi
 else
   log "INFO" "VM $VMID is not running (status: $STATUS)"

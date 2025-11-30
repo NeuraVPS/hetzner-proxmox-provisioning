@@ -109,7 +109,7 @@ systemctl daemon-reload
 systemctl enable pve-guests-hooks.service
 
 # Allow replacement of disks
-apt-get install -y pv
+apt-get install -y pv jq
 
 # Add Swap for security
 zfs create -V 32G \
