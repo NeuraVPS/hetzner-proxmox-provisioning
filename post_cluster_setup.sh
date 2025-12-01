@@ -22,12 +22,8 @@ chmod +x /var/lib/svz/snippets/pve-post-boot-resume.sh
 chmod +x /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
 chmod +x /var/lib/svz/snippets/reset-vm-conntrack.py
 
-sftp -oBatchMode=yes root@[fd00:4000::1] <<EOF
+sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
 get /etc/firebase-credentials.json /etc/firebase-credentials.json
-bye
-EOF
-
-sftp -oBatchMode=yes root@[fd00:4000::1] <<EOF
 get /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
 bye
 EOF
