@@ -147,6 +147,37 @@ zfs set recordsize=16K rpool/ROOT
 zpool set autotrim=on rpool
 zfs set logbias=throughput rpool/data
 
+# Configure GRUB to disable Intel integrated GPU (i915)
+log "Configuring GRUB to disable Intel integrated GPU (i915)"
+GRUB_DEFAULT="/etc/default/grub"
+if [ -f "$GRUB_DEFAULT" ]; then
+  # Read current GRUB_CMDLINE_LINUX if it exists
+  if grep -q "^GRUB_CMDLINE_LINUX=" "$GRUB_DEFAULT"; then
+    # Extract existing parameters and add i915 disabling parameters
+    CURRENT_CMDLINE=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_DEFAULT" | sed 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/')
+    # Remove deprecated i915.modeset=0 if present (replaced by nomodeset)
+    CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed 's/i915\.modeset=0//g')
+    # Add nomodeset if not already present (disables all GPU mode setting)
+    if [[ "$CURRENT_CMDLINE" != *"nomodeset"* ]]; then
+      CURRENT_CMDLINE="${CURRENT_CMDLINE} nomodeset"
+    fi
+    # Add i915.enable_guc=0 if not already present (disables GuC firmware)
+    if [[ "$CURRENT_CMDLINE" != *"i915.enable_guc=0"* ]]; then
+      CURRENT_CMDLINE="${CURRENT_CMDLINE} i915.enable_guc=0"
+    fi
+    # Update GRUB_CMDLINE_LINUX
+    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${CURRENT_CMDLINE}\"|" "$GRUB_DEFAULT"
+  else
+    # If GRUB_CMDLINE_LINUX doesn't exist, add it
+    echo 'GRUB_CMDLINE_LINUX="nomodeset i915.enable_guc=0"' >> "$GRUB_DEFAULT"
+  fi
+  log "Updated GRUB_CMDLINE_LINUX in $GRUB_DEFAULT"
+  update-grub
+  log "GRUB updated with i915 disabling parameters"
+else
+  log "WARNING: $GRUB_DEFAULT not found, skipping GRUB configuration"
+fi
+
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
 echo "==> Configuring Proxmox firewall (datacenter baseline)"
