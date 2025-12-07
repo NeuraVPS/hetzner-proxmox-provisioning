@@ -157,6 +157,18 @@ def get_running_vms():
             vms.append(int(fields[0]))
     return vms
 
+def get_all_vms():
+    """Return dict mapping vmid -> "running" or "stopped" for all VMs."""
+    result = run(["qm", "list"])
+    vm_status = {}
+    for line in result.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 3:
+            vmid = int(fields[0])
+            status = fields[2]
+            vm_status[vmid] = "running" if status == "running" else "stopped"
+    return vm_status
+
 def get_vm_info(vmid):
     try:
         config = run(["qm", "config", str(vmid)])
@@ -397,13 +409,13 @@ def sync_ipv6_to_firestore(vm_infos):
             ipv6_address = info.get("ipv6")
             
             try:
-                # Query for server document with matching proxmoxId
+                # Query for server document with matching proxmoxId and nodeId
                 servers_ref = db.collection('servers')
                 # Use new filter API if available to avoid deprecation warnings
                 if FIELD_FILTER_AVAILABLE:
-                    query = servers_ref.where(filter=FieldFilter('proxmoxId', '==', vmid))
+                    query = servers_ref.where(filter=FieldFilter('proxmoxId', '==', vmid)).where(filter=FieldFilter('nodeId', '==', NODE_NAME))
                 else:
-                    query = servers_ref.where('proxmoxId', '==', vmid)
+                    query = servers_ref.where('proxmoxId', '==', vmid).where('nodeId', '==', NODE_NAME)
                 docs = list(query.stream())
                 
                 if not docs:
@@ -450,11 +462,51 @@ def sync_ipv6_to_firestore(vm_infos):
     except Exception as e:
         logger.error(f"Failed to sync IPv6 to Firestore: {e}")
 
-def update_last_started_in_firestore(vmid):
-    """Update lastStarted timestamp in Firestore when a VM receives an IP.
+def get_firestore_status(vmid):
+    """Get current status from Firestore for a VM.
     
     Args:
         vmid: VM ID (proxmoxId)
+    
+    Returns:
+        Current status string ("running" or "stopped") or None if not found/not set
+    """
+    if not ensure_firebase_initialized():
+        return None
+    
+    try:
+        db = firestore.client()
+        
+        # Query for server document with matching proxmoxId and nodeId
+        servers_ref = db.collection('servers')
+        # Use new filter API if available to avoid deprecation warnings
+        if FIELD_FILTER_AVAILABLE:
+            query = servers_ref.where(filter=FieldFilter('proxmoxId', '==', vmid)).where(filter=FieldFilter('nodeId', '==', NODE_NAME))
+        else:
+            query = servers_ref.where('proxmoxId', '==', vmid).where('nodeId', '==', NODE_NAME)
+        docs = list(query.stream())
+        
+        if not docs:
+            logger.debug(f"No Firestore document found for VM {vmid} (proxmoxId={vmid}, nodeId={NODE_NAME})")
+            return None
+        
+        if len(docs) > 1:
+            logger.warning(f"Multiple Firestore documents found for VM {vmid} (proxmoxId={vmid}, nodeId={NODE_NAME}), using first")
+        
+        # Get status from first matching document
+        doc_data = docs[0].to_dict()
+        return doc_data.get('status')
+        
+    except Exception as e:
+        logger.warning(f"Failed to get status for VM {vmid} from Firestore: {e}")
+        return None
+
+def update_status_in_firestore(vmid, status):
+    """Update status and lastStatusUpdate timestamp in Firestore.
+    
+    Args:
+        vmid: VM ID (proxmoxId)
+        status: Status string ("running" or "stopped")
     """
     if not ensure_firebase_initialized():
         return
@@ -462,34 +514,37 @@ def update_last_started_in_firestore(vmid):
     try:
         db = firestore.client()
         
-        # Query for server document with matching proxmoxId
+        # Query for server document with matching proxmoxId and nodeId
         servers_ref = db.collection('servers')
         # Use new filter API if available to avoid deprecation warnings
         if FIELD_FILTER_AVAILABLE:
-            query = servers_ref.where(filter=FieldFilter('proxmoxId', '==', vmid))
+            query = servers_ref.where(filter=FieldFilter('proxmoxId', '==', vmid)).where(filter=FieldFilter('nodeId', '==', NODE_NAME))
         else:
-            query = servers_ref.where('proxmoxId', '==', vmid)
+            query = servers_ref.where('proxmoxId', '==', vmid).where('nodeId', '==', NODE_NAME)
         docs = list(query.stream())
         
         if not docs:
-            logger.debug(f"No Firestore document found for VM {vmid} (proxmoxId={vmid}) to update lastStarted")
+            logger.debug(f"No Firestore document found for VM {vmid} (proxmoxId={vmid}, nodeId={NODE_NAME}) to update status")
             return
         
         if len(docs) > 1:
-            logger.warning(f"Multiple Firestore documents found for VM {vmid} (proxmoxId={vmid}), updating all")
+            logger.warning(f"Multiple Firestore documents found for VM {vmid} (proxmoxId={vmid}, nodeId={NODE_NAME}), updating all")
         
         # Update each matching document
         for doc_snapshot in docs:
             server_id = doc_snapshot.id
-            update_data = {'lastStarted': firestore.SERVER_TIMESTAMP}
+            update_data = {
+                'status': status,
+                'lastStatusUpdate': firestore.SERVER_TIMESTAMP
+            }
             
             # Get document reference and update
             server_doc_ref = db.collection('servers').document(server_id)
             server_doc_ref.update(update_data)
-            logger.info(f"Updated Firestore server {server_id} (VM {vmid}): lastStarted timestamp set")
+            logger.info(f"Updated Firestore server {server_id} (VM {vmid}): status set to {status}")
             
     except Exception as e:
-        logger.warning(f"Failed to update lastStarted for VM {vmid} in Firestore: {e}")
+        logger.warning(f"Failed to update status for VM {vmid} in Firestore: {e}")
 
 # ---------------------------------------------------------------
 # Main logic
@@ -517,7 +572,7 @@ def main():
         
         logger.info(f"Hook triggered: VM {triggered_vmid}, phase {phase}")
     
-    # Handle post-stop hook: just remove DNAT rules for this VM
+    # Handle post-stop hook: remove DNAT rules and update status
     if hook_mode and phase == "post-stop":
         logger.info(f"Removing DNAT rules for VM {triggered_vmid}")
         actual = parse_iptables_rules(vmid_filter=triggered_vmid)
@@ -527,6 +582,8 @@ def main():
             if m:
                 comment = m.group(1)
                 delete_rule_by_comment(comment, "nat")
+        # Update status to stopped
+        update_status_in_firestore(triggered_vmid, "stopped")
         logger.info("Sync complete.")
         return
     
@@ -535,6 +592,7 @@ def main():
     logger.info(f"WAN interface: {wan_if}")
 
     vm_infos = {}
+    vms_for_ipv6_sync = {}  # Track VMs for IPv6 sync (manual mode only)
     
     # In hook mode, only process the triggered VM
     if hook_mode:
@@ -545,10 +603,10 @@ def main():
                 info = wait_for_vm_ip(triggered_vmid)
                 if info:
                     vm_infos[triggered_vmid] = info
-                    # Sync IPv6 first (before lastStarted update, as functions triggered by lastStarted need the updated IP)
+                    # Sync IPv6 first (before status update, as functions triggered by status change need the updated IP)
                     sync_ipv6_to_firestore({triggered_vmid: info})
-                    # Update lastStarted timestamp when VM receives an IP
-                    update_last_started_in_firestore(triggered_vmid)
+                    # Update status to running when VM receives an IP
+                    update_status_in_firestore(triggered_vmid, "running")
                 else:
                     logger.warning(f"VM {triggered_vmid} did not get an IP, skipping")
             except Exception as e:
@@ -557,22 +615,36 @@ def main():
                     return
                 raise
     else:
-        # Manual mode: process all running VMs
-        vmids = get_running_vms()
-        logger.info(f"Running VMs: {vmids}")
+        # Manual mode: process all VMs (running and stopped)
+        all_vm_status = get_all_vms()
+        logger.info(f"All VMs: {list(all_vm_status.keys())}")
         
-        for vmid in vmids:
-            try:
-                info = get_vm_info(vmid)
-                if info:
-                    vm_infos[vmid] = info
-                else:
-                    logger.warning(f"No internal IP for VM {vmid}")
-            except Exception as e:
-                if "no guest agent" in str(e).lower():
-                    logger.warning(f"VM {vmid} has no guest agent - skipping")
-                else:
-                    raise
+        for vmid, actual_status in all_vm_status.items():
+            # Get current status from Firestore
+            firestore_status = get_firestore_status(vmid)
+            
+            # Only update status if it has changed
+            if firestore_status != actual_status:
+                logger.info(f"VM {vmid} status changed from {firestore_status} to {actual_status}, updating Firestore")
+                update_status_in_firestore(vmid, actual_status)
+            
+            # For running VMs: get VM info and prepare for IPv6 sync and DNAT rules
+            if actual_status == "running":
+                try:
+                    info = get_vm_info(vmid)
+                    if info:
+                        vm_infos[vmid] = info
+                        # Track for IPv6 sync if IPv6 is available
+                        if info.get("ipv6"):
+                            vms_for_ipv6_sync[vmid] = info
+                    else:
+                        logger.warning(f"No internal IP for VM {vmid}")
+                except Exception as e:
+                    if "no guest agent" in str(e).lower():
+                        logger.warning(f"VM {vmid} has no guest agent - skipping")
+                    else:
+                        raise
+            # For stopped VMs: DNAT rules will be automatically removed since they're not in vm_infos
 
     # Build expected rules (only NAT rules - group rules handle FORWARD filtering)
     expected_nat, expected_filter = build_expected_rules(vm_infos, wan_if)
@@ -587,9 +659,9 @@ def main():
     sync_iptables_rules(expected_nat, actual["nat"], "nat")
     sync_iptables_rules(expected_filter, actual["filter"], "filter")
 
-    # Sync IPv6 addresses to Firestore (only in manual mode)
-    if not hook_mode and vm_infos:
-        sync_ipv6_to_firestore(vm_infos)
+    # Sync IPv6 addresses to Firestore (only in manual mode, only for running VMs with IPv6)
+    if not hook_mode and vms_for_ipv6_sync:
+        sync_ipv6_to_firestore(vms_for_ipv6_sync)
 
     logger.info("Sync complete.")
 
