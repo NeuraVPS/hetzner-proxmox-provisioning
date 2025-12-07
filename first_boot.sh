@@ -255,7 +255,7 @@ pve-firewall restart || true
 log "Installing cluster-wide hookscript for dynamic RDP DNAT + INPUT open/close"
 mkdir -p /var/lib/svz
 if ! pvesm status | awk '{print $1}' | grep -x shared; then
-  pvesm add dir shared --path /var/lib/svz --content snippets --shared true || true
+  pvesm add dir shared --path /var/lib/svz --content snippets,dump --shared true || true
 fi
 
 # Always overwrite to keep latest version
