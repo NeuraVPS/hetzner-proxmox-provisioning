@@ -184,10 +184,10 @@ echo "==> Configuring Proxmox firewall (datacenter baseline)"
 cat >/etc/pve/firewall/cluster.fw <<'EOF'
 [OPTIONS]
 
-policy_out: ACCEPT
-policy_in: DROP
 enable: 1
+policy_in: DROP
 policy_forward: DROP
+policy_out: ACCEPT
 
 [ALIASES]
 
@@ -200,9 +200,6 @@ fd00:4000::/108
 
 [IPSET hosts-ipv6]
 
-2a01:4f9:3071:17a7::/64
-2a01:4f9:6a:44eb::/64
-
 [RULES]
 
 GROUP management
@@ -212,7 +209,6 @@ IN DHCPv6(ACCEPT) -i vmbr0 -log nolog
 
 [group management]
 
-IN PMG(ACCEPT) -log nolog
 IN SSH(ACCEPT) -log nolog
 
 [group vm-default]
@@ -255,7 +251,7 @@ pve-firewall restart || true
 log "Installing cluster-wide hookscript for dynamic RDP DNAT + INPUT open/close"
 mkdir -p /var/lib/svz
 if ! pvesm status | awk '{print $1}' | grep -x shared; then
-  pvesm add dir shared --path /var/lib/svz --content snippets,dump --shared true || true
+  pvesm add dir shared --path /var/lib/svz --content snippets,backup --shared true || true
 fi
 
 # Always overwrite to keep latest version
@@ -283,10 +279,13 @@ chmod +x /var/lib/svz/snippets/reset-vm-conntrack.py
 sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
 get /etc/firebase-credentials.json /etc/firebase-credentials.json
 get /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
+get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
+
+pve-firewall restart || true
 
 log "first_boot.sh finished"
 
 # manually add with: qm set 100 --hookscript shared:snippets/sync-dnat.py
-#reboot
+shutdown -r +1
