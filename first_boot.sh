@@ -81,32 +81,32 @@ EOF
 systemctl restart dnsmasq
 
 # Script to preserve VM status on reboot
-cat >/etc/systemd/system/pve-guests-hooks.service <<EOF
-[Unit]
-Description=Custom hooks to suspend/resume VMs around pve-guests lifecycle
-# Run AFTER guests have started
-After=pve-guests.service
-# Tie our lifetime to pve-guests
-PartOf=pve-guests.service
+# cat >/etc/systemd/system/pve-guests-hooks.service <<EOF
+# [Unit]
+# Description=Custom hooks to suspend/resume VMs around pve-guests lifecycle
+# # Run AFTER guests have started
+# After=pve-guests.service
+# # Tie our lifetime to pve-guests
+# PartOf=pve-guests.service
 
-[Service]
-Type=oneshot
-TimeoutStartSec=60min
-RemainAfterExit=yes
-TimeoutStopSec=60min
+# [Service]
+# Type=oneshot
+# TimeoutStartSec=60min
+# RemainAfterExit=yes
+# TimeoutStopSec=60min
 
-# --- resume hook ---
-ExecStart=/var/lib/svz/snippets/pve-post-boot-resume.sh
+# # --- resume hook ---
+# ExecStart=/var/lib/svz/snippets/pve-post-boot-resume.sh
 
-# --- suspend hook ---
-ExecStop=/var/lib/svz/snippets/pve-pre-reboot-suspend.sh
+# # --- suspend hook ---
+# ExecStop=/var/lib/svz/snippets/pve-pre-reboot-suspend.sh
 
-[Install]
-WantedBy=pve-guests.service
-EOF
+# [Install]
+# WantedBy=pve-guests.service
+# EOF
 
-systemctl daemon-reload
-systemctl enable pve-guests-hooks.service
+# systemctl daemon-reload
+# systemctl enable pve-guests-hooks.service
 
 # Allow replacement of disks
 apt-get install -y pv jq
@@ -258,11 +258,11 @@ fi
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py \
     -o /var/lib/svz/snippets/sync-dnat.py
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-pre-reboot-suspend.sh \
-    -o /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
+# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-pre-reboot-suspend.sh \
+#     -o /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-post-boot-resume.sh \
-    -o /var/lib/svz/snippets/pve-post-boot-resume.sh
+# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-post-boot-resume.sh \
+#     -o /var/lib/svz/snippets/pve-post-boot-resume.sh
 
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/restore-vm-disk-from-vma.sh \
     -o /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
@@ -271,8 +271,8 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
     -o /var/lib/svz/snippets/reset-vm-conntrack.py
 
 chmod +x /var/lib/svz/snippets/sync-dnat.py
-chmod +x /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
-chmod +x /var/lib/svz/snippets/pve-post-boot-resume.sh
+# chmod +x /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
+# chmod +x /var/lib/svz/snippets/pve-post-boot-resume.sh
 chmod +x /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
 chmod +x /var/lib/svz/snippets/reset-vm-conntrack.py
 
