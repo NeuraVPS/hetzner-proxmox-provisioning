@@ -112,27 +112,45 @@ systemctl restart dnsmasq
 apt-get install -y pv jq
 
 # Add Swap for security
-zfs create -V 32G \
-  -b 16384 \
-  -o compression=off \
-  -o primarycache=metadata \
-  -o logbias=throughput \
-  -o sync=always \
-  -o redundant_metadata=most \
-  rpool/swapvol
+# zfs create -V 32G \
+#   -b 16384 \
+#   -o compression=off \
+#   -o primarycache=metadata \
+#   -o logbias=throughput \
+#   -o sync=always \
+#   -o redundant_metadata=most \
+#   rpool/swapvol
 
-# Esperar a que udev cree el dispositivo
-for i in {1..30}; do
-    if [ -e /dev/zvol/rpool/swapvol ]; then
-        break
+# # Esperar a que udev cree el dispositivo
+# for i in {1..30}; do
+#     if [ -e /dev/zvol/rpool/swapvol ]; then
+#         break
+#     fi
+#     udevadm settle
+#     sleep 0.2
+# done
+
+# mkswap /dev/zvol/rpool/swapvol
+# swapon /dev/zvol/rpool/swapvol
+# echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
+apt-get install -y zram-tools
+ZRAM_CONF="/etc/default/zramswap"
+touch "$ZRAM_CONF"
+
+set_zram_param() {
+    local key="$1"
+    local value="$2"
+    if grep -qE "^${key}=" "$ZRAM_CONF"; then
+        sed -i "s/^${key}=.*/${key}=${value}/" "$ZRAM_CONF"
+    else
+        echo "${key}=${value}" >> "$ZRAM_CONF"
     fi
-    udevadm settle
-    sleep 0.2
-done
+}
 
-mkswap /dev/zvol/rpool/swapvol
-swapon /dev/zvol/rpool/swapvol
-echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
+set_zram_param ALGO zstd
+set_zram_param PERCENT 25
+
+systemctl enable --now zramswap
 
 # Server optimizations
 zfs set reservation=50G rpool
@@ -141,7 +159,7 @@ echo "options zfs zfs_arc_max=34359738368" > /etc/modprobe.d/zfs.conf
 update-initramfs -u
 zfs set compression=zstd-3 rpool/data
 zfs set compression=zstd-3 rpool/ROOT
-zfs set compression=off rpool/swapvol
+# zfs set compression=off rpool/swapvol
 zfs set sync=disabled rpool/data
 zfs set recordsize=16K rpool/ROOT
 zpool set autotrim=on rpool
