@@ -28,7 +28,13 @@ except ImportError:
 BRIDGE_NET = "10.0.0.0/16"
 BASE_PORT_RDP = 20000
 BASE_PORT_SAMBA = 10000
-NODE_NAME = subprocess.getoutput("hostname")
+# Get hostname reliably - use subprocess.run to avoid capturing stderr
+try:
+    result = subprocess.run(["hostname"], capture_output=True, text=True, check=True)
+    NODE_NAME = result.stdout.strip()
+except (subprocess.CalledProcessError, FileNotFoundError):
+    # Fallback to os.uname if hostname command fails
+    NODE_NAME = os.uname().nodename
 
 # Set up logging
 LOG_FILE = Path("/var/log/sync-dnat.log")
