@@ -11,6 +11,7 @@ screen -r
 ```
 
 This will automatically generate:
+
 - Hostname: `pve0000001-AX162-R`
 - Private IPv4: `10.64.0.1`
 - Private IPv6: `fd00:4000::1`
@@ -20,6 +21,7 @@ The server ID can be any number between 1 and 1,048,574.
 # Prepare new host
 
 ## Checklist
+
 - /etc/firebase-credentials.json
 - /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
 - Add server IPv6 CDIR to Proxmox firewall
@@ -29,6 +31,7 @@ The server ID can be any number between 1 and 1,048,574.
 # Prepare Windows Template
 
 ## Checklist
+
 - Apply Windows and Winget updates
 - Disable Password lock Policy
 - Apply Java patch for SQX
@@ -41,15 +44,20 @@ The server ID can be any number between 1 and 1,048,574.
 - From Linux, remove recovery partition
 
 ## Java Issue with sqx
+
 ```powershell
 setx _JAVA_OPTIONS "-Djava.awt.headless=true" /M
 setx JAVA_TOOL_OPTIONS "-Djava.awt.headless=true" /M
 ```
 
 ## Other useful configurations
+
 ```powershell
 # Don't lock accounts on failed login attempts
 net accounts /lockoutthreshold:0
+
+# Don't require password changes
+net accounts /maxpwage:UNLIMITED
 
 # Hide Telemetry configuration on first login
 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Force | Out-Null
@@ -109,6 +117,7 @@ New-Item -ItemType SymbolicLink -Path $linkPath -Target $targetFolder -Force | O
 ```
 
 ## Winget update fix for Sysprep
+
 ```powershell
 Get-AppxPackage *winget* | Remove-AppxPackage
 ```

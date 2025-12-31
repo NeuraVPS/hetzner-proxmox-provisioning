@@ -4,18 +4,33 @@
 # DEFINE LOCAL FUNCTION (runs remotely)
 ############################################################
 remote_task() {
-    echo "== Running remote task =="
-    # /var/lib/svz/snippets/sync-dnat.py
-    # apt-get update && apt-get full-upgrade -y
+#     echo "== Running remote task =="
+#     # /var/lib/svz/snippets/sync-dnat.py
+#     # apt-get update && apt-get full-upgrade -y
     
-    echo "== Finished =="
+    sftp -oBatchMode=yes  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@[fd00:4000::1e] <<EOF
+get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
+bye
+EOF
+
+#     sftp -oBatchMode=yes  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@[fd00:4000::1e] <<EOF
+# get /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst.2
+# bye
+# EOF
+
+pve-firewall restart || true
+
+  # mv /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst.2 /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
+
+#     systemctl restart corosync
+#     echo "== Finished =="
 }
 ############################################################
 
 # Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
-for ((i=1; i<=20; i++)); do
+for ((i=1; i<=32; i++)); do
     HEX=$(printf "%x" "$i")
     IP="fd00:4000::${HEX}"
 
