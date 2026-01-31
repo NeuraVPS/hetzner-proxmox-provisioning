@@ -141,6 +141,18 @@ pve_zfs_migrate_vm() {
     < "$CONF_LOCAL"
   _ok "VM config copied."
 
+  local FW_LOCAL="/etc/pve/firewall/${VMID}.fw"
+  if [[ -f "$FW_LOCAL" ]]; then
+    _info "Copying firewall config -> /etc/pve/firewall/${VMID}.fw"
+    ssh "${SSH_OPTS[@]}" "$DEST_SSH" "mkdir -p /etc/pve/firewall"
+    ssh "${SSH_OPTS[@]}" "$DEST_SSH" \
+      "cat > '/etc/pve/firewall/${VMID}.fw.tmp' && mv -f '/etc/pve/firewall/${VMID}.fw.tmp' '/etc/pve/firewall/${VMID}.fw'" \
+      < "$FW_LOCAL"
+    _ok "Firewall config copied."
+  else
+    _info "No firewall config found at ${FW_LOCAL}; skipping."
+  fi
+
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
     _info "Updating Firestore (connectionUrl, nodeId) before starting VM on destination..."
     local DEST_PUBLIC_IP
