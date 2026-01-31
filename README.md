@@ -72,10 +72,24 @@ Set-ItemProperty -Path "HKLM:\Software\Microsoft\ServerManager" -Name "DoNotOpen
 # Disable WindowsFeedbackHub installation for new users
 Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "Microsoft.WindowsFeedbackHub" | Remove-AppxProvisionedPackage -Online
 
-# Disable Edge start wizard
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Force | Out-Null
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "HideFirstRunExperience" -Value 1 -Type DWord
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "BackgroundModeEnabled" -Value 0 -Type DWord
+# Disable Edge start wizard and make it clean
+$k = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+New-Item -Path $k -Force | Out-Null
+
+# Quitar first-run / wizard
+New-ItemProperty $k -Name HideFirstRunExperience -PropertyType DWord -Value 1 -Force | Out-Null
+
+# Sin procesos background (server friendly)
+New-ItemProperty $k -Name BackgroundModeEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $k -Name StartupBoostEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+
+# NTP: eliminar TODO el contenido
+New-ItemProperty $k -Name NewTabPageContentEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $k -Name NewTabPageQuickLinksEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $k -Name NewTabPageBackgroundImageEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $k -Name NewTabPageCustomizeEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $k -Name NewTabPageAppsEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $k -Name NewTabPageHideWeather -PropertyType DWord -Value 1 -Force | Out-Null
 
 # Show all file extensions in explorer
 Start-Process powershell -ArgumentList @"
@@ -114,6 +128,26 @@ if (Test-Path $linkPath) {
 }
 
 New-Item -ItemType SymbolicLink -Path $linkPath -Target $targetFolder -Force | Out-Null
+
+# Optimized UI
+$base = "Registry::HKEY_USERS\.DEFAULT\Control Panel\Desktop"
+
+Set-ItemProperty $base -Name DragFullWindows -Value "0"
+Set-ItemProperty $base -Name MenuAnimation -Value "0"
+Set-ItemProperty $base -Name ToolTipAnimation -Value "0"
+Set-ItemProperty $base -Name ComboBoxAnimation -Value "0"
+Set-ItemProperty $base -Name MinAnimate -Value "0"
+Set-ItemProperty $base -Name FontSmoothing -Value "2"
+Set-ItemProperty $base -Name FontSmoothingType -Value 2
+Set-ItemProperty $base -Name CursorShadow -Value 0
+Set-ItemProperty $base -Name DropShadow -Value 0
+Set-ItemProperty $base -Name UIEffects -Value 0
+Set-ItemProperty $base -Name UserPreferencesMask -Value ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00))
+
+New-Item "Registry::HKEY_USERS\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Force | Out-Null
+Set-ItemProperty "Registry::HKEY_USERS\.DEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+  -Name VisualFXSetting -Value 3
+
 ```
 
 ## Winget update fix for Sysprep
