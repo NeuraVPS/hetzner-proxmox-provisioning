@@ -574,70 +574,7 @@ HOSTSFILE="/mnt/etc/hosts"
 
 log "Generated /etc/hosts with IPv4: ${MAIN_IPV4:-none}, IPv6: ${MAIN_IPV6:-none}, FQDN: ${FQDN_NAME:-$SHORTNAME}"
 
-### --- STEP 6.5: disable Intel integrated GPU -------------------------
-
-log "Configuring GRUB to disable Intel integrated GPU (i915)"
-
-# Configure GRUB kernel parameters to disable Intel GPU
-GRUB_DEFAULT="/mnt/etc/default/grub"
-if [ -f "$GRUB_DEFAULT" ]; then
-  # Read current GRUB_CMDLINE_LINUX if it exists
-  if grep -q "^GRUB_CMDLINE_LINUX=" "$GRUB_DEFAULT"; then
-    # Extract existing parameters and add i915 disabling parameters
-    CURRENT_CMDLINE=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_DEFAULT" | sed 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/')
-    # Remove deprecated i915.modeset=0 if present (replaced by nomodeset)
-    CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed 's/i915\.modeset=0//g')
-    # Add nomodeset if not already present (disables all GPU mode setting)
-    if [[ "$CURRENT_CMDLINE" != *"nomodeset"* ]]; then
-      CURRENT_CMDLINE="${CURRENT_CMDLINE} nomodeset"
-    fi
-    # Add i915.enable_guc=0 if not already present (disables GuC firmware)
-    if [[ "$CURRENT_CMDLINE" != *"i915.enable_guc=0"* ]]; then
-      CURRENT_CMDLINE="${CURRENT_CMDLINE} i915.enable_guc=0"
-    fi
-    # Update GRUB_CMDLINE_LINUX
-    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${CURRENT_CMDLINE}\"|" "$GRUB_DEFAULT"
-  else
-    # If GRUB_CMDLINE_LINUX doesn't exist, add it
-    echo "GRUB_CMDLINE_LINUX=\"nomodeset i915.enable_guc=0\"" >> "$GRUB_DEFAULT"
-  fi
-  log "Updated GRUB_CMDLINE_LINUX in $GRUB_DEFAULT"
-else
-  log "WARNING: $GRUB_DEFAULT not found, creating it"
-  mkdir -p "$(dirname "$GRUB_DEFAULT")"
-  cat > "$GRUB_DEFAULT" <<EOF
-GRUB_DEFAULT=0
-GRUB_TIMEOUT=5
-GRUB_CMDLINE_LINUX="nomodeset i915.enable_guc=0"
-EOF
-fi
-
-# Blacklist i915 module to prevent it from loading
-log "Blacklisting i915 kernel module"
-MODPROBE_BLACKLIST="/mnt/etc/modprobe.d/blacklist-i915.conf"
-mkdir -p "$(dirname "$MODPROBE_BLACKLIST")"
-cat > "$MODPROBE_BLACKLIST" <<EOF
-# Disable Intel integrated GPU to prevent system crashes
-blacklist i915
-options i915 enable_guc=0
-EOF
-log "Created blacklist file: $MODPROBE_BLACKLIST"
-
-# Also update initramfs blacklist if the directory exists
-if [ -d "/mnt/etc/initramfs-tools" ]; then
-  INITRAMFS_BLACKLIST="/mnt/etc/initramfs-tools/modules.blacklist"
-  if [ -f "$INITRAMFS_BLACKLIST" ]; then
-    if ! grep -q "^i915$" "$INITRAMFS_BLACKLIST"; then
-      echo "i915" >> "$INITRAMFS_BLACKLIST"
-      log "Added i915 to initramfs blacklist"
-    fi
-  else
-    echo "i915" > "$INITRAMFS_BLACKLIST"
-    log "Created initramfs blacklist with i915"
-  fi
-fi
-
-log "Intel GPU (i915) disabled via GRUB kernel parameters and module blacklist"
+# Integrated GPU (Intel xe/i915, AMD amdgpu) disabled in first_boot.sh
 
 log "Cleaning up /mnt/hdd symlink"
 rm -f /mnt/hdd

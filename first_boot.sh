@@ -283,33 +283,33 @@ update-initramfs -u
 # zpool set autotrim=on rpool
 # zfs set logbias=throughput rpool/data
 
-# Configure GRUB to disable Intel integrated GPU (i915)
-log "Configuring GRUB to disable Intel integrated GPU (i915)"
+# Disable integrated GPUs (Intel + AMD) on headless Proxmox to avoid kernel issues
+# Intel: i915 (older), xe (Alder Lake+). AMD: amdgpu
+log "Disabling integrated GPUs (blacklist xe, i915, amdgpu)"
+cat > /etc/modprobe.d/blacklist-headless-gpu.conf <<'EOF'
+# Avoid kernel panics / issues with integrated GPUs on headless Proxmox
+blacklist xe
+blacklist i915
+blacklist amdgpu
+EOF
+
+log "Configuring GRUB to disable integrated GPUs (nomodeset + blacklist)"
 GRUB_DEFAULT="/etc/default/grub"
 if [ -f "$GRUB_DEFAULT" ]; then
-  # Read current GRUB_CMDLINE_LINUX if it exists
   if grep -q "^GRUB_CMDLINE_LINUX=" "$GRUB_DEFAULT"; then
-    # Extract existing parameters and add i915 disabling parameters
     CURRENT_CMDLINE=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_DEFAULT" | sed 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/')
-    # Remove deprecated i915.modeset=0 if present (replaced by nomodeset)
     CURRENT_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed 's/i915\.modeset=0//g')
-    # Add nomodeset if not already present (disables all GPU mode setting)
-    if [[ "$CURRENT_CMDLINE" != *"nomodeset"* ]]; then
-      CURRENT_CMDLINE="${CURRENT_CMDLINE} nomodeset"
-    fi
-    # Add i915.enable_guc=0 if not already present (disables GuC firmware)
-    if [[ "$CURRENT_CMDLINE" != *"i915.enable_guc=0"* ]]; then
-      CURRENT_CMDLINE="${CURRENT_CMDLINE} i915.enable_guc=0"
-    fi
-    # Update GRUB_CMDLINE_LINUX
+    [[ "$CURRENT_CMDLINE" != *"nomodeset"* ]] && CURRENT_CMDLINE="${CURRENT_CMDLINE} nomodeset"
+    [[ "$CURRENT_CMDLINE" != *"i915.enable_guc=0"* ]] && CURRENT_CMDLINE="${CURRENT_CMDLINE} i915.enable_guc=0"
+    # Prevent Intel (xe, i915) and AMD (amdgpu) integrated GPU drivers from loading
+    [[ "$CURRENT_CMDLINE" != *"modprobe.blacklist=xe"* ]] && CURRENT_CMDLINE="${CURRENT_CMDLINE} modprobe.blacklist=xe,i915,amdgpu"
     sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${CURRENT_CMDLINE}\"|" "$GRUB_DEFAULT"
   else
-    # If GRUB_CMDLINE_LINUX doesn't exist, add it
-    echo 'GRUB_CMDLINE_LINUX="nomodeset i915.enable_guc=0"' >> "$GRUB_DEFAULT"
+    echo 'GRUB_CMDLINE_LINUX="nomodeset i915.enable_guc=0 modprobe.blacklist=xe,i915,amdgpu"' >> "$GRUB_DEFAULT"
   fi
   log "Updated GRUB_CMDLINE_LINUX in $GRUB_DEFAULT"
   update-grub
-  log "GRUB updated with i915 disabling parameters"
+  log "GRUB updated with integrated GPUs disabled (nomodeset + blacklist xe,i915,amdgpu)"
 else
   log "WARNING: $GRUB_DEFAULT not found, skipping GRUB configuration"
 fi
