@@ -118,11 +118,26 @@ SWAP_RESERVE_GB=23
 log "Setting up raw swap partitions (${SWAP_RESERVE_GB} GB per disk) on rpool disks"
 if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>&1; then
   apt-get install -y gdisk
-  # Get rpool vdev block devices (e.g. /dev/sda1, /dev/sdb1); -P gives full path
+  # Get rpool vdev block devices. Pool may show /dev/ paths, by-id paths, or short names (sda1, vda1).
   vdevs=()
+  # 1) Full paths from zpool status -P (and -L to resolve by-id to /dev/sdX or similar)
   while IFS= read -r line; do
-    [[ "$line" =~ ^/dev/ ]] && vdevs+=("$line")
-  done < <(zpool status -P rpool 2>/dev/null | grep -oE '/dev/[^[:space:]]+' || true)
+    [[ -n "$line" ]] && vdevs+=("$line")
+  done < <(zpool status -P -L rpool 2>/dev/null | grep -oE '/dev/[^[:space:]]+' || true)
+  # 2) If no /dev/ paths, try short names from zpool status (sda1, vda1, nvme0n1p1)
+  if [[ ${#vdevs[@]} -eq 0 ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && vdevs+=("/dev/$line")
+    done < <(zpool status rpool 2>/dev/null | grep -oE '\b(sd[a-z][0-9]+|vd[a-z][0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)\b' | sort -u || true)
+  fi
+  # Resolve symlinks (e.g. /dev/disk/by-id/...-part1 -> /dev/sda1) so parent derivation works
+  for i in "${!vdevs[@]}"; do
+    dev="${vdevs[i]}"
+    [[ -b "$dev" ]] || continue
+    canon=$(readlink -f "$dev" 2>/dev/null)
+    [[ -n "$canon" ]] && [[ -b "$canon" ]] && vdevs[i]="$canon"
+  done
+  log "rpool vdevs found: ${vdevs[*]:-(none)}"
   # Dedupe parent disks (sda1 and sdb1 -> /dev/sda, /dev/sdb)
   declare -A parent_disks
   for dev in "${vdevs[@]}"; do
@@ -135,41 +150,54 @@ if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>
     fi
     [[ -b "$parent" ]] && parent_disks["$parent"]=1
   done
+  log "parent disks for swap: ${!parent_disks[*]:-(none)}"
   for disk in "${!parent_disks[@]}"; do
-    # Next partition number (2 if only ZFS partition exists); nvme uses p2
-    if [[ "$disk" =~ /nvme ]]; then
-      part2="${disk}p2"
+    disk_base=$(basename "$disk")
+    # Find next partition number (installer may use p1/p2/p3 for EFI+boot+ZFS, so we need p4 for swap)
+    next_num=1
+    if [[ "$disk_base" == nvme* ]]; then
+      for p in /sys/block/"$disk_base"/"$disk_base"p*; do
+        [[ -e "$p" ]] || continue
+        n="${p##*p}"
+        [[ "$n" =~ ^[0-9]+$ ]] && (( n >= next_num )) && next_num=$((n + 1))
+      done
+      part_swap="${disk}p${next_num}"
     else
-      part2="${disk}2"
+      for p in /sys/block/"$disk_base"/"$disk_base"[0-9]*; do
+        [[ -e "$p" ]] || continue
+        n="${p##*"$disk_base"}"
+        [[ "$n" =~ ^[0-9]+$ ]] && (( n >= next_num )) && next_num=$((n + 1))
+      done
+      part_swap="${disk}${next_num}"
     fi
-    if [[ -b "$part2" ]]; then
-      # Already have a partition 2; ensure swap is on and in fstab
-      if blkid -o value -s TYPE "$part2" 2>/dev/null | grep -qx swap; then
-        uuid=$(blkid -o value -s UUID "$part2" 2>/dev/null)
+    if [[ -b "$part_swap" ]]; then
+      # Partition already exists; ensure swap is on and in fstab
+      if blkid -o value -s TYPE "$part_swap" 2>/dev/null | grep -qx swap; then
+        uuid=$(blkid -o value -s UUID "$part_swap" 2>/dev/null)
         if [[ -n "$uuid" ]] && ! grep -q "UUID=$uuid" /etc/fstab 2>/dev/null; then
           echo "UUID=$uuid none swap sw 0 0" >> /etc/fstab
-          log "Added existing swap $part2 (UUID=$uuid) to fstab"
+          log "Added existing swap $part_swap (UUID=$uuid) to fstab"
         fi
-        swapon "$part2" 2>/dev/null || true
+        swapon "$part_swap" 2>/dev/null || true
       fi
       continue
     fi
-    # Create swap partition (installer left free space via zfs.hdsize); sgdisk will fail if not enough space
-    log "Creating ${SWAP_RESERVE_GB} GB swap partition on $disk"
-    sgdisk -n "2:0:+${SWAP_RESERVE_GB}G" -t "2:8200" "$disk" || { log "WARNING: sgdisk failed on $disk"; continue; }
+    # Create next partition for swap (installer left free space via zfs.hdsize)
+    log "Creating ${SWAP_RESERVE_GB} GB swap partition ${next_num} on $disk"
+    sgdisk -n "${next_num}:0:+${SWAP_RESERVE_GB}G" -t "${next_num}:8200" "$disk" || { log "WARNING: sgdisk failed on $disk"; continue; }
     partprobe "$disk" 2>/dev/null || true
     udevadm settle -t 5 2>/dev/null || true
-    [[ -b "$part2" ]] || { log "WARNING: Partition $part2 not found after sgdisk"; continue; }
-    mkswap -f "$part2" || { log "WARNING: mkswap failed on $part2"; continue; }
-    uuid=$(blkid -o value -s UUID "$part2" 2>/dev/null)
+    [[ -b "$part_swap" ]] || { log "WARNING: Partition $part_swap not found after sgdisk"; continue; }
+    mkswap -f "$part_swap" || { log "WARNING: mkswap failed on $part_swap"; continue; }
+    uuid=$(blkid -o value -s UUID "$part_swap" 2>/dev/null)
     if [[ -z "$uuid" ]]; then
-      log "WARNING: Could not get UUID for $part2"
-      echo "$part2 none swap sw 0 0" >> /etc/fstab
+      log "WARNING: Could not get UUID for $part_swap"
+      echo "$part_swap none swap sw 0 0" >> /etc/fstab
     else
       grep -q "UUID=$uuid" /etc/fstab 2>/dev/null || echo "UUID=$uuid none swap sw 0 0" >> /etc/fstab
     fi
-    swapon "$part2" || true
-    log "Swap enabled on $part2 (UUID=${uuid:-N/A})"
+    swapon "$part_swap" || true
+    log "Swap enabled on $part_swap (UUID=${uuid:-N/A})"
   done
   if [[ ${#parent_disks[@]} -eq 0 ]]; then
     log "No rpool vdevs found (whole-disk rpool?), skipping raw swap setup"
