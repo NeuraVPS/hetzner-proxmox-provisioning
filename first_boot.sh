@@ -111,6 +111,75 @@ systemctl restart dnsmasq
 # Allow replacement of disks
 apt-get install -y pv jq
 
+############################################
+# Raw swap: 23 GB per disk (reserved by install via zfs.hdsize)
+############################################
+SWAP_RESERVE_GB=23
+log "Setting up raw swap partitions (${SWAP_RESERVE_GB} GB per disk) on rpool disks"
+if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>&1; then
+  apt-get install -y gdisk
+  # Get rpool vdev block devices (e.g. /dev/sda1, /dev/sdb1); -P gives full path
+  vdevs=()
+  while IFS= read -r line; do
+    [[ "$line" =~ ^/dev/ ]] && vdevs+=("$line")
+  done < <(zpool status -P rpool 2>/dev/null | grep -oE '/dev/[^[:space:]]+' || true)
+  # Dedupe parent disks (sda1 and sdb1 -> /dev/sda, /dev/sdb)
+  declare -A parent_disks
+  for dev in "${vdevs[@]}"; do
+    [[ -b "$dev" ]] || continue
+    # Parent disk: /dev/nvme0n1p1 -> /dev/nvme0n1 (strip pN); /dev/sda1 -> /dev/sda (strip trailing digits)
+    if [[ "$dev" =~ /nvme[0-9]+n[0-9]+p[0-9]+ ]]; then
+      parent="${dev%p*}"
+    else
+      parent="${dev%%[0-9]*}"
+    fi
+    [[ -b "$parent" ]] && parent_disks["$parent"]=1
+  done
+  for disk in "${!parent_disks[@]}"; do
+    # Next partition number (2 if only ZFS partition exists); nvme uses p2
+    if [[ "$disk" =~ /nvme ]]; then
+      part2="${disk}p2"
+    else
+      part2="${disk}2"
+    fi
+    if [[ -b "$part2" ]]; then
+      # Already have a partition 2; ensure swap is on and in fstab
+      if blkid -o value -s TYPE "$part2" 2>/dev/null | grep -qx swap; then
+        uuid=$(blkid -o value -s UUID "$part2" 2>/dev/null)
+        if [[ -n "$uuid" ]] && ! grep -q "UUID=$uuid" /etc/fstab 2>/dev/null; then
+          echo "UUID=$uuid none swap sw 0 0" >> /etc/fstab
+          log "Added existing swap $part2 (UUID=$uuid) to fstab"
+        fi
+        swapon "$part2" 2>/dev/null || true
+      fi
+      continue
+    fi
+    # Create swap partition (installer left free space via zfs.hdsize); sgdisk will fail if not enough space
+    log "Creating ${SWAP_RESERVE_GB} GB swap partition on $disk"
+    sgdisk -n "2:0:+${SWAP_RESERVE_GB}G" -t "2:8200" "$disk" || { log "WARNING: sgdisk failed on $disk"; continue; }
+    partprobe "$disk" 2>/dev/null || true
+    udevadm settle -t 5 2>/dev/null || true
+    [[ -b "$part2" ]] || { log "WARNING: Partition $part2 not found after sgdisk"; continue; }
+    mkswap -f "$part2" || { log "WARNING: mkswap failed on $part2"; continue; }
+    uuid=$(blkid -o value -s UUID "$part2" 2>/dev/null)
+    if [[ -z "$uuid" ]]; then
+      log "WARNING: Could not get UUID for $part2"
+      echo "$part2 none swap sw 0 0" >> /etc/fstab
+    else
+      grep -q "UUID=$uuid" /etc/fstab 2>/dev/null || echo "UUID=$uuid none swap sw 0 0" >> /etc/fstab
+    fi
+    swapon "$part2" || true
+    log "Swap enabled on $part2 (UUID=${uuid:-N/A})"
+  done
+  if [[ ${#parent_disks[@]} -eq 0 ]]; then
+    log "No rpool vdevs found (whole-disk rpool?), skipping raw swap setup"
+  else
+    log "Raw swap setup finished for ${#parent_disks[@]} disk(s)"
+  fi
+else
+  log "rpool not found or zpool not available, skipping raw swap setup"
+fi
+
 # Add Swap for security
 # zfs create -V 32G \
 #   -b 16384 \
@@ -133,37 +202,37 @@ apt-get install -y pv jq
 # mkswap /dev/zvol/rpool/swapvol
 # swapon /dev/zvol/rpool/swapvol
 # echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
-apt-get install -y zram-tools
-ZRAM_CONF="/etc/default/zramswap"
-touch "$ZRAM_CONF"
+# apt-get install -y zram-tools
+# ZRAM_CONF="/etc/default/zramswap"
+# touch "$ZRAM_CONF"
 
-set_zram_param() {
-    local key="$1"
-    local value="$2"
-    if grep -qE "^${key}=" "$ZRAM_CONF"; then
-        sed -i "s/^${key}=.*/${key}=${value}/" "$ZRAM_CONF"
-    else
-        echo "${key}=${value}" >> "$ZRAM_CONF"
-    fi
-}
+# set_zram_param() {
+#     local key="$1"
+#     local value="$2"
+#     if grep -qE "^${key}=" "$ZRAM_CONF"; then
+#         sed -i "s/^${key}=.*/${key}=${value}/" "$ZRAM_CONF"
+#     else
+#         echo "${key}=${value}" >> "$ZRAM_CONF"
+#     fi
+# }
 
-set_zram_param ALGO zstd
-set_zram_param PERCENT 25
+# set_zram_param ALGO zstd
+# set_zram_param PERCENT 25
 
-systemctl enable --now zramswap
+# systemctl enable --now zramswap
 
 # Server optimizations
-zfs set reservation=50G rpool
+# zfs set reservation=50G rpool
 echo 34359738368 > /sys/module/zfs/parameters/zfs_arc_max
 echo "options zfs zfs_arc_max=34359738368" > /etc/modprobe.d/zfs.conf
 update-initramfs -u
-zfs set compression=zstd-3 rpool/data
-zfs set compression=zstd-3 rpool/ROOT
-# zfs set compression=off rpool/swapvol
-zfs set sync=disabled rpool/data
-zfs set recordsize=16K rpool/ROOT
-zpool set autotrim=on rpool
-zfs set logbias=throughput rpool/data
+# zfs set compression=zstd-3 rpool/data
+# zfs set compression=zstd-3 rpool/ROOT
+# # zfs set compression=off rpool/swapvol
+# zfs set sync=disabled rpool/data
+# zfs set recordsize=16K rpool/ROOT
+# zpool set autotrim=on rpool
+# zfs set logbias=throughput rpool/data
 
 # Configure GRUB to disable Intel integrated GPU (i915)
 log "Configuring GRUB to disable Intel integrated GPU (i915)"

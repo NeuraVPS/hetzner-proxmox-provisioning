@@ -8,7 +8,7 @@ remote_task() {
 #     # /var/lib/svz/snippets/sync-dnat.py
 #     # apt-get update && apt-get full-upgrade -y
     
-    sftp -oBatchMode=yes  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@[fd00:4000::1] <<EOF
+    sftp -oBatchMode=yes  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@[fd00:4000::2] <<EOF
 get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
@@ -30,7 +30,7 @@ pve-firewall restart || true
 # Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
-for ((i=2; i<=42; i++)); do
+for ((i=3; i<=48; i++)); do
     HEX=$(printf "%x" "$i")
     IP="fd00:4000::${HEX}"
 

@@ -118,6 +118,31 @@ for d in "${DISKS[@]}"; do
   wipefs -a "$d"
 done
 
+# Reserve 23 GB per disk for raw swap: limit ZFS to (min_disk_gb - 23) so first_boot can create swap partitions
+log "Computing ZFS hdsize (reserve 23 GB per disk for raw swap)"
+MIN_GB=""
+for d in "${DISKS[@]}"; do
+  bytes=$(blockdev --getsize64 "$d" 2>/dev/null || true)
+  [ -n "$bytes" ] || continue
+  gb=$((bytes / 1024 / 1024 / 1024))
+  if [ -z "$MIN_GB" ] || [ "$gb" -lt "$MIN_GB" ]; then
+    MIN_GB=$gb
+  fi
+done
+if [ -z "$MIN_GB" ] || [ "$MIN_GB" -lt 1 ]; then
+  log "WARNING: Could not get disk sizes, not setting zfs.hdsize (installer will use full disks)"
+  ZFS_HDSIZE_LINE=""
+else
+  ZFS_HDSIZE=$((MIN_GB - 23))
+  if [ "$ZFS_HDSIZE" -lt 32 ]; then
+    log "WARNING: Disks too small (min ${MIN_GB} GB); not setting zfs.hdsize (no swap reservation)"
+    ZFS_HDSIZE_LINE=""
+  else
+    log "Using zfs.hdsize = ${ZFS_HDSIZE} GB (23 GB free per disk for raw swap)"
+    ZFS_HDSIZE_LINE="zfs.hdsize = ${ZFS_HDSIZE}"
+  fi
+fi
+
 ### --- STEP 3: download Proxmox ISO --------------------------------
 
 if [ ! -f "$ISO_PATH" ]; then
@@ -155,6 +180,7 @@ source = "from-dhcp"
 [disk-setup]
 filesystem = "zfs"
 zfs.raid = "raid1"
+${ZFS_HDSIZE_LINE}
 disk-list = ["vda", "vdb"]
 
 [first-boot]
