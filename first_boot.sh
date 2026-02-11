@@ -117,7 +117,7 @@ apt-get install -y pv jq
 SWAP_RESERVE_GB=23
 log "Setting up raw swap partitions (${SWAP_RESERVE_GB} GB per disk) on rpool disks"
 if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>&1; then
-  apt-get install -y gdisk
+  apt-get install -y gdisk parted
   # Get rpool vdev block devices. Pool may show /dev/ paths, by-id paths, or short names (sda1, vda1).
   vdevs=()
   # 1) Full paths from zpool status -P (and -L to resolve by-id to /dev/sdX or similar)
@@ -150,7 +150,13 @@ if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>
     fi
     [[ -b "$parent" ]] && parent_disks["$parent"]=1
   done
-  log "parent disks for swap: ${!parent_disks[*]:-(none)}"
+  # Build list without ${!array[*]} (that can be parsed as indirect expansion "1 1" -> invalid variable name)
+  parent_list=""
+  for d in "${!parent_disks[@]}"; do
+    [[ -n "$parent_list" ]] && parent_list+=" "
+    parent_list+="$d"
+  done
+  log "parent disks for swap: ${parent_list:-(none)}"
   for disk in "${!parent_disks[@]}"; do
     disk_base=$(basename "$disk")
     # Find next partition number (installer may use p1/p2/p3 for EFI+boot+ZFS, so we need p4 for swap)
@@ -159,14 +165,22 @@ if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>
       for p in /sys/block/"$disk_base"/"$disk_base"p*; do
         [[ -e "$p" ]] || continue
         n="${p##*p}"
-        [[ "$n" =~ ^[0-9]+$ ]] && (( n >= next_num )) && next_num=$((n + 1))
+        n="${n//[^0-9]/}"
+        if [[ -n "$n" ]]; then
+          num=$((10#"$n"))
+          [[ "$num" -ge "$next_num" ]] && next_num=$((num + 1))
+        fi
       done
       part_swap="${disk}p${next_num}"
     else
       for p in /sys/block/"$disk_base"/"$disk_base"[0-9]*; do
         [[ -e "$p" ]] || continue
         n="${p##*"$disk_base"}"
-        [[ "$n" =~ ^[0-9]+$ ]] && (( n >= next_num )) && next_num=$((n + 1))
+        n="${n//[^0-9]/}"
+        if [[ -n "$n" ]]; then
+          num=$((10#"$n"))
+          [[ "$num" -ge "$next_num" ]] && next_num=$((num + 1))
+        fi
       done
       part_swap="${disk}${next_num}"
     fi
@@ -183,10 +197,17 @@ if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>
       continue
     fi
     # Create next partition for swap (installer left free space via zfs.hdsize)
+    next_num=$((next_num + 0))
     log "Creating ${SWAP_RESERVE_GB} GB swap partition ${next_num} on $disk"
     sgdisk -n "${next_num}:0:+${SWAP_RESERVE_GB}G" -t "${next_num}:8200" "$disk" || { log "WARNING: sgdisk failed on $disk"; continue; }
     partprobe "$disk" 2>/dev/null || true
     udevadm settle -t 5 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [[ -b "$part_swap" ]] && break
+      sleep 1
+      partprobe "$disk" 2>/dev/null || true
+      udevadm settle -t 2 2>/dev/null || true
+    done
     [[ -b "$part_swap" ]] || { log "WARNING: Partition $part_swap not found after sgdisk"; continue; }
     mkswap -f "$part_swap" || { log "WARNING: mkswap failed on $part_swap"; continue; }
     uuid=$(blkid -o value -s UUID "$part_swap" 2>/dev/null)
