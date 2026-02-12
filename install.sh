@@ -576,6 +576,14 @@ log "Generated /etc/hosts with IPv4: ${MAIN_IPV4:-none}, IPv6: ${MAIN_IPV6:-none
 
 # Integrated GPU (Intel xe/i915, AMD amdgpu) disabled in first_boot.sh
 
+# Copy SSH key from rescue environment into new install (for first_boot SSH config)
+if [ -f /root/.ssh/neuravps_id ]; then
+  mkdir -p /mnt/root/.ssh
+  cp -a /root/.ssh/neuravps_id /mnt/root/.ssh/neuravps_id
+  chmod 600 /mnt/root/.ssh/neuravps_id
+  log "Copied /root/.ssh/neuravps_id into new install"
+fi
+
 log "Cleaning up /mnt/hdd symlink"
 rm -f /mnt/hdd
 

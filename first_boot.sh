@@ -8,6 +8,23 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 systemctl restart sshd
 
+# Root SSH client config for cluster/private network (10.64.x, fd00:4000::)
+mkdir -p /root/.ssh
+SSH_CONFIG="/root/.ssh/config"
+if ! grep -q 'IdentityFile ~/.ssh/neuravps_id' "$SSH_CONFIG" 2>/dev/null; then
+  cat >> "$SSH_CONFIG" <<'EOF'
+
+# NeuraVPS private network (Hetzner VLAN / IPv6)
+Host 10.64.* fd00:4000::*
+    IdentityFile ~/.ssh/neuravps_id
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+EOF
+  chmod 600 "$SSH_CONFIG"
+  log "Added neuravps_id SSH config for 10.64.* and fd00:4000::*"
+fi
+
 # Add Proxmox repositories and keys
 rm /etc/apt/sources.list.d/pve-enterprise.sources || true
 
@@ -229,59 +246,10 @@ else
   log "rpool not found or zpool not available, skipping raw swap setup"
 fi
 
-# Add Swap for security
-# zfs create -V 32G \
-#   -b 16384 \
-#   -o compression=off \
-#   -o primarycache=metadata \
-#   -o logbias=throughput \
-#   -o sync=always \
-#   -o redundant_metadata=most \
-#   rpool/swapvol
-
-# # Esperar a que udev cree el dispositivo
-# for i in {1..30}; do
-#     if [ -e /dev/zvol/rpool/swapvol ]; then
-#         break
-#     fi
-#     udevadm settle
-#     sleep 0.2
-# done
-
-# mkswap /dev/zvol/rpool/swapvol
-# swapon /dev/zvol/rpool/swapvol
-# echo "/dev/zvol/rpool/swapvol none swap defaults 0 0" >> /etc/fstab
-# apt-get install -y zram-tools
-# ZRAM_CONF="/etc/default/zramswap"
-# touch "$ZRAM_CONF"
-
-# set_zram_param() {
-#     local key="$1"
-#     local value="$2"
-#     if grep -qE "^${key}=" "$ZRAM_CONF"; then
-#         sed -i "s/^${key}=.*/${key}=${value}/" "$ZRAM_CONF"
-#     else
-#         echo "${key}=${value}" >> "$ZRAM_CONF"
-#     fi
-# }
-
-# set_zram_param ALGO zstd
-# set_zram_param PERCENT 25
-
-# systemctl enable --now zramswap
-
 # Server optimizations
-# zfs set reservation=50G rpool
 echo 34359738368 > /sys/module/zfs/parameters/zfs_arc_max
 echo "options zfs zfs_arc_max=34359738368" > /etc/modprobe.d/zfs.conf
 update-initramfs -u
-# zfs set compression=zstd-3 rpool/data
-# zfs set compression=zstd-3 rpool/ROOT
-# # zfs set compression=off rpool/swapvol
-# zfs set sync=disabled rpool/data
-# zfs set recordsize=16K rpool/ROOT
-# zpool set autotrim=on rpool
-# zfs set logbias=throughput rpool/data
 
 # Disable integrated GPUs (Intel + AMD) on headless Proxmox to avoid kernel issues
 # Intel: i915 (older), xe (Alder Lake+). AMD: amdgpu
@@ -412,12 +380,12 @@ chmod +x /var/lib/svz/snippets/sync-dnat.py
 chmod +x /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
 chmod +x /var/lib/svz/snippets/reset-vm-conntrack.py
 
-# sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
-# get /etc/firebase-credentials.json /etc/firebase-credentials.json
-# get /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
-# get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
-# bye
-# EOF
+sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
+get /etc/firebase-credentials.json /etc/firebase-credentials.json
+get /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
+get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
+bye
+EOF
 
 pve-firewall restart || true
 
