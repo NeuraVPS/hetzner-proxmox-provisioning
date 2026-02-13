@@ -158,6 +158,25 @@ Get-AppxPackage *winget* | Remove-AppxPackage
 
 ## Sysprep
 
+The answer file sets `CopyProfile` in the **specialize** pass (it does not run in oobeSystem). That copies the built-in Administrator profile to the Default User template. Even when correct, **CopyProfile often does not preserve Edge** (and other modern app data): many settings are user-SID–bound or encrypted and get reset on first logon.
+
+### Reliable way to keep Edge (and other profile data): export/restore scripts
+
+1. **On the reference VM (before sysprep):**
+   - Copy `scripts/export_edge_profile.ps1` and `scripts/restore_edge_profile.ps1` to `C:\Provisioning\`.
+   - Configure Edge (and anything else in the Administrator profile) as desired.
+   - Run as Administrator:
+     ```powershell
+     C:\Provisioning\export_edge_profile.ps1
+     ```
+   - This copies the Edge profile to `C:\Provisioning\EdgeDefault` (survives generalize).
+
+2. **Sysprep** as below. The unattend `FirstLogonCommands` will run `restore_edge_profile.ps1` at first logon if it exists; that script restores `EdgeDefault` into the new user’s profile.
+
+3. **If you don’t use the Edge scripts:** leave `C:\Provisioning\` empty or omit the scripts; the first-logon command only runs the restore script if the file exists.
+
+**CopyProfile (specialize) requirements:** use only the built-in Administrator account and run sysprep as Administrator. Taskbar pins, Start layout, and some encrypted settings are still not preserved; use GPO or scripts for those.
+
 ```powershell
 cd C:\Windows\System32\Sysprep
 .\sysprep.exe /generalize /oobe /shutdown /unattend:C:\Windows\unattend.xml
