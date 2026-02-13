@@ -1,6 +1,4 @@
 pve_zfs_migrate_vm() {
-  #set -euo pipefail
-
   local VMID="${1:?Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [dest_node] [snapname] [shutdown_timeout] [src_cleanup] [dest_cleanup] [delete_src_vm] [update_firestore]}"
   local DEST_SSH="${2:?Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [dest_node] [snapname] [shutdown_timeout] [src_cleanup] [dest_cleanup] [delete_src_vm] [update_firestore]}"
 
@@ -17,9 +15,47 @@ pve_zfs_migrate_vm() {
   local MBUFFER_BLOCK="128k"
   local MBUFFER_MEM="1G"
 
-  _die()  { echo "❌ $*" >&2; return 1; }
+  local MIGRATION_SUCCESS=0
+  local PHASE=0
+
+  _die()  { echo "❌ $*" >&2; exit 1; }
   _info() { echo "ℹ️  $*" >&2; }
   _ok()   { echo "✅ $*" >&2; }
+
+  _cleanup_on_failure() {
+    set +e
+    _info "Migration failed or interrupted; cleaning up and restoring state..."
+    if [[ "$PHASE" -ge 1 ]]; then
+      _info "Destroying source snapshots @${SNAPNAME}..."
+      for ds in "${DATASETS[@]}"; do
+        zfs destroy "${ds}@${SNAPNAME}" 2>/dev/null || true
+      done
+      _info "Starting VM ${VMID} on source again..."
+      qm start "$VMID" 2>/dev/null || true
+    fi
+    if [[ "$PHASE" -ge 2 ]]; then
+      _info "Cleaning up destination (snapshots, datasets, config)..."
+      if [[ "$PHASE" -ge 4 ]]; then
+        ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm stop '${VMID}'" 2>/dev/null || true
+      fi
+      for ds in "${DATASETS[@]}"; do
+        ssh "${SSH_OPTS[@]}" "$DEST_SSH" "zfs destroy '${ds}@${SNAPNAME}'" 2>/dev/null || true
+        ssh "${SSH_OPTS[@]}" "$DEST_SSH" "zfs destroy -R '${ds}'" 2>/dev/null || true
+      done
+      ssh "${SSH_OPTS[@]}" "$DEST_SSH" "rm -f '${CONF_DEST}' '${CONF_DEST}.tmp' '/etc/pve/firewall/${VMID}.fw'" 2>/dev/null || true
+    fi
+  }
+
+  _exit_handler() {
+    local code=$?
+    if [[ "${MIGRATION_SUCCESS:-0}" -ne 1 ]]; then
+      _cleanup_on_failure
+    fi
+    exit "$code"
+  }
+  trap _exit_handler EXIT
+
+  set -E -e -o pipefail
 
   command -v qm >/dev/null || _die "qm not found; run on a Proxmox node."
   command -v zfs >/dev/null || _die "zfs not found."
@@ -112,6 +148,7 @@ pve_zfs_migrate_vm() {
     zfs snapshot "${ds}@${SNAPNAME}"
   done
   _ok "Source snapshots created."
+  PHASE=1
 
   _info "Sending datasets to ${DEST_SSH} (pv % progress)..."
   local i=0 total="${#DATASETS[@]}"
@@ -131,6 +168,7 @@ pve_zfs_migrate_vm() {
           "mbuffer -q -s '${MBUFFER_BLOCK}' -m '${MBUFFER_MEM}' | zfs receive -F '${ds}'"
 
     _ok "[$i/$total] ${ds}@${SNAPNAME} transferred (100%)"
+    PHASE=2
   done
   _ok "All datasets transferred."
 
@@ -152,34 +190,37 @@ pve_zfs_migrate_vm() {
   else
     _info "No firewall config found at ${FW_LOCAL}; skipping."
   fi
-
-  if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
-    _info "Updating Firestore (connectionUrl, nodeId) before starting VM on destination..."
-    local DEST_PUBLIC_IP
-    DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
-    if [[ -n "$DEST_PUBLIC_IP" ]]; then
-      local BASE_PORT=20000
-      local CONNECTION_URL="${DEST_PUBLIC_IP}:$((BASE_PORT + VMID))"
-      local HELPER
-      HELPER="$(mktemp -t update_firestore_migration_XXXXXX.py)"
-      if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER" 2>/dev/null; then
-        if python3 "$HELPER" "$VMID" "$CONNECTION_URL" "$DEST_NODE"; then
-          _ok "Firestore updated: connectionUrl=${CONNECTION_URL}, nodeId=${DEST_NODE}"
-        else
-          _info "Firestore update skipped or failed (no creds, no doc, or error); continuing."
-        fi
-      else
-        _info "Could not download Firestore helper or python3 not found; skipping Firestore update."
-      fi
-      rm -f "$HELPER"
-    else
-      _info "Could not get destination public IPv4; skipping Firestore update."
-    fi
-  fi
+  PHASE=3
 
   _info "Starting VM ${VMID} on destination..."
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm start '${VMID}'"
   _ok "VM ${VMID} started on destination."
+  PHASE=4
+
+  if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
+    _info "Updating Firestore (connectionUrl, nodeId)..."
+    local DEST_PUBLIC_IP
+    DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
+    if [[ -z "$DEST_PUBLIC_IP" ]]; then
+      _die "Could not get destination public IPv4; cannot update Firestore."
+    fi
+    local BASE_PORT=20000
+    local CONNECTION_URL="${DEST_PUBLIC_IP}:$((BASE_PORT + VMID))"
+    local HELPER
+    HELPER="$(mktemp -t update_firestore_migration_XXXXXX.py)"
+    if ! command -v python3 >/dev/null 2>&1; then
+      _die "python3 not found; cannot update Firestore."
+    fi
+    if ! curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER"; then
+      _die "Could not download Firestore helper."
+    fi
+    if ! python3 "$HELPER" "$VMID" "$CONNECTION_URL" "$DEST_NODE"; then
+      rm -f "$HELPER"
+      _die "Firestore update failed."
+    fi
+    rm -f "$HELPER"
+    _ok "Firestore updated: connectionUrl=${CONNECTION_URL}, nodeId=${DEST_NODE}"
+  fi
 
   if [[ "$DEST_CLEANUP" == "yes" ]]; then
     _info "Destroying destination snapshots @${SNAPNAME}..."
@@ -202,14 +243,30 @@ pve_zfs_migrate_vm() {
   fi
 
   if [[ "$DELETE_SRC_VM" == "true" ]]; then
-    _info "Verifying VM ${VMID} is running on destination..."
+    _info "Verifying VM ${VMID} is running on destination (first check)..."
     sleep 5
     local DEST_STATUS
     DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
     if [[ "$DEST_STATUS" != "running" ]]; then
       _die "VM ${VMID} is not running on destination (status: ${DEST_STATUS:-unknown}); refusing to destroy source."
     fi
-    _ok "VM ${VMID} is running on destination."
+    _ok "VM ${VMID} is running on destination (first check)."
+    _info "Verifying VM ${VMID} is still running (second check after 8s)..."
+    sleep 8
+    DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
+    if [[ "$DEST_STATUS" != "running" ]]; then
+      _die "VM ${VMID} is not running on destination after second check (status: ${DEST_STATUS:-unknown}); refusing to destroy source."
+    fi
+    _info "Verifying disks exist on destination..."
+    local DEST_CONFIG
+    DEST_CONFIG="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" || true)"
+    if [[ -z "$DEST_CONFIG" ]]; then
+      _die "Could not read VM config on destination; refusing to destroy source."
+    fi
+    if ! echo "$DEST_CONFIG" | grep -qE '^(scsi|virtio|sata|ide)[0-9]+:'; then
+      _die "VM config on destination has no disk entries; refusing to destroy source."
+    fi
+    _ok "VM ${VMID} is running on destination with disks attached."
     _info "Destroying VM ${VMID} on source (and associated disks)..."
     qm destroy "$VMID" --purge --destroy-unreferenced-disks 2>/dev/null || qm destroy "$VMID" --purge 2>/dev/null || true
     for ds in "${DATASETS[@]}"; do
@@ -222,7 +279,9 @@ pve_zfs_migrate_vm() {
     _ok "Source VM ${VMID} and associated disks destroyed."
   fi
 
+  MIGRATION_SUCCESS=1
   _ok "Migration completed: VM ${VMID} -> ${DEST_SSH} (node ${DEST_NODE})"
+  trap - EXIT
 }
 
 # Examples:
