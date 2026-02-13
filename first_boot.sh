@@ -355,7 +355,7 @@ pve-firewall restart || true
 log "Installing cluster-wide hookscript for dynamic RDP DNAT + INPUT open/close"
 mkdir -p /var/lib/svz
 if ! pvesm status | awk '{print $1}' | grep -x shared; then
-  pvesm add dir shared --path /var/lib/svz --content snippets,backup --shared true || true
+  pvesm add dir shared --path /var/lib/svz --content snippets --shared true || true
 fi
 
 # Always overwrite to keep latest version
@@ -368,21 +368,15 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
 # curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-post-boot-resume.sh \
 #     -o /var/lib/svz/snippets/pve-post-boot-resume.sh
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/restore-vm-disk-from-vma.sh \
-    -o /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
-
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/reset-vm-conntrack.py \
-    -o /var/lib/svz/snippets/reset-vm-conntrack.py
+# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/restore-vm-disk-from-vma.sh \
+#     -o /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
 
 chmod +x /var/lib/svz/snippets/sync-dnat.py
 # chmod +x /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
 # chmod +x /var/lib/svz/snippets/pve-post-boot-resume.sh
-chmod +x /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
-chmod +x /var/lib/svz/snippets/reset-vm-conntrack.py
 
 sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
 get /etc/firebase-credentials.json /etc/firebase-credentials.json
-get /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
 get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
