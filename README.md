@@ -35,7 +35,8 @@ The server ID can be any number between 1 and 1,048,574.
 - Apply Windows and Winget updates
 - Disable Password lock Policy
 - Apply Java patch for SQX
-- Install desired software
+- Install desired software (including 10× MetaTrader 5 portable in `C:\MetaTrader\MetaTrader 5 - 001` … `010`)
+- Set MetaTrader file/URL associations: copy `scripts/mt5_open.vbs` to `C:\MetaTrader\mt5_open.vbs`, then run as Administrator: `powershell -ExecutionPolicy Bypass -File scripts\set_mt5_associations.ps1` (or from `C:\Provisioning\` if you copied the script there). This configures EX5, MQL5, MQL5.Header, mql5buy, metaeditor5, and MetaTrader 5 Export to use the launcher and default icons from instance 001. The launcher re-applies HKCU associations 5 seconds after opening a file so MetaTrader cannot keep overrides.
 - NTP servers for Hetzner
 - Permitir Samba en el firewall de Windows
 - Crear carpeta C:\Mis Servidores y enlace en el escritorio
