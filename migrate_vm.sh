@@ -1,14 +1,71 @@
 pve_zfs_migrate_vm() {
-  local VMID="${1:?Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [dest_node] [snapname] [shutdown_timeout] [src_cleanup] [dest_cleanup] [delete_src_vm] [update_firestore]}"
-  local DEST_SSH="${2:?Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [dest_node] [snapname] [shutdown_timeout] [src_cleanup] [dest_cleanup] [delete_src_vm] [update_firestore]}"
+  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]. Options: --dest-node, --snapname, --shutdown-timeout, --src-cleanup, --dest-cleanup, --delete-src-vm, --update-firestore, --keep-dest-stopped. Or pass positional args 3-10 for legacy. Use --help for details."
+  [[ $# -ge 2 ]] || { echo "$USAGE" >&2; exit 1; }
 
-  local DEST_NODE="${3:-}"
-  local SNAPNAME="${4:-migration}"
-  local SHUTDOWN_TIMEOUT="${5:-180}"
-  local SRC_CLEANUP="${6:-yes}"
-  local DEST_CLEANUP="${7:-yes}"
-  local DELETE_SRC_VM="${8:-false}"
-  local UPDATE_FIRESTORE="${9:-true}"
+  local VMID="$1"
+  local DEST_SSH="$2"
+  shift 2
+
+  local DEST_NODE=""
+  local SNAPNAME="migration"
+  local SHUTDOWN_TIMEOUT="180"
+  local SRC_CLEANUP="yes"
+  local DEST_CLEANUP="yes"
+  local DELETE_SRC_VM="true"
+  local UPDATE_FIRESTORE="true"
+  local KEEP_DEST_STOPPED="false"
+
+  if [[ $# -gt 0 && "$1" == --* ]]; then
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --help|-h)
+          echo "pve_zfs_migrate_vm <vmid> <dest_ssh> [options]"
+          echo "  Required: vmid, dest_ssh"
+          echo "  Options (defaults in parentheses):"
+          echo "    --dest-node=<node>       Destination node name (auto-detect)"
+          echo "    --snapname=<name>        Snapshot name (migration)"
+          echo "    --shutdown-timeout=<sec> Shutdown wait seconds (180)"
+          echo "    --src-cleanup=<yes|no>   Remove source snapshots after (yes)"
+          echo "    --dest-cleanup=<yes|no>  Remove dest snapshots after (yes)"
+          echo "    --delete-src-vm=<true|false>  Destroy source VM after migration (true)"
+          echo "    --update-firestore=<true|false>  Update Firestore after migration (true)"
+          echo "    --keep-dest-stopped=<true|false>  Do not start VM on destination (false)"
+          echo "  Boolean options can be given as --opt or --opt=true/false."
+          echo "  With set -e, keep session open and preserve exit code: r=0; curl ... | bash -s -- <vmid> <dest> ... || r=\$?"
+          exit 0
+          ;;
+        --dest-node=*)  DEST_NODE="${1#*=}"; shift ;;
+        --dest-node)    [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; DEST_NODE="$2"; shift 2 ;;
+        --snapname=*)   SNAPNAME="${1#*=}"; shift ;;
+        --snapname)     [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; SNAPNAME="$2"; shift 2 ;;
+        --shutdown-timeout=*)  SHUTDOWN_TIMEOUT="${1#*=}"; shift ;;
+        --shutdown-timeout)    [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; SHUTDOWN_TIMEOUT="$2"; shift 2 ;;
+        --src-cleanup=*)       SRC_CLEANUP="${1#*=}"; shift ;;
+        --src-cleanup)         [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; SRC_CLEANUP="$2"; shift 2 ;;
+        --dest-cleanup=*)      DEST_CLEANUP="${1#*=}"; shift ;;
+        --dest-cleanup)        [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; DEST_CLEANUP="$2"; shift 2 ;;
+        --delete-src-vm=*)     DELETE_SRC_VM="${1#*=}"; shift ;;
+        --delete-src-vm)       if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then DELETE_SRC_VM="${2}"; shift 2; else DELETE_SRC_VM="true"; shift; fi ;;
+        --update-firestore=*)  UPDATE_FIRESTORE="${1#*=}"; shift ;;
+        --update-firestore)    if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then UPDATE_FIRESTORE="${2}"; shift 2; else UPDATE_FIRESTORE="true"; shift; fi ;;
+        --keep-dest-stopped=*) KEEP_DEST_STOPPED="${1#*=}"; shift ;;
+        --keep-dest-stopped)   if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then KEEP_DEST_STOPPED="${2}"; shift 2; else KEEP_DEST_STOPPED="true"; shift; fi ;;
+        *)
+          echo "Unknown option: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+  elif [[ $# -ge 1 ]]; then
+    DEST_NODE="${1:-}"; [[ $# -ge 1 ]] && shift
+    SNAPNAME="${1:-migration}"; [[ $# -ge 1 ]] && shift
+    SHUTDOWN_TIMEOUT="${1:-180}"; [[ $# -ge 1 ]] && shift
+    SRC_CLEANUP="${1:-yes}"; [[ $# -ge 1 ]] && shift
+    DEST_CLEANUP="${1:-yes}"; [[ $# -ge 1 ]] && shift
+    DELETE_SRC_VM="${1:-true}"; [[ $# -ge 1 ]] && shift
+    UPDATE_FIRESTORE="${1:-true}"; [[ $# -ge 1 ]] && shift
+    KEEP_DEST_STOPPED="${1:-false}"; [[ $# -ge 1 ]] && shift
+  fi
 
   local SSH_OPTS=(-o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes)
 
@@ -197,6 +254,14 @@ pve_zfs_migrate_vm() {
   done
   _ok "All datasets transferred."
 
+  _info "Verifying received datasets and snapshots on destination..."
+  for ds in "${DATASETS[@]}"; do
+    if ! ssh "${SSH_OPTS[@]}" "$DEST_SSH" "zfs list -H -o name '${ds}@${SNAPNAME}' >/dev/null 2>&1"; then
+      _die "Destination missing dataset or snapshot: ${ds}@${SNAPNAME}; aborting before copying config."
+    fi
+  done
+  _ok "All required datasets and snapshots present on destination."
+
   _info "Copying VM config -> ${CONF_DEST}"
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "mkdir -p '$(dirname "$CONF_DEST")'"
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" \
@@ -217,10 +282,15 @@ pve_zfs_migrate_vm() {
   fi
   PHASE=3
 
-  _info "Starting VM ${VMID} on destination..."
-  ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm start '${VMID}'"
-  _ok "VM ${VMID} started on destination."
-  PHASE=4
+  if [[ "$KEEP_DEST_STOPPED" == "true" ]]; then
+    _info "Keeping destination VM stopped (keep_dest_stopped=true)."
+    PHASE=4
+  else
+    _info "Starting VM ${VMID} on destination..."
+    ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm start '${VMID}'"
+    _ok "VM ${VMID} started on destination."
+    PHASE=4
+  fi
 
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
     _info "Updating Firestore (connectionUrl, nodeId)..."
@@ -267,7 +337,7 @@ pve_zfs_migrate_vm() {
     _info "Keeping source snapshots."
   fi
 
-  if [[ "$DELETE_SRC_VM" == "true" ]]; then
+  if [[ "$DELETE_SRC_VM" == "true" && "$KEEP_DEST_STOPPED" != "true" ]]; then
     _info "Verifying VM ${VMID} is running on destination (first check)..."
     sleep 5
     local DEST_STATUS
@@ -302,6 +372,8 @@ pve_zfs_migrate_vm() {
       fi
     done
     _ok "Source VM ${VMID} and associated disks destroyed."
+  elif [[ "$DELETE_SRC_VM" == "true" && "$KEEP_DEST_STOPPED" == "true" ]]; then
+    _info "Skipping source VM destruction (keep_dest_stopped=true; start and verify destination VM first)."
   fi
 
   MIGRATION_SUCCESS=1
@@ -310,10 +382,21 @@ pve_zfs_migrate_vm() {
 }
 
 # Examples:
-#   Run with local script (pass args):
-#     bash migrate_vm.sh 619 fd00:4000::2d
-#
-#   One-liner: download from GitHub and run (no manual download):
-#     curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 619 fd00:4000::2d
+#   Minimal (only required args):
+#     bash migrate_vm.sh 620 fd00:4000::6
+#   With named options:
+#     bash migrate_vm.sh 620 fd00:4000::6 --keep-dest-stopped
+#     bash migrate_vm.sh 620 fd00:4000::6 --keep-dest-stopped --delete-src-vm=false
+#   Legacy positional (args 3-10: dest_node snapname shutdown_timeout src_cleanup dest_cleanup delete_src_vm update_firestore keep_dest_stopped):
+#     bash migrate_vm.sh 619 fd00:4000::2d '' migration 180 yes yes false true true
+#   One-liner (curl):
+#     curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 --keep-dest-stopped
+#   Keep session open on failure but preserve exit code (e.g. with set -e):
+#     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 || r=$? ; echo "Exit code: $r"
+#   Multiple migrations in sequence: parent shell never closes; next runs only if previous succeeded.
+#     Use { } not ( ) so r is updated in the same shell. Use || true so a failed [[ ]] does not exit the shell with set -e.
+#     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 || r=$? ; echo "Exit code: $r"
+#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 621 fd00:4000::6 || r=$? ; echo "Exit code: $r"; } || true
+#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 622 fd00:4000::6 || r=$? ; echo "Exit code: $r"; } || true
 #
 pve_zfs_migrate_vm "$@"
