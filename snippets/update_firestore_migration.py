@@ -41,9 +41,34 @@ def initialize_firebase():
         return False
 
 
+def update_server_maintenance(vmid: int, maintenance: bool) -> bool:
+    """
+    Update servers collection: find document by proxmoxId, set maintenance.
+    Returns True on success, False otherwise.
+    """
+    if not initialize_firebase():
+        return False
+    try:
+        db = firestore.client()
+        servers_ref = db.collection("servers")
+        if FIELD_FILTER_AVAILABLE:
+            query = servers_ref.where(filter=FieldFilter("proxmoxId", "==", vmid))
+        else:
+            query = servers_ref.where("proxmoxId", "==", vmid)
+        docs = list(query.stream())
+        if not docs:
+            return False
+        for doc_snapshot in docs:
+            server_doc_ref = db.collection("servers").document(doc_snapshot.id)
+            server_doc_ref.update({"maintenance": maintenance})
+        return True
+    except Exception:
+        return False
+
+
 def update_server_migration(vmid: int, connection_url: str, node_id: str) -> bool:
     """
-    Update servers collection: find document by proxmoxId, set connectionUrl and nodeId.
+    Update servers collection: find document by proxmoxId, set connectionUrl, nodeId, and maintenance=False.
     Returns True on success, False otherwise.
     """
     if not initialize_firebase():
@@ -63,6 +88,7 @@ def update_server_migration(vmid: int, connection_url: str, node_id: str) -> boo
             server_doc_ref.update({
                 "connectionUrl": connection_url,
                 "nodeId": node_id,
+                "maintenance": False,
             })
         return True
     except Exception:
@@ -70,12 +96,23 @@ def update_server_migration(vmid: int, connection_url: str, node_id: str) -> boo
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Update Firestore server connectionUrl and nodeId for migration")
+    parser = argparse.ArgumentParser(description="Update Firestore server for migration (connectionUrl, nodeId, maintenance)")
+    parser.add_argument("--set-maintenance", choices=("true", "false"), metavar="BOOL",
+                        help="Only set maintenance field (requires only vmid)")
     parser.add_argument("vmid", type=int, help="Proxmox VM ID (proxmoxId)")
-    parser.add_argument("connection_url", help="connectionUrl (e.g. 157.180.15.173:20411)")
-    parser.add_argument("node_id", help="Destination node hostname (nodeId)")
+    parser.add_argument("connection_url", nargs="?", default="", help="connectionUrl (e.g. 157.180.15.173:20411)")
+    parser.add_argument("node_id", nargs="?", default="", help="Destination node hostname (nodeId)")
     args = parser.parse_args()
 
+    if args.set_maintenance is not None:
+        maintenance = args.set_maintenance == "true"
+        if not update_server_maintenance(args.vmid, maintenance):
+            sys.stderr.write("update_firestore_migration: set maintenance failed\n")
+            sys.exit(1)
+        sys.exit(0)
+
+    if not args.connection_url or not args.node_id:
+        parser.error("connection_url and node_id required when not using --set-maintenance")
     if not update_server_migration(args.vmid, args.connection_url, args.node_id):
         sys.stderr.write("update_firestore_migration: failed (no creds, no doc, or Firestore error)\n")
         sys.exit(1)

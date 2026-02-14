@@ -25,6 +25,15 @@ pve_zfs_migrate_vm() {
   _cleanup_on_failure() {
     set +e
     _info "Migration failed or interrupted; cleaning up and restoring state..."
+    if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
+      _info "Setting server maintenance=false in Firestore..."
+      local HELPER_CLEANUP
+      HELPER_CLEANUP="$(mktemp -t update_firestore_migration_XXXXXX.py)"
+      if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER_CLEANUP" 2>/dev/null; then
+        python3 "$HELPER_CLEANUP" --set-maintenance false "$VMID" 2>/dev/null || true
+      fi
+      rm -f "$HELPER_CLEANUP"
+    fi
     if [[ "$PHASE" -ge 1 ]]; then
       _info "Destroying source snapshots @${SNAPNAME}..."
       for ds in "${DATASETS[@]}"; do
@@ -118,6 +127,22 @@ pve_zfs_migrate_vm() {
 
   _info "Datasets to migrate:"
   for ds in "${DATASETS[@]}"; do _info "  - $ds"; done
+
+  if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
+    _info "Setting server maintenance=true in Firestore before migration..."
+    local HELPER_MAINT
+    HELPER_MAINT="$(mktemp -t update_firestore_migration_XXXXXX.py)"
+    if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER_MAINT" 2>/dev/null; then
+      if python3 "$HELPER_MAINT" --set-maintenance true "$VMID" 2>/dev/null; then
+        _ok "Server maintenance=true set."
+      else
+        _info "Could not set maintenance (no creds or doc); continuing."
+      fi
+      rm -f "$HELPER_MAINT"
+    else
+      _info "Could not download Firestore helper or python3 not found; skipping maintenance flag."
+    fi
+  fi
 
   _info "Shutting down VM ${VMID}..."
   qm shutdown "$VMID" || true
