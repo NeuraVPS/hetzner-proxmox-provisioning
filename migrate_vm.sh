@@ -1,5 +1,5 @@
 pve_zfs_migrate_vm() {
-  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]. Options: --dest-node, --snapname, --shutdown-timeout, --src-cleanup, --dest-cleanup, --delete-src-vm, --update-firestore, --keep-dest-stopped. Or pass positional args 3-10 for legacy. Use --help for details."
+  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]. Options: --dest-node, --snapname, --shutdown-timeout, --suspend-timeout, --hot, --src-cleanup, --dest-cleanup, --delete-src-vm, --update-firestore, --keep-dest-stopped. Or pass positional args 3-11 for legacy. Use --help for details."
   [[ $# -ge 2 ]] || { echo "$USAGE" >&2; exit 1; }
 
   local VMID="$1"
@@ -14,6 +14,8 @@ pve_zfs_migrate_vm() {
   local DELETE_SRC_VM="true"
   local UPDATE_FIRESTORE="true"
   local KEEP_DEST_STOPPED="false"
+  local HOT_MIGRATION="false"
+  local SUSPEND_TIMEOUT="120"
 
   if [[ $# -gt 0 && "$1" == --* ]]; then
     while [[ $# -gt 0 ]]; do
@@ -30,6 +32,11 @@ pve_zfs_migrate_vm() {
           echo "    --delete-src-vm=<true|false>  Destroy source VM after migration (true)"
           echo "    --update-firestore=<true|false>  Update Firestore after migration (true)"
           echo "    --keep-dest-stopped=<true|false>  Do not start VM on destination (false)"
+          echo "    --hot=<true|false>                Hot migration: suspend to disk, migrate, resume on dest (false)"
+          echo "    --suspend-timeout=<sec>           Wait up to this many seconds for suspend to complete (120)"
+          echo "  Hot migration uses suspend-to-disk and qm resume on destination. VM state must be on storage"
+          echo "  that is migrated (e.g. same ZFS as VM disks). With --hot and --keep-dest-stopped the VM is"
+          echo "  left suspended on destination."
           echo "  Boolean options can be given as --opt or --opt=true/false."
           echo "  With set -e, keep session open and preserve exit code: r=0; curl ... | bash -s -- <vmid> <dest> ... || r=\$?"
           exit 0
@@ -50,6 +57,10 @@ pve_zfs_migrate_vm() {
         --update-firestore)    if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then UPDATE_FIRESTORE="${2}"; shift 2; else UPDATE_FIRESTORE="true"; shift; fi ;;
         --keep-dest-stopped=*) KEEP_DEST_STOPPED="${1#*=}"; shift ;;
         --keep-dest-stopped)   if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then KEEP_DEST_STOPPED="${2}"; shift 2; else KEEP_DEST_STOPPED="true"; shift; fi ;;
+        --hot=*)               HOT_MIGRATION="${1#*=}"; shift ;;
+        --hot)                 if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then HOT_MIGRATION="${2}"; shift 2; else HOT_MIGRATION="true"; shift; fi ;;
+        --suspend-timeout=*)   SUSPEND_TIMEOUT="${1#*=}"; shift ;;
+        --suspend-timeout)     [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; SUSPEND_TIMEOUT="$2"; shift 2 ;;
         *)
           echo "Unknown option: $1" >&2
           exit 1
@@ -65,6 +76,8 @@ pve_zfs_migrate_vm() {
     DELETE_SRC_VM="${1:-true}"; [[ $# -ge 1 ]] && shift
     UPDATE_FIRESTORE="${1:-true}"; [[ $# -ge 1 ]] && shift
     KEEP_DEST_STOPPED="${1:-false}"; [[ $# -ge 1 ]] && shift
+    HOT_MIGRATION="${1:-false}"; [[ $# -ge 1 ]] && shift
+    SUSPEND_TIMEOUT="${1:-120}"; [[ $# -ge 1 ]] && shift
   fi
 
   local SSH_OPTS=(-o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes)
@@ -74,6 +87,7 @@ pve_zfs_migrate_vm() {
 
   local MIGRATION_SUCCESS=0
   local PHASE=0
+  local WAS_SUSPENDED=0
 
   _die()  { echo "❌ $*" >&2; exit 1; }
   _info() { echo "ℹ️  $*" >&2; }
@@ -96,8 +110,13 @@ pve_zfs_migrate_vm() {
       for ds in "${DATASETS[@]}"; do
         zfs destroy "${ds}@${SNAPNAME}" 2>/dev/null || true
       done
-      _info "Starting VM ${VMID} on source again..."
-      qm start "$VMID" 2>/dev/null || true
+      if [[ "$WAS_SUSPENDED" -eq 1 ]]; then
+        _info "Resuming VM ${VMID} on source again..."
+        qm resume "$VMID" 2>/dev/null || true
+      else
+        _info "Starting VM ${VMID} on source again..."
+        qm start "$VMID" 2>/dev/null || true
+      fi
     fi
     if [[ "$PHASE" -ge 2 ]]; then
       _info "Cleaning up destination (snapshots, datasets, config)..."
@@ -201,19 +220,33 @@ pve_zfs_migrate_vm() {
     fi
   fi
 
-  _info "Shutting down VM ${VMID}..."
-  qm shutdown "$VMID" || true
+  if [[ "$HOT_MIGRATION" == "true" ]]; then
+    _info "Suspending VM ${VMID} to disk (hot migration)..."
+    qm suspend "$VMID" --todisk 1 || _die "qm suspend failed for VM ${VMID}."
+    WAS_SUSPENDED=1
+    local elapsed=0
+    while ! qm status "$VMID" 2>/dev/null | grep -q "status: suspended"; do
+      if (( elapsed >= SUSPEND_TIMEOUT )); then
+        _die "Suspend timeout (${SUSPEND_TIMEOUT}s) reached; VM may be in an inconsistent state. Check and resume manually if needed."
+      fi
+      sleep 2; (( elapsed += 2 ))
+    done
+    _ok "VM ${VMID} suspended."
+  else
+    _info "Shutting down VM ${VMID}..."
+    qm shutdown "$VMID" || true
 
-  local elapsed=0
-  while qm status "$VMID" 2>/dev/null | grep -q "status: running"; do
-    if (( elapsed >= SHUTDOWN_TIMEOUT )); then
-      _info "Shutdown timeout reached; forcing stop..."
-      qm stop "$VMID" || true
-      break
-    fi
-    sleep 2; (( elapsed += 2 ))
-  done
-  _ok "VM ${VMID} stopped."
+    local elapsed=0
+    while qm status "$VMID" 2>/dev/null | grep -q "status: running"; do
+      if (( elapsed >= SHUTDOWN_TIMEOUT )); then
+        _info "Shutdown timeout reached; forcing stop..."
+        qm stop "$VMID" || true
+        break
+      fi
+      sleep 2; (( elapsed += 2 ))
+    done
+    _ok "VM ${VMID} stopped."
+  fi
 
   _info "Ensuring snapshot name @${SNAPNAME} is free (source + destination)..."
   for ds in "${DATASETS[@]}"; do
@@ -282,18 +315,8 @@ pve_zfs_migrate_vm() {
   fi
   PHASE=3
 
-  if [[ "$KEEP_DEST_STOPPED" == "true" ]]; then
-    _info "Keeping destination VM stopped (keep_dest_stopped=true)."
-    PHASE=4
-  else
-    _info "Starting VM ${VMID} on destination..."
-    ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm start '${VMID}'"
-    _ok "VM ${VMID} started on destination."
-    PHASE=4
-  fi
-
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
-    _info "Updating Firestore (connectionUrl, nodeId)..."
+    _info "Updating Firestore (connectionUrl, nodeId) before starting VM..."
     local DEST_PUBLIC_IP
     DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
     if [[ -z "$DEST_PUBLIC_IP" ]]; then
@@ -315,6 +338,22 @@ pve_zfs_migrate_vm() {
     fi
     rm -f "$HELPER"
     _ok "Firestore updated: connectionUrl=${CONNECTION_URL}, nodeId=${DEST_NODE}"
+  fi
+
+  if [[ "$KEEP_DEST_STOPPED" == "true" ]]; then
+    _info "Keeping destination VM stopped (keep_dest_stopped=true)."
+    PHASE=4
+  else
+    if [[ "$HOT_MIGRATION" == "true" ]]; then
+      _info "Resuming VM ${VMID} on destination..."
+      ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm resume '${VMID}'"
+      _ok "VM ${VMID} resumed on destination."
+    else
+      _info "Starting VM ${VMID} on destination..."
+      ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm start '${VMID}'"
+      _ok "VM ${VMID} started on destination."
+    fi
+    PHASE=4
   fi
 
   if [[ "$DEST_CLEANUP" == "yes" ]]; then
@@ -387,8 +426,10 @@ pve_zfs_migrate_vm() {
 #   With named options:
 #     bash migrate_vm.sh 620 fd00:4000::6 --keep-dest-stopped
 #     bash migrate_vm.sh 620 fd00:4000::6 --keep-dest-stopped --delete-src-vm=false
-#   Legacy positional (args 3-10: dest_node snapname shutdown_timeout src_cleanup dest_cleanup delete_src_vm update_firestore keep_dest_stopped):
-#     bash migrate_vm.sh 619 fd00:4000::2d '' migration 180 yes yes false true true
+#   Hot migration (suspend then resume on dest):
+#     bash migrate_vm.sh 620 fd00:4000::6 --hot
+#   Legacy positional (args 3-11: dest_node snapname shutdown_timeout src_cleanup dest_cleanup delete_src_vm update_firestore keep_dest_stopped hot suspend_timeout):
+#     bash migrate_vm.sh 619 fd00:4000::2d '' migration 180 yes yes false true true false 120
 #   One-liner (curl):
 #     curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 --keep-dest-stopped
 #   Keep session open on failure but preserve exit code (e.g. with set -e):
