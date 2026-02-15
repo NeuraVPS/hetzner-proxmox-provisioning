@@ -7,7 +7,6 @@ remote_task() {
   echo "== Running remote task =="
 
   scp [fd00:4000::1]:/etc/pve/firewall/cluster.fw /etc/pve/firewall/
-
   pve-firewall restart || true
 
   echo "== Finished =="
@@ -17,7 +16,7 @@ remote_task() {
 # Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
-for ((i=2; i<=52; i++)); do
+for ((i=6; i<=53; i++)); do
     HEX=$(printf "%x" "$i")
     IP="fd00:4000::${HEX}"
 

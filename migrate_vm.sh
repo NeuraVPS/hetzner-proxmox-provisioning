@@ -221,16 +221,33 @@ pve_zfs_migrate_vm() {
   fi
 
   if [[ "$HOT_MIGRATION" == "true" ]]; then
+    local memory_mb
+    memory_mb="$(qm config "$VMID" 2>/dev/null | awk -F': ' '/^memory:/{print $2; exit}' | tr -d ' ')"
+    local memory_bytes=$(( (memory_mb + 0) * 1024 * 1024 ))
+    [[ "$memory_bytes" -le 0 ]] && memory_bytes=1
+
     _info "Suspending VM ${VMID} to disk (hot migration)..."
-    qm suspend "$VMID" --todisk 1 || _die "qm suspend failed for VM ${VMID}."
-    WAS_SUSPENDED=1
+    qm suspend "$VMID" --todisk 1 &
+    local SUSPEND_PID=$!
     local elapsed=0
     while ! qm status "$VMID" 2>/dev/null | grep -q "status: suspended"; do
       if (( elapsed >= SUSPEND_TIMEOUT )); then
+        kill "$SUSPEND_PID" 2>/dev/null || true
         _die "Suspend timeout (${SUSPEND_TIMEOUT}s) reached; VM may be in an inconsistent state. Check and resume manually if needed."
+      fi
+      local state_used
+      state_used="$(zfs list -H -p -o name,used 2>/dev/null | awk -v vmid="$VMID" 'index($1, "vm-" vmid) && index($1, "state-suspend") {print $2; exit}')"
+      if [[ -n "${state_used:-}" && "$memory_bytes" -gt 0 ]]; then
+        local pct=$(( state_used * 100 / memory_bytes ))
+        [[ "$pct" -gt 99 ]] && pct=99
+        _info "Suspending to disk... ${pct}%"
+      else
+        _info "Suspending to disk..."
       fi
       sleep 2; (( elapsed += 2 ))
     done
+    wait "$SUSPEND_PID" || _die "qm suspend failed for VM ${VMID}."
+    WAS_SUSPENDED=1
     _ok "VM ${VMID} suspended."
   else
     _info "Shutting down VM ${VMID}..."
