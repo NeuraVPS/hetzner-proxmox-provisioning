@@ -327,6 +327,10 @@ IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
 IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
 IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
 IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
+IN RDP(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN RDP(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN SMB(ACCEPT) -source fd00:4000::1/128 -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -dest +dc/hosts-ipv6 -log nolog
 
 [group vm-no-internet]

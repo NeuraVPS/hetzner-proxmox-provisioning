@@ -28,6 +28,7 @@ except ImportError:
 BRIDGE_NET = "10.0.0.0/16"
 BASE_PORT_RDP = 20000
 BASE_PORT_SAMBA = 10000
+BASE_INTERNAL_IPV6 = "fd00:4000::1"  # SNAT source for IPv6 DNAT so VMs only see BASE, not client IPv6
 NODES_CONF = Path("/etc/sync-dnat/nodes.conf")
 # Get hostname reliably - use subprocess.run to avoid capturing stderr
 try:
@@ -447,6 +448,24 @@ def _delete_nat6_prerouting_by_comment(comment):
     except Exception as e:
         logger.warning(f"ip6tables nat PREROUTING delete by comment failed: {e}")
 
+def _delete_nat6_postrouting_by_comment(comment):
+    """Delete ip6tables nat POSTROUTING rules that have this comment. Deletes by line number high-to-low."""
+    try:
+        output = run(["ip6tables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v", "--line-numbers"])
+        line_nums = []
+        for line in output.splitlines():
+            if comment in line:
+                parts = line.strip().split()
+                if parts and parts[0].isdigit():
+                    line_nums.append(int(parts[0]))
+        for num in sorted(line_nums, reverse=True):
+            subprocess.run(
+                ["ip6tables", "-t", "nat", "-D", "POSTROUTING", str(num)],
+                capture_output=True, check=False
+            )
+    except Exception as e:
+        logger.warning(f"ip6tables nat POSTROUTING delete by comment failed: {e}")
+
 def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
     """Add BASE NAT64 BIB entries and ip6tables FORWARD for (node_hostname, vmid, vm_ipv6). Must run on BASE."""
     if not is_base_node():
@@ -512,6 +531,29 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
                 logger.info(f"ADD: ip6tables DNAT {base_ipv6}#{samba_port} -> [{vm_ipv6}]:445 (vmid-{vmid})")
             except subprocess.CalledProcessError as e:
                 logger.warning(f"ip6tables DNAT Samba add failed: {e}")
+        # SNAT so VMs see source BASE only; VM firewall allows fd00:4000::1, not arbitrary IPv6
+        snat_comment = f"nat64-snat-vmid-{vmid}"
+        try:
+            subprocess.run(
+                ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-p", "tcp", "-d", vm_ipv6,
+                 "--dport", str(to_port_rdp), "-j", "SNAT", "--to-source", BASE_INTERNAL_IPV6,
+                 "-m", "comment", "--comment", snat_comment],
+                capture_output=True, check=True
+            )
+            logger.info(f"ADD: ip6tables SNAT -> {BASE_INTERNAL_IPV6} for {vm_ipv6}:{to_port_rdp} (vmid-{vmid})")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"ip6tables SNAT RDP add failed: {e}")
+        if ostype.startswith("win"):
+            try:
+                subprocess.run(
+                    ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-p", "tcp", "-d", vm_ipv6,
+                     "--dport", "445", "-j", "SNAT", "--to-source", BASE_INTERNAL_IPV6,
+                     "-m", "comment", "--comment", snat_comment],
+                    capture_output=True, check=True
+                )
+                logger.info(f"ADD: ip6tables SNAT -> {BASE_INTERNAL_IPV6} for {vm_ipv6}:445 (vmid-{vmid})")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"ip6tables SNAT Samba add failed: {e}")
     else:
         logger.debug("BASE has no public IPv6, skipping IPv6 DNAT")
 
@@ -532,6 +574,7 @@ def apply_base_delete_nat64(node_hostname, vmid):
     _jool_bib_remove(base_ip, samba_port)
     _delete_rule_by_comment_ip6(f"nat64-fwd-vmid-{vmid}")
     _delete_nat6_prerouting_by_comment(f"nat64-dnat-vmid-{vmid}")
+    _delete_nat6_postrouting_by_comment(f"nat64-snat-vmid-{vmid}")
     logger.info(f"Removed BASE NAT64 rules for {node_hostname} vmid {vmid}")
     return True
 
