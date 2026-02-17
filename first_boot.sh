@@ -421,9 +421,11 @@ IFUPEOF
   log "NAT64: Installing boot restore script and systemd service"
   cat > /usr/local/bin/nat64-boot-restore.sh <<'NAT64BOOT'
 #!/bin/bash
-# Restore Jool instance, pool4, and BIB after BASE reboot. Idempotent.
+# Restore NAT64 routes, Jool instance, pool4, and BIB after BASE reboot. Idempotent.
 LOG_TAG="nat64-boot-restore"
 logger -t "$LOG_TAG" "Starting NAT64 boot restore"
+# Apply routes to VM subnets (from nat64-routes.conf) so traffic can reach nodes
+[[ -x /usr/local/bin/apply-nat64-routes.sh ]] && /usr/local/bin/apply-nat64-routes.sh
 modprobe jool 2>/dev/null || true
 jool instance add "default" --netfilter --pool6 64:ff9b::/96 2>/dev/null || true
 BASE_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
