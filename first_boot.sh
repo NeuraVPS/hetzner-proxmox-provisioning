@@ -411,10 +411,31 @@ IFUPEOF
   /usr/local/bin/apply-nat64-routes.sh
 else
   log "NAT64: Registering this node's VM subnet on BASE (return route 64:ff9b::/96 is in /etc/network/interfaces post-up)"
-  # Register this node's VM subnet on BASE so BASE can route to our VMs
+  # If fd00 interface is missing, fix eth0.4000 -> <parent>.4000 mismatch (e.g. vlan-raw-device enp5s0 => use enp5s0.4000)
   FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
+  if [[ -z "$FD00_IFACE" ]] && [[ -f /etc/network/interfaces ]]; then
+    PARENT=$(awk '/vlan-raw-device/ { print $NF; exit }' /etc/network/interfaces)
+    if [[ -z "$PARENT" ]]; then
+      REAL_VLAN=$(ip link show 2>/dev/null | awk -F: '/\.4000:/ { gsub(/^ /,"",$2); print $2; exit }')
+      [[ -n "$REAL_VLAN" ]] && PARENT="${REAL_VLAN%.4000}"
+    fi
+    if [[ -n "$PARENT" ]] && grep -q 'eth0\.4000' /etc/network/interfaces; then
+      log "NAT64: Fixing interface name eth0.4000 -> ${PARENT}.4000 in /etc/network/interfaces"
+      sed -i "s/eth0\.4000/${PARENT}.4000/g" /etc/network/interfaces
+      ifreload -a 2>/dev/null || true
+      FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
+    fi
+    if [[ -z "$FD00_IFACE" && -n "$PARENT" ]] && grep -q "${PARENT}\.4000" /etc/network/interfaces; then
+      log "NAT64: Running ifreload -a to bring up ${PARENT}.4000"
+      ifreload -a 2>/dev/null || true
+      FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
+    fi
+  fi
+  # Register this node's VM subnet on BASE so BASE can route to our VMs
+  # ip may list the interface as eth0.4000@enp5s0; use the name without @parent for ip commands
   if [[ -n "$FD00_IFACE" ]]; then
-    NODE_FD00=$(ip -6 addr show dev "$FD00_IFACE" | awk '/inet6 fd00:4000::/ { print $2; exit }' | cut -d/ -f1)
+    FD00_DEV="${FD00_IFACE%%@*}"
+    NODE_FD00=$(ip -6 addr show dev "$FD00_DEV" 2>/dev/null | awk '/inet6 fd00:4000::/ { print $2; exit }' | cut -d/ -f1)
     VM_PREFIX=$(ip -6 addr show vmbr0 2>/dev/null | awk '/inet6 .* scope global/ { print $2; exit }' | sed 's/::1\/64/::\/64/')
     if [[ -n "$NODE_FD00" && -n "$VM_PREFIX" ]]; then
       if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes root@fd00:4000::1 "grep -q '^${VM_PREFIX}' /etc/sync-dnat/nat64-routes.conf 2>/dev/null || echo '${VM_PREFIX} ${NODE_FD00}' >> /etc/sync-dnat/nat64-routes.conf; /usr/local/bin/apply-nat64-routes.sh"; then
@@ -426,7 +447,7 @@ else
       log "WARNING: NAT64: Could not detect NODE_FD00 or VM_PREFIX, skipping BASE registration"
     fi
   else
-    log "WARNING: NAT64: Could not detect fd00:4000 interface, skipping BASE registration"
+    log "WARNING: NAT64: Could not detect fd00:4000 interface (no address on any interface). If you see 'Device eth0.4000@enp5s0 does not exist', fix /etc/network/interfaces to use the real VLAN name (e.g. enp5s0.4000). Skipping BASE registration."
   fi
 fi
 
