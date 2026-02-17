@@ -29,8 +29,6 @@ BRIDGE_NET = "10.0.0.0/16"
 BASE_PORT_RDP = 20000
 BASE_PORT_SAMBA = 10000
 NODES_CONF = Path("/etc/sync-dnat/nodes.conf")
-BASE_HOST = "fd00:4000::1"
-SYNC_DNAT_SCRIPT_PATH = "/var/lib/svz/snippets/sync-dnat.py"
 # Get hostname reliably - use subprocess.run to avoid capturing stderr
 try:
     result = subprocess.run(["hostname"], capture_output=True, text=True, check=True)
@@ -336,29 +334,6 @@ def parse_iptables_rules(vmid_filter=None, base_mode=False):
                 rules[current_table].add(normalize_rule(line))
     return rules
 
-def extract_vmids_from_rules(rules_nat):
-    """Extract unique vmids from node-managed NAT rules (ssh/rdp/samba-vmid-X)."""
-    vmids = set()
-    for rule in rules_nat:
-        m = re.search(r"(?:ssh|rdp|samba)-vmid-(\d+)", rule)
-        if m:
-            vmids.add(int(m.group(1)))
-    return vmids
-
-def parse_base_rules():
-    """Parse BASE forwarding rules. Returns dict vmid -> node_public_ip (from --to-destination)."""
-    rules = parse_iptables_rules(base_mode=True)
-    result = {}  # vmid -> dest_ip (we only need rdp or samba once per vmid)
-    for rule in rules["nat"]:
-        m = re.search(r"base-(?:rdp|samba)-vmid-(\d+)", rule)
-        if not m:
-            continue
-        vmid = int(m.group(1))
-        m2 = re.search(r"--to-destination\s+([^:]+):\d+", rule)
-        if m2:
-            result[vmid] = m2.group(1)
-    return result
-
 def build_expected_rules(vm_infos, wan_if):
     """Build expected iptables rules.
     
@@ -400,194 +375,113 @@ def build_expected_rules(vm_infos, wan_if):
     
     return expected_nat, expected_filter
 
-def ssh_run(host, cmd, timeout=15):
-    """Run command on remote host via SSH. Returns (success, stdout)."""
-    target = f"root@{host}"
-    ssh_cmd = [
-        "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-        "-o", "BatchMode=yes", "-o", "UserKnownHostsFile=/dev/null",
-        target, *cmd
-    ]
+def get_base_public_ip():
+    """Return BASE's public IPv4 (for Jool BIB). Must run on BASE."""
+    out = run(["ip", "-4", "route", "get", "8.8.8.8"])
+    m = re.search(r"src\s+(\S+)", out)
+    return m.group(1) if m else None
+
+def _jool_bib_add(vm_ipv6, vm_port, base_ip, base_port, protocol="--tcp"):
+    """Add one Jool BIB entry. Returns True on success."""
     try:
-        result = subprocess.run(
-            ssh_cmd, capture_output=True, text=True, timeout=timeout, check=False
+        subprocess.run(
+            ["jool", "bib", "add", f"{vm_ipv6}#{vm_port}", f"{base_ip}#{base_port}", protocol],
+            capture_output=True, text=True, check=True, timeout=10
         )
-        if result.returncode != 0 and result.stderr:
-            logger.warning(f"SSH to {host} failed (exit {result.returncode}): {result.stderr.strip()}")
-        return result.returncode == 0, result.stdout
-    except subprocess.TimeoutExpired:
-        logger.warning(f"SSH to {host} timed out")
-        return False, ""
-    except Exception as e:
-        logger.warning(f"SSH to {host} failed: {e}")
-        return False, ""
-
-def _base_rule_exists(comment):
-    """Check if a BASE rule with the given comment exists (NAT table)."""
-    output = run(["iptables-save"])
-    return f"--comment {comment}" in output
-
-def _base_fwd_rule_exists(comment):
-    """Check if a BASE FORWARD rule with the given comment exists."""
-    output = run(["iptables-save"])
-    return f"--comment {comment}" in output
-
-def apply_base_create(node_hostname, vmid):
-    """Add BASE forwarding rules for (node_hostname, vmid). Must run on BASE. Idempotent: skips if rules exist."""
-    if not is_base_node():
-        logger.error("apply_base_create must run on BASE")
-        return False
-    nodes = get_nodes_config()
-    if not nodes:
-        logger.error("nodes.conf missing or empty")
-        return False
-    node_public_ip = nodes.get(node_hostname)
-    if not node_public_ip:
-        logger.error(f"Node {node_hostname} not found in nodes.conf")
-        return False
-    rdp_comment = f"base-rdp-vmid-{vmid}"
-    samba_comment = f"base-samba-vmid-{vmid}"
-    if _base_rule_exists(rdp_comment) and _base_rule_exists(samba_comment):
-        logger.info(f"BASE rules for {node_hostname} vmid {vmid} already present, skipping")
         return True
-    wan_if = get_default_wan_if()
-    if not wan_if:
-        logger.error("Could not determine WAN interface")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Jool BIB add failed: {e}")
+        return False
+
+def _jool_bib_remove(base_ip, base_port, protocol="--tcp"):
+    """Remove one Jool BIB entry by BASE side port. Returns True on success."""
+    try:
+        subprocess.run(
+            ["jool", "bib", "remove", f"{base_ip}#{base_port}", protocol],
+            capture_output=True, text=True, check=True, timeout=10
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Jool BIB remove failed: {e}")
+        return False
+
+def _delete_rule_by_comment_ip6(comment):
+    """Delete ip6tables FORWARD rules that have this comment. Deletes by line number high-to-low."""
+    try:
+        output = run(["ip6tables", "-L", "FORWARD", "-n", "-v", "--line-numbers"])
+        line_nums = []
+        for line in output.splitlines():
+            if comment in line:
+                parts = line.strip().split()
+                if parts and parts[0].isdigit():
+                    line_nums.append(int(parts[0]))
+        for num in sorted(line_nums, reverse=True):
+            subprocess.run(["ip6tables", "-D", "FORWARD", str(num)], capture_output=True, check=False)
+    except Exception as e:
+        logger.warning(f"ip6tables delete by comment failed: {e}")
+
+def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
+    """Add BASE NAT64 BIB entries and ip6tables FORWARD for (node_hostname, vmid, vm_ipv6). Must run on BASE."""
+    if not is_base_node():
+        logger.error("apply_base_create_nat64 must run on BASE")
+        return False
+    base_ip = get_base_public_ip()
+    if not base_ip:
+        logger.error("Could not determine BASE public IPv4")
         return False
     rdp_port = BASE_PORT_RDP + vmid
     samba_port = BASE_PORT_SAMBA + vmid
-    rdp_nat_rule = [
-        "iptables", "-t", "nat", "-A", "PREROUTING",
-        "-i", wan_if, "-p", "tcp", "--dport", str(rdp_port),
-        "-m", "comment", "--comment", rdp_comment,
-        "-j", "DNAT", "--to-destination", f"{node_public_ip}:{rdp_port}"
-    ]
-    samba_nat_rule = [
-        "iptables", "-t", "nat", "-A", "PREROUTING",
-        "-i", wan_if, "-p", "tcp", "--dport", str(samba_port),
-        "-m", "comment", "--comment", samba_comment,
-        "-j", "DNAT", "--to-destination", f"{node_public_ip}:{samba_port}"
-    ]
-    rdp_fwd_comment = f"base-fwd-rdp-vmid-{vmid}"
-    samba_fwd_comment = f"base-fwd-samba-vmid-{vmid}"
-    rdp_snat_comment = f"base-snat-rdp-vmid-{vmid}"
-    samba_snat_comment = f"base-snat-samba-vmid-{vmid}"
-    rdp_fwd_rule = [
-        "iptables", "-A", "FORWARD",
-        "-d", node_public_ip, "-p", "tcp", "--dport", str(rdp_port),
-        "-m", "comment", "--comment", rdp_fwd_comment, "-j", "ACCEPT"
-    ]
-    samba_fwd_rule = [
-        "iptables", "-A", "FORWARD",
-        "-d", node_public_ip, "-p", "tcp", "--dport", str(samba_port),
-        "-m", "comment", "--comment", samba_fwd_comment, "-j", "ACCEPT"
-    ]
-    rdp_snat_rule = [
-        "iptables", "-t", "nat", "-A", "POSTROUTING",
-        "-d", node_public_ip, "-p", "tcp", "--dport", str(rdp_port),
-        "-m", "comment", "--comment", rdp_snat_comment, "-j", "MASQUERADE"
-    ]
-    samba_snat_rule = [
-        "iptables", "-t", "nat", "-A", "POSTROUTING",
-        "-d", node_public_ip, "-p", "tcp", "--dport", str(samba_port),
-        "-m", "comment", "--comment", samba_snat_comment, "-j", "MASQUERADE"
-    ]
+    to_port_rdp = 3389 if ostype.startswith("win") else 22
+    fwd_comment = f"nat64-fwd-vmid-{vmid}"
+    ok = True
+    if _jool_bib_add(vm_ipv6, to_port_rdp, base_ip, rdp_port):
+        logger.info(f"ADD: jool bib {base_ip}#{rdp_port} -> {vm_ipv6}#{to_port_rdp} (vmid-{vmid})")
+    else:
+        ok = False
     try:
-        subprocess.run(rdp_nat_rule, check=True)
-        logger.info(f"ADD: PREROUTING DNAT dport {rdp_port} -> {node_public_ip}:{rdp_port} (base-rdp-vmid-{vmid})")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        subprocess.run(samba_nat_rule, check=True)
-        logger.info(f"ADD: PREROUTING DNAT dport {samba_port} -> {node_public_ip}:{samba_port} (base-samba-vmid-{vmid})")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        subprocess.run(rdp_fwd_rule, check=True)
-        logger.info(f"ADD: FORWARD -d {node_public_ip} dport {rdp_port} ACCEPT (base-fwd-rdp-vmid-{vmid})")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        subprocess.run(samba_fwd_rule, check=True)
-        logger.info(f"ADD: FORWARD -d {node_public_ip} dport {samba_port} ACCEPT (base-fwd-samba-vmid-{vmid})")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        subprocess.run(rdp_snat_rule, check=True)
-        logger.info(f"ADD: POSTROUTING MASQUERADE -> {node_public_ip}:{rdp_port} (base-snat-rdp-vmid-{vmid})")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        subprocess.run(samba_snat_rule, check=True)
-        logger.info(f"ADD: POSTROUTING MASQUERADE -> {node_public_ip}:{samba_port} (base-snat-samba-vmid-{vmid})")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        # Verify rules are present (e.g. pve-firewall might not have wiped them yet)
-        if not _base_rule_exists(rdp_comment) or not _base_fwd_rule_exists(rdp_fwd_comment):
-            logger.warning("Rules may not have been applied; check if pve-firewall or other tool overwrites iptables")
-        logger.info(f"Added BASE rules for {node_hostname} vmid {vmid}")
-        return True
+        subprocess.run(
+            ["ip6tables", "-A", "FORWARD", "-p", "tcp", "-d", vm_ipv6,
+             "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"],
+            capture_output=True, check=True
+        )
+        subprocess.run(
+            ["ip6tables", "-A", "FORWARD", "-p", "tcp", "-s", vm_ipv6,
+             "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"],
+            capture_output=True, check=True
+        )
+        logger.info(f"ADD: ip6tables FORWARD for {vm_ipv6} (vmid-{vmid})")
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to add BASE rules: {e}")
-        return False
+        logger.warning(f"ip6tables FORWARD add failed: {e}")
+    if ostype.startswith("win"):
+        if _jool_bib_add(vm_ipv6, 445, base_ip, samba_port):
+            logger.info(f"ADD: jool bib {base_ip}#{samba_port} -> {vm_ipv6}#445 (vmid-{vmid})")
+        else:
+            ok = False
+    return ok
 
-def apply_base_delete(node_hostname, vmid):
-    """Remove BASE forwarding rules for (node_hostname, vmid). Must run on BASE."""
+def apply_base_delete_nat64(node_hostname, vmid):
+    """Remove BASE NAT64 BIB entries and ip6tables FORWARD for (node_hostname, vmid). Must run on BASE."""
     if not is_base_node():
-        logger.error("apply_base_delete must run on BASE")
+        logger.error("apply_base_delete_nat64 must run on BASE")
         return False
-    rdp_comment = f"base-rdp-vmid-{vmid}"
-    samba_comment = f"base-samba-vmid-{vmid}"
-    rdp_fwd_comment = f"base-fwd-rdp-vmid-{vmid}"
-    samba_fwd_comment = f"base-fwd-samba-vmid-{vmid}"
-    rdp_snat_comment = f"base-snat-rdp-vmid-{vmid}"
-    samba_snat_comment = f"base-snat-samba-vmid-{vmid}"
-    try:
-        delete_rule_by_comment(rdp_comment, "nat")
-        delete_rule_by_comment(samba_comment, "nat")
-        delete_rule_by_comment(rdp_fwd_comment, "filter")
-        delete_rule_by_comment(samba_fwd_comment, "filter")
-        delete_rule_by_comment(rdp_snat_comment, "nat")
-        delete_rule_by_comment(samba_snat_comment, "nat")
-        logger.info(f"Removed BASE rules for {node_hostname} vmid {vmid}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to remove BASE rules: {e}")
+    base_ip = get_base_public_ip()
+    if not base_ip:
+        logger.error("Could not determine BASE public IPv4")
         return False
-
-def get_running_vmids_on_node(ssh_target):
-    """SSH to node and return list of running vmids."""
-    ok, stdout = ssh_run(ssh_target, ["qm", "list"])
-    if not ok:
-        return []
-    vmids = []
-    for line in stdout.splitlines()[1:]:
-        fields = line.split()
-        if len(fields) >= 3 and fields[2] == "running":
-            try:
-                vmids.append(int(fields[0]))
-            except ValueError:
-                pass
-    return vmids
+    rdp_port = BASE_PORT_RDP + vmid
+    samba_port = BASE_PORT_SAMBA + vmid
+    _jool_bib_remove(base_ip, rdp_port)
+    _jool_bib_remove(base_ip, samba_port)
+    _delete_rule_by_comment_ip6(f"nat64-fwd-vmid-{vmid}")
+    logger.info(f"Removed BASE NAT64 rules for {node_hostname} vmid {vmid}")
+    return True
 
 def sync_base_for_node(node_hostname):
-    """Sync all BASE forwarding rules for one node. Must run on BASE."""
+    """Sync BASE NAT64 BIB for one node. No-op: BIB is updated by node notifications on VM start/stop."""
     if not is_base_node():
         logger.error("sync_base_for_node must run on BASE")
         return False
-    nodes = get_nodes_config()
-    if not nodes:
-        logger.error("nodes.conf missing or empty")
-        return False
-    node_public_ip = nodes.get(node_hostname)
-    if not node_public_ip:
-        logger.error(f"Node {node_hostname} not found in nodes.conf")
-        return False
-    expected_vmids = set(get_running_vmids_on_node(node_hostname))
-    current = parse_base_rules()
-    actual_vmids = {v for v, ip in current.items() if ip == node_public_ip}
-    to_add = expected_vmids - actual_vmids
-    to_del = actual_vmids - expected_vmids
-    for vmid in to_add:
-        apply_base_create(node_hostname, vmid)
-    for vmid in to_del:
-        apply_base_delete(node_hostname, vmid)
-    logger.info(f"Synced BASE rules for {node_hostname}: +{len(to_add)} -{len(to_del)}")
+    logger.info("NAT64: sync via node notification only (no-op)")
     return True
 
 def sync_base_all():
@@ -601,35 +495,6 @@ def sync_base_all():
         return False
     for node_hostname in nodes:
         sync_base_for_node(node_hostname)
-
-def notify_base(added_vmids, removed_vmids):
-    """SSH to BASE and run update_base create/delete for each vmid."""
-    if is_base_node():
-        return
-    if not added_vmids and not removed_vmids:
-        logger.info("No BASE notify (local rules unchanged)")
-        return
-    logger.info(f"Notifying BASE: added={added_vmids}, removed={removed_vmids}")
-    for vmid in added_vmids:
-        logger.info(f"SSH to BASE: update_base create {NODE_NAME} {vmid}")
-        ok, out = ssh_run(BASE_HOST, [SYNC_DNAT_SCRIPT_PATH, "update_base", "create", NODE_NAME, str(vmid)])
-        if ok:
-            if out and out.strip():
-                for line in out.strip().splitlines():
-                    logger.info(f"BASE: {line}")
-            logger.info(f"BASE notified: create {NODE_NAME} {vmid}")
-        else:
-            logger.warning(f"Failed to notify BASE: create {NODE_NAME} {vmid}")
-    for vmid in removed_vmids:
-        logger.info(f"SSH to BASE: update_base delete {NODE_NAME} {vmid}")
-        ok, out = ssh_run(BASE_HOST, [SYNC_DNAT_SCRIPT_PATH, "update_base", "delete", NODE_NAME, str(vmid)])
-        if ok:
-            if out and out.strip():
-                for line in out.strip().splitlines():
-                    logger.info(f"BASE: {line}")
-            logger.info(f"BASE notified: delete {NODE_NAME} {vmid}")
-        else:
-            logger.warning(f"Failed to notify BASE: delete {NODE_NAME} {vmid}")
 
 def delete_rule_by_comment(comment, table):
     """Delete all rules in the given table that have this comment."""
@@ -851,19 +716,27 @@ def handle_update_base():
     if not is_base_node():
         logger.error("update_base must run on BASE node")
         return True
-    # update_base create NODE_HOSTNAME vmid
-    if len(sys.argv) >= 5 and sys.argv[2] in ("create", "delete"):
-        action = sys.argv[2]
+    # update_base create NODE_HOSTNAME vmid VM_IPV6 OSTYPE
+    if len(sys.argv) >= 6 and sys.argv[2] == "create":
         node_hostname = sys.argv[3]
         try:
             vmid = int(sys.argv[4])
         except ValueError:
             logger.error(f"Invalid vmid: {sys.argv[4]}")
             return True
-        if action == "create":
-            apply_base_create(node_hostname, vmid)
-        else:
-            apply_base_delete(node_hostname, vmid)
+        vm_ipv6 = sys.argv[5]
+        ostype = sys.argv[6] if len(sys.argv) > 6 else "linux"
+        apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype)
+        return True
+    # update_base delete NODE_HOSTNAME vmid
+    if len(sys.argv) >= 5 and sys.argv[2] == "delete":
+        node_hostname = sys.argv[3]
+        try:
+            vmid = int(sys.argv[4])
+        except ValueError:
+            logger.error(f"Invalid vmid: {sys.argv[4]}")
+            return True
+        apply_base_delete_nat64(node_hostname, vmid)
         return True
     # update_base NODE_HOSTNAME (sync one node)
     if len(sys.argv) >= 3:
@@ -913,7 +786,6 @@ def main():
                 delete_rule_by_comment(comment, "nat")
         # Update status to stopped
         update_status_in_firestore(triggered_vmid, "stopped")
-        notify_base(set(), {triggered_vmid})
         logger.info("Sync complete.")
         return
     
@@ -985,25 +857,13 @@ def main():
     else:
         actual = parse_iptables_rules()
 
-    # Compute added/removed vmids for BASE notify (before sync)
-    before_vmids = extract_vmids_from_rules(actual["nat"])
-    expected_vmids = set(vm_infos.keys())
-    added_vmids = expected_vmids - before_vmids
-    removed_vmids = before_vmids - expected_vmids
-
-    # On post-start, always notify BASE for the triggered VM (BASE will compare and skip if already present)
-    if hook_mode and phase == "post-start" and triggered_vmid in vm_infos:
-        added_vmids = added_vmids | {triggered_vmid}
-
-    # Sync iptables rules
+    # Sync iptables rules (node-side NAT: NODE -> VM, kept for compatibility)
     sync_iptables_rules(expected_nat, actual["nat"], "nat")
     sync_iptables_rules(expected_filter, actual["filter"], "filter")
 
     # Sync IPv6 addresses to Firestore (only in manual mode, only for running VMs with IPv6)
     if not hook_mode and vms_for_ipv6_sync:
         sync_ipv6_to_firestore(vms_for_ipv6_sync)
-
-    notify_base(added_vmids, removed_vmids)
 
     logger.info("Sync complete.")
 

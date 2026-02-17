@@ -392,6 +392,15 @@ log "Detected uplink IPv6:       ${WAN_V6_ADDR}/${WAN_V6_PREFIXLEN}"
 log "Using guest prefix:         ${VM_V6_SUBNET}::/${VM_V6_PREFIXLEN}"
 log "vmbr0 gateway IPv6 will be: ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
 
+# NAT64 return route (64:ff9b::/96 via BASE) only for nodes, not BASE (SERVER_ID 1)
+if [[ "$SERVER_ID" -eq 1 ]]; then
+  NAT64_EXTRA=""
+else
+  NAT64_EXTRA="
+    post-up   ip -6 route add 64:ff9b::/96 via fd00:4000::1
+    post-down ip -6 route del 64:ff9b::/96 via fd00:4000::1"
+fi
+
 if ! grep -q "auto eth0.4000" /mnt/etc/network/interfaces; then
 cat >> /mnt/etc/network/interfaces <<EOF
 
@@ -404,7 +413,7 @@ iface eth0.4000 inet static
 
 iface eth0.4000 inet6 static
     address ${PRIVATE_IPV6}
-    netmask 108
+    netmask 108${NAT64_EXTRA}
 EOF
 fi
 

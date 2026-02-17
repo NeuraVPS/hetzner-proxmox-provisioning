@@ -5,10 +5,6 @@
 ############################################################
 remote_task() {
   echo "== Running remote task =="
-
-
-  curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache"   "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py?t=$(date +%s)"   -o /var/lib/svz/snippets/sync-dnat.py
-
   echo "== Finished =="
 }
 ############################################################
@@ -16,7 +12,7 @@ remote_task() {
 # Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
-for ((i=6; i<=53; i++)); do
+for ((i=2; i<=53; i++)); do
     HEX=$(printf "%x" "$i")
     IP="fd00:4000::${HEX}"
 

@@ -381,6 +381,55 @@ get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
 
+############################################
+# NAT64 routes (BASE and nodes)
+# See docs/nat64-base-setup.md. VM firewalls must allow source 64:ff9b::/96 for RDP/Samba.
+############################################
+if [[ "$(hostname)" == *BASE* ]]; then
+  log "NAT64: Configuring BASE (nat64-routes.conf + apply script)"
+  mkdir -p /etc/sync-dnat
+  touch /etc/sync-dnat/nat64-routes.conf
+  cat > /usr/local/bin/apply-nat64-routes.sh <<'APPLYEOF'
+#!/bin/bash
+# Apply NAT64 routes from /etc/sync-dnat/nat64-routes.conf (format: VM_IPv6_PREFIX NODE_FD00_GATEWAY)
+CONF=/etc/sync-dnat/nat64-routes.conf
+[[ -f "$CONF" ]] || exit 0
+while read -r prefix gateway _; do
+  [[ -z "$prefix" || "$prefix" =~ ^# ]] && continue
+  ip -6 route add "$prefix" via "$gateway" 2>/dev/null || true
+done < "$CONF"
+APPLYEOF
+  chmod +x /usr/local/bin/apply-nat64-routes.sh
+  cat > /etc/network/if-up.d/apply-nat64-routes <<'IFUPEOF'
+#!/bin/bash
+# Run apply-nat64-routes when the interface with fd00:4000::1 comes up
+[[ "$ADDRFAM" = inet6 ]] || exit 0
+ip -6 addr show dev "$IFACE" 2>/dev/null | grep -q 'fd00:4000::1/' || exit 0
+/usr/local/bin/apply-nat64-routes.sh
+IFUPEOF
+  chmod +x /etc/network/if-up.d/apply-nat64-routes
+  /usr/local/bin/apply-nat64-routes.sh
+else
+  log "NAT64: Registering this node's VM subnet on BASE (return route 64:ff9b::/96 is in /etc/network/interfaces post-up)"
+  # Register this node's VM subnet on BASE so BASE can route to our VMs
+  FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
+  if [[ -n "$FD00_IFACE" ]]; then
+    NODE_FD00=$(ip -6 addr show dev "$FD00_IFACE" | awk '/inet6 fd00:4000::/ { print $2; exit }' | cut -d/ -f1)
+    VM_PREFIX=$(ip -6 addr show vmbr0 2>/dev/null | awk '/inet6 .* scope global/ { print $2; exit }' | sed 's/::1\/64/::\/64/')
+    if [[ -n "$NODE_FD00" && -n "$VM_PREFIX" ]]; then
+      if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes root@fd00:4000::1 "grep -q '^${VM_PREFIX}' /etc/sync-dnat/nat64-routes.conf 2>/dev/null || echo '${VM_PREFIX} ${NODE_FD00}' >> /etc/sync-dnat/nat64-routes.conf; /usr/local/bin/apply-nat64-routes.sh"; then
+        log "NAT64: Registered VM subnet ${VM_PREFIX} on BASE via ${NODE_FD00}"
+      else
+        log "WARNING: NAT64: Could not register VM subnet on BASE (SSH or apply failed)"
+      fi
+    else
+      log "WARNING: NAT64: Could not detect NODE_FD00 or VM_PREFIX, skipping BASE registration"
+    fi
+  else
+    log "WARNING: NAT64: Could not detect fd00:4000 interface, skipping BASE registration"
+  fi
+fi
+
 pve-firewall restart || true
 
 log "first_boot.sh finished"
