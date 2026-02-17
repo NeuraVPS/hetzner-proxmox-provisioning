@@ -496,6 +496,45 @@ def sync_base_all():
     for node_hostname in nodes:
         sync_base_for_node(node_hostname)
 
+
+def sync_base_restore_from_firestore():
+    """Repopulate BASE BIB and ip6tables from Firestore (for use after BASE reboot).
+    Queries all servers with ipv6 set and calls apply_base_create_nat64 for each.
+    Must run on BASE. Requires Firebase credentials.
+    """
+    if not is_base_node():
+        logger.error("sync_base_restore_from_firestore must run on BASE")
+        return False
+    if not ensure_firebase_initialized():
+        logger.error("Firebase not initialized (credentials missing); cannot restore BIB from Firestore")
+        return False
+    try:
+        db = firestore.client()
+        servers_ref = db.collection("servers")
+        count = 0
+        for doc in servers_ref.stream():
+            data = doc.to_dict() or {}
+            ipv6 = (data.get("ipv6") or "").strip() or None
+            if not ipv6:
+                continue
+            node_id = data.get("nodeId")
+            vmid_raw = data.get("proxmoxId")
+            if not node_id or vmid_raw is None:
+                continue
+            try:
+                vmid = int(vmid_raw)
+            except (TypeError, ValueError):
+                continue
+            ostype = "win" if (data.get("serverType") or "").lower() == "mt" else "linux"
+            if apply_base_create_nat64(node_id, vmid, ipv6, ostype):
+                count += 1
+        logger.info(f"NAT64 restore from Firestore: applied BIB for {count} server(s)")
+        return True
+    except Exception as e:
+        logger.warning(f"NAT64 restore from Firestore failed: {e}")
+        return False
+
+
 def delete_rule_by_comment(comment, table):
     """Delete all rules in the given table that have this comment."""
     output = run(["iptables", "-t", table, "-S"])
@@ -737,6 +776,10 @@ def handle_update_base():
             logger.error(f"Invalid vmid: {sys.argv[4]}")
             return True
         apply_base_delete_nat64(node_hostname, vmid)
+        return True
+    # update_base restore — repopulate BIB from Firestore (after BASE reboot)
+    if len(sys.argv) == 3 and sys.argv[2] == "restore":
+        sync_base_restore_from_firestore()
         return True
     # update_base NODE_HOSTNAME (sync one node)
     if len(sys.argv) >= 3:
