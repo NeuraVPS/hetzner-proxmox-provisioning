@@ -78,10 +78,12 @@ This is added automatically by `first_boot.sh` to the node's interface that has 
 
 ## 7. Proxmox firewall on BASE
 
-Allow incoming TCP to BASE's public IP for the NAT64 ports (RDP/SSH 20000–20999, Samba 10000–10999). Either:
+Allow incoming TCP to BASE's public IP for the NAT64 ports (RDP/SSH 20000–20999, Samba 10000–10999). **Both IPv4 and IPv6** must be allowed so that clients can connect via BASE_IPv4:port (NAT64) and BASE_IPv6:port (IPv6 DNAT). Either:
 
-- In Proxmox UI: Datacenter or node Firewall → add IN ACCEPT rules for TCP 20000–20999 and 10000–10999, or
+- In Proxmox UI: Datacenter or node Firewall → add IN ACCEPT rules for TCP 20000–20999 and 10000–10999 on both IPv4 and IPv6 (or rules that apply to all address families), or
 - Temporarily: `pve-firewall stop` (not recommended in production).
+
+**DNS (optional):** To use a subdomain (e.g. `rdp.example.com`), add an **A** record to BASE's public IPv4 and an **AAAA** record to BASE's public IPv6. Do not expose VM IPv6 addresses in DNS; only BASE's IPs are used. Clients then connect to `subdomain:20201` (or the appropriate port); IPv4 uses NAT64, IPv6 uses DNAT on BASE.
 
 ---
 
@@ -191,7 +193,8 @@ Persist in sysctl.d if needed.
 | pool4           | BASE      | Add BASE public IP, ports 10000–10999 and 20000–20999 (tcp/udp)            |
 | Routes to VMs   | BASE      | Via nat64-routes.conf + apply-nat64-routes.sh (first_boot registers nodes) |
 | Return route    | Each node | 64:ff9b::/96 via fd00:4000::1 (first_boot adds to interfaces)              |
-| BASE firewall   | BASE      | Allow TCP 20000–20999, 10000–10999 to BASE                                 |
+| BASE firewall   | BASE      | Allow TCP 20000–20999, 10000–10999 to BASE (IPv4 and IPv6)                  |
+| IPv6 DNAT       | BASE      | sync-dnat.py adds ip6tables DNAT so BASE_IPv6:port works like BASE_IPv4    |
 | Cluster VM fw   | cluster.fw| ipset nat64-clients (64:ff9b::/96); vm-default allows SSH/RDP/SMB from it   |
 | Guest firewall | Each VM   | Allow source 64:ff9b::/96 for RDP (3389), SSH (22), Samba (445) if needed   |
 | BIB + ip6tables | BASE      | Automatic via sync-dnat.py on VM start/stop                                |

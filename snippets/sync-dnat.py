@@ -381,6 +381,15 @@ def get_base_public_ip():
     m = re.search(r"src\s+(\S+)", out)
     return m.group(1) if m else None
 
+def get_base_public_ipv6():
+    """Return BASE's public IPv6 (for IPv6 DNAT). Must run on BASE. Returns None if not found."""
+    try:
+        out = run(["ip", "-6", "route", "get", "2001:4860:4860::8888"])
+        m = re.search(r"src\s+(\S+)", out)
+        return m.group(1) if m else None
+    except subprocess.CalledProcessError:
+        return None
+
 def _jool_bib_add(vm_ipv6, vm_port, base_ip, base_port, protocol="--tcp"):
     """Add one Jool BIB entry. Returns True on success."""
     try:
@@ -420,6 +429,24 @@ def _delete_rule_by_comment_ip6(comment):
     except Exception as e:
         logger.warning(f"ip6tables delete by comment failed: {e}")
 
+def _delete_nat6_prerouting_by_comment(comment):
+    """Delete ip6tables nat PREROUTING rules that have this comment. Deletes by line number high-to-low."""
+    try:
+        output = run(["ip6tables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"])
+        line_nums = []
+        for line in output.splitlines():
+            if comment in line:
+                parts = line.strip().split()
+                if parts and parts[0].isdigit():
+                    line_nums.append(int(parts[0]))
+        for num in sorted(line_nums, reverse=True):
+            subprocess.run(
+                ["ip6tables", "-t", "nat", "-D", "PREROUTING", str(num)],
+                capture_output=True, check=False
+            )
+    except Exception as e:
+        logger.warning(f"ip6tables nat PREROUTING delete by comment failed: {e}")
+
 def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
     """Add BASE NAT64 BIB entries and ip6tables FORWARD for (node_hostname, vmid, vm_ipv6). Must run on BASE."""
     if not is_base_node():
@@ -457,6 +484,37 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
             logger.info(f"ADD: jool bib {base_ip}#{samba_port} -> {vm_ipv6}#445 (vmid-{vmid})")
         else:
             ok = False
+
+    # IPv6 DNAT: BASE_IPv6:port -> VM_IPv6:3389/445 so IPv6 clients can connect without NAT64
+    base_ipv6 = get_base_public_ipv6()
+    dnat_comment = f"nat64-dnat-vmid-{vmid}"
+    if base_ipv6:
+        try:
+            subprocess.run(
+                ["ip6tables", "-t", "nat", "-A", "PREROUTING", "-d", base_ipv6,
+                 "-p", "tcp", "--dport", str(rdp_port), "-j", "DNAT",
+                 "--to-destination", f"[{vm_ipv6}]:{to_port_rdp}",
+                 "-m", "comment", "--comment", dnat_comment],
+                capture_output=True, check=True
+            )
+            logger.info(f"ADD: ip6tables DNAT {base_ipv6}#{rdp_port} -> [{vm_ipv6}]:{to_port_rdp} (vmid-{vmid})")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"ip6tables DNAT RDP add failed: {e}")
+        if ostype.startswith("win"):
+            try:
+                subprocess.run(
+                    ["ip6tables", "-t", "nat", "-A", "PREROUTING", "-d", base_ipv6,
+                     "-p", "tcp", "--dport", str(samba_port), "-j", "DNAT",
+                     "--to-destination", f"[{vm_ipv6}]:445",
+                     "-m", "comment", "--comment", dnat_comment],
+                    capture_output=True, check=True
+                )
+                logger.info(f"ADD: ip6tables DNAT {base_ipv6}#{samba_port} -> [{vm_ipv6}]:445 (vmid-{vmid})")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"ip6tables DNAT Samba add failed: {e}")
+    else:
+        logger.debug("BASE has no public IPv6, skipping IPv6 DNAT")
+
     return ok
 
 def apply_base_delete_nat64(node_hostname, vmid):
@@ -473,6 +531,7 @@ def apply_base_delete_nat64(node_hostname, vmid):
     _jool_bib_remove(base_ip, rdp_port)
     _jool_bib_remove(base_ip, samba_port)
     _delete_rule_by_comment_ip6(f"nat64-fwd-vmid-{vmid}")
+    _delete_nat6_prerouting_by_comment(f"nat64-dnat-vmid-{vmid}")
     logger.info(f"Removed BASE NAT64 rules for {node_hostname} vmid {vmid}")
     return True
 
