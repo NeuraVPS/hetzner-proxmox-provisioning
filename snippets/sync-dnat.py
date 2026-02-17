@@ -525,7 +525,7 @@ def sync_base_restore_from_firestore():
                 vmid = int(vmid_raw)
             except (TypeError, ValueError):
                 continue
-            ostype = "win" if (data.get("serverType") or "").lower() == "mt" else "linux"
+            ostype = "win"  # Assume Windows (RDP 3389, Samba 445); change when Linux servers are needed
             if apply_base_create_nat64(node_id, vmid, ipv6, ostype):
                 count += 1
         logger.info(f"NAT64 restore from Firestore: applied BIB for {count} server(s)")
