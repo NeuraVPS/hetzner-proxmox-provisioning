@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
+# Run on the provisioning host to update package lists and upgrade packages on each
+# Proxmox node. Keeps qemu-server, pve-edk2-firmware, and other PVE packages current
+# (e.g. for EFI/Secure Boot and ms-cert support). Use with care; schedule during low traffic.
 
 ############################################################
 # DEFINE LOCAL FUNCTION (runs remotely)
 ############################################################
 remote_task() {
-  echo "== Running remote task =="
-  curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
-    "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py?t=$(date +%s)" \
-    -o /var/lib/svz/snippets/sync-dnat.py
-  
-  scp [fd00:4000::1]:/etc/pve/firewall/cluster.fw /etc/pve/firewall/
-  pve-firewall restart || true
+  echo "== Running package update on $(hostname) =="
+  apt-get update -qq
+  apt-get upgrade -y -qq
   echo "== Finished =="
 }
 ############################################################
 
-# Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
 for ((i=2; i<=53; i++)); do
@@ -25,7 +23,6 @@ for ((i=2; i<=53; i++)); do
     echo "------------------------------------------------"
     echo "Connecting to $IP ($i)"
 
-    # Send function and execute it
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$IP" \
         "$FUNC_CONTENT; remote_task" \
         || echo "❌ Failed to connect to $IP"
