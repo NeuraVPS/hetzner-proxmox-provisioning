@@ -490,6 +490,81 @@ pve_zfs_migrate_vm() {
       _ok "VM ${VMID} started on destination."
     fi
     PHASE=4
+
+    # Hot migration only: wait for VM running, force Windows network reset, run sync-dnat post-start
+    if [[ "$HOT_MIGRATION" == "true" ]]; then
+      local WAIT_RUNNING_TIMEOUT=180 wait_elapsed=0
+      _info "Waiting for VM ${VMID} to be running on destination (timeout ${WAIT_RUNNING_TIMEOUT}s)..."
+      while true; do
+        local DEST_STATUS
+        DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
+        if [[ "$DEST_STATUS" == "running" ]]; then
+          _ok "VM ${VMID} is running on destination."
+          break
+        fi
+        if (( wait_elapsed >= WAIT_RUNNING_TIMEOUT )); then
+          _die "VM ${VMID} did not reach running state within ${WAIT_RUNNING_TIMEOUT}s (status: ${DEST_STATUS:-unknown})."
+        fi
+        sleep 5
+        (( wait_elapsed += 5 )) || true
+      done
+
+      # Force Windows to reset network via guest agent so DHCP + Slak reconfigure
+      _info "Waiting a bit for guest agent to become available..."
+      sleep 45
+      local ostype
+      ostype="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)"
+      if [[ "$ostype" == win* ]]; then
+        local agent_retries=5 agent_attempt=0 agent_pid="" agent_exit_timeout=120 agent_exit_elapsed=0
+        while (( agent_attempt < agent_retries )); do
+          local exec_out
+          exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'pvesh create /nodes/'"${DEST_NODE}"'/qemu/'"${VMID}"'/agent/exec --output-format json --command cmd.exe --command /c --command "ipconfig /release \& ipconfig /renew"' 2>&1)" || true
+          agent_pid="$(echo "$exec_out" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+          if [[ -n "$agent_pid" && "$agent_pid" -gt 0 ]]; then
+            _info "Guest agent exec started (PID ${agent_pid}); waiting for network reset to complete..."
+            agent_exit_elapsed=0
+            while (( agent_exit_elapsed < agent_exit_timeout )); do
+              local status_out
+              status_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${agent_pid}' 2>/dev/null" || true)"
+              if echo "$status_out" | grep -qE '"exited"\s*:\s*1'; then
+                _ok "Windows network reset (ipconfig release/renew) completed."
+                break 2
+              fi
+              sleep 5
+              (( agent_exit_elapsed += 5 )) || true
+            done
+            _info "Guest exec-status timeout or completed; continuing."
+            break
+          fi
+          if echo "$exec_out" | grep -qi "guest agent is not running"; then
+            (( agent_attempt++ )) || true
+            _info "Guest agent not ready (attempt ${agent_attempt}/${agent_retries}); retrying in 10s..."
+            sleep 10
+          else
+            _info "Guest exec failed or not available: ${exec_out:0:200}; skipping network reset."
+            break
+          fi
+        done
+        if [[ $agent_attempt -ge $agent_retries && ( -z "${agent_pid}" || "${agent_pid:-0}" -le 0 ) ]]; then
+          _info "Could not run guest agent network reset after ${agent_retries} retries; continuing (sync-dnat will still run)."
+        fi
+      else
+        _info "VM ostype is '${ostype}' (not Windows); skipping guest agent network reset."
+      fi
+
+      # Reconfigure assigned IPv6 on this host from Firestore (post-start)
+      local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
+      if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
+        _info "Running sync-dnat.py post-start on destination to reconfigure IPv6..."
+        if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "'${SYNC_DNAT}' '${VMID}' post-start" 2>/dev/null; then
+          _ok "sync-dnat.py post-start completed."
+        else
+          _info "sync-dnat.py post-start failed or returned non-zero; continuing (non-fatal)."
+        fi
+      else
+        _info "sync-dnat.py not found or not executable on destination; skipping post-start."
+      fi
+    fi
   fi
 
   if [[ "$DEST_CLEANUP" == "yes" ]]; then
