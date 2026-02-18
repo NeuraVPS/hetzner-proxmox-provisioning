@@ -88,15 +88,41 @@ pve_zfs_migrate_vm() {
   local MIGRATION_SUCCESS=0
   local PHASE=0
   local WAS_SUSPENDED=0
+  local FIRESTORE_UPDATED_TO_DEST=0
+  local SOURCE_NODE=""
+  local SOURCE_CONNECTION_URL=""
 
   _die()  { echo "❌ $*" >&2; exit 1; }
   _info() { echo "ℹ️  $*" >&2; }
   _ok()   { echo "✅ $*" >&2; }
+  _bytes_human() {
+    local b="${1:-0}"
+    if command -v numfmt >/dev/null 2>&1; then
+      numfmt --to=iec-i --suffix=B "$b" 2>/dev/null || echo "${b} bytes"
+    else
+      if [[ "$b" -ge 1073741824 ]]; then
+        echo "$(( b / 1073741824 )) GiB"
+      elif [[ "$b" -ge 1048576 ]]; then
+        echo "$(( b / 1048576 )) MiB"
+      else
+        echo "${b} bytes"
+      fi
+    fi
+  }
 
   _cleanup_on_failure() {
     set +e
     _info "Migration failed or interrupted; cleaning up and restoring state..."
     if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
+      if [[ "${FIRESTORE_UPDATED_TO_DEST:-0}" == "1" ]] && [[ -n "${SOURCE_CONNECTION_URL:-}" ]] && [[ -n "${SOURCE_NODE:-}" ]]; then
+        _info "Reverting Firestore to source (connectionUrl, nodeId)..."
+        local HELPER_REVERT
+        HELPER_REVERT="$(mktemp -t update_firestore_migration_XXXXXX.py)"
+        if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER_REVERT" 2>/dev/null; then
+          python3 "$HELPER_REVERT" "$VMID" "$SOURCE_CONNECTION_URL" "$SOURCE_NODE" 2>/dev/null || true
+        fi
+        rm -f "$HELPER_REVERT"
+      fi
       _info "Setting server maintenance=false in Firestore..."
       local HELPER_CLEANUP
       HELPER_CLEANUP="$(mktemp -t update_firestore_migration_XXXXXX.py)"
@@ -225,28 +251,86 @@ pve_zfs_migrate_vm() {
     memory_mb="$(qm config "$VMID" 2>/dev/null | awk -F': ' '/^memory:/{print $2; exit}' | tr -d ' ')"
     local memory_bytes=$(( (memory_mb + 0) * 1024 * 1024 ))
     [[ "$memory_bytes" -le 0 ]] && memory_bytes=1
+    local node_name
+    node_name="$(hostname 2>/dev/null)" || node_name=""
+    if [[ -n "$node_name" ]]; then
+      local api_json api_val config_bytes
+      config_bytes=$(( (memory_mb + 0) * 1024 * 1024 ))
+      api_json="$(pvesh get "/nodes/${node_name}/qemu/${VMID}/status/current" --output-format=json 2>/dev/null)" || true
+      if [[ -n "${api_json:-}" ]]; then
+        # Proxmox API returns mem/maxmem in bytes; match "mem" key only (not "maxmem")
+        api_val="$(echo "$api_json" | grep -oE '(^|,)"mem":[0-9]+' | head -1 | sed 's/.*"mem"://')"
+        [[ -z "${api_val:-}" ]] && api_val="$(echo "$api_json" | grep -oE '(^|,)"balloon":[0-9]+' | head -1 | sed 's/.*"balloon"://')"
+        if [[ -n "${api_val:-}" && "$api_val" -gt 0 ]]; then
+          # Sanity cap: denominator at most 2x configured memory so progress bar stays meaningful
+          if [[ "$config_bytes" -gt 0 && "$api_val" -le $(( config_bytes * 2 )) ]]; then
+            memory_bytes=$api_val
+          fi
+        fi
+      fi
+    fi
+    [[ "$memory_bytes" -le 0 ]] && memory_bytes=1
 
+    local MEM_HUMAN
+    MEM_HUMAN="$(_bytes_human "$memory_bytes")"
     _info "Suspending VM ${VMID} to disk (hot migration)..."
+    _info "  Amount of RAM to suspend (denominator): ${memory_bytes} bytes (${MEM_HUMAN})"
     qm suspend "$VMID" --todisk 1 &
     local SUSPEND_PID=$!
     local elapsed=0
-    while ! qm status "$VMID" 2>/dev/null | grep -q "status: suspended"; do
+    _is_suspended() {
+      local s
+      s="$(qm status "$VMID" 2>/dev/null | awk -F': ' '/^status:/{gsub(/^[ \t]+|[ \t\r]+$/,"",$2); print $2; exit}')"
+      [[ "$s" == "suspended" ]]
+    }
+    _get_state_used() {
+      local u
+      u="$(zfs list -H -p -o name,used 2>/dev/null | awk -v vmid="$VMID" 'index($1, "vm-" vmid) && index($1, "state-suspend") {print $2; exit}')"
+      [[ -n "$u" ]] && echo "$u" && return
+      zfs list -H -p -o name,used -t volume 2>/dev/null | awk -v vmid="$VMID" 'index($1, "vm-" vmid) && index($1, "state-suspend") {print $2; exit}'
+    }
+    while true; do
+      if _is_suspended || ! kill -0 "$SUSPEND_PID" 2>/dev/null; then
+        break
+      fi
       if (( elapsed >= SUSPEND_TIMEOUT )); then
         kill "$SUSPEND_PID" 2>/dev/null || true
         _die "Suspend timeout (${SUSPEND_TIMEOUT}s) reached; VM may be in an inconsistent state. Check and resume manually if needed."
       fi
       local state_used
-      state_used="$(zfs list -H -p -o name,used 2>/dev/null | awk -v vmid="$VMID" 'index($1, "vm-" vmid) && index($1, "state-suspend") {print $2; exit}')"
+      state_used="$(_get_state_used)"
+      # Debug: every 6 seconds print written/total so we can see if numerator is detected
+      if (( elapsed > 0 && elapsed % 6 == 0 )); then
+        if [[ -n "${state_used:-}" && "$state_used" -ge 0 ]]; then
+          local sh
+          sh="$(_bytes_human "$state_used")"
+          _info "  Suspend progress: written ${state_used} bytes (${sh}) / ${memory_bytes} bytes (${MEM_HUMAN})"
+        else
+          _info "  Suspend progress: written (no ZFS state dataset found yet) / ${memory_bytes} bytes (${MEM_HUMAN})"
+        fi
+      fi
       if [[ -n "${state_used:-}" && "$memory_bytes" -gt 0 ]]; then
         local pct=$(( state_used * 100 / memory_bytes ))
         [[ "$pct" -gt 99 ]] && pct=99
-        _info "Suspending to disk... ${pct}%"
+        local bar_width=30 filled=$(( pct * bar_width / 100 )) bar="" i
+        for (( i=0; i<filled; i++ )); do bar+="#"; done
+        for (( i=filled; i<bar_width; i++ )); do bar+=" "; done
+        printf '\r[%s] %3d%%   ' "$bar" "$pct" >&2
       else
-        _info "Suspending to disk..."
+        printf '\rSuspending to disk... ( %3ds)   ' "$elapsed" >&2
       fi
       sleep 2; (( elapsed += 2 ))
     done
-    wait "$SUSPEND_PID" || _die "qm suspend failed for VM ${VMID}."
+    printf '\n' >&2
+    # Reap suspend process; cap wait at 10s so we never block forever if it lingers
+    wait "$SUSPEND_PID" 2>/dev/null &
+    local WAIT_PID=$!
+    local wait_elapsed=0
+    while kill -0 "$WAIT_PID" 2>/dev/null && (( wait_elapsed < 10 )); do
+      sleep 1; (( wait_elapsed += 1 ))
+    done
+    kill "$WAIT_PID" 2>/dev/null || true
+    wait "$WAIT_PID" 2>/dev/null || true
     WAS_SUSPENDED=1
     _ok "VM ${VMID} suspended."
   else
@@ -263,6 +347,25 @@ pve_zfs_migrate_vm() {
       sleep 2; (( elapsed += 2 ))
     done
     _ok "VM ${VMID} stopped."
+  fi
+
+  # Hot migration: include suspend state zvol so resume works on destination
+  if [[ "$HOT_MIGRATION" == "true" ]]; then
+    local state_ds
+    state_ds="$(zfs list -H -o name 2>/dev/null | grep -E "vm-${VMID}-state-suspend" | head -1)"
+    if [[ -n "${state_ds:-}" ]]; then
+      local -a ALL_DS=("${DATASETS[@]}" "$state_ds")
+      local -a UNIQUE2=()
+      declare -A seen2=()
+      local d
+      for d in "${ALL_DS[@]}"; do
+        if [[ -z "${seen2[$d]:-}" ]]; then UNIQUE2+=("$d"); seen2["$d"]=1; fi
+      done
+      DATASETS=("${UNIQUE2[@]}")
+      _info "Including suspend state zvol in migration: ${state_ds}"
+    else
+      _info "No ZFS state zvol found for VM ${VMID} (state may be on other storage); resume on destination may fail."
+    fi
   fi
 
   _info "Ensuring snapshot name @${SNAPNAME} is free (source + destination)..."
@@ -293,11 +396,17 @@ pve_zfs_migrate_vm() {
 
     _info "[$i/$total] Transferring ${ds}@${SNAPNAME} (estimated ${SIZE} bytes)..."
 
+    if command -v stdbuf >/dev/null 2>&1; then
+      PV_CMD=(stdbuf -e 0 pv -s "$SIZE" -ptebar)
+    else
+      PV_CMD=(pv -s "$SIZE" -ptebar)
+    fi
     zfs send -R "${ds}@${SNAPNAME}" \
-      | pv -s "$SIZE" -ptebar \
+      | "${PV_CMD[@]}" \
       | mbuffer -q -s "${MBUFFER_BLOCK}" -m "${MBUFFER_MEM}" \
       | ssh "${SSH_OPTS[@]}" "$DEST_SSH" \
-          "mbuffer -q -s '${MBUFFER_BLOCK}' -m '${MBUFFER_MEM}' | zfs receive -F '${ds}'"
+          "mbuffer -q -s '${MBUFFER_BLOCK}' -m '${MBUFFER_MEM}' | zfs receive -F '${ds}'" \
+      || _die "Transfer failed for ${ds}@${SNAPNAME}"
 
     _ok "[$i/$total] ${ds}@${SNAPNAME} transferred (100%)"
     PHASE=2
@@ -332,14 +441,23 @@ pve_zfs_migrate_vm() {
   fi
   PHASE=3
 
+  # Update Firestore before start/resume so sync-dnat.py can update IPs on start
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
     _info "Updating Firestore (connectionUrl, nodeId) before starting VM..."
+    SOURCE_NODE="$(hostname 2>/dev/null)" || SOURCE_NODE=""
+    local SOURCE_PUBLIC_IP
+    SOURCE_PUBLIC_IP="$(curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')" || true
+    SOURCE_PUBLIC_IP="${SOURCE_PUBLIC_IP%%[[:space:]]*}"
+    SOURCE_PUBLIC_IP="${SOURCE_PUBLIC_IP//$'\r'/}"
+    local BASE_PORT=20000
+    if [[ -n "${SOURCE_PUBLIC_IP:-}" ]]; then
+      SOURCE_CONNECTION_URL="${SOURCE_PUBLIC_IP}:$((BASE_PORT + VMID))"
+    fi
     local DEST_PUBLIC_IP
     DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
     if [[ -z "$DEST_PUBLIC_IP" ]]; then
       _die "Could not get destination public IPv4; cannot update Firestore."
     fi
-    local BASE_PORT=20000
     local CONNECTION_URL="${DEST_PUBLIC_IP}:$((BASE_PORT + VMID))"
     local HELPER
     HELPER="$(mktemp -t update_firestore_migration_XXXXXX.py)"
@@ -354,6 +472,7 @@ pve_zfs_migrate_vm() {
       _die "Firestore update failed."
     fi
     rm -f "$HELPER"
+    FIRESTORE_UPDATED_TO_DEST=1
     _ok "Firestore updated: connectionUrl=${CONNECTION_URL}, nodeId=${DEST_NODE}"
   fi
 
