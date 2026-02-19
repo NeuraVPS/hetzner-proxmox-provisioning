@@ -8,9 +8,6 @@ remote_task() {
   curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
     "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py?t=$(date +%s)" \
     -o /var/lib/svz/snippets/sync-dnat.py
-  
-  scp [fd00:4000::1]:/etc/pve/firewall/cluster.fw /etc/pve/firewall/
-  pve-firewall restart || true
   echo "== Finished =="
 }
 ############################################################

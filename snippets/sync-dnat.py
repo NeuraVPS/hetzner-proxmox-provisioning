@@ -580,6 +580,36 @@ def apply_base_delete_nat64(node_hostname, vmid):
     logger.info(f"Removed BASE NAT64 rules for {node_hostname} vmid {vmid}")
     return True
 
+def _get_base_nat64_vmids():
+    """Return set of VMIDs that have NAT64 rules on BASE (from ip6tables PREROUTING comments)."""
+    vmids = set()
+    try:
+        output = run(["ip6tables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"])
+        for line in output.splitlines():
+            # Comment format: /* nat64-dnat-vmid-996 */
+            m = re.search(r"nat64-dnat-vmid-(\d+)", line)
+            if m:
+                vmids.add(int(m.group(1)))
+    except Exception as e:
+        logger.warning(f"Could not list BASE NAT64 VMIDs: {e}")
+    return vmids
+
+
+def sync_base_wipe_nat64():
+    """Remove all NAT64 rules (Jool BIB + ip6tables) from BASE. Use before restore for a full cleanup."""
+    if not is_base_node():
+        logger.error("sync_base_wipe_nat64 must run on BASE")
+        return False
+    vmids = _get_base_nat64_vmids()
+    if not vmids:
+        logger.info("No NAT64 rules found on BASE")
+        return True
+    for vmid in sorted(vmids):
+        apply_base_delete_nat64("unknown", vmid)
+    logger.info(f"Wiped NAT64 rules for VMIDs: {sorted(vmids)}")
+    return True
+
+
 def sync_base_for_node(node_hostname):
     """Sync BASE NAT64 BIB for one node. No-op: BIB is updated by node notifications on VM start/stop."""
     if not is_base_node():
@@ -884,6 +914,10 @@ def handle_update_base():
     # update_base restore — repopulate BIB from Firestore (after BASE reboot)
     if len(sys.argv) == 3 and sys.argv[2] == "restore":
         sync_base_restore_from_firestore()
+        return True
+    # update_base wipe — remove all NAT64 rules (then run restore for a full cleanup)
+    if len(sys.argv) == 3 and sys.argv[2] == "wipe":
+        sync_base_wipe_nat64()
         return True
     # update_base NODE_HOSTNAME (sync one node)
     if len(sys.argv) >= 3:
