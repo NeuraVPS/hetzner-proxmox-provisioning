@@ -552,6 +552,10 @@ pve_zfs_migrate_vm() {
         _info "VM ostype is '${ostype}' (not Windows); skipping guest agent network reset."
       fi
 
+      # Allow time for new IPv6 to be assigned and visible before sync-dnat reads it
+      _info "Waiting 20s for new IPv6 to settle after network reset..."
+      sleep 20
+
       # Reconfigure assigned IPv6 on this host from Firestore (post-start)
       local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
       if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
