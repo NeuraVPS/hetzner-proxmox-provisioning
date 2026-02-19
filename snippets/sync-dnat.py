@@ -475,6 +475,8 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
     if not base_ip:
         logger.error("Could not determine BASE public IPv4")
         return False
+    # Remove any existing NAT64 rules for this VMID so create is idempotent (avoids duplicate rules after migration).
+    apply_base_delete_nat64(node_hostname, vmid)
     rdp_port = BASE_PORT_RDP + vmid
     samba_port = BASE_PORT_SAMBA + vmid
     to_port_rdp = 3389 if ostype.startswith("win") else 22
