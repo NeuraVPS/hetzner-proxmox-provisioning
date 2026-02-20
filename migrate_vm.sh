@@ -16,6 +16,9 @@ pve_zfs_migrate_vm() {
   local KEEP_DEST_STOPPED="false"
   local HOT_MIGRATION="false"
   local SUSPEND_TIMEOUT="120"
+  local HOT_REFRESH_MAX_ATTEMPTS=3
+  local HOT_REFRESH_WAIT_SECONDS=10
+  local HOT_TRIGGER_WAIT_SECONDS=10
 
   if [[ $# -gt 0 && "$1" == --* ]]; then
     while [[ $# -gt 0 ]]; do
@@ -110,6 +113,284 @@ pve_zfs_migrate_vm() {
     fi
   }
 
+  _extract_global_ipv6_from_interfaces_json() {
+    local interfaces_json="${1:-}"
+    if [[ -z "$interfaces_json" ]]; then
+      echo ""
+      return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo ""
+      return 0
+    fi
+    JSON_INPUT="$interfaces_json" python3 - <<'PY'
+import json
+import os
+import ipaddress
+
+raw = os.environ.get("JSON_INPUT", "")
+if not raw:
+    raise SystemExit(0)
+
+try:
+    interfaces = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+
+if not isinstance(interfaces, list):
+    raise SystemExit(0)
+
+for iface in interfaces:
+    if not isinstance(iface, dict):
+        continue
+    name = str(iface.get("name", "")).lower()
+    if "loopback" in name:
+        continue
+    for addr in iface.get("ip-addresses", []):
+        if not isinstance(addr, dict):
+            continue
+        ip = str(addr.get("ip-address", "")).strip()
+        if not ip:
+            continue
+        if "%" in ip or ip.startswith("fe80::") or ip == "::1":
+            continue
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if ip_obj.version != 6:
+            continue
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+            continue
+        print(ip)
+        raise SystemExit(0)
+PY
+  }
+
+  _get_vm_ipv6_local() {
+    local vmid="$1"
+    local interfaces_json
+    set +e
+    interfaces_json="$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null)"
+    local rc=$?
+    set -e
+    if (( rc != 0 )) || [[ -z "$interfaces_json" ]]; then
+      echo ""
+      return 0
+    fi
+    _extract_global_ipv6_from_interfaces_json "$interfaces_json"
+  }
+
+  _get_vm_ipv6_dest() {
+    local interfaces_json
+    set +e
+    interfaces_json="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm guest cmd '${VMID}' network-get-interfaces 2>/dev/null" | tr -d '\r')"
+    local rc=$?
+    set -e
+    if (( rc != 0 )) || [[ -z "$interfaces_json" ]]; then
+      echo ""
+      return 0
+    fi
+    _extract_global_ipv6_from_interfaces_json "$interfaces_json"
+  }
+
+  GA_LAST_EXITCODE=""
+  GA_LAST_STDOUT=""
+  GA_LAST_STDERR=""
+  _ga_exec_and_wait_dest() {
+    local description="$1"
+    local timeout_seconds="${2:-180}"
+    shift 2
+    local -a command_parts=("$@")
+    local -a create_cmd=(pvesh create "/nodes/${DEST_NODE}/qemu/${VMID}/agent/exec" --output-format json)
+    local create_cmd_str exec_out pid status_out
+    local elapsed=0 poll=2
+
+    GA_LAST_EXITCODE=""
+    GA_LAST_STDOUT=""
+    GA_LAST_STDERR=""
+
+    for arg in "${command_parts[@]}"; do
+      create_cmd+=(--command "$arg")
+    done
+    printf -v create_cmd_str "%q " "${create_cmd[@]}"
+
+    set +e
+    exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "$create_cmd_str" 2>&1)"
+    local exec_rc=$?
+    set -e
+    if (( exec_rc != 0 )); then
+      GA_LAST_STDERR="Failed to start ${description}: ${exec_out}"
+      return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+      GA_LAST_STDERR="python3 is required to parse guest-agent responses."
+      return 1
+    fi
+    pid="$(EXEC_JSON="$exec_out" python3 - <<'PY'
+import json
+import os
+raw = os.environ.get("EXEC_JSON", "")
+try:
+    payload = json.loads(raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+if isinstance(payload, dict):
+    data = payload.get("data")
+    if isinstance(data, dict) and data.get("pid") is not None:
+        pid = data.get("pid")
+    else:
+        pid = payload.get("pid")
+else:
+    pid = None
+print(pid if isinstance(pid, int) else "")
+PY
+)"
+    if [[ -z "$pid" || "$pid" -le 0 ]]; then
+      GA_LAST_STDERR="Missing PID for ${description}. Raw response: ${exec_out}"
+      return 1
+    fi
+
+    while (( elapsed < timeout_seconds )); do
+      set +e
+      status_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${pid}'" 2>&1)"
+      local status_rc=$?
+      set -e
+      if (( status_rc != 0 )); then
+        sleep "$poll"
+        (( elapsed += poll )) || true
+        continue
+      fi
+
+      local parsed exited exitcode out_b64 err_b64
+      parsed="$(STATUS_JSON="$status_out" python3 - <<'PY'
+import base64
+import json
+import os
+raw = os.environ.get("STATUS_JSON", "")
+try:
+    payload = json.loads(raw)
+except Exception:
+    print("0 -1   ")
+    raise SystemExit(0)
+if isinstance(payload, dict):
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = payload
+else:
+    data = {}
+exited = int(data.get("exited", 0) or 0)
+exitcode_raw = data.get("exitcode")
+if exitcode_raw is None:
+    exitcode = -1
+else:
+    try:
+        exitcode = int(exitcode_raw)
+    except Exception:
+        exitcode = -1
+out_data = data.get("out-data") or ""
+err_data = data.get("err-data") or ""
+print(f"{exited} {exitcode} {base64.b64encode(out_data.encode()).decode()} {base64.b64encode(err_data.encode()).decode()}")
+PY
+)"
+      read -r exited exitcode out_b64 err_b64 <<<"$parsed"
+      GA_LAST_EXITCODE="$exitcode"
+      GA_LAST_STDOUT="$(printf '%s' "${out_b64:-}" | base64 -d 2>/dev/null || true)"
+      GA_LAST_STDERR="$(printf '%s' "${err_b64:-}" | base64 -d 2>/dev/null || true)"
+
+      if [[ "${exited:-0}" == "1" ]]; then
+        if [[ "${GA_LAST_EXITCODE:-1}" == "0" ]]; then
+          return 0
+        fi
+        return 1
+      fi
+      sleep "$poll"
+      (( elapsed += poll )) || true
+    done
+
+    GA_LAST_STDERR="Timed out after ${timeout_seconds}s waiting for ${description} (PID ${pid}). Last status: ${status_out}"
+    return 1
+  }
+
+  _get_firestore_ipv6_by_vmid() {
+    local vmid="$1"
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo ""
+      return 0
+    fi
+    VMID_QUERY="$vmid" python3 - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+vmid_raw = os.environ.get("VMID_QUERY", "")
+try:
+    vmid = int(vmid_raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    try:
+        from google.cloud.firestore_v1 import FieldFilter
+        has_filter = True
+    except Exception:
+        has_filter = False
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+try:
+    if not firebase_admin._apps:
+        creds_file = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+        creds_path = Path(creds_file)
+        if not creds_path.exists() or not creds_path.is_file():
+            print("")
+            raise SystemExit(0)
+        firebase_admin.initialize_app(credentials.Certificate(str(creds_path)))
+
+    db = firestore.client()
+    servers_ref = db.collection("servers")
+    if has_filter:
+        query = servers_ref.where(filter=FieldFilter("proxmoxId", "==", vmid))
+    else:
+        query = servers_ref.where("proxmoxId", "==", vmid)
+    docs = list(query.stream())
+    if not docs:
+        print("")
+        raise SystemExit(0)
+
+    ipv6 = docs[0].to_dict().get("ipv6")
+    if ipv6 is None:
+        print("")
+    else:
+        print(str(ipv6).strip())
+except Exception:
+    print("")
+PY
+  }
+
+  _run_connectivity_checks() {
+    local out6 out4 rc6 rc4
+    set +e
+    out6="$(nc -w 5 -6 -zv sqx.neuravps.com 20996 2>&1)"
+    rc6=$?
+    out4="$(nc -w 5 -4 -zv sqx.neuravps.com 20996 2>&1)"
+    rc4=$?
+    set -e
+    if (( rc6 == 0 && rc4 == 0 )); then
+      _ok "Connectivity checks succeeded (IPv6 and IPv4): sqx.neuravps.com:20996"
+      return 0
+    fi
+    _info "Connectivity check IPv6 output: ${out6}"
+    _info "Connectivity check IPv4 output: ${out4}"
+    return 1
+  }
+
   _cleanup_on_failure() {
     set +e
     _info "Migration failed or interrupted; cleaning up and restoring state..."
@@ -170,6 +451,25 @@ pve_zfs_migrate_vm() {
 
   command -v qm >/dev/null || _die "qm not found; run on a Proxmox node."
   command -v zfs >/dev/null || _die "zfs not found."
+
+  local PRE_MIGRATION_IPV6=""
+  if [[ "$HOT_MIGRATION" == "true" ]]; then
+    _info "Detecting VM ${VMID} IPv6 before migration..."
+    local pre_attempt=1 pre_max_attempts=6
+    while (( pre_attempt <= pre_max_attempts )); do
+      PRE_MIGRATION_IPV6="$(_get_vm_ipv6_local "$VMID")"
+      if [[ -n "$PRE_MIGRATION_IPV6" ]]; then
+        _ok "Detected pre-migration IPv6 for VM ${VMID}: ${PRE_MIGRATION_IPV6}"
+        break
+      fi
+      if (( pre_attempt == pre_max_attempts )); then
+        _die "Could not detect previous IPv6 for VM ${VMID} before migration."
+      fi
+      _info "Previous IPv6 not available yet (attempt ${pre_attempt}/${pre_max_attempts}); retrying in 5s..."
+      sleep 5
+      (( pre_attempt++ )) || true
+    done
+  fi
 
   # Tools on source (pv needed for %)
   if ! command -v mbuffer >/dev/null 2>&1 || ! command -v pv >/dev/null 2>&1; then
@@ -491,7 +791,7 @@ pve_zfs_migrate_vm() {
     fi
     PHASE=4
 
-    # Hot migration only: wait for VM running, force Windows network reset, run sync-dnat post-start
+    # Hot migration only: wait for VM running, force Windows network reset, validate IPv6 rollover, run sync-dnat post-start
     if [[ "$HOT_MIGRATION" == "true" ]]; then
       local WAIT_RUNNING_TIMEOUT=180 wait_elapsed=0
       _info "Waiting for VM ${VMID} to be running on destination (timeout ${WAIT_RUNNING_TIMEOUT}s)..."
@@ -509,64 +809,92 @@ pve_zfs_migrate_vm() {
         (( wait_elapsed += 5 )) || true
       done
 
-      # Force Windows to reset network via guest agent so DHCP + Slak reconfigure
-      _info "Waiting a bit for guest agent to become available..."
-      sleep 45
+      # Force Windows to reset network via guest agent and ensure IPv6 changes from pre-migration value
+      _info "Waiting for guest agent to become available on destination..."
+      sleep 20
       local ostype
       ostype="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)"
+      local old_ipv6="$PRE_MIGRATION_IPV6"
+      local new_ipv6=""
+
       if [[ "$ostype" == win* ]]; then
-        local agent_retries=5 agent_attempt=0 agent_pid="" agent_exit_timeout=120 agent_exit_elapsed=0
-        while (( agent_attempt < agent_retries )); do
-          local exec_out
-          exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'pvesh create /nodes/'"${DEST_NODE}"'/qemu/'"${VMID}"'/agent/exec --output-format json --command cmd.exe --command /c --command "ipconfig /release \& ipconfig /renew"' 2>&1)" || true
-          agent_pid="$(echo "$exec_out" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-          if [[ -n "$agent_pid" && "$agent_pid" -gt 0 ]]; then
-            _info "Guest agent exec started (PID ${agent_pid}); waiting for network reset to complete..."
-            agent_exit_elapsed=0
-            while (( agent_exit_elapsed < agent_exit_timeout )); do
-              local status_out
-              status_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${agent_pid}' 2>/dev/null" || true)"
-              if echo "$status_out" | grep -qE '"exited"\s*:\s*1'; then
-                _ok "Windows network reset (ipconfig release/renew) completed."
-                break 2
-              fi
-              sleep 5
-              (( agent_exit_elapsed += 5 )) || true
-            done
-            _info "Guest exec-status timeout or completed; continuing."
-            break
-          fi
-          if echo "$exec_out" | grep -qi "guest agent is not running"; then
-            (( agent_attempt++ )) || true
-            _info "Guest agent not ready (attempt ${agent_attempt}/${agent_retries}); retrying in 10s..."
-            sleep 10
+        local refresh_attempt=1
+        while (( refresh_attempt <= HOT_REFRESH_MAX_ATTEMPTS )); do
+          _info "Windows network refresh attempt ${refresh_attempt}/${HOT_REFRESH_MAX_ATTEMPTS}..."
+          if ! _ga_exec_and_wait_dest "Windows network refresh (PowerShell)" 180 \
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+            -Command '$ErrorActionPreference="Stop"; ipconfig /release; Start-Sleep -Seconds 3; ipconfig /renew; Start-Sleep -Seconds 2; Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.IPAddress -notlike "fe80*" -and $_.IPAddress -ne "::1" -and $_.IPAddress -notlike "fd*" -and $_.IPAddress -notlike "fc*" } | Select-Object -ExpandProperty IPAddress'; then
+            _info "PowerShell network refresh failed (exit ${GA_LAST_EXITCODE:-unknown}). stdout: ${GA_LAST_STDOUT:-<empty>}"
+            _info "PowerShell network refresh stderr: ${GA_LAST_STDERR:-<empty>}"
+            _info "Trying cmd fallback (ipconfig release/renew)..."
+            if ! _ga_exec_and_wait_dest "Windows network refresh (cmd fallback)" 180 cmd.exe /c "ipconfig /release & ipconfig /renew"; then
+              _die "Windows network refresh failed on attempt ${refresh_attempt}. PowerShell and fallback both failed. Last stdout: ${GA_LAST_STDOUT:-<empty>} | Last stderr: ${GA_LAST_STDERR:-<empty>}"
+            fi
+            _ok "Fallback network refresh succeeded. stdout: ${GA_LAST_STDOUT:-<empty>}"
           else
-            _info "Guest exec failed or not available: ${exec_out:0:200}; skipping network reset."
+            _ok "PowerShell network refresh succeeded. stdout: ${GA_LAST_STDOUT:-<empty>}"
+          fi
+
+          _info "Waiting ${HOT_REFRESH_WAIT_SECONDS}s for Windows to acquire a new IPv6..."
+          sleep "${HOT_REFRESH_WAIT_SECONDS}"
+          new_ipv6="$(_get_vm_ipv6_dest)"
+          if [[ -n "$new_ipv6" && "$new_ipv6" != "$old_ipv6" ]]; then
+            _ok "IPv6 rollover detected for VM ${VMID}: ${old_ipv6} -> ${new_ipv6}"
             break
           fi
+
+          if (( refresh_attempt == HOT_REFRESH_MAX_ATTEMPTS )); then
+            _die "IPv6 did not change after ${HOT_REFRESH_MAX_ATTEMPTS} network refresh attempts. Old IPv6: ${old_ipv6}; New IPv6: ${new_ipv6:-<empty>}"
+          fi
+          _info "IPv6 unchanged after attempt ${refresh_attempt}. old=${old_ipv6} new=${new_ipv6:-<empty>}; retrying refresh..."
+          (( refresh_attempt++ )) || true
         done
-        if [[ $agent_attempt -ge $agent_retries && ( -z "${agent_pid}" || "${agent_pid:-0}" -le 0 ) ]]; then
-          _info "Could not run guest agent network reset after ${agent_retries} retries; continuing (sync-dnat will still run)."
-        fi
       else
-        _info "VM ostype is '${ostype}' (not Windows); skipping guest agent network reset."
+        _info "VM ostype is '${ostype}' (not Windows); skipping Windows network refresh."
+        sleep "${HOT_REFRESH_WAIT_SECONDS}"
+        new_ipv6="$(_get_vm_ipv6_dest)"
+        if [[ -n "$new_ipv6" && "$new_ipv6" != "$old_ipv6" ]]; then
+          _ok "IPv6 changed for non-Windows VM: ${old_ipv6} -> ${new_ipv6}"
+        elif [[ -n "$new_ipv6" ]]; then
+          _info "IPv6 did not change for non-Windows VM (old=${old_ipv6}, new=${new_ipv6}); continuing."
+        else
+          _info "Could not detect destination IPv6 for non-Windows VM after migration."
+        fi
       fi
 
-      # Allow time for new IPv6 to be assigned and visible before sync-dnat reads it
-      _info "Waiting 20s for new IPv6 to settle after network reset..."
-      sleep 20
-
-      # Reconfigure assigned IPv6 on this host from Firestore (post-start)
+      # Reconfigure assigned IPv6 on destination and make failure explicit
       local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
-      if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
-        _info "Running sync-dnat.py post-start on destination to reconfigure IPv6..."
-        if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "'${SYNC_DNAT}' '${VMID}' post-start" 2>/dev/null; then
-          _ok "sync-dnat.py post-start completed."
-        else
-          _info "sync-dnat.py post-start failed or returned non-zero; continuing (non-fatal)."
+      if ! ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
+        _die "sync-dnat.py not found or not executable on destination (${SYNC_DNAT})."
+      fi
+      _info "Running sync-dnat.py post-start on destination..."
+      if ! ssh "${SSH_OPTS[@]}" "$DEST_SSH" "'${SYNC_DNAT}' '${VMID}' post-start" 2>&1; then
+        _die "sync-dnat.py post-start failed on destination."
+      fi
+      _ok "sync-dnat.py post-start completed."
+
+      _info "Waiting ${HOT_TRIGGER_WAIT_SECONDS}s for Firestore trigger/NAT64 propagation..."
+      sleep "${HOT_TRIGGER_WAIT_SECONDS}"
+
+      # Validate connectivity to published endpoint over both IPv6 and IPv4.
+      if ! _run_connectivity_checks; then
+        local firestore_ipv6
+        firestore_ipv6="$(_get_firestore_ipv6_by_vmid "$VMID")"
+        _info "Connectivity failed. Firestore IPv6 for VM ${VMID}: ${firestore_ipv6:-<empty>}; detected destination IPv6: ${new_ipv6:-<empty>}"
+
+        if [[ -n "${new_ipv6:-}" && "${firestore_ipv6:-}" != "${new_ipv6:-}" ]]; then
+          _info "Firestore IPv6 mismatch detected; rerunning sync-dnat.py post-start..."
+          if ! ssh "${SSH_OPTS[@]}" "$DEST_SSH" "'${SYNC_DNAT}' '${VMID}' post-start" 2>&1; then
+            _die "Connectivity failed and sync-dnat remediation failed for VM ${VMID}."
+          fi
+          sleep "${HOT_TRIGGER_WAIT_SECONDS}"
+          firestore_ipv6="$(_get_firestore_ipv6_by_vmid "$VMID")"
+          _info "Firestore IPv6 after remediation: ${firestore_ipv6:-<empty>}"
         fi
-      else
-        _info "sync-dnat.py not found or not executable on destination; skipping post-start."
+
+        if ! _run_connectivity_checks; then
+          _die "Post-migration connectivity validation failed for VM ${VMID}. old_ipv6=${old_ipv6} new_ipv6=${new_ipv6:-<empty>} firestore_ipv6=${firestore_ipv6:-<empty>}"
+        fi
       fi
     fi
   fi
