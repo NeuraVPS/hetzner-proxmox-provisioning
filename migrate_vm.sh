@@ -816,23 +816,37 @@ PY
       ostype="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)"
       local old_ipv6="$PRE_MIGRATION_IPV6"
       local new_ipv6=""
+      local ipv6_changed=0
 
       if [[ "$ostype" == win* ]]; then
         local refresh_attempt=1
         while (( refresh_attempt <= HOT_REFRESH_MAX_ATTEMPTS )); do
-          _info "Windows network refresh attempt ${refresh_attempt}/${HOT_REFRESH_MAX_ATTEMPTS}..."
-          if ! _ga_exec_and_wait_dest "Windows network refresh (PowerShell)" 180 \
-            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-            -Command '$ErrorActionPreference="Stop"; ipconfig /release; Start-Sleep -Seconds 3; ipconfig /renew; Start-Sleep -Seconds 2; Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.IPAddress -notlike "fe80*" -and $_.IPAddress -ne "::1" -and $_.IPAddress -notlike "fd*" -and $_.IPAddress -notlike "fc*" } | Select-Object -ExpandProperty IPAddress'; then
-            _info "PowerShell network refresh failed (exit ${GA_LAST_EXITCODE:-unknown}). stdout: ${GA_LAST_STDOUT:-<empty>}"
-            _info "PowerShell network refresh stderr: ${GA_LAST_STDERR:-<empty>}"
-            _info "Trying cmd fallback (ipconfig release/renew)..."
-            if ! _ga_exec_and_wait_dest "Windows network refresh (cmd fallback)" 180 cmd.exe /c "ipconfig /release & ipconfig /renew"; then
-              _die "Windows network refresh failed on attempt ${refresh_attempt}. PowerShell and fallback both failed. Last stdout: ${GA_LAST_STDOUT:-<empty>} | Last stderr: ${GA_LAST_STDERR:-<empty>}"
-            fi
-            _ok "Fallback network refresh succeeded. stdout: ${GA_LAST_STDOUT:-<empty>}"
+          local is_strong_attempt=0
+          local ps_description="Windows network refresh (PowerShell basic)"
+          local ps_command='$ErrorActionPreference="Stop"; ipconfig /release; Start-Sleep -Seconds 3; ipconfig /renew; Start-Sleep -Seconds 2; Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.IPAddress -notlike "fe80*" -and $_.IPAddress -ne "::1" -and $_.IPAddress -notlike "fd*" -and $_.IPAddress -notlike "fc*" } | Select-Object -ExpandProperty IPAddress'
+          if (( refresh_attempt == HOT_REFRESH_MAX_ATTEMPTS )); then
+            is_strong_attempt=1
+            ps_description="Windows network refresh (PowerShell strong no-reboot)"
+            ps_command='$ErrorActionPreference="Stop"; ipconfig /release; Start-Sleep -Seconds 2; ipconfig /renew; Start-Sleep -Seconds 2; $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -notmatch "Loopback" } | Select-Object -First 1; if (-not $adapter) { throw "No active network adapter found" }; Disable-NetAdapter -Name $adapter.Name -Confirm:$false; Start-Sleep -Seconds 4; Enable-NetAdapter -Name $adapter.Name -Confirm:$false; Start-Sleep -Seconds 6; netsh interface ipv6 reset; Start-Sleep -Seconds 4; ipconfig /renew; Start-Sleep -Seconds 2; Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.IPAddress -notlike "fe80*" -and $_.IPAddress -ne "::1" -and $_.IPAddress -notlike "fd*" -and $_.IPAddress -notlike "fc*" } | Select-Object -ExpandProperty IPAddress'
+            _info "Windows network refresh attempt ${refresh_attempt}/${HOT_REFRESH_MAX_ATTEMPTS} (strong reset: adapter bounce + IPv6 reset)..."
           else
-            _ok "PowerShell network refresh succeeded. stdout: ${GA_LAST_STDOUT:-<empty>}"
+            _info "Windows network refresh attempt ${refresh_attempt}/${HOT_REFRESH_MAX_ATTEMPTS}..."
+          fi
+
+          if ! _ga_exec_and_wait_dest "${ps_description}" 240 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${ps_command}"; then
+            _info "${ps_description} failed (exit ${GA_LAST_EXITCODE:-unknown}). stdout: ${GA_LAST_STDOUT:-<empty>}"
+            _info "${ps_description} stderr: ${GA_LAST_STDERR:-<empty>}"
+            if (( is_strong_attempt == 0 )); then
+              _info "Trying cmd fallback (ipconfig release/renew)..."
+              if ! _ga_exec_and_wait_dest "Windows network refresh (cmd fallback)" 180 cmd.exe /c "ipconfig /release & ipconfig /renew"; then
+                _die "Windows network refresh failed on attempt ${refresh_attempt}. PowerShell and fallback both failed. Last stdout: ${GA_LAST_STDOUT:-<empty>} | Last stderr: ${GA_LAST_STDERR:-<empty>}"
+              fi
+              _ok "Fallback network refresh succeeded. stdout: ${GA_LAST_STDOUT:-<empty>}"
+            else
+              _die "Strong no-reboot Windows network reset failed on final attempt. Last stdout: ${GA_LAST_STDOUT:-<empty>} | Last stderr: ${GA_LAST_STDERR:-<empty>}"
+            fi
+          else
+            _ok "${ps_description} succeeded. stdout: ${GA_LAST_STDOUT:-<empty>}"
           fi
 
           _info "Waiting ${HOT_REFRESH_WAIT_SECONDS}s for Windows to acquire a new IPv6..."
@@ -840,11 +854,13 @@ PY
           new_ipv6="$(_get_vm_ipv6_dest)"
           if [[ -n "$new_ipv6" && "$new_ipv6" != "$old_ipv6" ]]; then
             _ok "IPv6 rollover detected for VM ${VMID}: ${old_ipv6} -> ${new_ipv6}"
+            ipv6_changed=1
             break
           fi
 
           if (( refresh_attempt == HOT_REFRESH_MAX_ATTEMPTS )); then
-            _die "IPv6 did not change after ${HOT_REFRESH_MAX_ATTEMPTS} network refresh attempts. Old IPv6: ${old_ipv6}; New IPv6: ${new_ipv6:-<empty>}"
+            _info "IPv6 did not change after ${HOT_REFRESH_MAX_ATTEMPTS} refresh attempts (including strong reset). old=${old_ipv6} new=${new_ipv6:-<empty>}. Proceeding to sync/connectivity validation."
+            break
           fi
           _info "IPv6 unchanged after attempt ${refresh_attempt}. old=${old_ipv6} new=${new_ipv6:-<empty>}; retrying refresh..."
           (( refresh_attempt++ )) || true
@@ -855,6 +871,7 @@ PY
         new_ipv6="$(_get_vm_ipv6_dest)"
         if [[ -n "$new_ipv6" && "$new_ipv6" != "$old_ipv6" ]]; then
           _ok "IPv6 changed for non-Windows VM: ${old_ipv6} -> ${new_ipv6}"
+          ipv6_changed=1
         elif [[ -n "$new_ipv6" ]]; then
           _info "IPv6 did not change for non-Windows VM (old=${old_ipv6}, new=${new_ipv6}); continuing."
         else
@@ -895,6 +912,10 @@ PY
         if ! _run_connectivity_checks; then
           _die "Post-migration connectivity validation failed for VM ${VMID}. old_ipv6=${old_ipv6} new_ipv6=${new_ipv6:-<empty>} firestore_ipv6=${firestore_ipv6:-<empty>}"
         fi
+      fi
+
+      if [[ "$ipv6_changed" == "0" ]]; then
+        _ok "IPv6 stayed unchanged after non-reboot reset attempts, but migration is accepted because sync-dnat and connectivity checks passed. old_ipv6=${old_ipv6} new_ipv6=${new_ipv6:-<empty>}"
       fi
     fi
   fi
