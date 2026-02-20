@@ -376,14 +376,57 @@ PY
 
   _run_connectivity_checks() {
     local out6 out4 rc6 rc4
+    local target_host="sqx.neuravps.com"
+    local target_port="20996"
+    local nc_help
+    nc_help="$(nc -h 2>&1 || true)"
+
+    local supports_v4=0 supports_v6=0
+    if [[ "$nc_help" == *" -4 "* || "$nc_help" == *" [-4]"* || "$nc_help" == *" -4,"* || "$nc_help" == *" -4\n"* ]]; then
+      supports_v4=1
+    fi
+    if [[ "$nc_help" == *" -6 "* || "$nc_help" == *" [-6]"* || "$nc_help" == *" -6,"* || "$nc_help" == *" -6\n"* ]]; then
+      supports_v6=1
+    fi
+
     set +e
-    out6="$(nc -w 5 -6 -zv sqx.neuravps.com 20996 2>&1)"
-    rc6=$?
-    out4="$(nc -w 5 -4 -zv sqx.neuravps.com 20996 2>&1)"
-    rc4=$?
+    if (( supports_v6 == 1 )); then
+      out6="$(nc -w 5 -6 -zv "$target_host" "$target_port" 2>&1)"
+      rc6=$?
+    else
+      local target_ipv6=""
+      if command -v getent >/dev/null 2>&1; then
+        target_ipv6="$(getent ahostsv6 "$target_host" 2>/dev/null | awk 'index($1,":"){print $1; exit}')"
+      fi
+      if [[ -z "$target_ipv6" ]]; then
+        out6="Could not resolve IPv6 for ${target_host} and nc does not support -6"
+        rc6=1
+      else
+        out6="$(nc -w 5 -zv "$target_ipv6" "$target_port" 2>&1)"
+        rc6=$?
+      fi
+    fi
+
+    if (( supports_v4 == 1 )); then
+      out4="$(nc -w 5 -4 -zv "$target_host" "$target_port" 2>&1)"
+      rc4=$?
+    else
+      local target_ipv4=""
+      if command -v getent >/dev/null 2>&1; then
+        target_ipv4="$(getent ahostsv4 "$target_host" 2>/dev/null | awk 'index($1,"."){print $1; exit}')"
+      fi
+      if [[ -z "$target_ipv4" ]]; then
+        out4="Could not resolve IPv4 for ${target_host} and nc does not support -4"
+        rc4=1
+      else
+        out4="$(nc -w 5 -zv "$target_ipv4" "$target_port" 2>&1)"
+        rc4=$?
+      fi
+    fi
     set -e
+
     if (( rc6 == 0 && rc4 == 0 )); then
-      _ok "Connectivity checks succeeded (IPv6 and IPv4): sqx.neuravps.com:20996"
+      _ok "Connectivity checks succeeded (IPv6 and IPv4): ${target_host}:${target_port}"
       return 0
     fi
     _info "Connectivity check IPv6 output: ${out6}"
@@ -471,11 +514,11 @@ PY
     done
   fi
 
-  # Tools on source (pv needed for %)
-  if ! command -v mbuffer >/dev/null 2>&1 || ! command -v pv >/dev/null 2>&1; then
-    _info "Installing required tools on source host (mbuffer + pv)..."
+  # Tools on source (pv needed for %, nc needed for connectivity checks)
+  if ! command -v mbuffer >/dev/null 2>&1 || ! command -v pv >/dev/null 2>&1 || ! dpkg -s netcat-openbsd >/dev/null 2>&1; then
+    _info "Installing required tools on source host (mbuffer + pv + netcat-openbsd)..."
     apt-get update -qq
-    apt-get -y install mbuffer pv
+    apt-get -y install mbuffer pv netcat-openbsd
   fi
 
   local CONF_LOCAL="/etc/pve/qemu-server/${VMID}.conf"
@@ -488,11 +531,11 @@ PY
   fi
   local CONF_DEST="/etc/pve/nodes/${DEST_NODE}/qemu-server/${VMID}.conf"
 
-  # Tool on destination (only mbuffer)
+  # Tools on destination (mbuffer + netcat-openbsd)
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" '
-    if ! command -v mbuffer >/dev/null 2>&1; then
+    if ! command -v mbuffer >/dev/null 2>&1 || ! dpkg -s netcat-openbsd >/dev/null 2>&1; then
       apt-get update -qq
-      apt-get -y install mbuffer
+      apt-get -y install mbuffer netcat-openbsd
     fi
   '
 
