@@ -629,7 +629,8 @@ PY
     _is_suspended() {
       local s
       s="$(qm status "$VMID" 2>/dev/null | awk -F': ' '/^status:/{gsub(/^[ \t]+|[ \t\r]+$/,"",$2); print $2; exit}')"
-      [[ "$s" == "suspended" ]]
+      # Suspend-to-disk: QEMU exits after saving, so status is "stopped" (not "suspended")
+      [[ "$s" == "suspended" || "$s" == "stopped" ]]
     }
     _get_state_used() {
       local u
@@ -679,6 +680,26 @@ PY
     done
     kill "$WAIT_PID" 2>/dev/null || true
     wait "$WAIT_PID" 2>/dev/null || true
+
+    # Verify VM reached suspended/stopped state. Suspend-to-disk exits QEMU so status is
+    # "stopped" (not "suspended"). If "State saved, quitting" was followed by "qmp command
+    # 'quit' failed - got timeout", the state was saved; wait up to 30s for transition.
+    if ! _is_suspended; then
+      _info "Suspend process finished; waiting for VM to reach suspended/stopped state (QMP quit may have timed out)..."
+      local verify_elapsed=0 verify_max=30 verify_poll=2
+      while (( verify_elapsed < verify_max )); do
+        sleep "$verify_poll"
+        (( verify_elapsed += verify_poll )) || true
+        if _is_suspended; then
+          _info "VM reached suspended/stopped state after ${verify_elapsed}s (state was saved)."
+          break
+        fi
+        _info "  Still waiting... (${verify_elapsed}s / ${verify_max}s)"
+      done
+      if ! _is_suspended; then
+        _die "VM ${VMID} did not reach suspended/stopped state within ${verify_max}s. If you saw 'State saved, quitting' then 'qmp command quit failed - got timeout', run 'qm status ${VMID}' to verify. For large-RAM VMs, patch /usr/share/perl5/PVE/QMPClient.pm to increase the 'quit' command timeout (default 5s). See Proxmox forum for details."
+      fi
+    fi
     WAS_SUSPENDED=1
     _ok "VM ${VMID} suspended."
   else
@@ -1068,8 +1089,8 @@ PY
 #     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 || r=$? ; echo "Exit code: $r"
 #   Multiple migrations in sequence: parent shell never closes; next runs only if previous succeeded.
 #     Use { } not ( ) so r is updated in the same shell. Use || true so a failed [[ ]] does not exit the shell with set -e.
-#     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 || r=$? ; echo "Exit code: $r"
-#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 621 fd00:4000::6 || r=$? ; echo "Exit code: $r"; } || true
-#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 622 fd00:4000::6 || r=$? ; echo "Exit code: $r"; } || true
+#     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"
+#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 621 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"; } || true
+#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 622 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"; } || true
 #
 pve_zfs_migrate_vm "$@"
