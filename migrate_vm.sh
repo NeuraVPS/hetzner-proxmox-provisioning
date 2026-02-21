@@ -1,5 +1,5 @@
 pve_zfs_migrate_vm() {
-  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]. Options: --dest-node, --snapname, --shutdown-timeout, --suspend-timeout, --hot, --src-cleanup, --dest-cleanup, --delete-src-vm, --update-firestore, --keep-dest-stopped. Or pass positional args 3-11 for legacy. Use --help for details."
+  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]. Options: --dest-node, --snapname, --shutdown-timeout, --suspend-timeout, --hot, --trigger-wait, --src-cleanup, --dest-cleanup, --delete-src-vm, --update-firestore, --keep-dest-stopped. Or pass positional args 3-12 for legacy. Use --help for details."
   [[ $# -ge 2 ]] || { echo "$USAGE" >&2; exit 1; }
 
   local VMID="$1"
@@ -18,7 +18,7 @@ pve_zfs_migrate_vm() {
   local SUSPEND_TIMEOUT="120"
   local HOT_REFRESH_MAX_ATTEMPTS=3
   local HOT_REFRESH_WAIT_SECONDS=10
-  local HOT_TRIGGER_WAIT_SECONDS=10
+  local HOT_TRIGGER_WAIT_SECONDS=30
 
   if [[ $# -gt 0 && "$1" == --* ]]; then
     while [[ $# -gt 0 ]]; do
@@ -37,6 +37,7 @@ pve_zfs_migrate_vm() {
           echo "    --keep-dest-stopped=<true|false>  Do not start VM on destination (false)"
           echo "    --hot=<true|false>                Hot migration: suspend to disk, migrate, resume on dest (false)"
           echo "    --suspend-timeout=<sec>           Wait up to this many seconds for suspend to complete (120)"
+          echo "    --trigger-wait=<sec>              Wait for Firestore trigger/NAT64 propagation before connectivity check (30)"
           echo "  Hot migration uses suspend-to-disk and qm resume on destination. VM state must be on storage"
           echo "  that is migrated (e.g. same ZFS as VM disks). With --hot and --keep-dest-stopped the VM is"
           echo "  left suspended on destination."
@@ -64,6 +65,8 @@ pve_zfs_migrate_vm() {
         --hot)                 if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then HOT_MIGRATION="${2}"; shift 2; else HOT_MIGRATION="true"; shift; fi ;;
         --suspend-timeout=*)   SUSPEND_TIMEOUT="${1#*=}"; shift ;;
         --suspend-timeout)     [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; SUSPEND_TIMEOUT="$2"; shift 2 ;;
+        --trigger-wait=*)      HOT_TRIGGER_WAIT_SECONDS="${1#*=}"; shift ;;
+        --trigger-wait)        [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 1; }; HOT_TRIGGER_WAIT_SECONDS="$2"; shift 2 ;;
         *)
           echo "Unknown option: $1" >&2
           exit 1
@@ -81,6 +84,7 @@ pve_zfs_migrate_vm() {
     KEEP_DEST_STOPPED="${1:-false}"; [[ $# -ge 1 ]] && shift
     HOT_MIGRATION="${1:-false}"; [[ $# -ge 1 ]] && shift
     SUSPEND_TIMEOUT="${1:-120}"; [[ $# -ge 1 ]] && shift
+    HOT_TRIGGER_WAIT_SECONDS="${1:-30}"; [[ $# -ge 1 ]] && shift
   fi
 
   local SSH_OPTS=(-o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes)
@@ -375,9 +379,10 @@ PY
   }
 
   _run_connectivity_checks() {
+    local vmid="${1:?VMID required}"
     local out6 out4 rc6 rc4
     local target_host="sqx.neuravps.com"
-    local target_port="20996"
+    local target_port=$((20000 + vmid))
     local nc_help
     nc_help="$(nc -h 2>&1 || true)"
 
@@ -937,10 +942,26 @@ PY
       sleep "${HOT_TRIGGER_WAIT_SECONDS}"
 
       # Validate connectivity to published endpoint over both IPv6 and IPv4.
-      if ! _run_connectivity_checks; then
+      # Retry up to 3 times with 10s between attempts (propagation can take 3-25s).
+      local conn_ok=0 conn_attempt=1 conn_max_attempts=3 conn_retry_delay=10
+      while (( conn_attempt <= conn_max_attempts )); do
+        if _run_connectivity_checks "$VMID"; then
+          conn_ok=1
+          break
+        fi
+        if (( conn_attempt < conn_max_attempts )); then
+          _info "Connectivity check attempt ${conn_attempt}/${conn_max_attempts} failed; retrying in ${conn_retry_delay}s..."
+          sleep "$conn_retry_delay"
+          (( conn_attempt++ )) || true
+        else
+          break
+        fi
+      done
+
+      if [[ "$conn_ok" -ne 1 ]]; then
         local firestore_ipv6
         firestore_ipv6="$(_get_firestore_ipv6_by_vmid "$VMID")"
-        _info "Connectivity failed. Firestore IPv6 for VM ${VMID}: ${firestore_ipv6:-<empty>}; detected destination IPv6: ${new_ipv6:-<empty>}"
+        _info "Connectivity failed after ${conn_max_attempts} attempts. Firestore IPv6 for VM ${VMID}: ${firestore_ipv6:-<empty>}; detected destination IPv6: ${new_ipv6:-<empty>}"
 
         if [[ -n "${new_ipv6:-}" && "${firestore_ipv6:-}" != "${new_ipv6:-}" ]]; then
           _info "Firestore IPv6 mismatch detected; rerunning sync-dnat.py post-start..."
@@ -952,7 +973,7 @@ PY
           _info "Firestore IPv6 after remediation: ${firestore_ipv6:-<empty>}"
         fi
 
-        if ! _run_connectivity_checks; then
+        if ! _run_connectivity_checks "$VMID"; then
           _die "Post-migration connectivity validation failed for VM ${VMID}. old_ipv6=${old_ipv6} new_ipv6=${new_ipv6:-<empty>} firestore_ipv6=${firestore_ipv6:-<empty>}"
         fi
       fi
@@ -1035,8 +1056,8 @@ PY
 #     bash migrate_vm.sh 620 fd00:4000::6 --keep-dest-stopped --delete-src-vm=false
 #   Hot migration (suspend then resume on dest):
 #     bash migrate_vm.sh 620 fd00:4000::6 --hot
-#   Legacy positional (args 3-11: dest_node snapname shutdown_timeout src_cleanup dest_cleanup delete_src_vm update_firestore keep_dest_stopped hot suspend_timeout):
-#     bash migrate_vm.sh 619 fd00:4000::2d '' migration 180 yes yes false true true false 120
+#   Legacy positional (args 3-12: dest_node snapname shutdown_timeout src_cleanup dest_cleanup delete_src_vm update_firestore keep_dest_stopped hot suspend_timeout trigger_wait):
+#     bash migrate_vm.sh 619 fd00:4000::2d '' migration 180 yes yes false true true false 120 30
 #   One-liner (curl):
 #     curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 --keep-dest-stopped
 #   Keep session open on failure but preserve exit code (e.g. with set -e):
