@@ -434,10 +434,10 @@ modprobe jool 2>/dev/null || true
 jool instance add "default" --netfilter --pool6 64:ff9b::/96 2>/dev/null || true
 BASE_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
 if [[ -n "$BASE_IP" ]]; then
-  jool pool4 add --tcp "$BASE_IP" 10000-10999 2>/dev/null || true
-  jool pool4 add --tcp "$BASE_IP" 20000-20999 2>/dev/null || true
-  jool pool4 add --udp "$BASE_IP" 10000-10999 2>/dev/null || true
-  jool pool4 add --udp "$BASE_IP" 20000-20999 2>/dev/null || true
+  jool pool4 add --tcp "$BASE_IP" 10000-19999 2>/dev/null || true
+  jool pool4 add --tcp "$BASE_IP" 20000-29999 2>/dev/null || true
+  jool pool4 add --udp "$BASE_IP" 10000-19999 2>/dev/null || true
+  jool pool4 add --udp "$BASE_IP" 20000-29999 2>/dev/null || true
 fi
 if [[ -x /var/lib/svz/snippets/sync-dnat.py ]]; then
   /var/lib/svz/snippets/sync-dnat.py update_base restore 2>/dev/null || true

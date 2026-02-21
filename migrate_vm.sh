@@ -1089,8 +1089,8 @@ PY
 #     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 || r=$? ; echo "Exit code: $r"
 #   Multiple migrations in sequence: parent shell never closes; next runs only if previous succeeded.
 #     Use { } not ( ) so r is updated in the same shell. Use || true so a failed [[ ]] does not exit the shell with set -e.
-#     r=0; curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 620 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"
-#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 621 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"; } || true
-#     [[ $r -eq 0 ]] && { curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 622 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"; } || true
+#     r=0; curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?nocache=$(date +%s)" | bash -s -- 620 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"
+#     [[ $r -eq 0 ]] && { curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?nocache=$(date +%s)" | bash -s -- 620 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"; } || true
+#     [[ $r -eq 0 ]] && { curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?nocache=$(date +%s)" | bash -s -- 620 fd00:4000::6 --hot || r=$? ; echo "Exit code: $r"; } || true
 #
 pve_zfs_migrate_vm "$@"
