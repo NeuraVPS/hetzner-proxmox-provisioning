@@ -987,7 +987,11 @@ PY
   if [[ "$DEST_CLEANUP" == "yes" ]]; then
     _info "Destroying destination snapshots @${SNAPNAME}..."
     for ds in "${DATASETS[@]}"; do
-      ssh "${SSH_OPTS[@]}" "$DEST_SSH" "zfs destroy '${ds}@${SNAPNAME}'" || true
+      if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "zfs list -H -o name '${ds}' 2>/dev/null" | grep -qxF "${ds}"; then
+        ssh "${SSH_OPTS[@]}" "$DEST_SSH" "zfs destroy '${ds}@${SNAPNAME}'" 2>/dev/null || true
+      else
+        _info "Skipping snapshot destroy for ${ds} (dataset no longer exists; Proxmox may have removed suspend state)"
+      fi
     done
     _ok "Destination snapshots removed."
   else
