@@ -87,6 +87,67 @@ pve_zfs_migrate_vm() {
     fi
   }
 
+  _extract_global_ipv6_from_interfaces_json() {
+    local interfaces_json="${1:-}"
+    if [[ -z "$interfaces_json" ]]; then echo ""; return 0; fi
+    if ! command -v python3 >/dev/null 2>&1; then echo ""; return 0; fi
+    JSON_INPUT="$interfaces_json" python3 -c '
+import json, os, ipaddress
+raw = os.environ.get("JSON_INPUT", "")
+if not raw: raise SystemExit(0)
+try: interfaces = json.loads(raw)
+except: raise SystemExit(0)
+if not isinstance(interfaces, list): raise SystemExit(0)
+for iface in interfaces:
+  if not isinstance(iface, dict): continue
+  if "loopback" in str(iface.get("name", "")).lower(): continue
+  for addr in iface.get("ip-addresses", []):
+    if not isinstance(addr, dict): continue
+    ip = str(addr.get("ip-address", "")).strip()
+    if not ip or "%" in ip or ip.startswith("fe80::") or ip == "::1": continue
+    try: ip_obj = ipaddress.ip_address(ip)
+    except ValueError: continue
+    if ip_obj.version != 6: continue
+    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local: continue
+    print(ip); raise SystemExit(0)
+'
+  }
+
+  _get_vm_ipv6_local() {
+    local vmid="$1" interfaces_json rc
+    set +e
+    interfaces_json="$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null)"
+    rc=$?
+    set -e
+    if (( rc != 0 )) || [[ -z "$interfaces_json" ]]; then echo ""; return 0; fi
+    _extract_global_ipv6_from_interfaces_json "$interfaces_json"
+  }
+
+  _get_vm_ipv6_dest() {
+    local interfaces_json rc
+    set +e
+    interfaces_json="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/network-get-interfaces --output-format json 2>/dev/null" | tr -d '\r')"
+    rc=$?
+    set -e
+    if (( rc != 0 )) || [[ -z "$interfaces_json" ]]; then echo ""; return 0; fi
+    _extract_global_ipv6_from_interfaces_json "$interfaces_json"
+  }
+
+  _run_connectivity_checks() {
+    local port=$((BASE_PORT + VMID)) out6 out4 rc6 rc4
+    set +e
+    out6="$(nc -w 5 -6 -zv sqx.neuravps.com "$port" 2>&1)"; rc6=$?
+    out4="$(nc -w 5 -4 -zv sqx.neuravps.com "$port" 2>&1)"; rc4=$?
+    set -e
+    if (( rc6 == 0 && rc4 == 0 )); then
+      _ok "Connectivity checks succeeded (IPv6 and IPv4): sqx.neuravps.com:${port}"
+      return 0
+    fi
+    _info "Connectivity check IPv6 output: ${out6}"
+    _info "Connectivity check IPv4 output: ${out4}"
+    return 1
+  }
+
   _cleanup_on_failure() {
     set +e
     _info "Migration failed; cleaning up and restoring state..."
@@ -176,6 +237,10 @@ pve_zfs_migrate_vm() {
     fi
   fi
 
+  local PRE_MIGRATION_IPV6=""
+  PRE_MIGRATION_IPV6="$(_get_vm_ipv6_local "$VMID")" || true
+  _info "Pre-migration IPv6 (source VM): ${PRE_MIGRATION_IPV6:-<none>}"
+
   # 3) Detach hookscript on source
   _info "Detaching hookscript on source..."
   qm set "$VMID" --delete hookscript 2>/dev/null || true
@@ -228,6 +293,66 @@ pve_zfs_migrate_vm() {
   local DEST_STATUS
   DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
   if [[ "$DEST_STATUS" == "running" ]]; then
+    # Windows: reset network via guest agent and wait for settle before sync-dnat
+    local ostype
+    ostype="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)"
+    if [[ "$ostype" == win* ]]; then
+      local old_ipv6="$PRE_MIGRATION_IPV6" new_ipv6="" agent_poll_interval=5 agent_poll_max=90 agent_attempt=0 agent_pid=""
+      local ipv6_poll_interval=5 ipv6_poll_max=120 ipv6_elapsed=0 ipv6_changed=0
+      _info "Polling for guest agent (retry every ${agent_poll_interval}s, max ${agent_poll_max}s)..."
+      while (( agent_attempt * agent_poll_interval < agent_poll_max )); do
+        local exec_out
+        exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'pvesh create /nodes/'"${DEST_NODE}"'/qemu/'"${VMID}"'/agent/exec --output-format json --command cmd.exe --command /c --command "ipconfig /release \& ipconfig /renew"' 2>&1)" || true
+        agent_pid="$(echo "$exec_out" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+        if [[ -n "$agent_pid" && "$agent_pid" -gt 0 ]]; then
+          _ok "Guest agent exec started (PID ${agent_pid}); waiting for network reset to complete..."
+          local agent_exit_elapsed=0 agent_exit_timeout=120
+          while (( agent_exit_elapsed < agent_exit_timeout )); do
+            local status_out
+            status_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${agent_pid}' 2>/dev/null" || true)"
+            if echo "$status_out" | grep -qE '"exited"\s*:\s*1'; then
+              _ok "Windows network reset (ipconfig release/renew) completed."
+              break 2
+            fi
+            sleep 5
+            (( agent_exit_elapsed += 5 )) || true
+          done
+          break
+        fi
+        if echo "$exec_out" | grep -qi "guest agent is not running"; then
+          (( agent_attempt++ )) || true
+          _info "Guest agent not ready (attempt ${agent_attempt}); retrying in ${agent_poll_interval}s..."
+          sleep "$agent_poll_interval"
+        else
+          _info "Guest exec failed or not available: ${exec_out:0:200}; skipping network reset."
+          break
+        fi
+      done
+      if [[ -z "${agent_pid}" || "${agent_pid:-0}" -le 0 ]]; then
+        _info "Could not run guest agent network reset within ${agent_poll_max}s; continuing (sync-dnat will still run)."
+      else
+        _info "Polling for IPv6 change (check every ${ipv6_poll_interval}s, max ${ipv6_poll_max}s)..."
+        ipv6_elapsed=0
+        while (( ipv6_elapsed < ipv6_poll_max )); do
+          new_ipv6="$(_get_vm_ipv6_dest)"
+          if [[ -n "$new_ipv6" && "$new_ipv6" != "$old_ipv6" ]]; then
+            _ok "IPv6 changed: ${old_ipv6} -> ${new_ipv6}"
+            ipv6_changed=1
+            break
+          fi
+          sleep "$ipv6_poll_interval"
+          (( ipv6_elapsed += ipv6_poll_interval )) || true
+        done
+        if [[ "$ipv6_changed" -eq 0 ]]; then
+          _info "IPv6 unchanged after ${ipv6_poll_max}s (old=${old_ipv6} new=${new_ipv6:-<empty>}); proceeding."
+        fi
+        _info "Waiting 5s for network to settle..."
+        sleep 5
+      fi
+    else
+      _info "VM ostype is '${ostype}' (not Windows); skipping guest agent network reset."
+    fi
+
     local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
     if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
       _info "Running sync-dnat.py post-start on destination..."
@@ -235,6 +360,12 @@ pve_zfs_migrate_vm() {
       _ok "sync-dnat post-start done."
     else
       _info "sync-dnat.py not found on destination; skipping post-start."
+    fi
+    _info "Verifying connectivity with netcat (sqx.neuravps.com:$((BASE_PORT + VMID)))..."
+    if _run_connectivity_checks; then
+      _ok "Netcat connectivity verification passed."
+    else
+      _info "Netcat connectivity check failed; migration may still be OK (Firestore/NAT may need time to propagate)."
     fi
   else
     _info "VM ${VMID} is not running on destination (status: ${DEST_STATUS:-unknown}); skipping sync-dnat post-start."
@@ -281,7 +412,7 @@ pve_zfs_migrate_vm() {
 #     bash migrate_vm.sh 1008 root@10.64.0.7
 #   With options:
 #     bash migrate_vm.sh 1008 root@10.64.0.7 --dest-node=0000007-AX162-R --target-storage=local-zfs
-#   One-liner (curl):
-#     curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh | bash -s -- 1008 root@10.64.0.7
+#   One-liner (curl; add ?t=$(date +%s) to avoid CDN cache):
+#     curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?t=$(date +%s)" | bash -s -- 1008 root@10.64.0.7
 #
 pve_zfs_migrate_vm "$@"
