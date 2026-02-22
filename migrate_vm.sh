@@ -418,6 +418,8 @@ if not printed:
     else
       _info "sync-dnat.py not found on destination; skipping post-start."
     fi
+    _info "Waiting 5s for NAT/routing to propagate before connectivity check..."
+    sleep 5
     _info "Verifying connectivity with netcat (sqx.neuravps.com:$((BASE_PORT + VMID)))..."
     if _run_connectivity_checks; then
       _ok "Netcat connectivity verification passed."
