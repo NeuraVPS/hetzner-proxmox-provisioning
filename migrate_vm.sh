@@ -95,8 +95,10 @@ pve_zfs_migrate_vm() {
 import json, os, ipaddress
 raw = os.environ.get("JSON_INPUT", "")
 if not raw: raise SystemExit(0)
-try: interfaces = json.loads(raw)
+try: data = json.loads(raw)
 except: raise SystemExit(0)
+# pvesh returns {"result": [...]}; qm guest cmd returns [...]
+interfaces = data.get("result", data) if isinstance(data, dict) else data
 if not isinstance(interfaces, list): raise SystemExit(0)
 for iface in interfaces:
   if not isinstance(iface, dict): continue
@@ -214,11 +216,13 @@ for iface in interfaces:
     SOURCE_CONNECTION_URL="${SOURCE_PUBLIC_IP}:$((BASE_PORT + VMID))"
   fi
 
-  # 1) apt-get update && apt-get -y upgrade on source and destination
+  # 1) apt-get update && apt-get -y upgrade, and install netcat-openbsd on source and destination
   _info "Running apt-get update && apt-get -y upgrade on source..."
   apt-get update -qq && apt-get -y upgrade -qq || _info "apt upgrade on source had issues; continuing."
+  apt-get install -y -qq netcat-openbsd 2>/dev/null || _info "netcat-openbsd install on source had issues; continuing."
   _info "Running apt-get update && apt-get -y upgrade on destination..."
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "apt-get update -qq && apt-get -y upgrade -qq" || _info "apt upgrade on dest had issues; continuing."
+  ssh "${SSH_OPTS[@]}" "$DEST_SSH" "apt-get install -y -qq netcat-openbsd" || _info "netcat-openbsd install on dest had issues; continuing."
 
   # 2) Firestore: maintenance=true, nodeId=DEST_NODE
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
@@ -302,7 +306,7 @@ for iface in interfaces:
       _info "Polling for guest agent (retry every ${agent_poll_interval}s, max ${agent_poll_max}s)..."
       while (( agent_attempt * agent_poll_interval < agent_poll_max )); do
         local exec_out
-        exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'pvesh create /nodes/'"${DEST_NODE}"'/qemu/'"${VMID}"'/agent/exec --output-format json --command cmd.exe --command /c --command "ipconfig /release \& ipconfig /renew"' 2>&1)" || true
+        exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'pvesh create /nodes/'"${DEST_NODE}"'/qemu/'"${VMID}"'/agent/exec --output-format json --command powershell.exe --command -NoProfile --command -NonInteractive --command -Command --command "ipconfig /release; Disable-NetAdapter -Name Ethernet -Confirm:\$false; Start-Sleep -Seconds 3; Enable-NetAdapter -Name Ethernet -Confirm:\$false; ipconfig /renew"' 2>&1)" || true
         agent_pid="$(echo "$exec_out" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
         if [[ -n "$agent_pid" && "$agent_pid" -gt 0 ]]; then
           _ok "Guest agent exec started (PID ${agent_pid}); waiting for network reset to complete..."
@@ -311,7 +315,28 @@ for iface in interfaces:
             local status_out
             status_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${agent_pid}' 2>/dev/null" || true)"
             if echo "$status_out" | grep -qE '"exited"\s*:\s*1'; then
-              _ok "Windows network reset (ipconfig release/renew) completed."
+              _ok "Windows network reset (adapter disable/enable) completed."
+              _info "Command output:"
+              echo "$status_out" | python3 -c '
+import json,sys,base64
+raw=json.load(sys.stdin)
+d=raw.get("data",raw.get("result",raw)) if isinstance(raw,dict) else {}
+if not isinstance(d,dict): d={}
+printed=0
+for k in ("out-data","err-data"):
+  v=d.get(k)
+  if v:
+    try: text=base64.b64decode(v).decode("utf-8","replace")
+    except: text=str(v)
+    label="stdout" if k=="out-data" else "stderr"
+    print("---", label, "---")
+    print(text)
+    print()
+    printed+=1
+if not printed:
+  print("(no out-data/err-data in response; raw keys:", list(d.keys()) if isinstance(d,dict) else "?")
+  print("Full response:", json.dumps(raw)[:500])
+' || true
               break 2
             fi
             sleep 5
