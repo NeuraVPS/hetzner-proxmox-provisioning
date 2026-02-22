@@ -4,14 +4,14 @@
 # The launcher re-applies HKCU associations 5s after opening a file so MetaTrader cannot keep overrides.
 
 param(
-    [string]$LauncherPath = "C:\MetaTrader\MetaTrader 5 - 001\mt5_open.vbs",
+    [string]$LauncherPath = "C:\MetaTrader\mt5_open.vbs",
     [string]$IconBase = "C:\MetaTrader\MetaTrader 5 - 001"
 )
 
 $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path -LiteralPath $LauncherPath)) {
-    Write-Error "Launcher not found: $LauncherPath. Copy scripts/mt5_open.vbs to C:\MetaTrader\MetaTrader 5 - 001\mt5_open.vbs first."
+    Write-Error "Launcher not found: $LauncherPath. Copy scripts/mt5_open.vbs to C:\MetaTrader\mt5_open.vbs first."
     exit 1
 }
 
