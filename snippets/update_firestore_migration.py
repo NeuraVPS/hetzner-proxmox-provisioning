@@ -66,6 +66,35 @@ def update_server_maintenance(vmid: int, maintenance: bool) -> bool:
         return False
 
 
+def update_server_migration_prep(vmid: int, node_id: str) -> bool:
+    """
+    Update servers collection: find document by proxmoxId, set maintenance=True and nodeId.
+    Used before migration starts (connectionUrl stays unchanged until migration completes).
+    Returns True on success, False otherwise.
+    """
+    if not initialize_firebase():
+        return False
+    try:
+        db = firestore.client()
+        servers_ref = db.collection("servers")
+        if FIELD_FILTER_AVAILABLE:
+            query = servers_ref.where(filter=FieldFilter("proxmoxId", "==", vmid))
+        else:
+            query = servers_ref.where("proxmoxId", "==", vmid)
+        docs = list(query.stream())
+        if not docs:
+            return False
+        for doc_snapshot in docs:
+            server_doc_ref = db.collection("servers").document(doc_snapshot.id)
+            server_doc_ref.update({
+                "maintenance": True,
+                "nodeId": node_id,
+            })
+        return True
+    except Exception:
+        return False
+
+
 def update_server_migration(vmid: int, connection_url: str, node_id: str) -> bool:
     """
     Update servers collection: find document by proxmoxId, set connectionUrl, nodeId, and maintenance=False.
@@ -99,10 +128,18 @@ def main():
     parser = argparse.ArgumentParser(description="Update Firestore server for migration (connectionUrl, nodeId, maintenance)")
     parser.add_argument("--set-maintenance", choices=("true", "false"), metavar="BOOL",
                         help="Only set maintenance field (requires only vmid)")
+    parser.add_argument("--set-migration-prep", metavar="NODE_ID",
+                        help="Set maintenance=True and nodeId (requires only vmid). Used before migration.")
     parser.add_argument("vmid", type=int, help="Proxmox VM ID (proxmoxId)")
     parser.add_argument("connection_url", nargs="?", default="", help="connectionUrl (e.g. 157.180.15.173:20411)")
     parser.add_argument("node_id", nargs="?", default="", help="Destination node hostname (nodeId)")
     args = parser.parse_args()
+
+    if args.set_migration_prep is not None:
+        if not update_server_migration_prep(args.vmid, args.set_migration_prep):
+            sys.stderr.write("update_firestore_migration: set migration prep failed\n")
+            sys.exit(1)
+        sys.exit(0)
 
     if args.set_maintenance is not None:
         maintenance = args.set_maintenance == "true"
