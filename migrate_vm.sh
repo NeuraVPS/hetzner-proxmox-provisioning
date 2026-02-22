@@ -377,21 +377,6 @@ if not printed:
     else
       _info "VM ostype is '${ostype}' (not Windows); skipping guest agent network reset."
     fi
-
-    local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
-    if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
-      _info "Running sync-dnat.py post-start on destination..."
-      ssh "${SSH_OPTS[@]}" "$DEST_SSH" "'${SYNC_DNAT}' '${VMID}' post-start" 2>/dev/null || _info "sync-dnat.py post-start had issues; continuing."
-      _ok "sync-dnat post-start done."
-    else
-      _info "sync-dnat.py not found on destination; skipping post-start."
-    fi
-    _info "Verifying connectivity with netcat (sqx.neuravps.com:$((BASE_PORT + VMID)))..."
-    if _run_connectivity_checks; then
-      _ok "Netcat connectivity verification passed."
-    else
-      _info "Netcat connectivity check failed; migration may still be OK (Firestore/NAT may need time to propagate)."
-    fi
   else
     _info "VM ${VMID} is not running on destination (status: ${DEST_STATUS:-unknown}); skipping sync-dnat post-start."
   fi
@@ -420,6 +405,24 @@ if not printed:
         fi
         rm -f "$HELPER"
       fi
+    fi
+  fi
+
+  # Run sync-dnat after Firestore update (NAT must point to new host/IP)
+  if [[ "$DEST_STATUS" == "running" ]]; then
+    local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
+    if ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}'" 2>/dev/null; then
+      _info "Running sync-dnat.py post-start on destination..."
+      ssh "${SSH_OPTS[@]}" "$DEST_SSH" "'${SYNC_DNAT}' '${VMID}' post-start" 2>/dev/null || _info "sync-dnat.py post-start had issues; continuing."
+      _ok "sync-dnat post-start done."
+    else
+      _info "sync-dnat.py not found on destination; skipping post-start."
+    fi
+    _info "Verifying connectivity with netcat (sqx.neuravps.com:$((BASE_PORT + VMID)))..."
+    if _run_connectivity_checks; then
+      _ok "Netcat connectivity verification passed."
+    else
+      _info "Netcat connectivity check failed; migration may still be OK (Firestore/NAT may need time to propagate)."
     fi
   fi
 
