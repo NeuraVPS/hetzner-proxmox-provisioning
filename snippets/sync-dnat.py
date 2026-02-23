@@ -487,13 +487,16 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
     else:
         ok = False
     try:
+        # Insert at position 1 so our rules are evaluated before PVEFW-FORWARD (Proxmox firewall),
+        # which would otherwise drop IPv6 forwarded traffic before we can ACCEPT it.
+        # Insert -s first so -d ends up at 1 (incoming to VM is checked first).
         subprocess.run(
-            ["ip6tables", "-A", "FORWARD", "-p", "tcp", "-d", vm_ipv6,
+            ["ip6tables", "-I", "FORWARD", "1", "-p", "tcp", "-s", vm_ipv6,
              "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"],
             capture_output=True, check=True
         )
         subprocess.run(
-            ["ip6tables", "-A", "FORWARD", "-p", "tcp", "-s", vm_ipv6,
+            ["ip6tables", "-I", "FORWARD", "1", "-p", "tcp", "-d", vm_ipv6,
              "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"],
             capture_output=True, check=True
         )
