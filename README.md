@@ -116,9 +116,9 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 Set-NetFirewallRule -DisplayName 'Uso compartido de archivos e impresoras (restrictivo) (SMB de entrada)' -Enabled True
 
 # Create Mis Servidores folder and Desktop symlink
-$targetFolder = 'C:\Mis Servidores';
+$targetFolder = 'C:\My Servers';
 $publicDesktop = 'C:\Users\Public\Desktop';
-$linkPath = "$publicDesktop\Mis Servidores";
+$linkPath = "$publicDesktop\My Servers";
 
 if (!(Test-Path $targetFolder)) { New-Item -ItemType Directory -Path $targetFolder -Force | Out-Null }
 
