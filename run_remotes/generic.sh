@@ -5,9 +5,9 @@
 ############################################################
 remote_task() {
   echo "== Running remote task =="
-  curl -sSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
-    "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py?t=$(date +%s)" \
-    -o /var/lib/svz/snippets/sync-dnat.py
+  mkdir -p /etc/sysctl.d
+  echo "vm.swappiness=10" > /etc/sysctl.d/99-proxmox-swap.conf
+  sysctl -p /etc/sysctl.d/99-proxmox-swap.conf 2>/dev/null
   echo "== Finished =="
 }
 ############################################################

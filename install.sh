@@ -118,10 +118,20 @@ for d in "${DISKS[@]}"; do
   wipefs -a "$d"
 done
 
-# Reserve 23 GB per disk for raw swap: limit ZFS to (min_disk_gb - 23) so first_boot can create swap partitions
-log "Computing ZFS hdsize (reserve 23 GB per disk for raw swap)"
+[ "${#DISKS[@]}" -ge 2 ] || die "At least 2 disks required for ZFS mirror"
+
+# Disks used for ZFS: when 3 disks, use only first two (third reserved for swap in first_boot)
+if [ "${#DISKS[@]}" -eq 3 ]; then
+  ZFS_DISKS=( "${DISKS[0]}" "${DISKS[1]}" )
+  log "Three disks detected: using first two for ZFS, third left for swap"
+else
+  ZFS_DISKS=( "${DISKS[@]}" )
+fi
+
+# Reserve 23 GB per disk for raw swap on ZFS disks (only when 2 disks; with 3 disks we use first two fully)
+log "Computing ZFS hdsize for disks: ${ZFS_DISKS[*]}"
 MIN_GB=""
-for d in "${DISKS[@]}"; do
+for d in "${ZFS_DISKS[@]}"; do
   bytes=$(blockdev --getsize64 "$d" 2>/dev/null || true)
   [ -n "$bytes" ] || continue
   gb=$((bytes / 1024 / 1024 / 1024))
@@ -129,7 +139,10 @@ for d in "${DISKS[@]}"; do
     MIN_GB=$gb
   fi
 done
-if [ -z "$MIN_GB" ] || [ "$MIN_GB" -lt 1 ]; then
+if [ "${#DISKS[@]}" -eq 3 ]; then
+  log "Three disks: no swap reserve on main disks (third disk will be used for swap in first_boot)"
+  ZFS_HDSIZE_LINE=""
+elif [ -z "$MIN_GB" ] || [ "$MIN_GB" -lt 1 ]; then
   log "WARNING: Could not get disk sizes, not setting zfs.hdsize (installer will use full disks)"
   ZFS_HDSIZE_LINE=""
 else
@@ -142,6 +155,10 @@ else
     ZFS_HDSIZE_LINE="zfs.hdsize = ${ZFS_HDSIZE}"
   fi
 fi
+
+# disk-list for answer file: first two disks by basename (works for vda/vdb, sda/sdb, nvme0n1/nvme1n1)
+DISK_LIST="[\"$(basename "${DISKS[0]}")\", \"$(basename "${DISKS[1]}")\"]"
+log "Using disk-list = ${DISK_LIST}"
 
 ### --- STEP 3: download Proxmox ISO --------------------------------
 
@@ -178,7 +195,7 @@ source = "from-dhcp"
 filesystem = "zfs"
 zfs.raid = "raid1"
 ${ZFS_HDSIZE_LINE}
-disk-list = ["vda", "vdb"]
+disk-list = ${DISK_LIST}
 
 [first-boot]
 source = "from-url"

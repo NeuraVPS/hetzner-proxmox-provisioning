@@ -246,6 +246,122 @@ else
   log "rpool not found or zpool not available, skipping raw swap setup"
 fi
 
+############################################
+# Third-disk swap (when 3 disks: third is dedicated NVMe for swap)
+############################################
+log "Checking for third empty disk to use as full-disk swap"
+if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>&1; then
+  # Build set of rpool parent disks (same logic as above)
+  rpool_parents=()
+  vdevs=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && vdevs+=("$line")
+  done < <(zpool status -P -L rpool 2>/dev/null | grep -oE '/dev/[^[:space:]]+' || true)
+  if [[ ${#vdevs[@]} -eq 0 ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && vdevs+=("/dev/$line")
+    done < <(zpool status rpool 2>/dev/null | grep -oE '\b(sd[a-z][0-9]+|vd[a-z][0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)\b' | sort -u || true)
+  fi
+  for dev in "${vdevs[@]}"; do
+    [[ -b "$dev" ]] || continue
+    canon=$(readlink -f "$dev" 2>/dev/null)
+    [[ -n "$canon" ]] && [[ -b "$canon" ]] && dev="$canon"
+    if [[ "$dev" =~ /nvme[0-9]+n[0-9]+p[0-9]+ ]]; then
+      parent="${dev%p*}"
+    else
+      parent="${dev%%[0-9]*}"
+    fi
+    [[ -b "$parent" ]] && rpool_parents+=("$parent")
+  done
+  # All block devices that are disks (exclude loop, etc.)
+  while IFS= read -r d; do
+    [[ -b "$d" ]] || continue
+    # Skip if this disk is an rpool parent
+    skip=
+    for p in "${rpool_parents[@]}"; do
+      [[ "$d" == "$p" ]] && skip=1 && break
+    done
+    [[ -n "$skip" ]] && continue
+    # Check if disk is empty: no partition table, or single partition that is swap (idempotent)
+    part_count=0
+    has_swap_part=
+    has_other_part=
+    if [[ "$(basename "$d")" == nvme* ]]; then
+      for part in "${d}"p*; do
+        [[ -b "$part" ]] || continue
+        part_count=$((part_count + 1))
+        fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || true)
+        if [[ "$fstype" == "swap" ]]; then
+          has_swap_part=$part
+        else
+          has_other_part=1
+        fi
+      done
+    else
+      for part in "${d}"[0-9]*; do
+        [[ -b "$part" ]] || continue
+        part_count=$((part_count + 1))
+        fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || true)
+        if [[ "$fstype" == "swap" ]]; then
+          has_swap_part=$part
+        else
+          has_other_part=1
+        fi
+      done
+    fi
+    if [[ -n "$has_other_part" ]]; then
+      continue
+    fi
+    if [[ -n "$has_swap_part" ]]; then
+      uuid=$(blkid -o value -s UUID "$has_swap_part" 2>/dev/null)
+      if [[ -n "$uuid" ]] && ! grep -q "UUID=$uuid" /etc/fstab 2>/dev/null; then
+        echo "UUID=$uuid none swap sw 0 0" >> /etc/fstab
+        log "Added existing third-disk swap $has_swap_part (UUID=$uuid) to fstab"
+      fi
+      swapon "$has_swap_part" 2>/dev/null || true
+      log "Third-disk swap already present on $d, enabled"
+      break
+    fi
+    if [[ "$part_count" -eq 0 ]]; then
+      apt-get install -y gdisk parted
+      log "Using empty third disk $d for full-disk swap"
+      sgdisk -n "1:0:0" -t "1:8200" "$d" || { log "WARNING: sgdisk failed on $d"; continue; }
+      partprobe "$d" 2>/dev/null || true
+      udevadm settle -t 5 2>/dev/null || true
+      if [[ "$(basename "$d")" == nvme* ]]; then
+        part_swap="${d}p1"
+      else
+        part_swap="${d}1"
+      fi
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [[ -b "$part_swap" ]] && break
+        sleep 1
+        partprobe "$d" 2>/dev/null || true
+        udevadm settle -t 2 2>/dev/null || true
+      done
+      [[ -b "$part_swap" ]] || { log "WARNING: Partition $part_swap not found after sgdisk"; continue; }
+      mkswap -f "$part_swap" || { log "WARNING: mkswap failed on $part_swap"; continue; }
+      uuid=$(blkid -o value -s UUID "$part_swap" 2>/dev/null)
+      if [[ -z "$uuid" ]]; then
+        echo "$part_swap none swap sw 0 0" >> /etc/fstab
+      else
+        grep -q "UUID=$uuid" /etc/fstab 2>/dev/null || echo "UUID=$uuid none swap sw 0 0" >> /etc/fstab
+      fi
+      swapon "$part_swap" || true
+      log "Third-disk swap enabled on $part_swap (UUID=${uuid:-N/A})"
+      break
+    fi
+  done < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+else
+  log "rpool not found, skipping third-disk swap check"
+fi
+
+# Prefer RAM over swap (use swap mainly when needed; good for Proxmox + balloon)
+log "Setting vm.swappiness=10 (prefer RAM, use swap when necessary)"
+mkdir -p /etc/sysctl.d
+echo "vm.swappiness=10" > /etc/sysctl.d/99-proxmox-swap.conf
+sysctl -p /etc/sysctl.d/99-proxmox-swap.conf 2>/dev/null || true
+
 # Server optimizations
 echo 34359738368 > /sys/module/zfs/parameters/zfs_arc_max
 echo "options zfs zfs_arc_max=34359738368" > /etc/modprobe.d/zfs.conf
