@@ -38,7 +38,7 @@ remote_task() {
 FUNC_CONTENT=$(declare -f remote_task)
 
 # Host range: same as other run_remotes scripts; adjust if your environment differs
-for ((i=2; i<=53; i++)); do
+for ((i=1; i<=53; i++)); do
   HEX=$(printf "%x" "$i")
   IP="fd00:4000::${HEX}"
 

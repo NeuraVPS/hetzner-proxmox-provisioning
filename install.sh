@@ -156,9 +156,10 @@ else
   fi
 fi
 
-# disk-list for answer file: first two disks by basename (works for vda/vdb, sda/sdb, nvme0n1/nvme1n1)
-DISK_LIST="[\"$(basename "${DISKS[0]}")\", \"$(basename "${DISKS[1]}")\"]"
-log "Using disk-list = ${DISK_LIST}"
+# disk-list for answer file: use vda,vdb because the installer runs inside QEMU (Step 5) where
+# the first two -drive arguments appear as /dev/vda and /dev/vdb in the guest.
+DISK_LIST='["vda", "vdb"]'
+log "Using disk-list = ${DISK_LIST} (guest devices inside QEMU)"
 
 ### --- STEP 3: download Proxmox ISO --------------------------------
 
