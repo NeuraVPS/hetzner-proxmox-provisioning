@@ -138,6 +138,26 @@ def run(cmd, check=True):
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
     return result.stdout.strip()
 
+
+def run_ip6tables(cmd, check=True, max_retries=3):
+    """Run an ip6tables command with retries on non-zero exit (e.g. exit 4 = resource/lock).
+    Returns subprocess.CompletedProcess. On final failure when check=True, raises CalledProcessError.
+    """
+    last_result = None
+    for attempt in range(max_retries):
+        last_result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if last_result.returncode == 0:
+            return last_result
+        if check and attempt < max_retries - 1:
+            time.sleep(0.3)
+            continue
+        if check:
+            raise subprocess.CalledProcessError(
+                last_result.returncode, cmd, last_result.stdout, last_result.stderr
+            )
+        return last_result
+    return last_result
+
 def normalize_rule(rule: str) -> str:
     """Normalize rule text for reliable comparison (ignore order, masks, -m tcp)."""
     rule = re.sub(r"/32", "", rule)  # remove explicit /32 masks
@@ -418,7 +438,8 @@ def _jool_bib_remove(base_ip, base_port, protocol="--tcp"):
 def _delete_rule_by_comment_ip6(comment):
     """Delete ip6tables FORWARD rules that have this comment. Deletes by line number high-to-low."""
     try:
-        output = run(["ip6tables", "-L", "FORWARD", "-n", "-v", "--line-numbers"])
+        result = run_ip6tables(["ip6tables", "-L", "FORWARD", "-n", "-v", "--line-numbers"])
+        output = result.stdout or ""
         line_nums = []
         for line in output.splitlines():
             if comment in line:
@@ -426,14 +447,17 @@ def _delete_rule_by_comment_ip6(comment):
                 if parts and parts[0].isdigit():
                     line_nums.append(int(parts[0]))
         for num in sorted(line_nums, reverse=True):
-            subprocess.run(["ip6tables", "-D", "FORWARD", str(num)], capture_output=True, check=False)
+            run_ip6tables(["ip6tables", "-D", "FORWARD", str(num)], check=False)
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"ip6tables delete by comment failed: {e} (stderr: {e.stderr})")
     except Exception as e:
         logger.warning(f"ip6tables delete by comment failed: {e}")
 
 def _delete_nat6_prerouting_by_comment(comment):
     """Delete ip6tables nat PREROUTING rules that have this comment. Deletes by line number high-to-low."""
     try:
-        output = run(["ip6tables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"])
+        result = run_ip6tables(["ip6tables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"])
+        output = result.stdout or ""
         line_nums = []
         for line in output.splitlines():
             if comment in line:
@@ -441,17 +465,20 @@ def _delete_nat6_prerouting_by_comment(comment):
                 if parts and parts[0].isdigit():
                     line_nums.append(int(parts[0]))
         for num in sorted(line_nums, reverse=True):
-            subprocess.run(
+            run_ip6tables(
                 ["ip6tables", "-t", "nat", "-D", "PREROUTING", str(num)],
-                capture_output=True, check=False
+                check=False
             )
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"ip6tables nat PREROUTING delete by comment failed: {e} (stderr: {e.stderr})")
     except Exception as e:
         logger.warning(f"ip6tables nat PREROUTING delete by comment failed: {e}")
 
 def _delete_nat6_postrouting_by_comment(comment):
     """Delete ip6tables nat POSTROUTING rules that have this comment. Deletes by line number high-to-low."""
     try:
-        output = run(["ip6tables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v", "--line-numbers"])
+        result = run_ip6tables(["ip6tables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v", "--line-numbers"])
+        output = result.stdout or ""
         line_nums = []
         for line in output.splitlines():
             if comment in line:
@@ -459,10 +486,12 @@ def _delete_nat6_postrouting_by_comment(comment):
                 if parts and parts[0].isdigit():
                     line_nums.append(int(parts[0]))
         for num in sorted(line_nums, reverse=True):
-            subprocess.run(
+            run_ip6tables(
                 ["ip6tables", "-t", "nat", "-D", "POSTROUTING", str(num)],
-                capture_output=True, check=False
+                check=False
             )
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"ip6tables nat POSTROUTING delete by comment failed: {e} (stderr: {e.stderr})")
     except Exception as e:
         logger.warning(f"ip6tables nat POSTROUTING delete by comment failed: {e}")
 
@@ -490,19 +519,17 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
         # Insert at position 1 so our rules are evaluated before PVEFW-FORWARD (Proxmox firewall),
         # which would otherwise drop IPv6 forwarded traffic before we can ACCEPT it.
         # Insert -s first so -d ends up at 1 (incoming to VM is checked first).
-        subprocess.run(
+        run_ip6tables(
             ["ip6tables", "-I", "FORWARD", "1", "-p", "tcp", "-s", vm_ipv6,
-             "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"],
-            capture_output=True, check=True
+             "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"]
         )
-        subprocess.run(
+        run_ip6tables(
             ["ip6tables", "-I", "FORWARD", "1", "-p", "tcp", "-d", vm_ipv6,
-             "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"],
-            capture_output=True, check=True
+             "-m", "comment", "--comment", fwd_comment, "-j", "ACCEPT"]
         )
         logger.info(f"ADD: ip6tables FORWARD for {vm_ipv6} (vmid-{vmid})")
     except subprocess.CalledProcessError as e:
-        logger.warning(f"ip6tables FORWARD add failed: {e}")
+        logger.warning(f"ip6tables FORWARD add failed: {e} (stderr: {e.stderr})")
     if ostype.startswith("win"):
         if _jool_bib_add(vm_ipv6, 445, base_ip, samba_port):
             logger.info(f"ADD: jool bib {base_ip}#{samba_port} -> {vm_ipv6}#445 (vmid-{vmid})")
@@ -514,51 +541,47 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
     dnat_comment = f"nat64-dnat-vmid-{vmid}"
     if base_ipv6:
         try:
-            subprocess.run(
+            run_ip6tables(
                 ["ip6tables", "-t", "nat", "-A", "PREROUTING", "-d", base_ipv6,
                  "-p", "tcp", "--dport", str(rdp_port), "-j", "DNAT",
                  "--to-destination", f"[{vm_ipv6}]:{to_port_rdp}",
-                 "-m", "comment", "--comment", dnat_comment],
-                capture_output=True, check=True
+                 "-m", "comment", "--comment", dnat_comment]
             )
             logger.info(f"ADD: ip6tables DNAT {base_ipv6}#{rdp_port} -> [{vm_ipv6}]:{to_port_rdp} (vmid-{vmid})")
         except subprocess.CalledProcessError as e:
-            logger.warning(f"ip6tables DNAT RDP add failed: {e}")
+            logger.warning(f"ip6tables DNAT RDP add failed: {e} (stderr: {e.stderr})")
         if ostype.startswith("win"):
             try:
-                subprocess.run(
+                run_ip6tables(
                     ["ip6tables", "-t", "nat", "-A", "PREROUTING", "-d", base_ipv6,
                      "-p", "tcp", "--dport", str(samba_port), "-j", "DNAT",
                      "--to-destination", f"[{vm_ipv6}]:445",
-                     "-m", "comment", "--comment", dnat_comment],
-                    capture_output=True, check=True
+                     "-m", "comment", "--comment", dnat_comment]
                 )
                 logger.info(f"ADD: ip6tables DNAT {base_ipv6}#{samba_port} -> [{vm_ipv6}]:445 (vmid-{vmid})")
             except subprocess.CalledProcessError as e:
-                logger.warning(f"ip6tables DNAT Samba add failed: {e}")
+                logger.warning(f"ip6tables DNAT Samba add failed: {e} (stderr: {e.stderr})")
         # SNAT so VMs see source BASE only; VM firewall allows fd00:4000::1, not arbitrary IPv6
         snat_comment = f"nat64-snat-vmid-{vmid}"
         try:
-            subprocess.run(
+            run_ip6tables(
                 ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-p", "tcp", "-d", vm_ipv6,
                  "--dport", str(to_port_rdp), "-j", "SNAT", "--to-source", BASE_INTERNAL_IPV6,
-                 "-m", "comment", "--comment", snat_comment],
-                capture_output=True, check=True
+                 "-m", "comment", "--comment", snat_comment]
             )
             logger.info(f"ADD: ip6tables SNAT -> {BASE_INTERNAL_IPV6} for {vm_ipv6}:{to_port_rdp} (vmid-{vmid})")
         except subprocess.CalledProcessError as e:
-            logger.warning(f"ip6tables SNAT RDP add failed: {e}")
+            logger.warning(f"ip6tables SNAT RDP add failed: {e} (stderr: {e.stderr})")
         if ostype.startswith("win"):
             try:
-                subprocess.run(
+                run_ip6tables(
                     ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-p", "tcp", "-d", vm_ipv6,
                      "--dport", "445", "-j", "SNAT", "--to-source", BASE_INTERNAL_IPV6,
-                     "-m", "comment", "--comment", snat_comment],
-                    capture_output=True, check=True
+                     "-m", "comment", "--comment", snat_comment]
                 )
                 logger.info(f"ADD: ip6tables SNAT -> {BASE_INTERNAL_IPV6} for {vm_ipv6}:445 (vmid-{vmid})")
             except subprocess.CalledProcessError as e:
-                logger.warning(f"ip6tables SNAT Samba add failed: {e}")
+                logger.warning(f"ip6tables SNAT Samba add failed: {e} (stderr: {e.stderr})")
     else:
         logger.debug("BASE has no public IPv6, skipping IPv6 DNAT")
 
@@ -587,12 +610,15 @@ def _get_base_nat64_vmids():
     """Return set of VMIDs that have NAT64 rules on BASE (from ip6tables PREROUTING comments)."""
     vmids = set()
     try:
-        output = run(["ip6tables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"])
+        result = run_ip6tables(["ip6tables", "-t", "nat", "-L", "PREROUTING", "-n", "-v", "--line-numbers"])
+        output = result.stdout or ""
         for line in output.splitlines():
             # Comment format: /* nat64-dnat-vmid-996 */
             m = re.search(r"nat64-dnat-vmid-(\d+)", line)
             if m:
                 vmids.add(int(m.group(1)))
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Could not list BASE NAT64 VMIDs: {e} (stderr: {e.stderr})")
     except Exception as e:
         logger.warning(f"Could not list BASE NAT64 VMIDs: {e}")
     return vmids
@@ -665,6 +691,7 @@ def sync_base_restore_from_firestore():
             ostype = "win"  # Assume Windows (RDP 3389, Samba 445); change when Linux servers are needed
             if apply_base_create_nat64(node_id, vmid, ipv6, ostype):
                 count += 1
+            time.sleep(0.1)  # Reduce ip6tables lock contention between VMs
         logger.info(f"NAT64 restore from Firestore: applied BIB for {count} server(s)")
         return True
     except Exception as e:
