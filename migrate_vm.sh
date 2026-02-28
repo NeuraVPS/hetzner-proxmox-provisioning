@@ -2,8 +2,10 @@
 # Migrate a Proxmox VM to another node using native remote_migrate API.
 # Uses: apt upgrade, Firestore prep, hookscript detach, token creation, pvesh remote_migrate, sync-dnat, hookscript reattach, token cleanup.
 
+MIGRATE_SCRIPT_URL="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh"
+
 pve_zfs_migrate_vm() {
-  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]. Options: --dest-node, --update-firestore, --target-storage. Use --help for details."
+  local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]  (run on source node). Or: <vmid> <source_ssh> <dest_ssh> [options]  (SSH to source, then migrate). Use --help for details."
   [[ $# -ge 2 ]] || { echo "$USAGE" >&2; exit 1; }
 
   local VMID="$1"
@@ -19,7 +21,8 @@ pve_zfs_migrate_vm() {
       case "$1" in
         --help|-h)
           echo "pve_zfs_migrate_vm <vmid> <dest_ssh> [options]"
-          echo "  Required: vmid, dest_ssh (e.g. root@10.64.0.7 or root@[fd00:4000::7])"
+          echo "  When run on the source node: vmid, dest_ssh (e.g. root@10.64.0.7 or root@[fd00:4000::7])."
+          echo "  When run from an orchestrator: <vmid> <source_ssh> <dest_ssh> [options] — SSHs to source_ssh and runs migration from there."
           echo "  Options (defaults in parentheses):"
           echo "    --dest-node=<node>       Destination node name (auto-detect)"
           echo "    --update-firestore=<true|false>  Update Firestore (true)"
@@ -437,12 +440,26 @@ if not printed:
   _ok "Migration completed: VM ${VMID} -> ${DEST_SSH} (node ${DEST_NODE})"
 }
 
+# Wrapper: 3-arg form (vmid source_ssh dest_ssh) → SSH to source host and run migration there
+if [[ $# -ge 3 && "$3" != --* ]]; then
+  VMID="$1"
+  SOURCE_SSH="$2"
+  DEST_SSH="$3"
+  shift 3
+  SSH_OPTS=(-o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes)
+  curl -sSL "$MIGRATE_SCRIPT_URL" | ssh "${SSH_OPTS[@]}" "$SOURCE_SSH" bash -s -- "$VMID" "$DEST_SSH" "$@"
+  exit $?
+fi
+
 # Examples:
-#   Minimal:
+#   Run on current host (must be source node):
 #     bash migrate_vm.sh 1008 root@10.64.0.7
+#   Run from orchestrator: SSH to source, then migrate to dest (enables sequential multi-host migrations):
+#     bash migrate_vm.sh 1008 root@hostA root@hostB
+#     bash migrate_vm.sh 1009 root@hostB root@hostC
 #   With options:
 #     bash migrate_vm.sh 1008 root@10.64.0.7 --dest-node=0000007-AX162-R --target-storage=local-zfs
 #   One-liner (curl; add ?t=$(date +%s) to avoid CDN cache):
-#     curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?t=$(date +%s)" | bash -s -- 1008 root@10.64.0.7
+#     curl -sSL "${MIGRATE_SCRIPT_URL}?t=$(date +%s)" | bash -s -- 1008 root@10.64.0.7
 #
 pve_zfs_migrate_vm "$@"
