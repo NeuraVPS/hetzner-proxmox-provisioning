@@ -5,9 +5,8 @@
 ############################################################
 remote_task() {
   echo "== Running remote task =="
-  mkdir -p /etc/sysctl.d
-  echo "vm.swappiness=10" > /etc/sysctl.d/99-proxmox-swap.conf
-  sysctl -p /etc/sysctl.d/99-proxmox-swap.conf 2>/dev/null
+  curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py \
+    -o /var/lib/svz/snippets/sync-dnat.py
   echo "== Finished =="
 }
 ############################################################
@@ -15,7 +14,7 @@ remote_task() {
 # Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
-for ((i=1; i<=53; i++)); do
+for ((i=1; i<=75; i++)); do
     HEX=$(printf "%x" "$i")
     IP="fd00:4000::${HEX}"
 
