@@ -3,7 +3,6 @@ import subprocess
 import json
 import ipaddress
 import re
-import shlex
 import sys
 import time
 import logging
@@ -158,13 +157,6 @@ def run_ip6tables(cmd, check=True, max_retries=3):
         return last_result
     return last_result
 
-def normalize_rule(rule: str) -> str:
-    """Normalize rule text for reliable comparison (ignore order, masks, -m tcp)."""
-    rule = re.sub(r"/32", "", rule)  # remove explicit /32 masks
-    rule = rule.replace("-m tcp", "")  # remove redundant matcher
-    rule = re.sub(r"\s+", " ", rule.strip())  # normalize spaces
-    return rule
-
 # ---------------------------------------------------------------
 # BASE node detection and config
 # ---------------------------------------------------------------
@@ -194,13 +186,6 @@ def get_nodes_config():
 # ---------------------------------------------------------------
 # Proxmox and VM info
 # ---------------------------------------------------------------
-
-def get_default_wan_if():
-    route = run(["ip", "route", "show", "default"])
-    for line in route.splitlines():
-        parts = line.split()
-        if "dev" in parts:
-            return parts[parts.index("dev") + 1]
 
 def get_running_vms():
     result = run(["qm", "list"])
@@ -326,76 +311,8 @@ def wait_for_vm_ip(vmid, max_wait=600, initial_wait=1):
     return None
 
 # ---------------------------------------------------------------
-# iptables management
+# BASE: public IP, Jool BIB, ip6tables NAT64
 # ---------------------------------------------------------------
-
-def parse_iptables_rules(vmid_filter=None, base_mode=False):
-    """Return dict of tables with only our managed rules.
-
-    Args:
-        vmid_filter: Optional VM ID to filter rules. If provided, only rules
-                    with comments containing -vmid-{vmid_filter} will be included.
-                    If None, all managed rules are included.
-        base_mode: If True, only match rules with base-rdp-vmid- or base-samba-vmid-.
-    """
-    rules = {"nat": set(), "filter": set()}
-    current_table = None
-    for line in run(["iptables-save"]).splitlines():
-        if line.startswith("*"):
-            current_table = line[1:]
-        elif line.startswith("-A") and current_table in rules:
-            if base_mode:
-                match = "base-rdp-vmid-" in line or "base-samba-vmid-" in line
-            else:
-                match = "ssh-vmid-" in line or "rdp-vmid-" in line or "samba-vmid-" in line
-            if match:
-                if vmid_filter is not None and not base_mode:
-                    if f"-vmid-{vmid_filter}" not in line:
-                        continue
-                rules[current_table].add(normalize_rule(line))
-    return rules
-
-def build_expected_rules(vm_infos, wan_if):
-    """Build expected iptables rules.
-    
-    Args:
-        vm_infos: Dict mapping vmid to VM info (ip, ostype)
-        wan_if: WAN interface name
-    
-    Returns:
-        Tuple of (expected_nat, expected_filter) where:
-        - expected_nat: set of normalized NAT rule strings
-        - expected_filter: empty dict (no FORWARD rules needed - group rules handle it)
-    """
-    expected_nat = set()
-    expected_filter = {}  # Empty - Proxmox firewall group rules handle FORWARD filtering
-    
-    for vmid, info in vm_infos.items():
-        vm_ip = info["ip"]
-        
-        # SSH/RDP rule (20000+vmid -> 22/3389)
-        to_port = 3389 if info["ostype"].startswith("win") else 22
-        comment = f"{'rdp' if to_port == 3389 else 'ssh'}-vmid-{vmid}"
-        host_port = BASE_PORT_RDP + vmid
-
-        nat_rule = normalize_rule(
-            f"-A PREROUTING -i {wan_if} -p tcp --dport {host_port} "
-            f"-m comment --comment {comment} -j DNAT --to-destination {vm_ip}:{to_port}"
-        )
-        expected_nat.add(nat_rule)
-        
-        # Samba rule (10000+vmid -> 445) - only for Windows VMs
-        if info["ostype"].startswith("win"):
-            samba_comment = f"samba-vmid-{vmid}"
-            samba_host_port = BASE_PORT_SAMBA + vmid
-            samba_nat_rule = normalize_rule(
-                f"-A PREROUTING -i {wan_if} -p tcp --dport {samba_host_port} "
-                f"-m comment --comment {samba_comment} -j DNAT --to-destination {vm_ip}:445"
-            )
-            expected_nat.add(samba_nat_rule)
-    
-    return expected_nat, expected_filter
-
 def get_base_public_ip():
     """Return BASE's public IPv4 (for Jool BIB). Must run on BASE."""
     out = run(["ip", "-4", "route", "get", "8.8.8.8"])
@@ -698,54 +615,6 @@ def sync_base_restore_from_firestore():
         logger.warning(f"NAT64 restore from Firestore failed: {e}")
         return False
 
-
-def delete_rule_by_comment(comment, table):
-    """Delete all rules in the given table that have this comment."""
-    output = run(["iptables", "-t", table, "-S"])
-    for line in output.splitlines():
-        if f'--comment {comment}' in line:
-            args = shlex.split(line)
-            args[0] = "-D"
-            logger.info(f"DEL: {' '.join(args)}")
-            subprocess.run(["iptables", "-t", table] + args, check=False)
-
-def sync_iptables_rules(expected, actual, table):
-    """Sync iptables rules, adds missing ones, deletes obsolete ones.
-    
-    Args:
-        expected: For NAT table, a set of normalized rule strings.
-                 For FILTER table, an empty dict (no FORWARD rules needed).
-        actual: Set of normalized rule strings for the table
-        table: Table name ('nat' or 'filter')
-    """
-    if table == "filter" and isinstance(expected, dict):
-        # FORWARD rules: expected is always empty (group rules handle it)
-        # Delete any old FORWARD rules that shouldn't exist
-        if actual:
-            logger.info(f"Cleaning up {len(actual)} old FORWARD rules (no longer needed)")
-            for rule in sorted(actual):
-                m = re.search(r"--comment\s+(\S+)", rule)
-                if m:
-                    comment = m.group(1)
-                    delete_rule_by_comment(comment, table)
-    else:
-        # NAT rules
-        expected_set = expected if isinstance(expected, set) else set(expected.keys())
-        to_add = expected_set - actual
-        to_del = actual - expected_set
-
-        # delete obsolete rules by comment
-        for rule in sorted(to_del):
-            m = re.search(r"--comment\s+(\S+)", rule)
-            if m:
-                comment = m.group(1)
-                delete_rule_by_comment(comment, table)
-
-        # add missing rules
-        for rule in sorted(to_add):
-            logger.info(f"ADD: {rule}")
-            subprocess.run(["iptables", "-t", table] + shlex.split(rule), check=True)
-
 # ---------------------------------------------------------------
 # Firestore sync
 # ---------------------------------------------------------------
@@ -985,24 +854,11 @@ def main():
         
         logger.info(f"Hook triggered: VM {triggered_vmid}, phase {phase}")
     
-    # Handle post-stop hook: remove DNAT rules and update status
+    # Handle post-stop hook: update status only (node DNAT deprecated; NAT64 from BASE)
     if hook_mode and phase == "post-stop":
-        logger.info(f"Removing DNAT rules for VM {triggered_vmid}")
-        actual = parse_iptables_rules(vmid_filter=triggered_vmid)
-        # Delete all rules for this VM
-        for rule in sorted(actual["nat"]):
-            m = re.search(r"--comment\s+(\S+)", rule)
-            if m:
-                comment = m.group(1)
-                delete_rule_by_comment(comment, "nat")
-        # Update status to stopped
         update_status_in_firestore(triggered_vmid, "stopped")
         logger.info("Sync complete.")
         return
-    
-    # Get WAN interface (needed for building rules)
-    wan_if = get_default_wan_if()
-    logger.info(f"WAN interface: {wan_if}")
 
     vm_infos = {}
     vms_for_ipv6_sync = {}  # Track VMs for IPv6 sync (manual mode only)
@@ -1041,7 +897,7 @@ def main():
                 logger.info(f"VM {vmid} status changed from {firestore_status} to {actual_status}, updating Firestore")
                 update_status_in_firestore(vmid, actual_status)
             
-            # For running VMs: get VM info and prepare for IPv6 sync and DNAT rules
+            # For running VMs: get VM info and prepare for IPv6 sync
             if actual_status == "running":
                 try:
                     info = get_vm_info(vmid)
@@ -1057,20 +913,6 @@ def main():
                         logger.warning(f"VM {vmid} has no guest agent - skipping")
                     else:
                         raise
-            # For stopped VMs: DNAT rules will be automatically removed since they're not in vm_infos
-
-    # Build expected rules (only NAT rules - group rules handle FORWARD filtering)
-    expected_nat, expected_filter = build_expected_rules(vm_infos, wan_if)
-    
-    # Get actual rules (filtered for hook mode)
-    if hook_mode:
-        actual = parse_iptables_rules(vmid_filter=triggered_vmid)
-    else:
-        actual = parse_iptables_rules()
-
-    # Sync iptables rules (node-side NAT: NODE -> VM, kept for compatibility)
-    sync_iptables_rules(expected_nat, actual["nat"], "nat")
-    sync_iptables_rules(expected_filter, actual["filter"], "filter")
 
     # Sync IPv6 addresses to Firestore (only in manual mode, only for running VMs with IPv6)
     if not hook_mode and vms_for_ipv6_sync:
