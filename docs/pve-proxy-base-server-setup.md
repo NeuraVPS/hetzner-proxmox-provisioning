@@ -299,3 +299,164 @@ Or add to root's crontab (`crontab -e`):
 - **setHosts deletes other records:** The script is designed to get all hosts, add/remove only the ACME TXT, then set the full list. If you have many records and hit API limits, see Namecheap's docs on setHosts limits.
 
 There is no official Certbot plugin for Namecheap; this hook approach is the standard way. Alternatives include **acme-dns** (CNAME `_acme-challenge.pve` to an acme-dns server that handles the challenge) or other DNS challenge services.
+
+---
+
+## 8. PVE SSO (auth.pve.neuravps.com) – set-ticket endpoint
+
+Admins can open the PVE panel already authenticated from the NeuraVPS website. The flow uses a one-time token: the Cloud Function returns a redirect to `https://auth.pve.neuravps.com/set-ticket?token=XXX`. This section configures the **set-ticket** endpoint on the BASE server so that visiting that URL redeems the token (via a secret-authenticated call to the Cloud Function), sets the `PVEAuthCookie` cookie for `.pve.neuravps.com`, and redirects the browser to `https://NODEID.pve.neuravps.com/`.
+
+### 8.1 DNS and TLS
+
+- Add **auth.pve.neuravps.com** A/AAAA records pointing to the BASE server (or rely on the same wildcard that already covers `*.pve.neuravps.com`).
+- Use the **same wildcard certificate** as in section 3 (`/etc/letsencrypt/live/pve.neuravps.com/`) for `auth.pve.neuravps.com` (the name is covered by `*.pve.neuravps.com`).
+
+### 8.2 Set-ticket app (Python, stdlib only)
+
+The repo includes a small HTTP server that handles `GET /set-ticket?token=XXX`:
+
+- **Path:** [scripts/pve-set-ticket.py](../scripts/pve-set-ticket.py)
+- **Copy to server:** e.g. `/opt/pve-set-ticket/pve-set-ticket.py`
+- **Environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `PVE_REDEEM_SECRET` | Shared secret (must match the secret configured in the Cloud Function `redeem_pve_ticket_token`). |
+| `REDEEM_FUNCTION_URL` | Full URL of the redeem function, e.g. `https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token`. |
+| `HOST` | Optional; default `127.0.0.1`. |
+| `PORT` | Optional; default `5000`. |
+
+Run the app with systemd so it listens on `127.0.0.1:5000`. Step-by-step:
+
+#### 1. Create directory and copy the script
+
+On the BASE server:
+
+```bash
+sudo mkdir -p /opt/pve-set-ticket
+sudo cp /path/to/scripts/pve-set-ticket.py /opt/pve-set-ticket/pve-set-ticket.py
+sudo chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
+```
+
+(Replace `/path/to/` with the path to your clone of this repo, or copy the script contents manually.)
+
+#### 2. Create the environment file
+
+Create `/opt/pve-set-ticket/env` with the two required variables (one per line, no quotes unless the value contains spaces):
+
+```bash
+sudo tee /opt/pve-set-ticket/env << 'EOF'
+PVE_REDEEM_SECRET=your_secret_here
+REDEEM_FUNCTION_URL=https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token
+EOF
+```
+
+Replace `your_secret_here` with the same value you set for the Firebase secret `PVE_REDEEM_SECRET`. Then restrict access:
+
+```bash
+sudo chmod 600 /opt/pve-set-ticket/env
+```
+
+#### 3. Create the systemd unit file
+
+```bash
+sudo tee /etc/systemd/system/pve-set-ticket.service << 'EOF'
+[Unit]
+Description=PVE set-ticket endpoint (auth.pve.neuravps.com)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+EnvironmentFile=/opt/pve-set-ticket/env
+ExecStart=/usr/bin/python3 /opt/pve-set-ticket/pve-set-ticket.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+If Python 3 is not at `/usr/bin/python3`, use `which python3` to get the path and update `ExecStart`.
+
+#### 4. Reload systemd, enable and start the service
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pve-set-ticket
+sudo systemctl start pve-set-ticket
+sudo systemctl status pve-set-ticket
+```
+
+You should see `active (running)`. Check that it is listening on port 5000:
+
+```bash
+ss -tlnp | grep 5000
+# or: curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:5000/set-ticket?token=invalid"
+# (expect 302 redirect)
+```
+
+#### 5. Useful commands
+
+| Command | Purpose |
+|--------|--------|
+| `sudo systemctl status pve-set-ticket` | Check if the service is running |
+| `sudo systemctl restart pve-set-ticket` | Restart after changing the script or env |
+| `sudo journalctl -u pve-set-ticket -f` | Follow logs |
+| `sudo systemctl stop pve-set-ticket` | Stop the service |
+| `sudo systemctl disable pve-set-ticket` | Disable automatic start on boot |
+
+### 8.3 Nginx: server block for auth.pve.neuravps.com
+
+Add this **before** the wildcard `server { server_name *.pve.neuravps.com; ... }` block in `neuravps-redirects.conf` (so the specific host is used for `auth.pve.neuravps.com`):
+
+```nginx
+# PVE SSO: set-ticket app (redeem token, set cookie, redirect to PVE UI)
+server {
+    server_name auth.pve.neuravps.com;
+
+    location /set-ticket {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        return 404;
+    }
+
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    ssl_certificate /etc/letsencrypt/live/pve.neuravps.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pve.neuravps.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name auth.pve.neuravps.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+Reload nginx after adding the block.
+
+### 8.4 Why the cookie is not HttpOnly
+
+The PVE web UI’s client-side JavaScript checks for `PVEAuthCookie` (e.g. via `document.cookie`) and shows the login form if it is missing. If the cookie is set with `HttpOnly`, the browser still sends it to the server and API calls succeed, but the UI does not see it and keeps showing the login mask. So the set-ticket app sets the cookie **without** `HttpOnly` (see [Proxmox forum #89194](https://forum.proxmox.com/threads/pve-web-interface-not-recognizing-pveauthcookie.89194/)).
+
+### 8.5 Summary
+
+| What | Where |
+|------|------|
+| Set-ticket script | `scripts/pve-set-ticket.py` → deploy to e.g. `/opt/pve-set-ticket/` |
+| Redeem secret | Firebase/Google Cloud secret `PVE_REDEEM_SECRET`; same value in Cloud Function and in `/opt/pve-set-ticket/env` |
+| Redeem function URL | `REDEEM_FUNCTION_URL` in env (e.g. `https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token`) |
+| Nginx | Server block for `auth.pve.neuravps.com` proxying `/set-ticket` to the app |
