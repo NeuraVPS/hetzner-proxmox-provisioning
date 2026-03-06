@@ -35,7 +35,8 @@ REDEEM_URL = None
 
 
 def redeem_token(token):
-    """Call Cloud Function to redeem token. Returns (ticket, node_id) or (None, error_msg)."""
+    """Call Cloud Function to redeem token. Returns ((ticket, node_id, vmid), None) or (None, error_msg).
+    vmid is optional (None for admin flow); when set, redirect goes to noVNC console URL."""
     global REDEEM_SECRET, REDEEM_URL
     url = f"{REDEEM_URL}?token={urllib.parse.quote(token, safe='')}"
     req = urllib.request.Request(url, method="GET")
@@ -49,7 +50,8 @@ def redeem_token(token):
             node_id = data.get("nodeId")
             if not ticket or not node_id:
                 return None, "Invalid response"
-            return (ticket, node_id), None
+            vmid = data.get("vmid")  # optional: present for customer VNC console
+            return (ticket, node_id, vmid), None
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode()
@@ -76,7 +78,7 @@ class SetTicketHandler(BaseHTTPRequestHandler):
         if err:
             self.send_redirect_error(err)
             return
-        ticket, node_id = result
+        ticket, node_id, vmid = result
         # Cookie for *.pve.neuravps.com; 2h to match PVE ticket TTL.
         # Do NOT use HttpOnly: the PVE web UI client-side JS checks document.cookie for
         # PVEAuthCookie and shows the login form if it is missing (Proxmox forum #89194).
@@ -84,7 +86,14 @@ class SetTicketHandler(BaseHTTPRequestHandler):
             f"PVEAuthCookie={ticket}; Domain=.pve.neuravps.com; Path=/; "
             "Secure; SameSite=Lax; Max-Age=7200"
         )
-        location = f"https://{node_id}.pve.neuravps.com/"
+        if vmid is not None:
+            vmid_str = str(int(vmid)) if isinstance(vmid, (int, float)) else str(vmid)
+            location = (
+                f"https://{node_id}.pve.neuravps.com/"
+                f"?console=kvm&vmid={vmid_str}&node={node_id}&resize=scale&novnc=1"
+            )
+        else:
+            location = f"https://{node_id}.pve.neuravps.com/"
         self.send_response(302)
         self.send_header("Location", location)
         self.send_header("Set-Cookie", cookie_val)
