@@ -866,21 +866,20 @@ def main():
     # In hook mode, only process the triggered VM
     if hook_mode:
         if phase == "post-start":
-            # For post-start, wait for the triggered VM to get an IP
+            # Push status to running ASAP (VM is up from Proxmox's perspective)
+            update_status_in_firestore(triggered_vmid, "running")
+            # Then wait for the VM to get an IP via qemu-agent and sync when available
             logger.info(f"Waiting for triggered VM {triggered_vmid} to get IP...")
             try:
                 info = wait_for_vm_ip(triggered_vmid)
                 if info:
                     vm_infos[triggered_vmid] = info
-                    # Sync IPv6 first (before status update, as functions triggered by status change need the updated IP)
                     sync_ipv6_to_firestore({triggered_vmid: info})
-                    # Update status to running when VM receives an IP
-                    update_status_in_firestore(triggered_vmid, "running")
                 else:
-                    logger.warning(f"VM {triggered_vmid} did not get an IP, skipping")
+                    logger.warning(f"VM {triggered_vmid} did not get an IP yet, status already set to running")
             except Exception as e:
                 if "no guest agent" in str(e).lower():
-                    logger.error(f"VM {triggered_vmid} has no guest agent - exiting immediately")
+                    logger.error(f"VM {triggered_vmid} has no guest agent - status already set to running")
                     return
                 raise
     else:
