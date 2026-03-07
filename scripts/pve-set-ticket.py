@@ -2,7 +2,9 @@
 """
 PVE set-ticket endpoint: redeem one-time token and set PVEAuthCookie, then redirect to PVE UI.
 
-Run on BASE server; nginx proxies auth.pve.neuravps.com to this app (e.g. port 5000).
+Run on BASE server; nginx proxies *.pve.neuravps.com/set-ticket to this app (e.g. port 5000).
+Using the node domain (NODEID.pve.neuravps.com) ensures first-party cookies when loading
+VNC in an iframe, avoiding third-party cookie blocking in modern browsers.
 Environment variables:
   PVE_REDEEM_SECRET   - Shared secret for redeeming tokens (must match Cloud Function secret).
   REDEEM_FUNCTION_URL - Cloud Function URL, e.g. https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token
@@ -79,24 +81,29 @@ class SetTicketHandler(BaseHTTPRequestHandler):
             self.send_redirect_error(err)
             return
         ticket, node_id, vmid = result
-        # Cookie for *.pve.neuravps.com; 2h to match PVE ticket TTL.
-        # Do NOT use HttpOnly: the PVE web UI client-side JS checks document.cookie for
-        # PVEAuthCookie and shows the login form if it is missing (Proxmox forum #89194).
-        cookie_val = (
-            f"PVEAuthCookie={ticket}; Domain=.pve.neuravps.com; Path=/; "
-            "Secure; SameSite=Lax; Max-Age=7200"
-        )
         if vmid is not None:
             vmid_str = str(int(vmid)) if isinstance(vmid, (int, float)) else str(vmid)
             location = (
-                f"https://{node_id}.pve.neuravps.com/"
-                f"?console=kvm&vmid={vmid_str}&node={node_id}&resize=scale&novnc=1"
+                f"/?console=kvm&vmid={vmid_str}&node={node_id}&resize=scale&novnc=1"
             )
         else:
-            location = f"https://{node_id}.pve.neuravps.com/"
+            location = "/"
         self.send_response(302)
         self.send_header("Location", location)
-        self.send_header("Set-Cookie", cookie_val)
+        # Expire any existing PVEAuthCookie first (e.g. from auth.pve or previous session),
+        # otherwise the browser may send both and the API uses the old/stale ticket (401).
+        self.send_header(
+            "Set-Cookie",
+            "PVEAuthCookie=; Path=/; Domain=.pve.neuravps.com; Max-Age=0",
+        )
+        self.send_header("Set-Cookie", "PVEAuthCookie=; Path=/; Max-Age=0")
+        # Set new cookie scoped to request host only (no Domain).
+        # Do NOT use HttpOnly: the PVE web UI client-side JS checks document.cookie for
+        # PVEAuthCookie and shows the login form if it is missing (Proxmox forum #89194).
+        self.send_header(
+            "Set-Cookie",
+            f"PVEAuthCookie={ticket}; Path=/; Secure; SameSite=Lax; Max-Age=7200",
+        )
         self.end_headers()
 
     def send_redirect_error(self, message):

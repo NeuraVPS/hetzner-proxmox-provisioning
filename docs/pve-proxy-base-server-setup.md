@@ -60,7 +60,7 @@ Use this as the full server block for the PVE proxy and redirects. Adjust `serve
 js_import /etc/nginx/njs/pve_proxy.js;
 js_set $pve_backend_from_host pve_proxy.backend_from_host;
 
-# Wildcard PVE: NODEID.pve.neuravps.com → proxy all traffic to that node (no path/cookie logic)
+# Wildcard PVE: NODEID.pve.neuravps.com → set-ticket to local app, everything else to node
 server {
     server_name *.pve.neuravps.com;
 
@@ -72,6 +72,19 @@ server {
 
     proxy_cookie_domain ~^(.+)$ $host;
     proxy_cookie_path / /;
+
+    # Set-ticket: redeem token, set PVEAuthCookie, redirect to PVE/noVNC (same origin → first-party cookies in iframe)
+    # Disable proxy_cookie_domain here so our expire/set headers are not rewritten; we need Domain=.pve.neuravps.com
+    # in the expire to clear old domain-scoped cookies, and no Domain on the new cookie (host-only).
+    location /set-ticket {
+        proxy_cookie_domain off;
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 
     location / {
         proxy_pass $pve_backend_from_host$request_uri;
@@ -302,16 +315,15 @@ There is no official Certbot plugin for Namecheap; this hook approach is the sta
 
 ---
 
-## 8. PVE SSO (auth.pve.neuravps.com) – set-ticket endpoint
+## 8. PVE SSO – set-ticket endpoint on node domain
 
-Admins can open the PVE panel already authenticated from the NeuraVPS website. The flow uses a one-time token: the Cloud Function returns a redirect to `https://auth.pve.neuravps.com/set-ticket?token=XXX`. This section configures the **set-ticket** endpoint on the BASE server so that visiting that URL redeems the token (via a secret-authenticated call to the Cloud Function), sets the `PVEAuthCookie` cookie for `.pve.neuravps.com`, and redirects the browser to `https://NODEID.pve.neuravps.com/`.
+Admins and customers can open the PVE panel / noVNC console authenticated from the NeuraVPS website. The Cloud Function returns a redirect to `https://NODEID.pve.neuravps.com/set-ticket?token=XXX`. Visiting that URL redeems the token (via a secret-authenticated call to the Cloud Function), sets the `PVEAuthCookie` cookie for `.pve.neuravps.com`, and redirects to `https://NODEID.pve.neuravps.com/` (or the noVNC console URL for customers).
 
-### 8.1 DNS and TLS
+Using the **node domain** (NODEID.pve.neuravps.com) for set-ticket ensures cookies are first-party when the VNC console loads in an iframe, avoiding third-party cookie blocking in modern browsers.
 
-- Add **auth.pve.neuravps.com** A/AAAA records pointing to the BASE server (or rely on the same wildcard that already covers `*.pve.neuravps.com`).
-- Use the **same wildcard certificate** as in section 3 (`/etc/letsencrypt/live/pve.neuravps.com/`) for `auth.pve.neuravps.com` (the name is covered by `*.pve.neuravps.com`).
+Nginx routes `*.pve.neuravps.com/set-ticket` to the set-ticket app (section 3). No separate `auth.pve.neuravps.com` host is required.
 
-### 8.2 Set-ticket app (Python, stdlib only)
+### 8.1 Set-ticket app (Python, stdlib only)
 
 The repo includes a small HTTP server that handles `GET /set-ticket?token=XXX`:
 
@@ -408,55 +420,19 @@ ss -tlnp | grep 5000
 | `sudo systemctl stop pve-set-ticket` | Stop the service |
 | `sudo systemctl disable pve-set-ticket` | Disable automatic start on boot |
 
-### 8.3 Nginx: server block for auth.pve.neuravps.com
+### 8.2 Nginx: location /set-ticket in wildcard block
 
-Add this **before** the wildcard `server { server_name *.pve.neuravps.com; ... }` block in `neuravps-redirects.conf` (so the specific host is used for `auth.pve.neuravps.com`):
+The `location /set-ticket` block is included in the wildcard `*.pve.neuravps.com` server block (section 3). It proxies to the set-ticket app at `127.0.0.1:5000`. No separate server block for `auth.pve.neuravps.com` is needed.
 
-```nginx
-# PVE SSO: set-ticket app (redeem token, set cookie, redirect to PVE UI)
-server {
-    server_name auth.pve.neuravps.com;
-
-    location /set-ticket {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location / {
-        return 404;
-    }
-
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    ssl_certificate /etc/letsencrypt/live/pve.neuravps.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/pve.neuravps.com/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-}
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name auth.pve.neuravps.com;
-    return 301 https://$host$request_uri;
-}
-```
-
-Reload nginx after adding the block.
-
-### 8.4 Why the cookie is not HttpOnly
+### 8.3 Why the cookie is not HttpOnly
 
 The PVE web UI’s client-side JavaScript checks for `PVEAuthCookie` (e.g. via `document.cookie`) and shows the login form if it is missing. If the cookie is set with `HttpOnly`, the browser still sends it to the server and API calls succeed, but the UI does not see it and keeps showing the login mask. So the set-ticket app sets the cookie **without** `HttpOnly` (see [Proxmox forum #89194](https://forum.proxmox.com/threads/pve-web-interface-not-recognizing-pveauthcookie.89194/)).
 
-### 8.5 Summary
+### 8.4 Summary
 
 | What | Where |
 |------|------|
 | Set-ticket script | `scripts/pve-set-ticket.py` → deploy to e.g. `/opt/pve-set-ticket/` |
 | Redeem secret | Firebase/Google Cloud secret `PVE_REDEEM_SECRET`; same value in Cloud Function and in `/opt/pve-set-ticket/env` |
 | Redeem function URL | `REDEEM_FUNCTION_URL` in env (e.g. `https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token`) |
-| Nginx | Server block for `auth.pve.neuravps.com` proxying `/set-ticket` to the app |
+| Nginx | `location /set-ticket` in the wildcard `*.pve.neuravps.com` server block, proxying to `http://127.0.0.1:5000` |
