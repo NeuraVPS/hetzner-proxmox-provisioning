@@ -196,14 +196,14 @@ VNC and console (noVNC, xtermjs) are used only via the wildcard host (`NODEID.pv
 
 The NeuraVPS console page (www.neuravps.com) embeds the noVNC iframe. To support “Send text to host” (paste text into the VNC session from a modal), the parent page uses `postMessage`; the noVNC page must run a small script that listens for messages and injects keystrokes into `noVNC_keyboardinput`. Because the iframe is cross-origin, that script cannot be added by the parent—it must be injected into the HTML served by the proxy.
 
-**Script source:** [../scripts/novnc-send-string-inject.js](../scripts/novnc-send-string-inject.js). It defines a message listener for `{ type: "noVNC_sendString", text }` from allowed origins (www.neuravps.com, neuravps.com, localhost) and types the string into the noVNC keyboard input element.
+**Script source:** [../scripts/novnc-send-string-inject.js](../scripts/novnc-send-string-inject.js). The script only exposes a single-event dispatch: it listens for `{ type: "noVNC_dispatchEvent", event }` (one keyboard event descriptor per message) and dispatches it on `noVNC_keyboardinput`. The parent (console page) builds the event list (text or key combo), implements the delay between events, and sends one postMessage per event. No regex or `$` in the injected code, so nginx is safe.
 
 **Nginx:** In the wildcard PVE server block, update `location /` to inject the script before `</body>` and to request an uncompressed response so `sub_filter` can run:
 
 - Add `proxy_set_header Accept-Encoding "";` so the backend returns uncompressed HTML.
 - Add `sub_filter '</body>' '<script>...minified script...</script></body>';` and `sub_filter_once on;`.
 
-Use the minified one-liner from the script file (remove comments and newlines). **Important:** in the regex inside the script, the dollar character must be written as `\x24` (JS hex escape) so the nginx config contains no `$` (nginx would otherwise report "invalid variable name"). Example `location /` block:
+Use the minified one-liner from the script file (remove comments and newlines). Example `location /` block:
 
 ```nginx
     location / {
@@ -219,7 +219,7 @@ Use the minified one-liner from the script file (remove comments and newlines). 
         proxy_set_header Accept-Encoding "";
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
-        sub_filter '</body>' '<script>(function(){"use strict";var DELAY_MS=15;var ALLOWED_ORIGINS=["https://www.neuravps.com"];function sendString(text){var el=document.getElementById("noVNC_keyboardinput");if(!el||typeof text!=="string")return;var i=0;text.split("").forEach(function(x){var t=i*DELAY_MS;i+=1;setTimeout(function(){var needsShift=/[A-Z!@#\x24%^&*()_+{}:\"<>?~|]/.test(x);var evt;if(needsShift){evt=new KeyboardEvent("keydown",{keyCode:16,key:"Shift",code:"ShiftLeft"});el.dispatchEvent(evt);evt=new KeyboardEvent("keydown",{key:x,shiftKey:true});el.dispatchEvent(evt);evt=new KeyboardEvent("keyup",{key:x,shiftKey:true});el.dispatchEvent(evt);evt=new KeyboardEvent("keyup",{keyCode:16,key:"Shift",code:"ShiftLeft"});el.dispatchEvent(evt);}else{evt=new KeyboardEvent("keydown",{key:x});el.dispatchEvent(evt);evt=new KeyboardEvent("keyup",{key:x});el.dispatchEvent(evt);}},t);});}window.addEventListener("message",function(event){if(ALLOWED_ORIGINS.indexOf(event.origin)===-1)return;var data=event.data;if(data&&data.type==="noVNC_sendString"&&typeof data.text==="string"){sendString(data.text);}});})();</script></body>';
+        sub_filter '</body>' '<script>(function(){"use strict";window.addEventListener("message",function(event){var data=event.data;if(!data||data.type!=="noVNC_dispatchEvent"||!data.event||typeof data.event!=="object")return;var e=data.event;if(e.type!=="keydown"&&e.type!=="keyup")return;var el=document.getElementById("noVNC_keyboardinput");if(!el)return;var opts={key:e.key,keyCode:e.keyCode};if(e.code!=null)opts.code=e.code;if(e.ctrlKey!=null)opts.ctrlKey=!!e.ctrlKey;if(e.altKey!=null)opts.altKey=!!e.altKey;if(e.shiftKey!=null)opts.shiftKey=!!e.shiftKey;if(e.metaKey!=null)opts.metaKey=!!e.metaKey;el.dispatchEvent(new KeyboardEvent(e.type,opts));});})();</script></body>';
         sub_filter_once on;
     }
 ```
