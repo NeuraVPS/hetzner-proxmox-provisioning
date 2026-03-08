@@ -402,16 +402,22 @@ fi
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
 echo "==> Configuring Proxmox firewall (datacenter baseline)"
 cat >/etc/pve/firewall/cluster.fw <<'EOF'
+root@0000001-BASE ~ # cat /etc/pve/firewall/cluster.fw 
 [OPTIONS]
 
-enable: 1
 policy_in: DROP
-policy_forward: DROP
+enable: 1
 policy_out: ACCEPT
+policy_forward: DROP
 
 [ALIASES]
 
 NAT-Gateway 10.0.0.1
+
+[IPSET base]
+
+2a01:4f9:3070:3984::2
+37.27.135.250
 
 [IPSET hetzner-internal]
 
@@ -420,12 +426,15 @@ fd00:4000::/108
 
 [IPSET hosts-ipv6]
 
+2a01:4f9:3070:3984::/64 # 0000001-BASE
+
 [IPSET nat64-clients]
 
 64:ff9b::/96
 
 [RULES]
 
+IN Web(ACCEPT) -dest +dc/base -log nolog
 GROUP management
 IN ACCEPT -source +dc/hetzner-internal -log nolog
 IN DHCPfwd(ACCEPT) -i vmbr0 -log nolog
@@ -437,23 +446,29 @@ IN SSH(ACCEPT) -log nolog
 
 [group vm-default]
 
-IN SSH(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN RDP(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
+IN SSH(ACCEPT) -source fd00:4000::1/128 -log nolog
 IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
-IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
-IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
-IN RDP(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN SSH(ACCEPT) -dest 0.0.0.0/0 -log nolog
 IN RDP(ACCEPT) -source fd00:4000::1/128 -log nolog
-IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
+IN RDP(ACCEPT) -dest 0.0.0.0/0 -log nolog
 IN SMB(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
+IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -dest +dc/hosts-ipv6 -log nolog
 
 [group vm-no-internet]
 
-IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
+IN SSH(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
 IN SSH(ACCEPT) -dest 0.0.0.0/0 -log nolog
+IN RDP(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
 IN RDP(ACCEPT) -dest 0.0.0.0/0 -log nolog
+IN SMB(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
+IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
+IN SMB(ACCEPT) -source +dc/hosts-ipv6 -dest +dc/hosts-ipv6 -log nolog
 IN DROP -log nolog
 OUT DROP -log nolog
 
