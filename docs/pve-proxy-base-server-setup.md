@@ -73,7 +73,7 @@ server {
     proxy_cookie_domain ~^(.+)$ $host;
     proxy_cookie_path / /;
 
-    # Set-ticket: redeem token, set PVEAuthCookie, redirect to PVE/noVNC (same origin → first-party cookies in iframe)
+    # Set-ticket: redeem token, set PVEAuthCookie, redirect to PVE/noVNC. Cookie uses SameSite=None; Partitioned so it works when the console is embedded in an iframe from another origin (e.g. localhost or www.neuravps.com).
     # Disable proxy_cookie_domain here so our expire/set headers are not rewritten; we need Domain=.pve.neuravps.com
     # in the expire to clear old domain-scoped cookies, and no Domain on the new cookie (host-only).
     location /set-ticket {
@@ -462,7 +462,11 @@ The `location /set-ticket` block is included in the wildcard `*.pve.neuravps.com
 
 The PVE web UI’s client-side JavaScript checks for `PVEAuthCookie` (e.g. via `document.cookie`) and shows the login form if it is missing. If the cookie is set with `HttpOnly`, the browser still sends it to the server and API calls succeed, but the UI does not see it and keeps showing the login mask. So the set-ticket app sets the cookie **without** `HttpOnly` (see [Proxmox forum #89194](https://forum.proxmox.com/threads/pve-web-interface-not-recognizing-pveauthcookie.89194/)).
 
-### 8.4 Summary
+### 8.4 Console in iframe (third-party cookies)
+
+The console is often embedded in an iframe (e.g. from `https://www.neuravps.com` or `http://localhost` during dev). The iframe is then **third-party** relative to the parent. Browsers may block or partition cookies set in that context. The set-ticket app sets `PVEAuthCookie` with **SameSite=None; Secure; Partitioned** so the cookie is stored and sent when set inside the iframe. If you still see **401 No ticket** on API calls from the noVNC page, try: testing from the production origin (`https://www.neuravps.com`), allowing third-party cookies for the dev site, or using a separate browser profile with relaxed cookie settings for local testing.
+
+### 8.5 Summary
 
 | What                | Where                                                                                                           |
 | ------------------- | --------------------------------------------------------------------------------------------------------------- |

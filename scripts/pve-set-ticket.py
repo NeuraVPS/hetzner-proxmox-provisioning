@@ -100,9 +100,12 @@ class SetTicketHandler(BaseHTTPRequestHandler):
         # Set new cookie scoped to request host only (no Domain).
         # Do NOT use HttpOnly: the PVE web UI client-side JS checks document.cookie for
         # PVEAuthCookie and shows the login form if it is missing (Proxmox forum #89194).
+        # SameSite=None; Secure so the cookie is stored when set inside a third-party iframe
+        # (e.g. console embedded from localhost or www.neuravps.com). Partitioned (CHIPS)
+        # so Chrome stores/sends it in the iframe context.
         self.send_header(
             "Set-Cookie",
-            f"PVEAuthCookie={ticket}; Path=/; Secure; SameSite=Lax; Max-Age=7200",
+            "PVEAuthCookie={}; Path=/; Secure; SameSite=None; Max-Age=7200; Partitioned".format(ticket),
         )
         self.end_headers()
 
