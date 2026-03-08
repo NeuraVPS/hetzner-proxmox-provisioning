@@ -502,6 +502,25 @@ chmod +x /var/lib/svz/snippets/sync-dnat.py
 # chmod +x /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
 # chmod +x /var/lib/svz/snippets/pve-post-boot-resume.sh
 
+# Systemd oneshot: at every boot, update lastNodeBootAt and sync VM statuses (all stopped after reboot)
+log "Installing node-boot-sync-dnat.service (runs sync-dnat.py node-boot after network is up)"
+cat > /etc/systemd/system/node-boot-sync-dnat.service <<'NODEBOOTEOF'
+[Unit]
+Description=Update lastNodeBootAt and sync VM status at boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/svz/snippets/sync-dnat.py node-boot
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+NODEBOOTEOF
+systemctl daemon-reload
+systemctl enable node-boot-sync-dnat.service
+
 sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
 get /etc/firebase-credentials.json /etc/firebase-credentials.json
 get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw

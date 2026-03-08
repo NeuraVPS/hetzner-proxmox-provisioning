@@ -8,6 +8,8 @@ Commands:
     sync-dnat.py <VMID> post-stop    — On VM stop: set status stopped in Firestore.
   Manual sync:
     sync-dnat.py                     — No args: sync all local VMs' status and IPv6 to Firestore (no BASE NAT64).
+  Node boot:
+    sync-dnat.py node-boot          — At node boot: set proxmox_nodes/<hostname>.lastNodeBootAt, then sync all VM statuses (and IPv6 for running VMs).
   update_base (BASE only):
     update_base create NODE_HOSTNAME VMID VM_IPV6 [OSTYPE]  — Add NAT64 BIB + ip6tables for one VM. OSTYPE defaults to "win".
     update_base delete NODE_HOSTNAME VMID                   — Remove NAT64 rules for one VM.
@@ -786,6 +788,21 @@ def update_status_in_firestore(vmid, status):
     except Exception as e:
         logger.warning(f"Failed to update status for VM {vmid} in Firestore: {e}")
 
+
+def update_proxmox_node_last_boot_at():
+    """Update proxmox_nodes/<hostname>.lastNodeBootAt to SERVER_TIMESTAMP. Document id = NODE_NAME (hostname). If doc does not exist, log and return."""
+    if not ensure_firebase_initialized():
+        logger.debug("Firebase not initialized, skipping lastNodeBootAt update")
+        return
+    try:
+        db = firestore.client()
+        doc_ref = db.collection("proxmox_nodes").document(NODE_NAME)
+        doc_ref.update({"lastNodeBootAt": firestore.SERVER_TIMESTAMP})
+        logger.info(f"Updated proxmox_nodes/{NODE_NAME} lastNodeBootAt")
+    except Exception as e:
+        logger.warning(f"Failed to update lastNodeBootAt for proxmox_nodes/{NODE_NAME}: {e}")
+
+
 # ---------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------
@@ -851,6 +868,12 @@ def main():
         handle_update_base()
         logger.info("Sync complete.")
         return
+
+    # Node boot: update lastNodeBootAt then run default (manual) sync
+    if len(sys.argv) >= 2 and sys.argv[1] == "node-boot":
+        logger.info("node-boot: updating lastNodeBootAt and syncing VM statuses")
+        update_proxmox_node_last_boot_at()
+        # Fall through to manual mode below (hook_mode remains False)
 
     if len(sys.argv) >= 3:
         triggered_vmid = int(sys.argv[1])
