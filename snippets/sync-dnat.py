@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+sync-dnat: Sync VM status and IPv6 to Firestore; on BASE, manage NAT64 (Jool BIB + ip6tables).
+
+Commands:
+  Hook (Proxmox):
+    sync-dnat.py <VMID> post-start  — On VM start: set status running, wait for IP, sync IPv6 to Firestore.
+    sync-dnat.py <VMID> post-stop    — On VM stop: set status stopped in Firestore.
+  Manual sync:
+    sync-dnat.py                     — No args: sync all local VMs' status and IPv6 to Firestore (no BASE NAT64).
+  update_base (BASE only):
+    update_base create NODE_HOSTNAME VMID VM_IPV6 [OSTYPE]  — Add NAT64 BIB + ip6tables for one VM. OSTYPE defaults to "win".
+    update_base delete NODE_HOSTNAME VMID                   — Remove NAT64 rules for one VM.
+    update_base restore                                     — Restore NAT64 to match Firestore: remove stale VMIDs, then add/update all.
+    update_base restore VMID                                 — Restore NAT64 rules for a single VM from Firestore.
+"""
 import subprocess
 import json
 import ipaddress
@@ -28,7 +43,6 @@ BRIDGE_NET = "10.0.0.0/16"
 BASE_PORT_RDP = 20000
 BASE_PORT_SAMBA = 10000
 BASE_INTERNAL_IPV6 = "fd00:4000::1"  # SNAT source for IPv6 DNAT so VMs only see BASE, not client IPv6
-NODES_CONF = Path("/etc/sync-dnat/nodes.conf")
 # Get hostname reliably - use subprocess.run to avoid capturing stderr
 try:
     result = subprocess.run(["hostname"], capture_output=True, text=True, check=True)
@@ -158,30 +172,12 @@ def run_ip6tables(cmd, check=True, max_retries=3):
     return last_result
 
 # ---------------------------------------------------------------
-# BASE node detection and config
+# BASE node detection
 # ---------------------------------------------------------------
 
 def is_base_node():
     """Return True when hostname contains 'BASE' (case-insensitive)."""
     return "BASE" in NODE_NAME.upper()
-
-def get_nodes_config():
-    """Read nodes.conf. Returns dict hostname -> public_ipv4, or None if missing/invalid."""
-    if not NODES_CONF.exists() or not NODES_CONF.is_file():
-        return None
-    nodes = {}
-    try:
-        for line in NODES_CONF.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split(None, 1)
-            if len(parts) >= 2:
-                nodes[parts[0]] = parts[1]
-    except Exception as e:
-        logger.warning(f"Failed to read {NODES_CONF}: {e}")
-        return None
-    return nodes
 
 # ---------------------------------------------------------------
 # Proxmox and VM info
@@ -541,46 +537,10 @@ def _get_base_nat64_vmids():
     return vmids
 
 
-def sync_base_wipe_nat64():
-    """Remove all NAT64 rules (Jool BIB + ip6tables) from BASE. Use before restore for a full cleanup."""
-    if not is_base_node():
-        logger.error("sync_base_wipe_nat64 must run on BASE")
-        return False
-    vmids = _get_base_nat64_vmids()
-    if not vmids:
-        logger.info("No NAT64 rules found on BASE")
-        return True
-    for vmid in sorted(vmids):
-        apply_base_delete_nat64("unknown", vmid)
-    logger.info(f"Wiped NAT64 rules for VMIDs: {sorted(vmids)}")
-    return True
-
-
-def sync_base_for_node(node_hostname):
-    """Sync BASE NAT64 BIB for one node. No-op: BIB is updated by node notifications on VM start/stop."""
-    if not is_base_node():
-        logger.error("sync_base_for_node must run on BASE")
-        return False
-    logger.info("NAT64: sync via node notification only (no-op)")
-    return True
-
-def sync_base_all():
-    """Sync all BASE forwarding rules for all nodes. Must run on BASE."""
-    if not is_base_node():
-        logger.error("sync_base_all must run on BASE")
-        return False
-    nodes = get_nodes_config()
-    if not nodes:
-        logger.error("nodes.conf missing or empty")
-        return False
-    for node_hostname in nodes:
-        sync_base_for_node(node_hostname)
-
-
 def sync_base_restore_from_firestore():
     """Repopulate BASE BIB and ip6tables from Firestore (for use after BASE reboot).
-    Queries all servers with ipv6 set and calls apply_base_create_nat64 for each.
-    Must run on BASE. Requires Firebase credentials.
+    Removes NAT64 rules for VMIDs no longer in Firestore, then adds/updates rules for all
+    servers with ipv6 set. Must run on BASE. Requires Firebase credentials.
     """
     if not is_base_node():
         logger.error("sync_base_restore_from_firestore must run on BASE")
@@ -591,7 +551,8 @@ def sync_base_restore_from_firestore():
     try:
         db = firestore.client()
         servers_ref = db.collection("servers")
-        count = 0
+        entries = []  # (node_id, vmid, ipv6, ostype)
+        firestore_vmids = set()
         for doc in servers_ref.stream():
             data = doc.to_dict() or {}
             ipv6 = (data.get("ipv6") or "").strip() or None
@@ -605,7 +566,20 @@ def sync_base_restore_from_firestore():
                 vmid = int(vmid_raw)
             except (TypeError, ValueError):
                 continue
-            ostype = "win"  # Assume Windows (RDP 3389, Samba 445); change when Linux servers are needed
+            ostype_raw = (data.get("ostype") or "win").strip() or "win"
+            ostype = ostype_raw if ostype_raw else "win"
+            entries.append((node_id, vmid, ipv6, ostype))
+            firestore_vmids.add(vmid)
+        # Remove NAT64 rules for VMIDs no longer in Firestore
+        current_vmids = _get_base_nat64_vmids()
+        stale_vmids = current_vmids - firestore_vmids
+        for vmid in sorted(stale_vmids):
+            apply_base_delete_nat64("unknown", vmid)
+        if stale_vmids:
+            logger.info(f"NAT64 restore: removed stale rules for VMID(s) {sorted(stale_vmids)}")
+        # Apply rules for each server in Firestore
+        count = 0
+        for node_id, vmid, ipv6, ostype in entries:
             if apply_base_create_nat64(node_id, vmid, ipv6, ostype):
                 count += 1
             time.sleep(0.1)  # Reduce ip6tables lock contention between VMs
@@ -613,6 +587,43 @@ def sync_base_restore_from_firestore():
         return True
     except Exception as e:
         logger.warning(f"NAT64 restore from Firestore failed: {e}")
+        return False
+
+
+def sync_base_restore_vmid_from_firestore(vmid):
+    """Restore NAT64 rules for a single VM from Firestore. Must run on BASE."""
+    if not is_base_node():
+        logger.error("sync_base_restore_vmid_from_firestore must run on BASE")
+        return False
+    if not ensure_firebase_initialized():
+        logger.error("Firebase not initialized; cannot restore from Firestore")
+        return False
+    try:
+        db = firestore.client()
+        servers_ref = db.collection("servers")
+        if FIELD_FILTER_AVAILABLE:
+            query = servers_ref.where(filter=FieldFilter("proxmoxId", "==", vmid))
+        else:
+            query = servers_ref.where("proxmoxId", "==", vmid)
+        docs = list(query.stream())
+        if not docs:
+            logger.warning(f"No Firestore server document found for VMID {vmid}")
+            return False
+        count = 0
+        for doc in docs:
+            data = doc.to_dict() or {}
+            ipv6 = (data.get("ipv6") or "").strip() or None
+            if not ipv6:
+                continue
+            node_id = data.get("nodeId") or "unknown"
+            ostype_raw = (data.get("ostype") or "win").strip() or "win"
+            ostype = ostype_raw if ostype_raw else "win"
+            if apply_base_create_nat64(node_id, vmid, ipv6, ostype):
+                count += 1
+        logger.info(f"NAT64 restore from Firestore for VMID {vmid}: applied for {count} document(s)")
+        return count > 0
+    except Exception as e:
+        logger.warning(f"NAT64 restore from Firestore for VMID {vmid} failed: {e}")
         return False
 
 # ---------------------------------------------------------------
@@ -788,7 +799,7 @@ def handle_update_base():
     if not is_base_node():
         logger.error("update_base must run on BASE node")
         return True
-    # update_base create NODE_HOSTNAME vmid VM_IPV6 OSTYPE
+    # update_base create NODE_HOSTNAME vmid VM_IPV6 [OSTYPE]
     if len(sys.argv) >= 6 and sys.argv[2] == "create":
         node_hostname = sys.argv[3]
         try:
@@ -797,7 +808,7 @@ def handle_update_base():
             logger.error(f"Invalid vmid: {sys.argv[4]}")
             return True
         vm_ipv6 = sys.argv[5]
-        ostype = sys.argv[6] if len(sys.argv) > 6 else "linux"
+        ostype = sys.argv[6] if len(sys.argv) > 6 else "win"
         apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype)
         return True
     # update_base delete NODE_HOSTNAME vmid
@@ -810,21 +821,20 @@ def handle_update_base():
             return True
         apply_base_delete_nat64(node_hostname, vmid)
         return True
+    # update_base restore VMID — restore one VM from Firestore
+    if len(sys.argv) == 4 and sys.argv[2] == "restore":
+        try:
+            vmid = int(sys.argv[3])
+        except ValueError:
+            logger.error(f"Invalid vmid: {sys.argv[3]}")
+            return True
+        sync_base_restore_vmid_from_firestore(vmid)
+        return True
     # update_base restore — repopulate BIB from Firestore (after BASE reboot)
     if len(sys.argv) == 3 and sys.argv[2] == "restore":
         sync_base_restore_from_firestore()
         return True
-    # update_base wipe — remove all NAT64 rules (then run restore for a full cleanup)
-    if len(sys.argv) == 3 and sys.argv[2] == "wipe":
-        sync_base_wipe_nat64()
-        return True
-    # update_base NODE_HOSTNAME (sync one node)
-    if len(sys.argv) >= 3:
-        node_hostname = sys.argv[2]
-        sync_base_for_node(node_hostname)
-        return True
-    # update_base (sync all nodes)
-    sync_base_all()
+    logger.error("update_base requires a subcommand: create, delete, or restore")
     return True
 
 def main():

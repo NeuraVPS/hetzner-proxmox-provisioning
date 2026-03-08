@@ -39,12 +39,12 @@ Create the directory if needed: `sudo mkdir -p /etc/nginx/njs`
 ```javascript
 // Backend from wildcard host (e.g. 000001-EX44.pve.neuravps.com) – reads pve_node_from_host
 function backend_from_host(r) {
-    var node = (r.variables.pve_node_from_host || '').toString().trim();
-    var match = node.match(/^([0-9]+)-/);
-    if (!match) return '';
-    var dec = parseInt(match[1], 10);
-    if (isNaN(dec)) return '';
-    return 'https://[fd00:4000::' + dec.toString(16) + ']:8006';
+  var node = (r.variables.pve_node_from_host || "").toString().trim();
+  var match = node.match(/^([0-9]+)-/);
+  if (!match) return "";
+  var dec = parseInt(match[1], 10);
+  if (isNaN(dec)) return "";
+  return "https://[fd00:4000::" + dec.toString(16) + "]:8006";
 }
 
 export default { backend_from_host };
@@ -167,7 +167,7 @@ server {
    Create or replace `/etc/nginx/sites-enabled/neuravps-redirects.conf` with the config from section 3.  
    The wildcard PVE server block needs a `resolver` for variable `proxy_pass`; the sqx/trading blocks do not.
 
-4. **Test and reload**  
+4. **Test and reload**
    ```bash
    sudo nginx -t && sudo systemctl reload nginx
    ```
@@ -176,13 +176,13 @@ server {
 
 ## 5. Quick reference
 
-| What | Where |
-|------|--------|
-| Map (`$pve_node_from_host`, `$connection_upgrade`) | `http {}` – e.g. `/etc/nginx/conf.d/pve-proxy-map.conf` |
-| NJS (`backend_from_host`) | `/etc/nginx/njs/pve_proxy.js` |
-| Site config | `/etc/nginx/sites-enabled/neuravps-redirects.conf` |
-| Wildcard cert (optional until you use *.pve) | `/etc/letsencrypt/live/pve.neuravps.com/` (see section 7) |
-| Resolver (if needed) | In each server block that uses `proxy_pass` with a variable or in `http {}` |
+| What                                               | Where                                                                       |
+| -------------------------------------------------- | --------------------------------------------------------------------------- |
+| Map (`$pve_node_from_host`, `$connection_upgrade`) | `http {}` – e.g. `/etc/nginx/conf.d/pve-proxy-map.conf`                     |
+| NJS (`backend_from_host`)                          | `/etc/nginx/njs/pve_proxy.js`                                               |
+| Site config                                        | `/etc/nginx/sites-enabled/neuravps-redirects.conf`                          |
+| Wildcard cert (optional until you use \*.pve)      | `/etc/letsencrypt/live/pve.neuravps.com/` (see section 7)                   |
+| Resolver (if needed)                               | In each server block that uses `proxy_pass` with a variable or in `http {}` |
 
 **Node → backend:** Host like `0000011-BASE` → decimal `11` → hex `b` → `https://[fd00:4000::b]:8006`.
 
@@ -192,9 +192,43 @@ server {
 
 VNC and console (noVNC, xtermjs) are used only via the wildcard host (`NODEID.pve.neuravps.com`). The wildcard server block forwards WebSocket with `Upgrade` / `Connection $connection_upgrade` and long timeouts so `wss://.../api2/json/nodes/.../vncwebsocket` works. If WebSocket fails (e.g. 1006), check the request has `Upgrade: websocket` and that the node/firewall allows the connection.
 
+### 6.1 noVNC send-text injection (paste to host)
+
+The NeuraVPS console page (www.neuravps.com) embeds the noVNC iframe. To support “Send text to host” (paste text into the VNC session from a modal), the parent page uses `postMessage`; the noVNC page must run a small script that listens for messages and injects keystrokes into `noVNC_keyboardinput`. Because the iframe is cross-origin, that script cannot be added by the parent—it must be injected into the HTML served by the proxy.
+
+**Script source:** [../scripts/novnc-send-string-inject.js](../scripts/novnc-send-string-inject.js). It defines a message listener for `{ type: "noVNC_sendString", text }` from allowed origins (www.neuravps.com, neuravps.com, localhost) and types the string into the noVNC keyboard input element.
+
+**Nginx:** In the wildcard PVE server block, update `location /` to inject the script before `</body>` and to request an uncompressed response so `sub_filter` can run:
+
+- Add `proxy_set_header Accept-Encoding "";` so the backend returns uncompressed HTML.
+- Add `sub_filter '</body>' '<script>...minified script...</script></body>';` and `sub_filter_once on;`.
+
+Use the minified one-liner from the script file (remove comments and newlines). **Important:** in the regex inside the script, the dollar character must be written as `\x24` (JS hex escape) so the nginx config contains no `$` (nginx would otherwise report "invalid variable name"). Example `location /` block:
+
+```nginx
+    location / {
+        proxy_pass $pve_backend_from_host$request_uri;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Accept-Encoding "";
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+        sub_filter '</body>' '<script>(function(){"use strict";var DELAY_MS=15;var ALLOWED_ORIGINS=["https://www.neuravps.com"];function sendString(text){var el=document.getElementById("noVNC_keyboardinput");if(!el||typeof text!=="string")return;var i=0;text.split("").forEach(function(x){var t=i*DELAY_MS;i+=1;setTimeout(function(){var needsShift=/[A-Z!@#\x24%^&*()_+{}:\"<>?~|]/.test(x);var evt;if(needsShift){evt=new KeyboardEvent("keydown",{keyCode:16,key:"Shift",code:"ShiftLeft"});el.dispatchEvent(evt);evt=new KeyboardEvent("keydown",{key:x,shiftKey:true});el.dispatchEvent(evt);evt=new KeyboardEvent("keyup",{key:x,shiftKey:true});el.dispatchEvent(evt);evt=new KeyboardEvent("keyup",{keyCode:16,key:"Shift",code:"ShiftLeft"});el.dispatchEvent(evt);}else{evt=new KeyboardEvent("keydown",{key:x});el.dispatchEvent(evt);evt=new KeyboardEvent("keyup",{key:x});el.dispatchEvent(evt);}},t);});}window.addEventListener("message",function(event){if(ALLOWED_ORIGINS.indexOf(event.origin)===-1)return;var data=event.data;if(data&&data.type==="noVNC_sendString"&&typeof data.text==="string"){sendString(data.text);}});})();</script></body>';
+        sub_filter_once on;
+    }
+```
+
+No extra headers (CORS, X-Frame-Options, CSP) are required for postMessage; the iframe already loads from the node domain.
+
 ---
 
-## 7. Wildcard subdomain (*.pve.neuravps.com) and Let’s Encrypt
+## 7. Wildcard subdomain (\*.pve.neuravps.com) and Let’s Encrypt
 
 The server block for `*.pve.neuravps.com` (section 3) proxies `NODEID.pve.neuravps.com` to the PVE node for that ID. It uses the map `$pve_node_from_host` (section 1) and the NJS function `backend_from_host` (section 2).
 
@@ -243,11 +277,11 @@ The repo includes a Python 3 script that uses only the standard library (`urllib
 
 The script reads these **environment variables** (set them in a small env file or export before running certbot):
 
-| Variable | Description |
-|----------|-------------|
-| `NAMECHEAP_API_USER` | API user (often your Namecheap username). |
-| `NAMECHEAP_API_KEY` | Your API key from the API Access page. |
-| `NAMECHEAP_USERNAME` | Namecheap account username. |
+| Variable              | Description                                               |
+| --------------------- | --------------------------------------------------------- |
+| `NAMECHEAP_API_USER`  | API user (often your Namecheap username).                 |
+| `NAMECHEAP_API_KEY`   | Your API key from the API Access page.                    |
+| `NAMECHEAP_USERNAME`  | Namecheap account username.                               |
 | `NAMECHEAP_CLIENT_IP` | Your BASE server's **public IPv4** (must be whitelisted). |
 
 **Behavior:**
@@ -331,12 +365,12 @@ The repo includes a small HTTP server that handles `GET /set-ticket?token=XXX`:
 - **Copy to server:** e.g. `/opt/pve-set-ticket/pve-set-ticket.py`
 - **Environment variables:**
 
-| Variable | Description |
-|----------|-------------|
-| `PVE_REDEEM_SECRET` | Shared secret (must match the secret configured in the Cloud Function `redeem_pve_ticket_token`). |
+| Variable              | Description                                                                                                       |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `PVE_REDEEM_SECRET`   | Shared secret (must match the secret configured in the Cloud Function `redeem_pve_ticket_token`).                 |
 | `REDEEM_FUNCTION_URL` | Full URL of the redeem function, e.g. `https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token`. |
-| `HOST` | Optional; default `127.0.0.1`. |
-| `PORT` | Optional; default `5000`. |
+| `HOST`                | Optional; default `127.0.0.1`.                                                                                    |
+| `PORT`                | Optional; default `5000`.                                                                                         |
 
 Run the app with systemd so it listens on `127.0.0.1:5000`. Step-by-step:
 
@@ -412,13 +446,13 @@ ss -tlnp | grep 5000
 
 #### 5. Useful commands
 
-| Command | Purpose |
-|--------|--------|
-| `sudo systemctl status pve-set-ticket` | Check if the service is running |
+| Command                                 | Purpose                                  |
+| --------------------------------------- | ---------------------------------------- |
+| `sudo systemctl status pve-set-ticket`  | Check if the service is running          |
 | `sudo systemctl restart pve-set-ticket` | Restart after changing the script or env |
-| `sudo journalctl -u pve-set-ticket -f` | Follow logs |
-| `sudo systemctl stop pve-set-ticket` | Stop the service |
-| `sudo systemctl disable pve-set-ticket` | Disable automatic start on boot |
+| `sudo journalctl -u pve-set-ticket -f`  | Follow logs                              |
+| `sudo systemctl stop pve-set-ticket`    | Stop the service                         |
+| `sudo systemctl disable pve-set-ticket` | Disable automatic start on boot          |
 
 ### 8.2 Nginx: location /set-ticket in wildcard block
 
@@ -430,9 +464,9 @@ The PVE web UI’s client-side JavaScript checks for `PVEAuthCookie` (e.g. via `
 
 ### 8.4 Summary
 
-| What | Where |
-|------|------|
-| Set-ticket script | `scripts/pve-set-ticket.py` → deploy to e.g. `/opt/pve-set-ticket/` |
-| Redeem secret | Firebase/Google Cloud secret `PVE_REDEEM_SECRET`; same value in Cloud Function and in `/opt/pve-set-ticket/env` |
-| Redeem function URL | `REDEEM_FUNCTION_URL` in env (e.g. `https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token`) |
-| Nginx | `location /set-ticket` in the wildcard `*.pve.neuravps.com` server block, proxying to `http://127.0.0.1:5000` |
+| What                | Where                                                                                                           |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Set-ticket script   | `scripts/pve-set-ticket.py` → deploy to e.g. `/opt/pve-set-ticket/`                                             |
+| Redeem secret       | Firebase/Google Cloud secret `PVE_REDEEM_SECRET`; same value in Cloud Function and in `/opt/pve-set-ticket/env` |
+| Redeem function URL | `REDEEM_FUNCTION_URL` in env (e.g. `https://europe-west1-neuravps.cloudfunctions.net/redeem_pve_ticket_token`)  |
+| Nginx               | `location /set-ticket` in the wildcard `*.pve.neuravps.com` server block, proxying to `http://127.0.0.1:5000`   |
