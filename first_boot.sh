@@ -8,21 +8,21 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 systemctl restart sshd
 
-# Root SSH client config for cluster/private network (10.64.x, fd00:4000::)
+# Root SSH client config for cluster (public IPv6; Cloud Functions and BASE use node public IPs)
 mkdir -p /root/.ssh
 SSH_CONFIG="/root/.ssh/config"
 if ! grep -q 'IdentityFile ~/.ssh/neuravps_id' "$SSH_CONFIG" 2>/dev/null; then
   cat >> "$SSH_CONFIG" <<'EOF'
 
-# NeuraVPS private network (Hetzner VLAN / IPv6)
-Host 10.64.* fd00:4000::*
+# NeuraVPS nodes (public IPv6)
+Host *
     IdentityFile ~/.ssh/neuravps_id
     IdentitiesOnly yes
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
 EOF
   chmod 600 "$SSH_CONFIG"
-  log "Added neuravps_id SSH config for 10.64.* and fd00:4000::*"
+  log "Added neuravps_id SSH config for all hosts (public IPv6)"
 fi
 
 # Add Proxmox repositories and keys
@@ -52,7 +52,6 @@ if [ -f /etc/apt/sources.list.d/debian.sources ]; then
 fi
 
 apt-get update && apt-get full-upgrade -y
-#apt-get purge -y proxmox-first-boot
 apt-get install -y python3-pip
 pip3 install firebase_admin --break-system-packages --root-user-action=ignore
 
@@ -96,37 +95,6 @@ dhcp-option=option6:dns-server,[2a01:4ff:ff00::add:1],[2a01:4ff:ff00::add:2]
 EOF
 
 systemctl restart dnsmasq
-
-# Script to preserve VM status on reboot
-# cat >/etc/systemd/system/pve-guests-hooks.service <<EOF
-# [Unit]
-# Description=Custom hooks to suspend/resume VMs around pve-guests lifecycle
-# # Run AFTER guests have started
-# After=pve-guests.service
-# # Tie our lifetime to pve-guests
-# PartOf=pve-guests.service
-
-# [Service]
-# Type=oneshot
-# TimeoutStartSec=60min
-# RemainAfterExit=yes
-# TimeoutStopSec=60min
-
-# # --- resume hook ---
-# ExecStart=/var/lib/svz/snippets/pve-post-boot-resume.sh
-
-# # --- suspend hook ---
-# ExecStop=/var/lib/svz/snippets/pve-pre-reboot-suspend.sh
-
-# [Install]
-# WantedBy=pve-guests.service
-# EOF
-
-# systemctl daemon-reload
-# systemctl enable pve-guests-hooks.service
-
-# Allow replacement of disks
-apt-get install -y pv jq
 
 ############################################
 # Raw swap: 23 GB per disk (reserved by install via zfs.hdsize)
@@ -418,14 +386,9 @@ NAT-Gateway 10.0.0.1
 2a01:4f9:3070:3984::2
 37.27.135.250
 
-[IPSET hetzner-internal]
-
-10.64.0.0/12
-fd00:4000::/108
-
 [IPSET hosts-ipv6]
 
-2a01:4f9:3070:3984::/64 # 0000001-BASE
+2a01:4f9:3070:3984::/64 # 0000001-BASE; production: add all node public IPv6 /64s for VM-to-VM Samba
 
 [IPSET nat64-clients]
 
@@ -433,9 +396,8 @@ fd00:4000::/108
 
 [RULES]
 
-IN Web(ACCEPT) -dest +dc/base -log nolog
+IN PMG(ACCEPT) -source +dc/base -log nolog
 GROUP management
-IN ACCEPT -source +dc/hetzner-internal -log nolog
 IN DHCPfwd(ACCEPT) -i vmbr0 -log nolog
 IN DHCPv6(ACCEPT) -i vmbr0 -log nolog
 
@@ -445,29 +407,23 @@ IN SSH(ACCEPT) -log nolog
 
 [group vm-default]
 
-IN SSH(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SSH(ACCEPT) -source +dc/base -log nolog
 IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
-IN SSH(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN RDP(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN RDP(ACCEPT) -source +dc/base -log nolog
 IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
-IN RDP(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN SMB(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SMB(ACCEPT) -source +dc/base -log nolog
 IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
-IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN SMB(ACCEPT) -source +dc/hosts-ipv6 -dest +dc/hosts-ipv6 -log nolog
+IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 
 [group vm-no-internet]
 
-IN SSH(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SSH(ACCEPT) -source +dc/base -log nolog
 IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
-IN SSH(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN RDP(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN RDP(ACCEPT) -source +dc/base -log nolog
 IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
-IN RDP(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN SMB(ACCEPT) -source fd00:4000::1/128 -log nolog
+IN SMB(ACCEPT) -source +dc/base -log nolog
 IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
-IN SMB(ACCEPT) -dest 0.0.0.0/0 -log nolog
-IN SMB(ACCEPT) -source +dc/hosts-ipv6 -dest +dc/hosts-ipv6 -log nolog
+IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 IN DROP -log nolog
 OUT DROP -log nolog
 
@@ -477,7 +433,7 @@ IN RDP(DROP) -log nolog
 
 [group vm-no-samba]
 
-IN SMB(ACCEPT) -source +dc/hosts-ipv6 -dest +dc/hosts-ipv6 -log nolog
+IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 IN SMB(DROP) -log nolog
 
 [group vm-no-ssh]
@@ -503,18 +459,7 @@ fi
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py \
     -o /var/lib/svz/snippets/sync-dnat.py
 
-# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-pre-reboot-suspend.sh \
-#     -o /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
-
-# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-post-boot-resume.sh \
-#     -o /var/lib/svz/snippets/pve-post-boot-resume.sh
-
-# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/restore-vm-disk-from-vma.sh \
-#     -o /var/lib/svz/snippets/restore-vm-disk-from-vma.sh
-
 chmod +x /var/lib/svz/snippets/sync-dnat.py
-# chmod +x /var/lib/svz/snippets/pve-pre-reboot-suspend.sh
-# chmod +x /var/lib/svz/snippets/pve-post-boot-resume.sh
 
 # Systemd oneshot: at every boot, update lastNodeBootAt and sync VM statuses (all stopped after reboot)
 log "Installing node-boot-sync-dnat.service (runs sync-dnat.py node-boot after network is up)"
@@ -535,131 +480,63 @@ NODEBOOTEOF
 systemctl daemon-reload
 systemctl enable node-boot-sync-dnat.service
 
-sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
+# BASE public IPv6: default or set BASE_PUBLIC_IPV6 before running first_boot (e.g. from Firestore later)
+BASE_PUBLIC_IPV6="${BASE_PUBLIC_IPV6:-2a01:4f9:3070:3984::2}"
+if [[ "$(hostname)" != *BASE* ]]; then
+  sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@["${BASE_PUBLIC_IPV6}"] <<EOF
 get /etc/firebase-credentials.json /etc/firebase-credentials.json
 get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
+fi
 
 ############################################
 # NAT64 routes (BASE and nodes)
 # See docs/nat64-base-setup.md. VM firewalls must allow source 64:ff9b::/96 for RDP/Samba.
 ############################################
-if [[ "$(hostname)" == *BASE* ]]; then
-  log "NAT64: Configuring BASE (nat64-routes.conf + apply script)"
-  mkdir -p /etc/sync-dnat
-  touch /etc/sync-dnat/nat64-routes.conf
-  cat > /usr/local/bin/apply-nat64-routes.sh <<'APPLYEOF'
-#!/bin/bash
-# Apply NAT64 routes from /etc/sync-dnat/nat64-routes.conf (format: VM_IPv6_PREFIX NODE_FD00_GATEWAY)
-CONF=/etc/sync-dnat/nat64-routes.conf
-[[ -f "$CONF" ]] || exit 0
-while read -r prefix gateway _; do
-  [[ -z "$prefix" || "$prefix" =~ ^# ]] && continue
-  ip -6 route add "$prefix" via "$gateway" 2>/dev/null || true
-done < "$CONF"
-APPLYEOF
-  chmod +x /usr/local/bin/apply-nat64-routes.sh
-  cat > /etc/network/if-up.d/apply-nat64-routes <<'IFUPEOF'
-#!/bin/bash
-# Run apply-nat64-routes when the interface with fd00:4000::1 comes up
-[[ "$ADDRFAM" = inet6 ]] || exit 0
-ip -6 addr show dev "$IFACE" 2>/dev/null | grep -q 'fd00:4000::1/' || exit 0
-/usr/local/bin/apply-nat64-routes.sh
-IFUPEOF
-  chmod +x /etc/network/if-up.d/apply-nat64-routes
-  /usr/local/bin/apply-nat64-routes.sh
-
-  # NAT64 boot restore: re-create Jool instance + pool4 and repopulate BIB from Firestore after reboot
-  log "NAT64: Installing boot restore script and systemd service"
-  cat > /usr/local/bin/nat64-boot-restore.sh <<'NAT64BOOT'
-#!/bin/bash
-# Restore NAT64 routes, Jool instance, pool4, and BIB after BASE reboot. Idempotent.
-LOG_TAG="nat64-boot-restore"
-logger -t "$LOG_TAG" "Starting NAT64 boot restore"
-# Apply routes to VM subnets (from nat64-routes.conf) so traffic can reach nodes
-[[ -x /usr/local/bin/apply-nat64-routes.sh ]] && /usr/local/bin/apply-nat64-routes.sh
-modprobe jool 2>/dev/null || true
-jool instance add "default" --netfilter --pool6 64:ff9b::/96 2>/dev/null || true
-BASE_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
-if [[ -n "$BASE_IP" ]]; then
-  jool pool4 add --tcp "$BASE_IP" 10000-19999 2>/dev/null || true
-  jool pool4 add --tcp "$BASE_IP" 20000-29999 2>/dev/null || true
-  jool pool4 add --udp "$BASE_IP" 10000-19999 2>/dev/null || true
-  jool pool4 add --udp "$BASE_IP" 20000-29999 2>/dev/null || true
-fi
-if [[ -x /var/lib/svz/snippets/sync-dnat.py ]]; then
-  /var/lib/svz/snippets/sync-dnat.py update_base restore 2>/dev/null || true
-  logger -t "$LOG_TAG" "NAT64 restore from Firestore completed"
-else
-  logger -t "$LOG_TAG" "sync-dnat.py not found, skipping BIB restore"
-fi
-logger -t "$LOG_TAG" "Finished"
-NAT64BOOT
-  chmod +x /usr/local/bin/nat64-boot-restore.sh
-  cat > /etc/systemd/system/nat64-boot-restore.service <<'NAT64SVC'
-[Unit]
-Description=NAT64 Jool and BIB restore after boot (BASE)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/nat64-boot-restore.sh
-TimeoutStartSec=120
-
-[Install]
-WantedBy=multi-user.target
-NAT64SVC
-  systemctl daemon-reload
-  systemctl enable nat64-boot-restore.service
-  log "NAT64: nat64-boot-restore.service enabled (runs once after network is up)"
-else
-  log "NAT64: Registering this node's VM subnet on BASE (return route 64:ff9b::/96 is in /etc/network/interfaces post-up)"
-  # If fd00 interface is missing, fix eth0.4000 -> <parent>.4000 mismatch (e.g. vlan-raw-device enp5s0 => use enp5s0.4000)
-  FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
-  if [[ -z "$FD00_IFACE" ]] && [[ -f /etc/network/interfaces ]]; then
-    PARENT=$(awk '/vlan-raw-device/ { print $NF; exit }' /etc/network/interfaces)
-    if [[ -z "$PARENT" ]]; then
-      REAL_VLAN=$(ip link show 2>/dev/null | awk -F: '/\.4000:/ { gsub(/^ /,"",$2); print $2; exit }')
-      [[ -n "$REAL_VLAN" ]] && PARENT="${REAL_VLAN%.4000}"
-    fi
-    if [[ -n "$PARENT" ]] && grep -q 'eth0\.4000' /etc/network/interfaces; then
-      log "NAT64: Fixing interface name eth0.4000 -> ${PARENT}.4000 in /etc/network/interfaces"
-      sed -i "s/eth0\.4000/${PARENT}.4000/g" /etc/network/interfaces
-      ifreload -a 2>/dev/null || true
-      FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
-    fi
-    if [[ -z "$FD00_IFACE" && -n "$PARENT" ]] && grep -q "${PARENT}\.4000" /etc/network/interfaces; then
-      log "NAT64: Running ifreload -a to bring up ${PARENT}.4000"
-      ifreload -a 2>/dev/null || true
-      FD00_IFACE=$(ip -6 addr show | awk '/^[0-9]+:.*state/ { iface=$2; gsub(/:$/,"",iface) } /inet6 fd00:4000::/ && !/::1\// { print iface; exit }')
-    fi
-  fi
-  # Register this node's VM subnet on BASE so BASE can route to our VMs
-  # ip may list the interface as eth0.4000@enp5s0; use the name without @parent for ip commands
-  if [[ -n "$FD00_IFACE" ]]; then
-    FD00_DEV="${FD00_IFACE%%@*}"
-    NODE_FD00=$(ip -6 addr show dev "$FD00_DEV" 2>/dev/null | awk '/inet6 fd00:4000::/ { print $2; exit }' | cut -d/ -f1)
-    VM_PREFIX=$(ip -6 addr show vmbr0 2>/dev/null | awk '/inet6 .* scope global/ { print $2; exit }' | sed 's/::1\/64/::\/64/')
-    if [[ -n "$NODE_FD00" && -n "$VM_PREFIX" ]]; then
-      if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes root@fd00:4000::1 "grep -q '^${VM_PREFIX}' /etc/sync-dnat/nat64-routes.conf 2>/dev/null || echo '${VM_PREFIX} ${NODE_FD00}' >> /etc/sync-dnat/nat64-routes.conf; /usr/local/bin/apply-nat64-routes.sh"; then
-        log "NAT64: Registered VM subnet ${VM_PREFIX} on BASE via ${NODE_FD00}"
-      else
-        log "WARNING: NAT64: Could not register VM subnet on BASE (SSH or apply failed)"
-      fi
+if [[ "$(hostname)" != *BASE* ]]; then
+  log "NAT64: Registering this node's VM subnet on BASE and adding return route via BASE public IPv6"
+  NODE_PUBLIC_IPV6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -oP 'src \K\S+' || true)
+  VM_PREFIX=$(ip -6 addr show vmbr0 2>/dev/null | awk '/inet6 .* scope global/ { print $2; exit }' | sed 's/::1\/64/::\/64/')
+  if [[ -n "$NODE_PUBLIC_IPV6" && -n "$VM_PREFIX" ]]; then
+    if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes root@["${BASE_PUBLIC_IPV6}"] "grep -q '^${VM_PREFIX}' /etc/sync-dnat/nat64-routes.conf 2>/dev/null || echo '${VM_PREFIX} ${NODE_PUBLIC_IPV6}' >> /etc/sync-dnat/nat64-routes.conf; /usr/local/bin/apply-nat64-routes.sh"; then
+      log "NAT64: Registered VM subnet ${VM_PREFIX} on BASE via ${NODE_PUBLIC_IPV6}"
     else
-      log "WARNING: NAT64: Could not detect NODE_FD00 or VM_PREFIX, skipping BASE registration"
+      log "WARNING: NAT64: Could not register VM subnet on BASE (SSH or apply failed)"
     fi
   else
-    log "WARNING: NAT64: Could not detect fd00:4000 interface (no address on any interface). If you see 'Device eth0.4000@enp5s0 does not exist', fix /etc/network/interfaces to use the real VLAN name (e.g. enp5s0.4000). Skipping BASE registration."
+    log "WARNING: NAT64: Could not detect NODE_PUBLIC_IPV6 or VM_PREFIX, skipping BASE registration"
+  fi
+  # Return route 64:ff9b::/96 via BASE (so NAT64 replies reach Jool on BASE)
+  mkdir -p /etc/sync-dnat
+  printf '%s' "$BASE_PUBLIC_IPV6" > /etc/sync-dnat/base_public_ipv6
+  cat > /etc/network/if-up.d/nat64-return-route <<'NAT64RETURN'
+#!/bin/bash
+[[ "$ADDRFAM" = inet6 ]] || exit 0
+ip -6 addr show dev "$IFACE" 2>/dev/null | grep -q 'scope global' || exit 0
+[[ -f /etc/sync-dnat/base_public_ipv6 ]] || exit 0
+gw=$(cat /etc/sync-dnat/base_public_ipv6)
+[[ -n "$gw" ]] || exit 0
+ip -6 route add 64:ff9b::/96 via "$gw" 2>/dev/null || true
+NAT64RETURN
+  chmod +x /etc/network/if-up.d/nat64-return-route
+  ip -6 route add 64:ff9b::/96 via "$BASE_PUBLIC_IPV6" 2>/dev/null || true
+  log "NAT64: Added return route 64:ff9b::/96 via ${BASE_PUBLIC_IPV6}"
+  # Update PVE proxy backends on BASE: add/replace only this node in pve-node-backends.conf (no Firestore)
+  if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes root@["${BASE_PUBLIC_IPV6}"] "NODE_ID='$(hostname)' NODE_IPV6='${NODE_PUBLIC_IPV6}'; f=/etc/nginx/pve-node-backends.conf; touch \$f; sed -i \"/^\${NODE_ID}[[:space:]]/d\" \$f; echo \"\${NODE_ID} https://[\${NODE_IPV6}]:8006;\" >> \$f; nginx -t && systemctl reload nginx"; then
+    log "PVE proxy: Registered this node on BASE backends and reloaded nginx"
+  else
+    log "WARNING: PVE proxy: Could not update backends on BASE (SSH or nginx reload failed)"
   fi
 fi
 
 pve-firewall restart || true
 
+if [[ "$(hostname)" == *BASE* ]]; then
+  log "Running BASE-only setup (first_boot_base.sh)"
+  curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/first_boot_base.sh | bash
+fi
+
 log "first_boot.sh finished"
 
-# manually add with: qm set 100 --hookscript shared:snippets/sync-dnat.py
 shutdown -r +1

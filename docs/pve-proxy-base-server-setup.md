@@ -4,7 +4,7 @@ Proxmox VE UI and console are exposed only via the **wildcard subdomain:** `http
 
 `sqx.neuravps.com` and `trading.neuravps.com` redirect every request to `https://www.neuravps.com` (path preserved); `.well-known/acme-challenge/` is served for Let's Encrypt renewal.
 
-Node IDs like `0000001-BASE` or `0000002-AX162-R` map to backends `https://[fd00:4000::<hex>]:8006` (decimal part → hex, e.g. 1 → `fd00:4000::1`).
+Node IDs like `0000001-BASE` or `0000002-AX162-R` map to backends **by public IPv6**: each node's backend is `https://[<node_public_ipv6>]:8006`, read from an include file that you generate from Firestore (see section 2). BASE must be able to reach each node on port 8006 (HTTPS); the cluster firewall in `first_boot.sh` allows **PMG (8006) from +dc/base** so nginx on BASE can proxy to all nodes.
 
 **Server:** BASE node (e.g. 0000001-BASE).  
 **Packages:** `nginx`, `libnginx-mod-http-js`.  
@@ -23,6 +23,12 @@ map $host $pve_node_from_host {
     default "";
 }
 
+# Backend URL per node: key = node hostname, value = https://[ipv6]:8006 (from include file)
+map $pve_node_from_host $pve_backend {
+    include /etc/nginx/pve-node-backends.conf;
+    default "";
+}
+
 # WebSocket: set Connection to "upgrade" only when client sends Upgrade (avoids breaking normal API)
 map $http_upgrade $connection_upgrade {
     default upgrade;
@@ -30,43 +36,55 @@ map $http_upgrade $connection_upgrade {
 }
 ```
 
+The file `/etc/nginx/pve-node-backends.conf` is **generated** from Firestore (section 2); do not edit it by hand for long-term use.
+
 ---
 
-## 2. NJS script: `/etc/nginx/njs/pve_proxy.js`
+## 2. Generate `/etc/nginx/pve-node-backends.conf`
 
-Create the directory if needed: `sudo mkdir -p /etc/nginx/njs`
+The map include file must list one line per node: `node_id https://[ipv6]:8006;` where `node_id` is the Proxmox hostname (e.g. `0000001-BASE`) and `ipv6` is that node's public IPv6 from Firestore `proxmox_nodes/<node_id>.ip`.
 
-```javascript
-// Backend from wildcard host (e.g. 000001-EX44.pve.neuravps.com) – reads pve_node_from_host
-function backend_from_host(r) {
-  var node = (r.variables.pve_node_from_host || "").toString().trim();
-  var match = node.match(/^([0-9]+)-/);
-  if (!match) return "";
-  var dec = parseInt(match[1], 10);
-  if (isNaN(dec)) return "";
-  return "https://[fd00:4000::" + dec.toString(16) + "]:8006";
-}
+**Automatic (recommended):** When a **new node** runs `first_boot.sh`, it SSHs to BASE and adds/updates only its line in the backends file, then reloads nginx. No separate script or Firestore read.
 
-export default { backend_from_host };
+**Manual (e.g. after migration or if a node’s IP changed):** On BASE:
+
+```bash
+sudo python3 /usr/local/bin/generate-pve-node-backends.py
+sudo nginx -t && sudo systemctl reload nginx
 ```
+
+If the script is not yet on BASE, fetch it once:
+
+```bash
+sudo curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/generate-pve-node-backends.py -o /usr/local/bin/generate-pve-node-backends.py
+sudo chmod +x /usr/local/bin/generate-pve-node-backends.py
+```
+
+The script reads Firestore `proxmox_nodes` (same credentials as sync-dnat: `/etc/firebase-credentials.json`) and writes **`/etc/nginx/pve-node-backends.conf`** only. To push cluster.fw to all nodes, run `run_remotes/update_firewall.sh` from BASE (it reads this file).
+
+**Example `pve-node-backends.conf`:**
+
+```
+0000001-BASE https://[2a01:4f9:3070:3984::2]:8006;
+0000002-AX162-R https://[2a01:4f9:xxxx::2]:8006;
+```
+
+If you ever add a node without running first_boot, run the script (and reload nginx) manually on BASE.
 
 ---
 
 ## 3. Site config: `/etc/nginx/sites-enabled/neuravps-redirects.conf`
 
-Use this as the full server block for the PVE proxy and redirects. Adjust `server_name`, SSL paths, and `return 301` target if needed.
+Use this as the full server block for the PVE proxy and redirects. Adjust `server_name`, SSL paths, and `return 301` target if needed. The backend is set by the **map** `$pve_backend` (section 1); no NJS is required for backend resolution.
 
 ```nginx
-js_import /etc/nginx/njs/pve_proxy.js;
-js_set $pve_backend_from_host pve_proxy.backend_from_host;
-
 # Wildcard PVE: NODEID.pve.neuravps.com → set-ticket to local app, everything else to node
 server {
     server_name *.pve.neuravps.com;
 
     resolver 127.0.0.53 valid=10s;
 
-    if ($pve_backend_from_host = "") {
+    if ($pve_backend = "") {
         return 404;
     }
 
@@ -87,7 +105,7 @@ server {
     }
 
     location / {
-        proxy_pass $pve_backend_from_host$request_uri;
+        proxy_pass $pve_backend$request_uri;
         proxy_ssl_verify off;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -157,11 +175,12 @@ server {
 
 ## 4. Apply on the BASE server
 
-1. **Map**  
-   Create `/etc/nginx/conf.d/pve-proxy-map.conf` with the map block from section 1 (or add that map inside `http {}` in `nginx.conf`).
+1. **Backends file**  
+   Generate `/etc/nginx/pve-node-backends.conf` (section 2):  
+   `sudo python3 /path/to/scripts/generate-pve-node-backends.py`
 
-2. **NJS**  
-   Create `/etc/nginx/njs/pve_proxy.js` with the full script from section 2.
+2. **Map**  
+   Create `/etc/nginx/conf.d/pve-proxy-map.conf` with the map block from section 1 (or add that map inside `http {}` in `nginx.conf`). The map includes `pve-node-backends.conf`.
 
 3. **Site**  
    Create or replace `/etc/nginx/sites-enabled/neuravps-redirects.conf` with the config from section 3.  
@@ -176,15 +195,15 @@ server {
 
 ## 5. Quick reference
 
-| What                                               | Where                                                                       |
-| -------------------------------------------------- | --------------------------------------------------------------------------- |
-| Map (`$pve_node_from_host`, `$connection_upgrade`) | `http {}` – e.g. `/etc/nginx/conf.d/pve-proxy-map.conf`                     |
-| NJS (`backend_from_host`)                          | `/etc/nginx/njs/pve_proxy.js`                                               |
-| Site config                                        | `/etc/nginx/sites-enabled/neuravps-redirects.conf`                          |
-| Wildcard cert (optional until you use \*.pve)      | `/etc/letsencrypt/live/pve.neuravps.com/` (see section 7)                   |
-| Resolver (if needed)                               | In each server block that uses `proxy_pass` with a variable or in `http {}` |
+| What                                                                 | Where                                                                       |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Map (`$pve_node_from_host`, `$pve_backend`, `$connection_upgrade`)   | `http {}` – e.g. `/etc/nginx/conf.d/pve-proxy-map.conf`                     |
+| Backends include file                                                | `/etc/nginx/pve-node-backends.conf` (generated by `scripts/generate-pve-node-backends.py`) |
+| Site config                                                          | `/etc/nginx/sites-enabled/neuravps-redirects.conf`                          |
+| Wildcard cert (optional until you use \*.pve)                        | `/etc/letsencrypt/live/pve.neuravps.com/` (see section 7)                   |
+| Resolver (if needed)                                                 | In each server block that uses `proxy_pass` with a variable or in `http {}` |
 
-**Node → backend:** Host like `0000011-BASE` → decimal `11` → hex `b` → `https://[fd00:4000::b]:8006`.
+**Node → backend:** Host like `0000011-BASE` is looked up in the map; the value comes from `pve-node-backends.conf` (e.g. `0000011-BASE https://[2a01:4f9:xxxx::2]:8006;`). No NJS is used for backend resolution.
 
 ---
 
@@ -207,7 +226,7 @@ Use the minified one-liner from the script file (remove comments and newlines). 
 
 ```nginx
     location / {
-        proxy_pass $pve_backend_from_host$request_uri;
+        proxy_pass $pve_backend$request_uri;
         proxy_ssl_verify off;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -230,7 +249,7 @@ No extra headers (CORS, X-Frame-Options, CSP) are required for postMessage; the 
 
 ## 7. Wildcard subdomain (\*.pve.neuravps.com) and Let’s Encrypt
 
-The server block for `*.pve.neuravps.com` (section 3) proxies `NODEID.pve.neuravps.com` to the PVE node for that ID. It uses the map `$pve_node_from_host` (section 1) and the NJS function `backend_from_host` (section 2).
+The server block for `*.pve.neuravps.com` (section 3) proxies `NODEID.pve.neuravps.com` to the PVE node for that ID. It uses the map `$pve_node_from_host` and `$pve_backend` (section 1); the backend URL comes from the include file generated in section 2.
 
 **TLS:** Wildcard certificates (`*.pve.neuravps.com`) require **DNS-01** validation; HTTP-01 cannot be used for wildcards. Existing certs for `trading.neuravps.com` and `sqx.neuravps.com` stay on HTTP-01 and are unchanged.
 

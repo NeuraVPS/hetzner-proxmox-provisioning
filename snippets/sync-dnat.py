@@ -44,7 +44,7 @@ except ImportError:
 BRIDGE_NET = "10.0.0.0/16"
 BASE_PORT_RDP = 20000
 BASE_PORT_SAMBA = 10000
-BASE_INTERNAL_IPV6 = "fd00:4000::1"  # SNAT source for IPv6 DNAT so VMs only see BASE, not client IPv6
+# SNAT source for IPv6 DNAT: use BASE's public IPv6 so VMs see +dc/base (cluster.fw allows it)
 # Get hostname reliably - use subprocess.run to avoid capturing stderr
 try:
     result = subprocess.run(["hostname"], capture_output=True, text=True, check=True)
@@ -476,25 +476,25 @@ def apply_base_create_nat64(node_hostname, vmid, vm_ipv6, ostype):
                 logger.info(f"ADD: ip6tables DNAT {base_ipv6}#{samba_port} -> [{vm_ipv6}]:445 (vmid-{vmid})")
             except subprocess.CalledProcessError as e:
                 logger.warning(f"ip6tables DNAT Samba add failed: {e} (stderr: {e.stderr})")
-        # SNAT so VMs see source BASE only; VM firewall allows fd00:4000::1, not arbitrary IPv6
+        # SNAT so VMs see source BASE only; VM firewall allows +dc/base (BASE public IPv6)
         snat_comment = f"nat64-snat-vmid-{vmid}"
         try:
             run_ip6tables(
                 ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-p", "tcp", "-d", vm_ipv6,
-                 "--dport", str(to_port_rdp), "-j", "SNAT", "--to-source", BASE_INTERNAL_IPV6,
+                 "--dport", str(to_port_rdp), "-j", "SNAT", "--to-source", base_ipv6,
                  "-m", "comment", "--comment", snat_comment]
             )
-            logger.info(f"ADD: ip6tables SNAT -> {BASE_INTERNAL_IPV6} for {vm_ipv6}:{to_port_rdp} (vmid-{vmid})")
+            logger.info(f"ADD: ip6tables SNAT -> {base_ipv6} for {vm_ipv6}:{to_port_rdp} (vmid-{vmid})")
         except subprocess.CalledProcessError as e:
             logger.warning(f"ip6tables SNAT RDP add failed: {e} (stderr: {e.stderr})")
         if ostype.startswith("win"):
             try:
                 run_ip6tables(
                     ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-p", "tcp", "-d", vm_ipv6,
-                     "--dport", "445", "-j", "SNAT", "--to-source", BASE_INTERNAL_IPV6,
+                     "--dport", "445", "-j", "SNAT", "--to-source", base_ipv6,
                      "-m", "comment", "--comment", snat_comment]
                 )
-                logger.info(f"ADD: ip6tables SNAT -> {BASE_INTERNAL_IPV6} for {vm_ipv6}:445 (vmid-{vmid})")
+                logger.info(f"ADD: ip6tables SNAT -> {base_ipv6} for {vm_ipv6}:445 (vmid-{vmid})")
             except subprocess.CalledProcessError as e:
                 logger.warning(f"ip6tables SNAT Samba add failed: {e} (stderr: {e.stderr})")
     else:

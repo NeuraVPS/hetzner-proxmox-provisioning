@@ -1,30 +1,22 @@
 #!/usr/bin/env bash
+# Push cluster.fw from BASE to all nodes. Run from BASE (or any host with
+# /etc/nginx/pve-node-backends.conf and SSH to all nodes).
+# Optional env: PVE_NODE_BACKENDS_PATH, BASE_PUBLIC_IPV6
 
-############################################################
-# DEFINE LOCAL FUNCTION (runs remotely)
-############################################################
-remote_task() {
-  echo "== Running remote task =="
+set -euo pipefail
+BACKENDS="${PVE_NODE_BACKENDS_PATH:-/etc/nginx/pve-node-backends.conf}"
+[[ -f "$BACKENDS" ]] || { echo "ERROR: $BACKENDS not found" >&2; exit 1; }
+BASE_PUBLIC_IPV6="${BASE_PUBLIC_IPV6:-$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -oP 'src \K\S+' || true)}"
+[[ -n "$BASE_PUBLIC_IPV6" ]] || { echo "ERROR: BASE_PUBLIC_IPV6 not set and could not detect" >&2; exit 1; }
 
-  scp [fd00:4000::1]:/etc/pve/firewall/cluster.fw /etc/pve/firewall/
-  pve-firewall restart || true
-
-  echo "== Finished =="
-}
-############################################################
-
-# Extract function body into a string
-FUNC_CONTENT=$(declare -f remote_task)
-
-for ((i=2; i<=77; i++)); do
-    HEX=$(printf "%x" "$i")
-    IP="fd00:4000::${HEX}"
-
-    echo "------------------------------------------------"
-    echo "Connecting to $IP ($i)"
-
-    # Send function and execute it
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$IP" \
-        "$FUNC_CONTENT; remote_task" \
-        || echo "❌ Failed to connect to $IP"
-done
+while IFS= read -r line; do
+  [[ -z "$line" || "$line" =~ ^# ]] && continue
+  ipv6=$(echo "$line" | sed -n 's|.*https://\[\([^]]*\)\]:8006;|\1|p')
+  [[ -n "$ipv6" ]] || continue
+  node_id="${line%%[[:space:]]*}"
+  echo "Pushing cluster.fw to $node_id ($ipv6)"
+  ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes "root@[${ipv6}]" \
+    "scp -o StrictHostKeyChecking=no root@[${BASE_PUBLIC_IPV6}]:/etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw && pve-firewall restart" \
+    || echo "WARNING: Failed $node_id"
+done < "$BACKENDS"
+echo "Finished pushing cluster.fw to all nodes"
