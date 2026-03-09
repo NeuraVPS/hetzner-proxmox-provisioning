@@ -402,7 +402,6 @@ fi
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
 echo "==> Configuring Proxmox firewall (datacenter baseline)"
 cat >/etc/pve/firewall/cluster.fw <<'EOF'
-root@0000001-BASE ~ # cat /etc/pve/firewall/cluster.fw 
 [OPTIONS]
 
 policy_in: DROP
