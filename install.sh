@@ -3,10 +3,12 @@
 
 if [[ $# -lt 2 ]]; then
   echo "Usage: $0 <server-id> <server_type>" >&2
-  echo "Example: $0 2 AX162-R" >&2
+  echo "Example: $0 2 AX162-R-384" >&2
   echo "" >&2
   echo "This will generate:" >&2
-  echo "  - Hostname: AX162-R-0000002" >&2
+  echo "  - Hostname: AX162-R-384-0000002" >&2
+  echo "  - Private IPv4: 10.64.0.2" >&2
+  echo "  - Private IPv6: fd00:4000::2" >&2
   exit 1
 fi
 
@@ -19,18 +21,32 @@ if ! [[ $SERVER_ID =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-# Usable range: 1 to 9,999,999
-if [[ $SERVER_ID -lt 1 || $SERVER_ID -gt 9999999 ]]; then
-  echo "Error: Server ID must be between 1 and 9,999,999" >&2
+# Validate range (1 to ~1M for 10.64.0.0/12 network)
+# 10.64.0.0/12 allows for 2^20 = 1,048,576 addresses
+# Usable range: 1 to 1,048,574 (avoiding .0.0 and last address)
+if [[ $SERVER_ID -lt 1 || $SERVER_ID -gt 1048574 ]]; then
+  echo "Error: Server ID must be between 1 and 1,048,574" >&2
   exit 1
 fi
 
 # Generate values from server ID and server type
 NAME="$(printf "%07d" "$SERVER_ID")-${SERVER_TYPE}"
 
+# Calculate IP octets for 10.64.0.0/12 network
+# The /12 network spans 10.64.0.0 to 10.79.255.255
+second_octet=$((64 + (SERVER_ID / 65536)))
+third_octet=$(((SERVER_ID / 256) % 256))
+fourth_octet=$((SERVER_ID % 256))
+PRIVATE_IPV4="10.${second_octet}.${third_octet}.${fourth_octet}"
+
+# For IPv6, convert server ID to hex
+PRIVATE_IPV6=$(printf "fd00:4000::%x" "$SERVER_ID")
+
 echo "Server ID: $SERVER_ID"
 echo "Server Type: $SERVER_TYPE"
 echo "Hostname: $NAME"
+echo "Private IPv4: $PRIVATE_IPV4"
+echo "Private IPv6: $PRIVATE_IPV6"
 
 ### --- CONFIG -------------------------------------------------------
 
@@ -376,7 +392,7 @@ if [ ! -s "/mnt/etc/network/interfaces" ]; then
   die "Generated /etc/network/interfaces is empty!"
 fi
 
-log "Configuring vmbr0 (IPv4 NAT + IPv6, no internal VLAN)"
+log "Configuring VLAN 4000 + vmbr0 (IPv4 NAT + IPv6)"
 
 # Grab first global IPv6 on that interface (e.g. 2a01:4f9:3071:1529::2/64)
 WAN_V6_INFO=$(ip -6 addr show dev "$FIRST_IF" scope global | awk '/inet6/{print $2; exit}')
@@ -394,8 +410,30 @@ log "Detected uplink IPv6:       ${WAN_V6_ADDR}/${WAN_V6_PREFIXLEN}"
 log "Using guest prefix:         ${VM_V6_SUBNET}::/${VM_V6_PREFIXLEN}"
 log "vmbr0 gateway IPv6 will be: ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
 
-# NAT64 return route (64:ff9b::/96 via BASE) is configured in first_boot.sh on the main interface (public IPv6).
-# No internal VLAN (eth0.4000 / fd00:4000::x) is used; nodes use public IPv6 only.
+# NAT64 return route (64:ff9b::/96 via BASE) only for nodes, not BASE (SERVER_ID 1)
+if [[ "$SERVER_ID" -eq 1 ]]; then
+  NAT64_EXTRA=""
+else
+  NAT64_EXTRA="
+    post-up   ip -6 route add 64:ff9b::/96 via fd00:4000::1
+    post-down ip -6 route del 64:ff9b::/96 via fd00:4000::1"
+fi
+
+if ! grep -q "auto eth0.4000" /mnt/etc/network/interfaces; then
+cat >> /mnt/etc/network/interfaces <<EOF
+
+auto eth0.4000
+iface eth0.4000 inet static
+    address ${PRIVATE_IPV4}
+    netmask 255.240.0.0
+    vlan-raw-device ${PREDICTED}
+    mtu 1400
+
+iface eth0.4000 inet6 static
+    address ${PRIVATE_IPV6}
+    netmask 108${NAT64_EXTRA}
+EOF
+fi
 
 if ! grep -q "auto vmbr0" /mnt/etc/network/interfaces; then
 sed -i -e "/^iface ${PREDICTED} inet6 static$/,/^$/{
