@@ -37,8 +37,6 @@ except ImportError:
 
 # Constants
 BRIDGE_NET = "10.0.0.0/16"
-BASE_PORT_RDP = 20000
-BASE_PORT_SAMBA = 10000
 # Get hostname reliably - use subprocess.run to avoid capturing stderr
 try:
     result = subprocess.run(["hostname"], capture_output=True, text=True, check=True)
