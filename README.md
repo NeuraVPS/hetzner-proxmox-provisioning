@@ -7,21 +7,7 @@ screen -r
 
 This will automatically generate:
 
-- Hostname: `pve0000001-AX162-R`
-- Private IPv4: `10.64.0.1`
-- Private IPv6: `fd00:4000::1`
-
-The server ID can be any number between 1 and 1,048,574.
-
-# Prepare new host
-
-## Checklist
-
-- /etc/firebase-credentials.json
-- /var/lib/svz/dump/vzdump-qemu-100-es.vma.zst
-- Add server IPv6 CDIR to Proxmox firewall
-- Add to firestore
-- Re add snippets to shared storage
+- Hostname: `HOSTNAME`
 
 # Prepare Windows Template
 
