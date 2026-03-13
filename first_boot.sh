@@ -483,9 +483,9 @@ NODEBOOTEOF
 systemctl daemon-reload
 systemctl enable node-boot-sync-dnat.service
 
-sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes root@[fd00:4000::1] <<EOF
-get /etc/firebase-credentials.json /etc/firebase-credentials.json
-get /etc/pve/firewall/cluster.fw /etc/pve/firewall/cluster.fw
+sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes -P 23 u560363@u560363.your-storagebox.de <<EOF
+get /home/id/firebase-credentials.json /etc/firebase-credentials.json
+get /home/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
 
