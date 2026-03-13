@@ -1,12 +1,7 @@
 Execute this on a new server to prepare it for Proxmox:
 
 ```bash
-screen -d -m bash -c "curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh | bash -s -- 1000 AX162-R; exec bash"
-screen -r
-```
-
-```bash
-screen -d -m bash -c "curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh | bash -s -- 1000 EX44; exec bash"
+screen -d -m bash -c "curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh | bash -s -- HOSTNAME; exec bash"
 screen -r
 ```
 

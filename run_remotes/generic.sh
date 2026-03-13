@@ -5,8 +5,6 @@
 ############################################################
 remote_task() {
   echo "== Running remote task =="
-  curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py \
-    -o /var/lib/svz/snippets/sync-dnat.py
   echo "== Finished =="
 }
 ############################################################
