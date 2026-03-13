@@ -84,6 +84,11 @@ FIREBASE_CREDENTIALS_FILE=/etc/firebase-credentials.json
 STATE_FILE=/var/lib/base-nat/state.json
 EOF
 
+# IMPORTANT: /etc/default/base-nat must exist BEFORE systemctl start (see heredoc above).
+# If you only curl scripts, create config first, e.g.:
+#   curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat.default.example -o /etc/default/base-nat
+#   nano /etc/default/base-nat
+
 # Scripts from repo snippets/
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-base-nat.py \
     -o /usr/local/sbin/sync-base-nat.py
@@ -91,13 +96,16 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
     -o /usr/local/sbin/base-nat-boot.sh
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat-boot.service \
     -o /etc/systemd/system/base-nat-boot.service
-# curl -o creates 644 files; service uses bash/python3 so start still works. Optional:
 chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
 mkdir -p /var/lib/base-nat
 systemctl daemon-reload
 systemctl enable base-nat-boot.service
 systemctl start base-nat-boot.service
 # Logs: journalctl -u base-nat-boot.service ; /var/log/sync-base-nat.log
+#
+# Jool on Debian: instance must use --netfilter (not --iptables). If you ever
+# see "Netfilter is the only available instance framework", redeploy base-nat-boot.sh
+# or run: jool instance remove base 2>/dev/null; systemctl start base-nat-boot.service
 
 # UFW: SMB 10000-19999 and RDP 20000-29999 on failover (VMID_MAX=9999)
 # ufw allow proto tcp from any to 77.42.49.79 port 10000:19999
