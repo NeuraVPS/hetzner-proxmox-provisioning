@@ -369,24 +369,64 @@ if ! grep -q "auto vmbr0" /mnt/etc/network/interfaces; then
 sed -i -e "/^iface ${PREDICTED} inet6 static$/,/^$/{
     s/^\([[:space:]]*netmask[[:space:]]\)64$/\1128/
 }" /mnt/etc/network/interfaces
-cat >> /mnt/etc/network/interfaces <<EOF
 
-auto vmbr0
-iface vmbr0 inet static
-    address 10.0.0.1/16
-    bridge-ports none
-    bridge-stp off
-    bridge-fd 0
-    post-up   echo 1 > /proc/sys/net/ipv4/ip_forward
-    post-up   iptables -t nat -A POSTROUTING -s '10.0.0.0/16' -o ${PREDICTED} -j MASQUERADE
-    post-up   iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1
-    post-down iptables -t nat -D POSTROUTING -s '10.0.0.0/16' -o ${PREDICTED} -j MASQUERADE
-    post-down iptables -t raw -D PREROUTING -i fwbr+ -j CT --zone 1
+# VM_V6_GATEWAY / VM_V6_PREFIXLEN were never set → heredoc wrote "address /". Derive vmbr0 IPv6
+# from the primary iface block Hetzner just wrote: same routed /64 as the host (…::/64 on vmbr0).
+VM_V6_GATEWAY=""
+VM_V6_PREFIXLEN="64"
+PRIMARY_V6_ADDR="$(
+  awk -v d="$PREDICTED" '
+    $0 ~ "^iface " d " inet6 static" {inblk=1; next}
+    inblk && /^iface / {exit}
+    inblk && /^[[:space:]]*address[[:space:]]+/ {
+      sub(/^[[:space:]]*address[[:space:]]+/, "")
+      gsub(/#.*/, "")
+      gsub(/[[:space:]]+$/, "")
+      print
+      exit
+    }
+  ' /mnt/etc/network/interfaces
+)"
+if [[ -n "$PRIMARY_V6_ADDR" ]]; then
+  ADDR_ONLY="${PRIMARY_V6_ADDR%%/*}"
+  ADDR_ONLY="${ADDR_ONLY//[[:space:]]/}"
+  # Hetzner main IP is usually n:n:n:n::h → routed /64 is n:n:n:n::/64; vmbr0 = n:n:n:n::1/64
+  if [[ "$ADDR_ONLY" == *::* ]]; then
+    PREFIX64="${ADDR_ONLY%%::*}"
+    COLONS="${PREFIX64//[^:]/}"
+    if [[ "${#COLONS}" -eq 3 ]]; then
+      VM_V6_GATEWAY="${PREFIX64}::1"
+      log "vmbr0 inet6: ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN} (from primary ${PREDICTED} address ${PRIMARY_V6_ADDR})"
+    else
+      log "WARNING: primary IPv6 shape not n:n:n:n::h; skipping vmbr0 inet6 (fix manually if needed)"
+    fi
+  else
+    log "WARNING: primary IPv6 has no ::; skipping vmbr0 inet6"
+  fi
+else
+  log "WARNING: no IPv6 address in generated iface ${PREDICTED}; vmbr0 will be IPv4-only"
+fi
 
-iface vmbr0 inet6 static
-    address ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}
-    post-up   echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-EOF
+{
+  echo ""
+  echo "auto vmbr0"
+  echo "iface vmbr0 inet static"
+  echo "    address 10.0.0.1/16"
+  echo "    bridge-ports none"
+  echo "    bridge-stp off"
+  echo "    bridge-fd 0"
+  echo "    post-up   echo 1 > /proc/sys/net/ipv4/ip_forward"
+  echo "    post-up   iptables -t nat -A POSTROUTING -s '10.0.0.0/16' -o ${PREDICTED} -j MASQUERADE"
+  echo "    post-up   iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1"
+  echo "    post-down iptables -t nat -D POSTROUTING -s '10.0.0.0/16' -o ${PREDICTED} -j MASQUERADE"
+  echo "    post-down iptables -t raw -D PREROUTING -i fwbr+ -j CT --zone 1"
+  if [[ -n "$VM_V6_GATEWAY" ]]; then
+    echo ""
+    echo "iface vmbr0 inet6 static"
+    echo "    address ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
+    echo "    post-up   echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"
+  fi
+} >> /mnt/etc/network/interfaces
 fi
 
 log "Successfully generated /etc/network/interfaces ($(wc -l < /mnt/etc/network/interfaces) lines)"
