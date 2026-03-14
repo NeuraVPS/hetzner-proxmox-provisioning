@@ -80,7 +80,7 @@ swapon -a
 # BASE NAT64 + IPv6 DNAT (Jool + sync-base-nat.py)
 # =============================================================================
 apt update
-apt install -y jool-tools jool-dkms linux-headers-amd64 python3-pip
+apt install -y jool-tools jool-dkms linux-headers-amd64 python3-pip sshpass
 pip3 install --break-system-packages firebase-admin
 
 # Firebase (same as Proxmox nodes)
