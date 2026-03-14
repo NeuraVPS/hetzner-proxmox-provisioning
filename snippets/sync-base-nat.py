@@ -25,6 +25,9 @@ Commands:
       Upsert node locally + nginx map (no Firestore read). For Cloud Function hooks.
   sync-base-nat.py sync nodes del <nodeId>
       Remove node from local map + nginx reload.
+  sync-base-nat.py sync nodes sync-firewall
+      Pull cluster.fw from Storage Box; replace [IPSET hosts-ipv6] with /64 per
+      pve_nodes.json; push back; SSH each node to pull + pve-firewall restart.
 
 Ports (TCP), VMID in [0, VMID_MAX] (default VMID_MAX=9999):
   Samba failover:(10000+VMID) -> vm:445   (ports 10000-19999)
@@ -41,6 +44,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -119,6 +123,15 @@ PVE_NGINX_MAP_FILE = Path(
         "PVE_NGINX_MAP_FILE", "/etc/nginx/conf.d/pve-proxy-backends.map.conf"
     )
 )
+# Storage Box: cluster.fw template (scp port 23). Override via env on BASE.
+FIREWALL_STORAGE_USER = os.environ.get("FIREWALL_STORAGE_USER", "u560363").strip()
+FIREWALL_STORAGE_HOST = os.environ.get(
+    "FIREWALL_STORAGE_HOST", "u560363.your-storagebox.de"
+).strip()
+FIREWALL_REMOTE_PATH = os.environ.get(
+    "FIREWALL_REMOTE_PATH", "/home/firewall/cluster.fw"
+).strip()
+FIREWALL_SCP_PORT = os.environ.get("FIREWALL_SCP_PORT", "23").strip()
 FIREBASE_CREDENTIALS = os.environ.get(
     "FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json"
 )
@@ -592,6 +605,72 @@ def _nginx_map_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+IPSET_HOSTS_IPV6_HEADER = "[IPSET hosts-ipv6]"
+
+
+def _firewall_scp_base_args() -> list[str]:
+    return [
+        "-P",
+        FIREWALL_SCP_PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+    ]
+
+
+def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
+    """
+    Keep template intact except [IPSET hosts-ipv6]: one line per unique /64
+    from nodes (node_id comment). Dedupe by /64; log duplicate subnets.
+    """
+    lines = text.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == IPSET_HOSTS_IPV6_HEADER:
+            start = i
+            break
+    if start is None:
+        raise ValueError("cluster.fw: missing [IPSET hosts-ipv6] section")
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        stripped = lines[j].strip()
+        if stripped.startswith("[") and stripped != IPSET_HOSTS_IPV6_HEADER:
+            end = j
+            break
+    seen_net: dict[str, str] = {}
+    dupes: list[tuple[str, str]] = []
+    for node_id in sorted(nodes.keys()):
+        ip_s = nodes[node_id].strip()
+        try:
+            iface = ipaddress.IPv6Interface(f"{ip_s}/64")
+            net = iface.network
+        except ValueError as e:
+            raise ValueError(f"node {node_id!r}: bad IPv6 {ip_s!r}: {e}") from e
+        net_s = str(net)
+        if net_s in seen_net:
+            dupes.append((node_id, seen_net[net_s]))
+            continue
+        seen_net[net_s] = node_id
+    if dupes:
+        for node_id, first in dupes:
+            logger.warning(
+                "sync-firewall: duplicate /64 for node %s (same as %s); skipping duplicate line",
+                node_id,
+                first,
+            )
+    body_lines = [f"{net_s} # {seen_net[net_s]}\n" for net_s in sorted(seen_net.keys())]
+    new_block = IPSET_HOSTS_IPV6_HEADER + "\n" + "".join(body_lines)
+    if end < len(lines) and lines[end].strip().startswith("["):
+        if not new_block.endswith("\n"):
+            new_block += "\n"
+    else:
+        new_block += "\n"
+    return "".join(lines[:start]) + new_block + "".join(lines[end:])
+
+
 def read_pve_nodes_state() -> dict[str, str]:
     if not PVE_NODES_STATE_FILE.is_file():
         return {}
@@ -763,6 +842,92 @@ def sync_nodes_del(node_id: str):
     logger.info("sync nodes del %s", node_id)
 
 
+def sync_nodes_sync_firewall():
+    """
+    Pull cluster.fw from Storage Box, rewrite [IPSET hosts-ipv6] from
+    pve_nodes.json, push back, then on each node scp pull + pve-firewall restart.
+    """
+    nodes = read_pve_nodes_state()
+    if not nodes:
+        logger.error("sync-firewall: pve_nodes.json empty or missing; abort")
+        sys.exit(1)
+    remote = f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{FIREWALL_REMOTE_PATH}"
+    scp_args = _firewall_scp_base_args()
+    fd, tmp_path = tempfile.mkstemp(prefix="cluster.fw.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_path)
+    try:
+        r = subprocess.run(
+            ["scp"] + scp_args + [remote, str(tmp)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            logger.error(
+                "sync-firewall: scp pull failed: %s",
+                (r.stderr or r.stdout or "").strip(),
+            )
+            sys.exit(1)
+        text = tmp.read_text()
+        try:
+            new_text = replace_hosts_ipv6_section(text, nodes)
+        except ValueError as e:
+            logger.error("sync-firewall: %s", e)
+            sys.exit(1)
+        tmp.write_text(new_text)
+        r2 = subprocess.run(
+            ["scp"] + scp_args + [str(tmp), remote],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r2.returncode != 0:
+            logger.error(
+                "sync-firewall: scp push failed: %s",
+                (r2.stderr or r2.stdout or "").strip(),
+            )
+            sys.exit(1)
+        logger.info("sync-firewall: Storage Box cluster.fw updated (%d nodes)", len(nodes))
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    remote_scp_inner = (
+        f"scp -P {FIREWALL_SCP_PORT} -o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null -o BatchMode=yes "
+        f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{FIREWALL_REMOTE_PATH} "
+        f"/etc/pve/firewall/cluster.fw && pve-firewall restart"
+    )
+    failed: list[str] = []
+    for node_id, ipv6 in sorted(nodes.items()):
+        target = f"root@{ipv6}"
+        ssh_cmd = [
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "BatchMode=yes",
+            target,
+            remote_scp_inner,
+        ]
+        r3 = subprocess.run(ssh_cmd, capture_output=True, text=True, check=False)
+        if r3.returncode != 0:
+            err = (r3.stderr or r3.stdout or "").strip()
+            logger.warning("sync-firewall: node %s (%s): %s", node_id, target, err)
+            failed.append(node_id)
+        else:
+            logger.info("sync-firewall: node %s ok", node_id)
+    if failed:
+        logger.error("sync-firewall: failed on %d node(s): %s", len(failed), failed)
+        sys.exit(1)
+    logger.info("sync-firewall: done (%d nodes)", len(nodes))
+
+
 def main_sync_nodes():
     args = sys.argv[3:]
     if not args:
@@ -786,12 +951,22 @@ def main_sync_nodes():
             sys.exit(2)
         sync_nodes_del(args[1])
         return
+    if args[0] == "sync-firewall":
+        if len(args) != 1:
+            print(
+                "Usage: sync-base-nat.py sync nodes sync-firewall",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        sync_nodes_sync_firewall()
+        return
     if len(args) != 1:
         print(
             "Usage: sync-base-nat.py sync nodes\n"
             "       sync-base-nat.py sync nodes <nodeId>\n"
             "       sync-base-nat.py sync nodes add <nodeId> <ipv6>\n"
-            "       sync-base-nat.py sync nodes del <nodeId>",
+            "       sync-base-nat.py sync nodes del <nodeId>\n"
+            "       sync-base-nat.py sync nodes sync-firewall",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -805,7 +980,7 @@ def main():
             "       sync-base-nat.py sync <proxmoxId>\n"
             "       sync-base-nat.py sync <proxmoxId> <ipv6>\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
-            "       sync-base-nat.py sync nodes ...",
+            "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,
         )
         sys.exit(2)
