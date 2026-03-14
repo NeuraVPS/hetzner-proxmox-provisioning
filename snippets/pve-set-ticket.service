@@ -1,0 +1,15 @@
+[Unit]
+Description=PVE set-ticket endpoint (*.pve.neuravps.com /set-ticket)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+EnvironmentFile=/opt/pve-set-ticket/env
+ExecStart=/usr/bin/python3 /opt/pve-set-ticket/pve-set-ticket.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -4,8 +4,8 @@
  * can postMessage({ type: "noVNC_dispatchEvent", event }) to dispatch one keyboard event
  * on noVNC_keyboardinput. The parent builds the event list and implements delays.
  *
- * Deploy: use the minified one-liner in nginx sub_filter (see docs/pve-proxy-base-server-setup.md
- * section "noVNC send-text injection"). This file is the readable source.
+ * Deploy: minified one-liner in nginx sub_filter (see snippets/neuravps-redirects.conf
+ * on BASE, or base_setup.sh PVE proxy section). This file is the readable source.
  */
 (function () {
   "use strict";

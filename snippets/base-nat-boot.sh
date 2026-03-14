@@ -44,4 +44,6 @@ if ! ip6tables -C INPUT -d "$FAILOVER_IPV6" -p tcp -m multiport --dports "$DPORT
   ip6tables -I INPUT 1 -d "$FAILOVER_IPV6" -p tcp -m multiport --dports "$DPORTS" -j ACCEPT
 fi
 
-exec python3 /usr/local/sbin/sync-base-nat.py sync
+python3 /usr/local/sbin/sync-base-nat.py sync
+# PVE wildcard proxy backends from Firestore proxmox_nodes (nginx map); ok if nginx absent
+python3 /usr/local/sbin/sync-base-nat.py sync nodes || true

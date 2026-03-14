@@ -162,3 +162,60 @@ systemctl start base-nat-boot.service
 # /usr/local/sbin/sync-base-nat.py sync 400
 # /usr/local/sbin/sync-base-nat.py sync 400 2001:db8::1
 # /usr/local/sbin/sync-base-nat.py sync 400 del
+#
+# PVE wildcard proxy (Firestore collection proxmox_nodes: doc id = node slug e.g. 0000009-EX44, field ip = IPv6)
+# /usr/local/sbin/sync-base-nat.py sync nodes
+# /usr/local/sbin/sync-base-nat.py sync nodes 0000009-EX44
+# /usr/local/sbin/sync-base-nat.py sync nodes add 0000009-EX44 2a01:4f9:...
+# /usr/local/sbin/sync-base-nat.py sync nodes del 0000009-EX44
+
+# =============================================================================
+# BASE: PVE proxy (*.pve.neuravps.com) + set-ticket + Firestore proxmox_nodes
+# =============================================================================
+# Node firewalls must allow BASE -> Proxmox :8006. Backends are built from
+# Firestore proxmox_nodes (document ID = server id, field ip = public IPv6).
+# base-nat-boot runs "sync nodes" after Jool. Re-run after node changes (Cloud Function SSH:
+# sync nodes | sync nodes add <id> <ip> | sync nodes del <id>) — no periodic timer.
+
+ufw allow "WWW Full"
+
+apt update
+apt install -y nginx libnginx-mod-http-js certbot
+
+mkdir -p /var/www/letsencrypt /etc/nginx/njs /opt/pve-set-ticket
+
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-map.conf \
+  -o /etc/nginx/conf.d/pve-proxy-map.conf
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-backends.map.conf.example \
+  -o /etc/nginx/conf.d/pve-proxy-backends.map.conf
+#
+# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/neuravps-redirects.conf \
+#   -o /etc/nginx/sites-available/neuravps-redirects.conf
+# ln -sf /etc/nginx/sites-available/neuravps-redirects.conf /etc/nginx/sites-enabled/neuravps-redirects.conf
+# rm -f /etc/nginx/sites-enabled/default
+#
+# Wildcard TLS (DNS-01): scripts/certbot-namecheap-dns-hooks.py — see deprecated doc
+# docs/pve-proxy-base-server-setup.md (section 7) for Namecheap + certbot renew.
+# Until certs exist, comment out the ssl_certificate server blocks in neuravps-redirects.conf
+# or obtain certs first, then:
+#
+# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/pve-set-ticket.py \
+#   -o /opt/pve-set-ticket/pve-set-ticket.py
+# chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
+# tee /opt/pve-set-ticket/env << 'EOF'
+# PVE_REDEEM_SECRET=...
+# REDEEM_FUNCTION_URL=https://.../redeem_pve_ticket_token
+# EOF
+# chmod 600 /opt/pve-set-ticket/env
+# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-set-ticket.service \
+#   -o /etc/systemd/system/pve-set-ticket.service
+# systemctl daemon-reload && systemctl enable --now pve-set-ticket
+#
+# After deploy or when Firestore proxmox_nodes changes (boot already syncs):
+#   /usr/local/sbin/sync-base-nat.py sync nodes
+#   nginx -t && systemctl reload nginx   # sync nodes reloads nginx itself if ok
+#
+# Cloud Function on node add/change/delete: SSH to BASE and run e.g.
+#   sync-base-nat.py sync nodes add <nodeId> <ip>
+#   sync-base-nat.py sync nodes del <nodeId>
+#   sync-base-nat.py sync nodes   (full refresh from Firestore)

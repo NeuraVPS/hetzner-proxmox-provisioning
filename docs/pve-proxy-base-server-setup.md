@@ -1,13 +1,25 @@
-# PVE proxy on BASE server (nginx + njs)
+# PVE proxy on BASE (deprecated runbook)
+
+**Deprecated — use [base_setup.sh](../base_setup.sh) (PVE proxy section) as the source of truth.**
+
+- **Backends:** Firestore collection **`proxmox_nodes`** (document ID = node slug, e.g. `0000009-EX44`; field **`ip`** = public IPv6). BASE runs **`sync-base-nat.py sync nodes`** on boot and can run **`sync nodes add|del|<nodeId>`** (see `base_setup.sh`).
+- **Nginx:** Repo snippets **`snippets/pve-proxy-map.conf`**, **`snippets/pve-proxy-backends.map.conf.example`** (initial empty map), **`snippets/neuravps-redirects.conf`** (wildcard `*.pve`, set-ticket, sub_filter for noVNC). No fd00 / NJS backend math anymore.
+- **Set-ticket:** [scripts/pve-set-ticket.py](../scripts/pve-set-ticket.py) + **`snippets/pve-set-ticket.service`**.
+
+The rest of this file is kept for **Let’s Encrypt wildcard (DNS-01) + Namecheap** notes (section 7) and historical context. Ignore fd00 / NJS `backend_from_host` sections below.
+
+---
+
+## Historical (fd00 — no longer used)
 
 Proxmox VE UI and console are exposed only via the **wildcard subdomain:** `https://NODEID.pve.neuravps.com/` (e.g. `https://000001-EX44.pve.neuravps.com/`). The hostname alone selects the node; all traffic is proxied with no path or cookie logic. Requires DNS A/AAAA for `*.pve.neuravps.com` and a wildcard TLS cert (DNS-01, see section 7).
 
 `sqx.neuravps.com` and `trading.neuravps.com` redirect every request to `https://www.neuravps.com` (path preserved); `.well-known/acme-challenge/` is served for Let's Encrypt renewal.
 
-Node IDs like `0000001-BASE` or `0000002-AX162-R` map to backends `https://[fd00:4000::<hex>]:8006` (decimal part → hex, e.g. 1 → `fd00:4000::1`).
+~~Node IDs formerly mapped to fd00 backends~~ — replaced by **`proxmox_nodes`** + generated nginx map.
 
 **Server:** BASE node (e.g. 0000001-BASE).  
-**Packages:** `nginx`, `libnginx-mod-http-js`.  
+**Packages:** `nginx`, `libnginx-mod-http-js` (NJS not required for backend URL if using map).  
 **Resolver:** When using variable `proxy_pass`, a `resolver` is required (e.g. in `server` or `http`): `resolver 127.0.0.53 valid=10s;`
 
 ---

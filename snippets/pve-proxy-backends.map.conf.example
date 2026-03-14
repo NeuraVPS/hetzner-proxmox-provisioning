@@ -1,0 +1,5 @@
+# Minimal map so nginx -t passes before first: sync-base-nat.py sync nodes
+# Overwritten by sync-base-nat.py (proxmox_nodes -> https://[ip]:8006)
+map $pve_node_from_host $pve_backend_from_host {
+    default "";
+}
