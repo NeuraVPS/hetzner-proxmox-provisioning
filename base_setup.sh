@@ -6,6 +6,11 @@ reboot
 apt install ufw
 ufw allow OpenSSH
 ufw enable
+
+# Allow forwarding (required for DNAT + Jool toward VMs)
+sudo sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+sudo ufw reload
+
 # configure SSH to allow only Neura SSH keys
 
 tasksel --new-install
@@ -35,23 +40,37 @@ swapon -a
 # =============================================================================
 # Edit /etc/network/interfaces — example matching Hetzner installimage + failover:
 #
+#### Hetzner Online GmbH installimage
+
+# source /etc/network/interfaces.d/*
+
+# auto lo
+# iface lo inet loopback
+# iface lo inet6 loopback
+
 # auto enp1s0
 # iface enp1s0 inet static
 #   address 46.62.188.207
 #   netmask 255.255.255.128
 #   gateway 46.62.188.129
+#   # route 46.62.188.128/25 via 46.62.188.129
 #   up route add -net 46.62.188.128 netmask 255.255.255.128 gw 46.62.188.129 dev enp1s0
+#   # Failover IPv4
 #   up ip addr add 77.42.49.79/32 dev enp1s0
 #   down ip addr del 77.42.49.79/32 dev enp1s0
 #   post-up sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 #   post-down sysctl -w net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
-#
+
 # iface enp1s0 inet6 static
 #   address 2a01:4f9:3090:2488::2
 #   netmask 64
 #   gateway fe80::1
+#   # Failover IPv6
 #   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp1s0
 #   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp1s0
+#   # Force main IPv6 as source for default-route traffic (egress)
+#   post-up ip -6 route replace default via fe80::1 dev enp1s0 src 2a01:4f9:3090:2488::2
+#   pre-down ip -6 route del default via fe80::1 dev enp1s0 src 2a01:4f9:3090:2488::2
 #
 # POOL6 for Jool must be a /96 inside the MAIN inet6 /64 (same machine), e.g.:
 #   2a01:4f9:3090:2488:64:ff9b::/96

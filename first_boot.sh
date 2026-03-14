@@ -378,54 +378,40 @@ enable: 1
 policy_out: ACCEPT
 policy_forward: DROP
 
-[ALIASES]
-
-NAT-Gateway 10.0.0.1
-
 [IPSET base]
 
-2a01:4f9:3070:3984::2
-37.27.135.250
-2a01:4f9:3090:2488::2
-46.62.188.207
+64:ff9b::/96 # TEMPORAL 1
+fd00:4000::/108 # TEMPORAL 2
+2a01:4f9:3090:189f::/64 # BASE Failover IPv6
+77.42.49.79 # BASE Failover IPv4
+2a01:4f9:3090:2488::/64 # BASE 0 IPv6
+46.62.188.207 # BASE 0 IPv4
+2a01:4f9:3070:3984::/64 # BASE 1 IPv6
+37.27.135.250 # BASE 1 IPv4
 
 [IPSET hosts-ipv6]
 
-2a01:4f9:3070:3984::/64 # 0000001-BASE; production: add all node public IPv6 /64s for VM-to-VM Samba
-
-[IPSET nat64-clients]
-
-64:ff9b::/96
+2a01:4f9:6a:44eb::/64 # 0000002-AX162-R
 
 [RULES]
 
 IN PMG(ACCEPT) -source +dc/base -log nolog
-GROUP management
+IN SSH(ACCEPT) -log nolog
 IN DHCPfwd(ACCEPT) -i vmbr0 -log nolog
 IN DHCPv6(ACCEPT) -i vmbr0 -log nolog
-
-[group management]
-
-IN SSH(ACCEPT) -log nolog
 
 [group vm-default]
 
 IN SSH(ACCEPT) -source +dc/base -log nolog
-IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
 IN RDP(ACCEPT) -source +dc/base -log nolog
-IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
 IN SMB(ACCEPT) -source +dc/base -log nolog
-IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 
 [group vm-no-internet]
 
 IN SSH(ACCEPT) -source +dc/base -log nolog
-IN SSH(ACCEPT) -source +dc/nat64-clients -log nolog
 IN RDP(ACCEPT) -source +dc/base -log nolog
-IN RDP(ACCEPT) -source +dc/nat64-clients -log nolog
 IN SMB(ACCEPT) -source +dc/base -log nolog
-IN SMB(ACCEPT) -source +dc/nat64-clients -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 IN DROP -log nolog
 OUT DROP -log nolog

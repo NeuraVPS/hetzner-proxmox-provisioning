@@ -6,8 +6,8 @@
 remote_task() {
   echo "== Running remote task =="
 
-  ip -4 neigh flush dev eth0.4000
-  ip -6 neigh flush dev eth0.4000
+  ip -4 neigh flush nud all
+  ip -6 neigh flush nud all
 
   echo "== Finished =="
 }
