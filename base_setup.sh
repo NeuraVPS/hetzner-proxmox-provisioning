@@ -188,29 +188,32 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
   -o /etc/nginx/conf.d/pve-proxy-map.conf
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-backends.map.conf.example \
   -o /etc/nginx/conf.d/pve-proxy-backends.map.conf
-#
-# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/neuravps-redirects.conf \
-#   -o /etc/nginx/sites-available/neuravps-redirects.conf
-# ln -sf /etc/nginx/sites-available/neuravps-redirects.conf /etc/nginx/sites-enabled/neuravps-redirects.conf
-# rm -f /etc/nginx/sites-enabled/default
+
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/neuravps-redirects.conf \
+  -o /etc/nginx/sites-available/neuravps-redirects.conf
+ln -sf /etc/nginx/sites-available/neuravps-redirects.conf /etc/nginx/sites-enabled/neuravps-redirects.conf
+rm -f /etc/nginx/sites-enabled/default
 #
 # Wildcard TLS (DNS-01): scripts/certbot-namecheap-dns-hooks.py — see deprecated doc
 # docs/pve-proxy-base-server-setup.md (section 7) for Namecheap + certbot renew.
+
+rsync -avz -e ssh root@[2a01:4f9:3070:3984::2]:/etc/letsencrypt/ /etc/letsencrypt/
+
 # Until certs exist, comment out the ssl_certificate server blocks in neuravps-redirects.conf
 # or obtain certs first, then:
-#
-# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/pve-set-ticket.py \
-#   -o /opt/pve-set-ticket/pve-set-ticket.py
-# chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
-# tee /opt/pve-set-ticket/env << 'EOF'
-# PVE_REDEEM_SECRET=...
-# REDEEM_FUNCTION_URL=https://.../redeem_pve_ticket_token
-# EOF
-# chmod 600 /opt/pve-set-ticket/env
-# curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-set-ticket.service \
-#   -o /etc/systemd/system/pve-set-ticket.service
-# systemctl daemon-reload && systemctl enable --now pve-set-ticket
-#
+
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/pve-set-ticket.py \
+  -o /opt/pve-set-ticket/pve-set-ticket.py
+chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
+tee /opt/pve-set-ticket/env << 'EOF'
+PVE_REDEEM_SECRET=...
+REDEEM_FUNCTION_URL=https://.../redeem_pve_ticket_token
+EOF
+chmod 600 /opt/pve-set-ticket/env
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-set-ticket.service \
+  -o /etc/systemd/system/pve-set-ticket.service
+systemctl daemon-reload && systemctl enable --now pve-set-ticket
+
 # After deploy or when Firestore proxmox_nodes changes (boot already syncs):
 #   /usr/local/sbin/sync-base-nat.py sync nodes
 #   nginx -t && systemctl reload nginx   # sync nodes reloads nginx itself if ok
