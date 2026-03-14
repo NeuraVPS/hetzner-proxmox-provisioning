@@ -8,7 +8,9 @@ Commands:
   sync-base-nat.py sync
       Full sync: Firestore servers (proxmoxId + ipv6); remove stale rules; apply all.
   sync-base-nat.py sync <proxmoxId>
-      Single VM from Firestore; if missing, remove rules only.
+      Single VM: one Firestore query + merge into STATE_FILE snapshot; full rebuild
+      of Jool/DNAT from that map. Run "sync" (no args) to refresh from Firestore
+      if servers were added only in the cloud.
   sync-base-nat.py sync <proxmoxId> <publicVMIPv6>
       Single VM with explicit IPv6 (no Firestore read for target).
   sync-base-nat.py sync <proxmoxId> del
@@ -210,6 +212,26 @@ def read_state() -> dict:
 def write_state(state: dict):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+
+def desired_from_state() -> dict[int, str]:
+    """vmid -> ipv6 from STATE_FILE (on-box snapshot)."""
+    out: dict[int, str] = {}
+    for k, d in read_state().items():
+        try:
+            vmid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        ipv6 = d.get("ipv6")
+        if ipv6:
+            try:
+                ipaddress.ip_address(str(ipv6).strip())
+            except ValueError:
+                continue
+            out[vmid] = str(ipv6).strip()
+    return out
 
 
 def ensure_ip6tables_chain():
@@ -422,30 +444,42 @@ def sync_single_vmid(
     delete_only: bool,
     ipv6_override: bool = False,
 ):
-    """ipv6_override: True when CLI passed explicit IPv6 (may differ from Firestore)."""
-    if not ensure_firebase():
-        logger.error("Firebase required for single-vm / del sync")
-        sys.exit(1)
-    desired = firestore_list_configured_servers()
-    if ipv6_override and ipv6 is not None:
-        desired[vmid] = ipv6
+    """Patch one VMID into on-box desired map (state snapshot), then full Jool/DNAT rebuild.
+
+    Does not scan all Firestore servers: desired starts from STATE_FILE, then
+    delete_only / explicit ipv6 / ipv6 from caller (e.g. firestore_ipv6_for_vmid).
+    Run full ``sync`` to pull every server from Firestore into state.
+    """
+    if not delete_only and not ipv6_override:
+        if not ensure_firebase():
+            logger.error("Firebase required for sync <proxmoxId> (lookup)")
+            sys.exit(1)
+    if ipv6_override and ipv6 is None:
+        logger.error("Explicit IPv6 required for sync <proxmoxId> <ipv6>")
+        sys.exit(2)
+    desired = desired_from_state()
     if delete_only:
         desired.pop(vmid, None)
-    elif ipv6 is None and not ipv6_override:
-        desired.pop(vmid, None)
-        logger.info("proxmoxId=%s not in Firestore; dropping from maps", vmid)
+        logger.info("proxmoxId=%s removed from maps", vmid)
+    elif ipv6_override:
+        desired[vmid] = ipv6  # type: ignore[assignment]
     elif ipv6 is not None:
         desired[vmid] = ipv6
+    else:
+        desired.pop(vmid, None)
+        logger.info("proxmoxId=%s not in Firestore; dropping from maps", vmid)
 
-    # Rebuild Jool BIBs: strip every vmid we might have touched, then apply full desired
-    state = read_state()
-    all_vmids = set(int(x) for x in state.keys()) | set(desired.keys()) | {vmid}
-    for v in all_vmids:
+    # Only touch Jool for this VMID (other BIBs unchanged). Full sync + boot still
+    # run apply_all_jool. Avoids ~6 Jool ops per server on every sync <id>.
+    try:
+        remove_vm_rules(vmid)
+    except Exception:
+        pass
+    if vmid in desired:
         try:
-            remove_vm_rules(v)
-        except Exception:
-            pass
-    apply_all_jool(desired)
+            apply_vm_jool(vmid, desired[vmid])
+        except Exception as e:
+            logger.warning("apply_vm_jool proxmoxId=%s: %s", vmid, e)
     rebuild_ip6tables_dnat(desired)
     write_state(
         {
@@ -461,7 +495,11 @@ def sync_single_vmid(
         run_jool(["session", "sync"], check=False)
     except Exception:
         pass
-    logger.info("Sync proxmoxId=%s done (servers=%d)", vmid, len(desired))
+    logger.info(
+        "Sync proxmoxId=%s done (desired=%d VMs; Jool updated for this id only)",
+        vmid,
+        len(desired),
+    )
 
 
 def main():
