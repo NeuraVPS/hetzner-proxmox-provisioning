@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 #set -euo pipefail
 
-if [[ $# -lt 2 ]]; then
+if [[ $# -ge 1 ]]; then
+  NAME="$1"
+elif [[ -n "${NEURAVPS_SERVER_NAME:-}" ]]; then
+  NAME="$NEURAVPS_SERVER_NAME"
+else
   echo "Usage: $0 <server-name>" >&2
-  echo "Example: $0 0000002-AX162-R" >&2
+  echo "Example:  $0 0000002-AX162-R" >&2
+  echo "Or:       NEURAVPS_SERVER_NAME=0000002-AX162-R $0   (used by SSH jump / automation)" >&2
+  echo "" >&2
+  echo "From URL (pass hostname or curl error 23 when piping):" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/install.sh -o /tmp/install.sh \\" >&2
+  echo "    && bash /tmp/install.sh 0000002-AX162-R" >&2
   echo "" >&2
   echo "This will generate:" >&2
-  echo "  - Hostname: 0000002-AX162-R" >&2
+  echo "  - Hostname: <server-name>" >&2
   exit 1
 fi
 
-NAME="$1"
 echo "Hostname: $NAME"
 
 ### --- CONFIG -------------------------------------------------------
