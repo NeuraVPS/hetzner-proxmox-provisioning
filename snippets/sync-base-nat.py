@@ -20,7 +20,8 @@ Ports (TCP), VMID in [0, VMID_MAX] (default VMID_MAX=9999):
   Samba failover:(10000+VMID) -> vm:445   (ports 10000-19999)
   RDP    failover:(20000+VMID) -> vm:3389 (ports 20000-29999)
 IPv4 path: Jool NAT64 static BIB + pool4 on FAILOVER_IPV4.
-IPv6 path: ip6tables DNAT on FAILOVER_IPV6.
+IPv6 path: ip6tables DNAT on FAILOVER_IPV6; optional POSTROUTING SNAT via MAIN_IPV6
+(Hetzner egress often drops forwarded packets whose source is not your routed /64).
 """
 from __future__ import annotations
 
@@ -95,6 +96,8 @@ load_default_env()
 
 FAILOVER_IPV4 = os.environ.get("FAILOVER_IPV4", "").strip()
 FAILOVER_IPV6 = os.environ.get("FAILOVER_IPV6", "").strip()
+# Primary inet6 on BASE (iface static ::2). SNAT forwarded DNAT traffic so egress source is in your /64.
+MAIN_IPV6 = os.environ.get("MAIN_IPV6", "").strip()
 POOL6 = os.environ.get("POOL6", "").strip()
 JOOL_INSTANCE = os.environ.get("JOOL_INSTANCE", "base").strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(DEFAULT_STATE_FILE)))
@@ -189,6 +192,8 @@ def validate_config():
         sys.exit(1)
     ipaddress.ip_address(FAILOVER_IPV4)
     ipaddress.ip_address(FAILOVER_IPV6)
+    if MAIN_IPV6:
+        ipaddress.ip_address(MAIN_IPV6)
     if POOL6:
         ipaddress.ip_network(POOL6, strict=False)
 
@@ -285,6 +290,65 @@ def flush_base_dnat_chain():
     run_ip6tables(["ip6tables", "-t", "nat", "-F", "BASE_DNAT"], check=False)
 
 
+def ensure_base_snat_chain():
+    """POSTROUTING SNAT so forwarded SYNs to VMs use MAIN_IPV6 (provider egress filter)."""
+    run_ip6tables(["ip6tables", "-t", "nat", "-N", "BASE_SNAT"], check=False)
+    r = run_ip6tables(
+        [
+            "ip6tables",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-j",
+            "BASE_SNAT",
+        ],
+        check=False,
+    )
+    if r.returncode != 0:
+        run_ip6tables(
+            ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-j", "BASE_SNAT"]
+        )
+
+
+def flush_base_snat_chain():
+    run_ip6tables(["ip6tables", "-t", "nat", "-F", "BASE_SNAT"], check=False)
+
+
+def rebuild_ip6tables_snat(desired: dict[int, str]):
+    """SNAT tcp to each VM:445/3389 to MAIN_IPV6 (only traffic BASE forwards, e.g. after DNAT)."""
+    ensure_base_snat_chain()
+    flush_base_snat_chain()
+    if not MAIN_IPV6:
+        logger.info(
+            "MAIN_IPV6 unset: no IPv6 SNAT (set MAIN_IPV6=primary ::2 if failover IPv6 DNAT times out)"
+        )
+        return
+    for _vmid, ipv6 in sorted(desired.items(), key=lambda x: x[0]):
+        run_ip6tables(
+            [
+                "ip6tables",
+                "-t",
+                "nat",
+                "-A",
+                "BASE_SNAT",
+                "-d",
+                ipv6,
+                "-p",
+                "tcp",
+                "-m",
+                "multiport",
+                "--dports",
+                "445,3389",
+                "-j",
+                "SNAT",
+                "--to-source",
+                MAIN_IPV6,
+            ]
+        )
+    logger.info("IPv6 SNAT via MAIN_IPV6 for %d VM target(s)", len(desired))
+
+
 def rebuild_ip6tables_dnat(desired: dict[int, str]):
     """desired: vmid -> ipv6 string"""
     ensure_ip6tables_chain()
@@ -334,6 +398,7 @@ def rebuild_ip6tables_dnat(desired: dict[int, str]):
                 f"[{ipv6}]:3389",
             ]
         )
+    rebuild_ip6tables_snat(desired)
 
 
 def remove_vm_rules(vmid: int):
@@ -414,7 +479,7 @@ def sync_full():
     for vmid, ipv6 in desired.items():
         logger.info("Apply proxmoxId=%s -> %s", vmid, ipv6)
     apply_all_jool(desired)
-    rebuild_ip6tables_dnat(desired)
+    rebuild_ip6tables_dnat(desired)  # includes rebuild_ip6tables_snat
     write_state(
         {
             str(k): {

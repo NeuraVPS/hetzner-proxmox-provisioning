@@ -92,6 +92,9 @@ cat >/etc/default/base-nat <<'EOF'
 JOOL_INSTANCE=base
 FAILOVER_IPV4=77.42.49.79
 FAILOVER_IPV6=2a01:4f9:fff1:5f::2
+# Primary inet6 on enp1s0 (same as iface inet6 static ::2). Enables SNAT for IPv6 DNAT
+# so forwarded SYNs leave with a source in your /64 (Hetzner drops other sources).
+MAIN_IPV6=2a01:4f9:3090:2488::2
 # NAT64 pool: must lie inside iface inet6 static /64 (Hetzner-routed to this server)
 POOL6=2a01:4f9:3090:2488:64:ff9b::/96
 # SMB: ports SAMBA_PORT_BASE .. SAMBA_PORT_BASE+VMID_MAX (default 10000-19999)
