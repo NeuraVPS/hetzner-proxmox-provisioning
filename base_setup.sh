@@ -66,11 +66,8 @@ swapon -a
 #   netmask 64
 #   gateway fe80::1
 #   # Failover IPv6
-#   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp1s0
+#   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp1s0 preferred_lft 0
 #   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp1s0
-#   # Force main IPv6 as source for default-route traffic (egress)
-#   post-up ip -6 route replace default via fe80::1 dev enp1s0 src 2a01:4f9:3090:2488::2
-#   pre-down ip -6 route del default via fe80::1 dev enp1s0 src 2a01:4f9:3090:2488::2
 #
 # POOL6 for Jool must be a /96 inside the MAIN inet6 /64 (same machine), e.g.:
 #   2a01:4f9:3090:2488:64:ff9b::/96
