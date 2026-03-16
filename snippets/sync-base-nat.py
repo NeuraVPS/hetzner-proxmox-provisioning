@@ -110,9 +110,7 @@ load_default_env()
 
 FAILOVER_IPV4 = os.environ.get("FAILOVER_IPV4", "").strip()
 FAILOVER_IPV6 = os.environ.get("FAILOVER_IPV6", "").strip()
-# Primary inet4/inet6 on BASE. Option B: set both for native listen on main + failover.
-MAIN_IPV4 = os.environ.get("MAIN_IPV4", "").strip()
-# MAIN_IPV6: iface static ::2; SNAT for forwarded DNAT traffic; Option B: PREROUTING to BASE_DNAT.
+# Primary inet6 on BASE (iface static ::2). SNAT forwarded DNAT traffic so egress source is in your /64.
 MAIN_IPV6 = os.environ.get("MAIN_IPV6", "").strip()
 POOL6 = os.environ.get("POOL6", "").strip()
 JOOL_INSTANCE = os.environ.get("JOOL_INSTANCE", "base").strip()
@@ -225,8 +223,6 @@ def validate_config():
         sys.exit(1)
     ipaddress.ip_address(FAILOVER_IPV4)
     ipaddress.ip_address(FAILOVER_IPV6)
-    if MAIN_IPV4:
-        ipaddress.ip_address(MAIN_IPV4)
     if MAIN_IPV6:
         ipaddress.ip_address(MAIN_IPV6)
     if POOL6:
@@ -319,48 +315,6 @@ def ensure_ip6tables_chain():
                 "BASE_DNAT",
             ]
         )
-    # Traffic to MAIN_IPV6 uses same BASE_DNAT (one NAT hop).
-    if MAIN_IPV6 and MAIN_IPV6 != FAILOVER_IPV6:
-        r_main = run_ip6tables(
-            [
-                "ip6tables",
-                "-t",
-                "nat",
-                "-C",
-                "PREROUTING",
-                "-d",
-                MAIN_IPV6,
-                "-p",
-                "tcp",
-                "-m",
-                "multiport",
-                "--dports",
-                DPORTS_SMB_RDP,
-                "-j",
-                "BASE_DNAT",
-            ],
-            check=False,
-        )
-        if r_main.returncode != 0:
-            run_ip6tables(
-                [
-                    "ip6tables",
-                    "-t",
-                    "nat",
-                    "-A",
-                    "PREROUTING",
-                    "-d",
-                    MAIN_IPV6,
-                    "-p",
-                    "tcp",
-                    "-m",
-                    "multiport",
-                    "--dports",
-                    DPORTS_SMB_RDP,
-                    "-j",
-                    "BASE_DNAT",
-                ]
-            )
 
 
 def flush_base_dnat_chain():
@@ -482,9 +436,6 @@ def remove_vm_rules(vmid: int):
     samba_p, rdp_p = vm_ports(vmid)
     jool_bib_remove_tcp(FAILOVER_IPV4, samba_p)
     jool_bib_remove_tcp(FAILOVER_IPV4, rdp_p)
-    if MAIN_IPV4:
-        jool_bib_remove_tcp(MAIN_IPV4, samba_p)
-        jool_bib_remove_tcp(MAIN_IPV4, rdp_p)
 
 
 def apply_vm_jool(vmid: int, ipv6: str):
@@ -493,19 +444,6 @@ def apply_vm_jool(vmid: int, ipv6: str):
     jool_bib_remove_tcp(FAILOVER_IPV4, rdp_p)
     jool_bib_add_tcp(FAILOVER_IPV4, samba_p, ipv6, 445)
     jool_bib_add_tcp(FAILOVER_IPV4, rdp_p, ipv6, 3389)
-    if MAIN_IPV4:
-        try:
-            jool_bib_add_tcp(MAIN_IPV4, samba_p, ipv6, 445)
-            jool_bib_add_tcp(MAIN_IPV4, rdp_p, ipv6, 3389)
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                "MAIN_IPV4 BIB add failed (vmid=%s). Ensure MAIN_IPV4 is in Jool pool4: "
-                "base-nat-boot adds it when MAIN_IPV4 is set in /etc/default/base-nat. "
-                "Jool stderr: %s",
-                vmid,
-                (e.stderr or e.stdout or "").strip(),
-            )
-            raise
 
 
 def firestore_list_configured_servers() -> dict[int, str]:

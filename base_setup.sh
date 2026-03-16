@@ -40,7 +40,7 @@ swapon -a
 # =============================================================================
 # Edit /etc/network/interfaces — example matching Hetzner installimage + failover:
 #
-# ### Hetzner Online GmbH installimage
+#### Hetzner Online GmbH installimage
 
 # source /etc/network/interfaces.d/*
 
@@ -56,7 +56,7 @@ swapon -a
 #   # route 46.62.188.128/25 via 46.62.188.129
 #   up route add -net 46.62.188.128 netmask 255.255.255.128 gw 46.62.188.129 dev enp1s0
 #   # Failover IPv4
-#   up ip addr add 77.42.49.79/32 dev enp1s0 preferred_lft 0
+#   up ip addr add 77.42.49.79/32 dev enp1s0
 #   down ip addr del 77.42.49.79/32 dev enp1s0
 #   post-up sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 #   post-down sysctl -w net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
@@ -89,9 +89,13 @@ cat >/etc/default/base-nat <<'EOF'
 JOOL_INSTANCE=base
 FAILOVER_IPV4=77.42.49.79
 FAILOVER_IPV6=2a01:4f9:fff1:5f::2
-MAIN_IPV4=37.27.135.250
-MAIN_IPV6=2a01:4f9:3070:3984::2
-POOL6=2a01:4f9:3070:3984:64:ff9b::/96
+# Primary inet6 on enp1s0 (same as iface inet6 static ::2). Enables SNAT for IPv6 DNAT
+# so forwarded SYNs leave with a source in your /64 (Hetzner drops other sources).
+MAIN_IPV6=2a01:4f9:3090:2488::2
+# NAT64 pool: must lie inside iface inet6 static /64 (Hetzner-routed to this server)
+POOL6=2a01:4f9:3090:2488:64:ff9b::/96
+# SMB: ports SAMBA_PORT_BASE .. SAMBA_PORT_BASE+VMID_MAX (default 10000-19999)
+# RDP: ports RDP_PORT_BASE .. RDP_PORT_BASE+VMID_MAX (default 20000-29999)
 SAMBA_PORT_BASE=10000
 RDP_PORT_BASE=20000
 VMID_MAX=9999
@@ -134,15 +138,20 @@ systemctl start base-nat-boot.service
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# Listen on both main and failover natively
+# Optional: test via MAIN IP when failover points at the other BASE
+# (ephemeral — repeat after reboot if needed)
 #
-# Set MAIN_IPV4 and MAIN_IPV6 in /etc/default/base-nat (see heredoc above). base-nat-boot adds
-# Jool pool4 and INPUT for main IPs; sync-base-nat adds BIB for MAIN_IPV4 and PREROUTING
-# MAIN_IPV6 -> BASE_DNAT, so both IPs are served with one NAT hop each (no main->failover DNAT).
-# Restart: systemctl restart base-nat-boot.service
+# Enable — main -> failover (SMB 10000-19999 + RDP 20000-29999)
+# iptables -t nat -I PREROUTING 1 -d 46.62.188.207 -p tcp -m multiport --dports 10000:19999,20000:29999 \
+#   -j DNAT --to-destination 77.42.49.79
+# ip6tables -t nat -I PREROUTING 1 -d 2a01:4f9:3090:2488::2 -p tcp -m multiport --dports 10000:19999,20000:29999 \
+#   -j DNAT --to-destination 2a01:4f9:fff1:5f::2
 #
-# Ephemeral test when failover points at the other BASE: add PREROUTING DNAT main->failover
-# by hand (iptables/ip6tables -I PREROUTING 1 -d $MAIN_IPV4 ... -j DNAT --to-destination $FAILOVER_IPV4).
+# Disable
+# iptables -t nat -D PREROUTING -d 46.62.188.207 -p tcp -m multiport --dports 10000:19999,20000:29999 -j DNAT --to-destination 77.42.49.79
+# ip6tables -t nat -D PREROUTING -d 2a01:4f9:3090:2488::2 -p tcp -m multiport --dports 10000:19999,20000:29999 -j DNAT --to-destination 2a01:4f9:fff1:5f::2
+#
+# While testing, allow the same ports toward the main addresses (ufw or INPUT).
 # -----------------------------------------------------------------------------
 
 # Manual sync examples (after boot)
