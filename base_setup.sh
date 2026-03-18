@@ -84,18 +84,20 @@ pip3 install --break-system-packages firebase-admin
 # install -m 600 firebase-credentials.json /etc/firebase-credentials.json
 # or: cp /path/to/firebase-credentials.json /etc/firebase-credentials.json && chmod 600 ...
 
-# Config — adjust FAILOVER + POOL6 to this host (POOL6 = main /64 + :64:ff9b::/96)
+# Config — MAIN_* = NAT ingress (SMB/RDP); FAILOVER_* = passthrough-only (DNAT to MAIN).
+# POOL6 = main /64 + :64:ff9b::/96 (Jool NAT64).
 cat >/etc/default/base-nat <<'EOF'
 JOOL_INSTANCE=base
+# Main/public IPs: NAT46 (Jool) and NAT66 (ip6tables DNAT) listen here.
+MAIN_IPV4=46.62.188.207
+MAIN_IPV6=2a01:4f9:3090:2488::2
+# Failover VIPs: traffic is DNAT'd to MAIN_IPV4/MAIN_IPV6 (passthrough).
 FAILOVER_IPV4=77.42.49.79
 FAILOVER_IPV6=2a01:4f9:fff1:5f::2
-# Primary inet6 on enp1s0 (same as iface inet6 static ::2). Enables SNAT for IPv6 DNAT
-# so forwarded SYNs leave with a source in your /64 (Hetzner drops other sources).
-MAIN_IPV6=2a01:4f9:3090:2488::2
 # NAT64 pool: must lie inside iface inet6 static /64 (Hetzner-routed to this server)
 POOL6=2a01:4f9:3090:2488:64:ff9b::/96
-# SMB: ports SAMBA_PORT_BASE .. SAMBA_PORT_BASE+VMID_MAX (default 10000-19999)
-# RDP: ports RDP_PORT_BASE .. RDP_PORT_BASE+VMID_MAX (default 20000-29999)
+# SMB: ports SAMBA_PORT_BASE .. SAMBA_PORT_BASE+VMID_MAX (TCP only; default 10000-19999)
+# RDP: ports RDP_PORT_BASE .. RDP_PORT_BASE+VMID_MAX (TCP+UDP; default 20000-29999)
 SAMBA_PORT_BASE=10000
 RDP_PORT_BASE=20000
 VMID_MAX=9999
@@ -124,9 +126,9 @@ systemctl start base-nat-boot.service
 # or run: jool instance remove base 2>/dev/null; systemctl start base-nat-boot.service
 
 # -----------------------------------------------------------------------------
-# Failover routing: Hetzner Cloud / Robot panel decides which BASE receives
-# traffic to the failover IPs. Both BASEs stay identically configured; the
-# standby host simply gets no failover traffic until you switch the panel.
+# Failover passthrough: traffic to FAILOVER_IPV4/FAILOVER_IPV6 is DNAT'd to
+# MAIN_IPV4/MAIN_IPV6. Hetzner panel decides which BASE receives failover
+# traffic; both BASEs stay identically configured.
 # -----------------------------------------------------------------------------
 
 # Manual sync examples (after boot)
