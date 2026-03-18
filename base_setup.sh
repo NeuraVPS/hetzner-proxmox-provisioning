@@ -104,9 +104,6 @@ STATE_FILE=/var/lib/base-nat/state.json
 EOF
 
 # IMPORTANT: /etc/default/base-nat must exist BEFORE systemctl start (see heredoc above).
-# If you only curl scripts, create config first, e.g.:
-#   curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat.default.example -o /etc/default/base-nat
-#   nano /etc/default/base-nat
 
 # Scripts from repo snippets/
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-base-nat.py \
@@ -126,32 +123,10 @@ systemctl start base-nat-boot.service
 # see "Netfilter is the only available instance framework", redeploy base-nat-boot.sh
 # or run: jool instance remove base 2>/dev/null; systemctl start base-nat-boot.service
 
-# UFW: SMB 10000-19999 and RDP 20000-29999 on failover (VMID_MAX=9999)
-# ufw allow proto tcp from any to 77.42.49.79 port 10000:19999
-# ufw allow proto tcp from any to 77.42.49.79 port 20000:29999
-# (same for FAILOVER_IPV6 if ufw supports per-rule IPv6)
-
 # -----------------------------------------------------------------------------
 # Failover routing: Hetzner Cloud / Robot panel decides which BASE receives
 # traffic to the failover IPs. Both BASEs stay identically configured; the
 # standby host simply gets no failover traffic until you switch the panel.
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Optional: test via MAIN IP when failover points at the other BASE
-# (ephemeral — repeat after reboot if needed)
-#
-# Enable — main -> failover (SMB 10000-19999 + RDP 20000-29999)
-# iptables -t nat -I PREROUTING 1 -d 46.62.188.207 -p tcp -m multiport --dports 10000:19999,20000:29999 \
-#   -j DNAT --to-destination 77.42.49.79
-# ip6tables -t nat -I PREROUTING 1 -d 2a01:4f9:3090:2488::2 -p tcp -m multiport --dports 10000:19999,20000:29999 \
-#   -j DNAT --to-destination 2a01:4f9:fff1:5f::2
-#
-# Disable
-# iptables -t nat -D PREROUTING -d 46.62.188.207 -p tcp -m multiport --dports 10000:19999,20000:29999 -j DNAT --to-destination 77.42.49.79
-# ip6tables -t nat -D PREROUTING -d 2a01:4f9:3090:2488::2 -p tcp -m multiport --dports 10000:19999,20000:29999 -j DNAT --to-destination 2a01:4f9:fff1:5f::2
-#
-# While testing, allow the same ports toward the main addresses (ufw or INPUT).
 # -----------------------------------------------------------------------------
 
 # Manual sync examples (after boot)
