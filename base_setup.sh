@@ -56,7 +56,7 @@ swapon -a
 #   # route 46.62.188.128/25 via 46.62.188.129
 #   up route add -net 46.62.188.128 netmask 255.255.255.128 gw 46.62.188.129 dev enp1s0
 #   # Failover IPv4
-#   up ip addr add 77.42.49.79/32 dev enp1s0
+#   up ip addr add 77.42.49.79/32 dev enp1s0 preferred_lft 0
 #   down ip addr del 77.42.49.79/32 dev enp1s0
 #   post-up sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 #   post-down sysctl -w net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0

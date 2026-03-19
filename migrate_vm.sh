@@ -267,12 +267,13 @@ for iface in interfaces:
   TOKEN_CREATED=1
   _ok "Token created."
 
-  # Get fingerprint
+  # Get fingerprint (with timeout so we never hang on unreachable hosts, e.g. public IP with port 8006 blocked)
   local CONNECT_SPEC
   CONNECT_SPEC="$(_openssl_connect_host "$DEST_HOST")"
+  _info "Fetching SSL fingerprint from ${CONNECT_SPEC}..."
   local FINGERPRINT
-  FINGERPRINT="$(openssl s_client -connect "$CONNECT_SPEC" -servername "$DEST_HOST" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d'=' -f2)"
-  [[ -n "$FINGERPRINT" ]] || _die "Could not get SSL fingerprint for $DEST_HOST:8006"
+  FINGERPRINT="$(timeout 15 openssl s_client -connect "$CONNECT_SPEC" -servername "$DEST_HOST" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d'=' -f2)"
+  [[ -n "$FINGERPRINT" ]] || _die "Could not get SSL fingerprint for $DEST_HOST:8006 (connection timed out or refused). When using a public IP, ensure port 8006 is open and reachable from this host (firewall/security group)."
 
   local TARGET_HOST_PARAM
   TARGET_HOST_PARAM="$(_target_endpoint_host "$DEST_HOST")"
@@ -460,6 +461,6 @@ fi
 #   With options:
 #     bash migrate_vm.sh 1008 root@10.64.0.7 --dest-node=0000007-AX162-R --target-storage=local-zfs
 #   One-liner (curl; add ?t=$(date +%s) to avoid CDN cache):
-#     curl -sSL "${MIGRATE_SCRIPT_URL}?t=$(date +%s)" | bash -s -- 1008 root@10.64.0.7
+#     curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?t=$(date +%s)" | bash -s -- 830 2a01:4f9:3070:2ccf::2
 #
 pve_zfs_migrate_vm "$@"
