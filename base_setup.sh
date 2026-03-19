@@ -3,13 +3,10 @@
 
 apt update && apt upgrade -y
 reboot
-apt install ufw
-ufw allow OpenSSH
-ufw enable
-
-# Allow forwarding (required for DNAT + Jool toward VMs)
-sudo sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-sudo ufw reload
+apt install -y nftables
+systemctl disable --now ufw 2>/dev/null || true
+apt purge -y ufw 2>/dev/null || true
+systemctl enable --now nftables
 
 # configure SSH to allow only Neura SSH keys
 
@@ -73,27 +70,47 @@ swapon -a
 #   2a01:4f9:3090:2488:64:ff9b::/96
 # On another BASE, change only the first four hextets to match that host’s main /64.
 
+# Conntrack tuning (64 GB RAM / long-lived RDP sessions).
+cat >/etc/sysctl.d/99-conntrack-tuning.conf <<'EOF'
+net.netfilter.nf_conntrack_max=2097152
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent=30
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv=30
+net.netfilter.nf_conntrack_tcp_timeout_established=43200
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait=120
+net.netfilter.nf_conntrack_tcp_timeout_close_wait=120
+net.netfilter.nf_conntrack_tcp_timeout_time_wait=60
+net.netfilter.nf_conntrack_tcp_timeout_close=10
+net.netfilter.nf_conntrack_udp_timeout=30
+net.netfilter.nf_conntrack_udp_timeout_stream=300
+EOF
+sysctl --system
+
 # =============================================================================
 # BASE NAT64 + IPv6 DNAT (Jool + sync-base-nat.py)
 # =============================================================================
 apt update
-apt install -y jool-tools jool-dkms linux-headers-amd64 python3-pip sshpass
+apt install -y jool-tools jool-dkms linux-headers-amd64 python3-pip sshpass nftables conntrack
 pip3 install --break-system-packages firebase-admin
 
 # Firebase (same as Proxmox nodes)
 # install -m 600 firebase-credentials.json /etc/firebase-credentials.json
 # or: cp /path/to/firebase-credentials.json /etc/firebase-credentials.json && chmod 600 ...
 
-# Config — MAIN_* = NAT ingress (SMB/RDP); FAILOVER_* = passthrough-only (DNAT to MAIN).
+# Config — MAIN_/FAILOVER_ IPv4 both ingress via Jool.
+# IPv4 traffic is anchored to MAIN_IPV4_TARGET_IPV6 / FAILOVER_IPV4_TARGET_IPV6
+# on public ports, then nftables DNAT maps to VM service ports.
 # POOL6 = main /64 + :64:ff9b::/96 (Jool NAT64).
 cat >/etc/default/base-nat <<'EOF'
 JOOL_INSTANCE=base
-# Main/public IPs: NAT46 (Jool) and NAT66 (ip6tables DNAT) listen here.
+# Main/public IPs: Jool pool4 + nftables NAT ingress.
 MAIN_IPV4=46.62.188.207
 MAIN_IPV6=2a01:4f9:3090:2488::2
-# Failover VIPs: traffic is DNAT'd to MAIN_IPV4/MAIN_IPV6 (passthrough).
+# Failover VIPs: same port map behavior as main ingress.
 FAILOVER_IPV4=77.42.49.79
 FAILOVER_IPV6=2a01:4f9:fff1:5f::2
+# Distinct IPv6 anchors for dual IPv4 ingress (must be different).
+MAIN_IPV4_TARGET_IPV6=2a01:4f9:3090:2488::3
+FAILOVER_IPV4_TARGET_IPV6=2a01:4f9:3090:2488::1
 # NAT64 pool: must lie inside iface inet6 static /64 (Hetzner-routed to this server)
 POOL6=2a01:4f9:3090:2488:64:ff9b::/96
 # SMB: ports SAMBA_PORT_BASE .. SAMBA_PORT_BASE+VMID_MAX (TCP only; default 10000-19999)
@@ -126,9 +143,8 @@ systemctl start base-nat-boot.service
 # or run: jool instance remove base 2>/dev/null; systemctl start base-nat-boot.service
 
 # -----------------------------------------------------------------------------
-# Failover passthrough: traffic to FAILOVER_IPV4/FAILOVER_IPV6 is DNAT'd to
-# MAIN_IPV4/MAIN_IPV6. Hetzner panel decides which BASE receives failover
-# traffic; both BASEs stay identically configured.
+# HA behavior: both BASE servers keep identical Jool+nftables config. Hetzner
+# panel decides which BASE receives FAILOVER_IPV4/FAILOVER_IPV6 at any time.
 # -----------------------------------------------------------------------------
 
 # Manual sync examples (after boot)
@@ -150,8 +166,6 @@ systemctl start base-nat-boot.service
 # Firestore proxmox_nodes (document ID = server id, field ip = public IPv6).
 # base-nat-boot runs "sync nodes" after Jool. Re-run after node changes (Cloud Function SSH:
 # sync nodes | sync nodes add <id> <ip> | sync nodes del <id>) — no periodic timer.
-
-ufw allow "WWW Full"
 
 apt update
 apt install -y nginx libnginx-mod-http-js certbot

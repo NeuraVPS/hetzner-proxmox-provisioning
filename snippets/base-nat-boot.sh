@@ -19,13 +19,13 @@ set +a
 : "${MAIN_IPV6:?MAIN_IPV6 required}"
 : "${FAILOVER_IPV4:?FAILOVER_IPV4 required}"
 : "${FAILOVER_IPV6:?FAILOVER_IPV6 required}"
+: "${MAIN_IPV4_TARGET_IPV6:=$MAIN_IPV6}"
+: "${FAILOVER_IPV4_TARGET_IPV6:=$FAILOVER_IPV6}"
 : "${SAMBA_PORT_BASE:=10000}"
 : "${RDP_PORT_BASE:=20000}"
 : "${VMID_MAX:=9999}"
 SAMBA_END=$((SAMBA_PORT_BASE + VMID_MAX))
 RDP_END=$((RDP_PORT_BASE + VMID_MAX))
-DPORTS_TCP="${SAMBA_PORT_BASE}:${SAMBA_END},${RDP_PORT_BASE}:${RDP_END}"
-DPORTS_RDP_UDP="${RDP_PORT_BASE}:${RDP_END}"
 
 modprobe jool
 
@@ -36,31 +36,25 @@ if ! jool instance display 2>/dev/null | grep -qw "$JOOL_INSTANCE"; then
   jool instance add "$JOOL_INSTANCE" --netfilter --pool6 "$POOL6"
 fi
 
-# Pool4 on main IPv4: TCP SMB+RDP range; UDP RDP range only.
+# Pool4 on both ingress IPv4s (single-instance kernel, anchor-based IPv6 fanout).
 jool -i "$JOOL_INSTANCE" pool4 add --tcp "$MAIN_IPV4" "${SAMBA_PORT_BASE}-${RDP_END}" --force 2>/dev/null || true
 jool -i "$JOOL_INSTANCE" pool4 add --udp "$MAIN_IPV4" "${RDP_PORT_BASE}-${RDP_END}" --force 2>/dev/null || true
+jool -i "$JOOL_INSTANCE" pool4 add --tcp "$FAILOVER_IPV4" "${SAMBA_PORT_BASE}-${RDP_END}" --force 2>/dev/null || true
+jool -i "$JOOL_INSTANCE" pool4 add --udp "$FAILOVER_IPV4" "${RDP_PORT_BASE}-${RDP_END}" --force 2>/dev/null || true
 
-# Failover -> main passthrough (PREROUTING DNAT so failover traffic hits main NAT rules).
-if ! iptables -t nat -C PREROUTING -d "$FAILOVER_IPV4" -j DNAT --to-destination "$MAIN_IPV4" 2>/dev/null; then
-  iptables -t nat -A PREROUTING -d "$FAILOVER_IPV4" -j DNAT --to-destination "$MAIN_IPV4"
-fi
-if ! ip6tables -t nat -C PREROUTING -d "$FAILOVER_IPV6" -j DNAT --to-destination "$MAIN_IPV6" 2>/dev/null; then
-  ip6tables -t nat -A PREROUTING -d "$FAILOVER_IPV6" -j DNAT --to-destination "$MAIN_IPV6"
-fi
-
-# INPUT: main IPs only. TCP SMB+RDP; UDP RDP only.
-if ! iptables -C INPUT -d "$MAIN_IPV4" -p tcp -m multiport --dports "$DPORTS_TCP" -j ACCEPT 2>/dev/null; then
-  iptables -I INPUT 1 -d "$MAIN_IPV4" -p tcp -m multiport --dports "$DPORTS_TCP" -j ACCEPT
-fi
-if ! iptables -C INPUT -d "$MAIN_IPV4" -p udp -m multiport --dports "$DPORTS_RDP_UDP" -j ACCEPT 2>/dev/null; then
-  iptables -I INPUT 1 -d "$MAIN_IPV4" -p udp -m multiport --dports "$DPORTS_RDP_UDP" -j ACCEPT
-fi
-if ! ip6tables -C INPUT -d "$MAIN_IPV6" -p tcp -m multiport --dports "$DPORTS_TCP" -j ACCEPT 2>/dev/null; then
-  ip6tables -I INPUT 1 -d "$MAIN_IPV6" -p tcp -m multiport --dports "$DPORTS_TCP" -j ACCEPT
-fi
-if ! ip6tables -C INPUT -d "$MAIN_IPV6" -p udp -m multiport --dports "$DPORTS_RDP_UDP" -j ACCEPT 2>/dev/null; then
-  ip6tables -I INPUT 1 -d "$MAIN_IPV6" -p udp -m multiport --dports "$DPORTS_RDP_UDP" -j ACCEPT
-fi
+# Base host firewall with nftables (no UFW): keep host services simple.
+nft delete table inet base_filter 2>/dev/null || true
+nft -f - <<'EOF'
+add table inet base_filter
+add chain inet base_filter input { type filter hook input priority 0; policy drop; }
+add chain inet base_filter forward { type filter hook forward priority 0; policy accept; }
+add chain inet base_filter output { type filter hook output priority 0; policy accept; }
+add rule inet base_filter input iif lo accept
+add rule inet base_filter input ct state established,related accept
+add rule inet base_filter input ip protocol icmp accept
+add rule inet base_filter input ip6 nexthdr ipv6-icmp accept
+add rule inet base_filter input tcp dport { 22, 80, 443 } accept
+EOF
 
 python3 /usr/local/sbin/sync-base-nat.py sync
 # PVE wildcard proxy backends from Firestore proxmox_nodes (nginx map); ok if nginx absent

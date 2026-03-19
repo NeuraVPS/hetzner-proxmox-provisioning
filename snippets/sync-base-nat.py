@@ -32,8 +32,10 @@ Commands:
 Ports, VMID in [0, VMID_MAX] (default VMID_MAX=9999):
   Samba main:(10000+VMID) -> vm:445   TCP only (ports 10000-19999)
   RDP    main:(20000+VMID) -> vm:3389 TCP+UDP (ports 20000-29999)
-IPv4 path: Jool NAT64 static BIB + pool4 on MAIN_IPV4. Failover IPv4 is DNAT'd to MAIN_IPV4.
-IPv6 path: ip6tables DNAT on MAIN_IPV6; POSTROUTING SNAT via MAIN_IPV6. Failover IPv6 DNAT'd to MAIN_IPV6.
+IPv4 path: map MAIN/FAILOVER IPv4 to distinct IPv6 anchor addresses
+  (MAIN_IPV4_TARGET_IPV6 / FAILOVER_IPV4_TARGET_IPV6) on public ports, then
+  nftables DNAT forwards those ports to VM service ports.
+IPv6 path: nftables DNAT on MAIN/FAILOVER/anchor IPv6; POSTROUTING SNAT via MAIN_IPV6.
 """
 from __future__ import annotations
 
@@ -44,7 +46,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 try:
@@ -109,11 +110,15 @@ load_default_env()
 
 FAILOVER_IPV4 = os.environ.get("FAILOVER_IPV4", "").strip()
 FAILOVER_IPV6 = os.environ.get("FAILOVER_IPV6", "").strip()
-# Main/public IPs: NAT ingress (Jool pool4/BIB and ip6tables DNAT listen here).
+# Main/public IPs: NAT ingress (Jool pool4/BIB and nftables DNAT listen here).
 MAIN_IPV4 = os.environ.get("MAIN_IPV4", "").strip()
 MAIN_IPV6 = os.environ.get("MAIN_IPV6", "").strip()
 POOL6 = os.environ.get("POOL6", "").strip()
 JOOL_INSTANCE = os.environ.get("JOOL_INSTANCE", "base").strip()
+MAIN_IPV4_TARGET_IPV6 = os.environ.get("MAIN_IPV4_TARGET_IPV6", MAIN_IPV6).strip()
+FAILOVER_IPV4_TARGET_IPV6 = os.environ.get(
+    "FAILOVER_IPV4_TARGET_IPV6", FAILOVER_IPV6
+).strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(DEFAULT_STATE_FILE)))
 PVE_NODES_STATE_FILE = Path(
     os.environ.get("PVE_NODES_STATE_FILE", str(STATE_DIR / "pve_nodes.json"))
@@ -141,10 +146,47 @@ RDP_PORT_BASE = int(os.environ.get("RDP_PORT_BASE", "20000"))
 VMID_MAX = int(os.environ.get("VMID_MAX", os.environ.get("PORT_MAX", "9999")))
 SAMBA_PORT_END = SAMBA_PORT_BASE + VMID_MAX
 RDP_PORT_END = RDP_PORT_BASE + VMID_MAX
-DPORTS_SMB_RDP = f"{SAMBA_PORT_BASE}:{SAMBA_PORT_END},{RDP_PORT_BASE}:{RDP_PORT_END}"
-DPORTS_RDP = f"{RDP_PORT_BASE}:{RDP_PORT_END}"  # UDP RDP only
+
+NFT_NAT_TABLE_FAMILY = "ip6"
+NFT_NAT_TABLE_NAME = "base_nat"
 
 FIREBASE_INITIALIZED = False
+
+
+def ingress_ipv4_hosts() -> tuple[str, ...]:
+    """IPv4s that carry direct Jool BIB mappings."""
+    hosts: list[str] = []
+    for ip in (MAIN_IPV4, FAILOVER_IPV4):
+        if ip and ip not in hosts:
+            hosts.append(ip)
+    return tuple(hosts)
+
+
+def jool_targets() -> tuple[tuple[str, str], ...]:
+    """(ingress_ipv4, jool_instance) pair(s) for static BIB operations."""
+    return tuple((ip, JOOL_INSTANCE) for ip in ingress_ipv4_hosts())
+
+
+def jool_ipv6_anchor_for_ingress(ingress_ipv4: str) -> str:
+    if ingress_ipv4 == MAIN_IPV4:
+        return MAIN_IPV4_TARGET_IPV6
+    if ingress_ipv4 == FAILOVER_IPV4:
+        return FAILOVER_IPV4_TARGET_IPV6
+    return MAIN_IPV4_TARGET_IPV6
+
+
+def ingress_ipv6_hosts() -> tuple[str, ...]:
+    """IPv6 ingress addresses for nftables DNAT prerouting."""
+    hosts: list[str] = []
+    for ip in (
+        MAIN_IPV6,
+        FAILOVER_IPV6,
+        MAIN_IPV4_TARGET_IPV6,
+        FAILOVER_IPV4_TARGET_IPV6,
+    ):
+        if ip and ip not in hosts:
+            hosts.append(ip)
+    return tuple(hosts)
 
 
 def initialize_firebase():
@@ -182,28 +224,32 @@ def run(cmd: list[str], check: bool = True) -> str:
     return (r.stdout or "").strip()
 
 
-def run_jool(args: list[str], check: bool = True) -> str:
-    cmd = ["jool", "-i", JOOL_INSTANCE] + args
+def run_jool(instance: str, args: list[str], check: bool = True) -> str:
+    cmd = ["jool", "-i", instance] + args
     return run(cmd, check=check)
 
 
-def run_ip6tables(cmd: list[str], check: bool = True, max_retries: int = 3):
-    last = None
-    for _ in range(max_retries):
-        last = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if last.returncode == 0:
-            return last
-        time.sleep(0.3)
-    if check:
+def run_nft(script: str, check: bool = True) -> str:
+    r = subprocess.run(
+        ["nft", "-f", "-"],
+        input=script,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and r.returncode != 0:
         raise subprocess.CalledProcessError(
-            last.returncode, cmd, last.stdout, last.stderr
+            r.returncode, ["nft", "-f", "-"], r.stdout, r.stderr
         )
-    return last
+    return (r.stdout or "").strip()
 
 
-def jool_bib_add_tcp(ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: int):
+def jool_bib_add_tcp(
+    instance: str, ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: int
+):
     # Syntax: bib add --tcp <IPv4>#port <IPv6>#port
     run_jool(
+        instance,
         [
             "bib",
             "add",
@@ -214,12 +260,15 @@ def jool_bib_add_tcp(ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: 
     )
 
 
-def jool_bib_remove_tcp(ipv4_host: str, ipv4_port: int):
-    run_jool(["bib", "remove", "--tcp", f"{ipv4_host}#{ipv4_port}"], check=False)
+def jool_bib_remove_tcp(instance: str, ipv4_host: str, ipv4_port: int):
+    run_jool(instance, ["bib", "remove", "--tcp", f"{ipv4_host}#{ipv4_port}"], check=False)
 
 
-def jool_bib_add_udp(ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: int):
+def jool_bib_add_udp(
+    instance: str, ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: int
+):
     run_jool(
+        instance,
         [
             "bib",
             "add",
@@ -230,8 +279,8 @@ def jool_bib_add_udp(ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: 
     )
 
 
-def jool_bib_remove_udp(ipv4_host: str, ipv4_port: int):
-    run_jool(["bib", "remove", "--udp", f"{ipv4_host}#{ipv4_port}"], check=False)
+def jool_bib_remove_udp(instance: str, ipv4_host: str, ipv4_port: int):
+    run_jool(instance, ["bib", "remove", "--udp", f"{ipv4_host}#{ipv4_port}"], check=False)
 
 
 def validate_config():
@@ -245,6 +294,13 @@ def validate_config():
     ipaddress.ip_address(MAIN_IPV6)
     ipaddress.ip_address(FAILOVER_IPV4)
     ipaddress.ip_address(FAILOVER_IPV6)
+    ipaddress.ip_address(MAIN_IPV4_TARGET_IPV6)
+    ipaddress.ip_address(FAILOVER_IPV4_TARGET_IPV6)
+    if MAIN_IPV4_TARGET_IPV6 == FAILOVER_IPV4_TARGET_IPV6:
+        logger.error(
+            "MAIN_IPV4_TARGET_IPV6 and FAILOVER_IPV4_TARGET_IPV6 must differ"
+        )
+        sys.exit(1)
     if POOL6:
         ipaddress.ip_network(POOL6, strict=False)
 
@@ -290,206 +346,123 @@ def desired_from_state() -> dict[int, str]:
     return out
 
 
-def ensure_ip6tables_chain():
-    # PREROUTING to BASE_DNAT: main IPv6, TCP SMB+RDP and UDP RDP only.
-    run_ip6tables(
-        ["ip6tables", "-t", "nat", "-N", "BASE_DNAT"], check=False
-    )
-    for proto, dports in [("tcp", DPORTS_SMB_RDP), ("udp", DPORTS_RDP)]:
-        r = run_ip6tables(
-            [
-                "ip6tables",
-                "-t",
-                "nat",
-                "-C",
-                "PREROUTING",
-                "-d",
-                MAIN_IPV6,
-                "-p",
-                proto,
-                "-m",
-                "multiport",
-                "--dports",
-                dports,
-                "-j",
-                "BASE_DNAT",
-            ],
-            check=False,
-        )
-        if r.returncode != 0:
-            run_ip6tables(
-                [
-                    "ip6tables",
-                    "-t",
-                    "nat",
-                    "-A",
-                    "PREROUTING",
-                    "-d",
-                    MAIN_IPV6,
-                    "-p",
-                    proto,
-                    "-m",
-                    "multiport",
-                    "--dports",
-                    dports,
-                    "-j",
-                    "BASE_DNAT",
-                ]
-            )
+def _nft_list(values: list[str]) -> str:
+    return ", ".join(values)
 
 
-def flush_base_dnat_chain():
-    run_ip6tables(["ip6tables", "-t", "nat", "-F", "BASE_DNAT"], check=False)
+def rebuild_nftables_nat(desired: dict[int, str]):
+    """
+    Rebuild nftables ip6 NAT table for BASE DNAT/SNAT.
 
+    - PREROUTING DNAT:
+      ingress IPv6 (main/failover/anchors) + public SMB/RDP ports -> VM service ports.
+    - POSTROUTING SNAT:
+      VM replies on TCP 445/3389 + UDP 3389 -> MAIN_IPV6.
+      Preserve Jool return identity by bypassing SNAT when source is POOL6.
+    """
+    ingress_v6 = list(ingress_ipv6_hosts())
+    if not ingress_v6:
+        logger.error("No ingress IPv6 addresses available for nftables DNAT")
+        sys.exit(1)
+    vm_targets = sorted(set(desired.values()))
 
-def ensure_base_snat_chain():
-    """POSTROUTING SNAT so forwarded SYNs to VMs use MAIN_IPV6 (provider egress filter)."""
-    run_ip6tables(["ip6tables", "-t", "nat", "-N", "BASE_SNAT"], check=False)
-    r = run_ip6tables(
-        [
-            "ip6tables",
-            "-t",
-            "nat",
-            "-C",
-            "POSTROUTING",
-            "-j",
-            "BASE_SNAT",
-        ],
-        check=False,
-    )
-    if r.returncode != 0:
-        run_ip6tables(
-            ["ip6tables", "-t", "nat", "-A", "POSTROUTING", "-j", "BASE_SNAT"]
-        )
+    run(["nft", "delete", "table", NFT_NAT_TABLE_FAMILY, NFT_NAT_TABLE_NAME], check=False)
 
+    rules: list[str] = [
+        f"add table {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME}",
+        f"add set {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} ingress_v6 {{ type ipv6_addr; }}",
+        (
+            f"add element {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} ingress_v6 "
+            f"{{ {_nft_list(ingress_v6)} }}"
+        ),
+        (
+            f"add chain {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
+            "{ type nat hook prerouting priority dstnat; policy accept; }"
+        ),
+        (
+            f"add chain {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
+            "{ type nat hook postrouting priority srcnat; policy accept; }"
+        ),
+    ]
 
-def flush_base_snat_chain():
-    run_ip6tables(["ip6tables", "-t", "nat", "-F", "BASE_SNAT"], check=False)
-
-
-def rebuild_ip6tables_snat(desired: dict[int, str]):
-    """SNAT to MAIN_IPV6: TCP 445,3389 and UDP 3389 (reply path for DNAT traffic)."""
-    ensure_base_snat_chain()
-    flush_base_snat_chain()
-    if not MAIN_IPV6:
-        logger.info(
-            "MAIN_IPV6 unset: no IPv6 SNAT (set MAIN_IPV6=primary ::2 if DNAT reply path fails)"
-        )
-        return
-    for _vmid, ipv6 in sorted(desired.items(), key=lambda x: x[0]):
-        for proto, dports in [("tcp", "445,3389"), ("udp", "3389")]:
-            run_ip6tables(
-                [
-                    "ip6tables",
-                    "-t",
-                    "nat",
-                    "-A",
-                    "BASE_SNAT",
-                    "-d",
-                    ipv6,
-                    "-p",
-                    proto,
-                    "-m",
-                    "multiport",
-                    "--dports",
-                    dports,
-                    "-j",
-                    "SNAT",
-                    "--to-source",
-                    MAIN_IPV6,
-                ]
-            )
-    logger.info("IPv6 SNAT via MAIN_IPV6 for %d VM target(s) (TCP 445/3389, UDP 3389)", len(desired))
-
-
-def rebuild_ip6tables_dnat(desired: dict[int, str]):
-    """desired: vmid -> ipv6 string"""
-    ensure_ip6tables_chain()
-    flush_base_dnat_chain()
     for vmid in sorted(desired.keys()):
         ipv6 = desired[vmid]
         samba_p, rdp_p = vm_ports(vmid)
-        run_ip6tables(
+        rules.extend(
             [
-                "ip6tables",
-                "-t",
-                "nat",
-                "-A",
-                "BASE_DNAT",
-                "-p",
-                "tcp",
-                "--dport",
-                str(samba_p),
-                "-m",
-                "comment",
-                "--comment",
-                f"base-nat-{vmid}-samba",
-                "-j",
-                "DNAT",
-                "--to-destination",
-                f"[{ipv6}]:445",
+                (
+                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
+                    f"ip6 daddr @ingress_v6 tcp dport {samba_p} "
+                    f"dnat to [{ipv6}]:445"
+                ),
+                (
+                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
+                    f"ip6 daddr @ingress_v6 tcp dport {rdp_p} "
+                    f"dnat to [{ipv6}]:3389"
+                ),
+                (
+                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
+                    f"ip6 daddr @ingress_v6 udp dport {rdp_p} "
+                    f"dnat to [{ipv6}]:3389"
+                ),
             ]
         )
-        run_ip6tables(
+
+    if POOL6:
+        rules.append(
+            f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
+            f"ip6 saddr {POOL6} return"
+        )
+
+    if vm_targets:
+        rules.extend(
             [
-                "ip6tables",
-                "-t",
-                "nat",
-                "-A",
-                "BASE_DNAT",
-                "-p",
-                "tcp",
-                "--dport",
-                str(rdp_p),
-                "-m",
-                "comment",
-                "--comment",
-                f"base-nat-{vmid}-rdp",
-                "-j",
-                "DNAT",
-                "--to-destination",
-                f"[{ipv6}]:3389",
+                (
+                    f"add set {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} vm_targets_v6 "
+                    "{ type ipv6_addr; }"
+                ),
+                (
+                    f"add element {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} vm_targets_v6 "
+                    f"{{ {_nft_list(vm_targets)} }}"
+                ),
+                (
+                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
+                    f"ip6 daddr @vm_targets_v6 tcp dport {{ 445, 3389 }} snat to {MAIN_IPV6}"
+                ),
+                (
+                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
+                    f"ip6 daddr @vm_targets_v6 udp dport 3389 snat to {MAIN_IPV6}"
+                ),
             ]
         )
-        run_ip6tables(
-            [
-                "ip6tables",
-                "-t",
-                "nat",
-                "-A",
-                "BASE_DNAT",
-                "-p",
-                "udp",
-                "--dport",
-                str(rdp_p),
-                "-m",
-                "comment",
-                "--comment",
-                f"base-nat-{vmid}-rdp-udp",
-                "-j",
-                "DNAT",
-                "--to-destination",
-                f"[{ipv6}]:3389",
-            ]
-        )
-    rebuild_ip6tables_snat(desired)
+
+    run_nft("\n".join(rules) + "\n")
+    logger.info(
+        "nftables NAT rebuilt (%d VM targets, %d ingress IPv6)",
+        len(desired),
+        len(ingress_v6),
+    )
 
 
 def remove_vm_rules(vmid: int):
     samba_p, rdp_p = vm_ports(vmid)
-    jool_bib_remove_tcp(MAIN_IPV4, samba_p)
-    jool_bib_remove_tcp(MAIN_IPV4, rdp_p)
-    jool_bib_remove_udp(MAIN_IPV4, rdp_p)
+    for ingress_ipv4, instance in jool_targets():
+        jool_bib_remove_tcp(instance, ingress_ipv4, samba_p)
+        jool_bib_remove_tcp(instance, ingress_ipv4, rdp_p)
+        jool_bib_remove_udp(instance, ingress_ipv4, rdp_p)
 
 
 def apply_vm_jool(vmid: int, ipv6: str):
     samba_p, rdp_p = vm_ports(vmid)
-    jool_bib_remove_tcp(MAIN_IPV4, samba_p)
-    jool_bib_remove_tcp(MAIN_IPV4, rdp_p)
-    jool_bib_remove_udp(MAIN_IPV4, rdp_p)
-    jool_bib_add_tcp(MAIN_IPV4, samba_p, ipv6, 445)
-    jool_bib_add_tcp(MAIN_IPV4, rdp_p, ipv6, 3389)
-    jool_bib_add_udp(MAIN_IPV4, rdp_p, ipv6, 3389)
+    for ingress_ipv4, instance in jool_targets():
+        jool_bib_remove_tcp(instance, ingress_ipv4, samba_p)
+        jool_bib_remove_tcp(instance, ingress_ipv4, rdp_p)
+        jool_bib_remove_udp(instance, ingress_ipv4, rdp_p)
+        anchor = jool_ipv6_anchor_for_ingress(ingress_ipv4)
+        # Anchor on public ports; nftables DNAT handles public_port -> service_port.
+        jool_bib_add_tcp(instance, ingress_ipv4, samba_p, anchor, samba_p)
+        jool_bib_add_tcp(instance, ingress_ipv4, rdp_p, anchor, rdp_p)
+        jool_bib_add_udp(instance, ingress_ipv4, rdp_p, anchor, rdp_p)
 
 
 def firestore_list_configured_servers() -> dict[int, str]:
@@ -556,7 +529,7 @@ def sync_full():
     for vmid, ipv6 in desired.items():
         logger.info("Apply proxmoxId=%s -> %s", vmid, ipv6)
     apply_all_jool(desired)
-    rebuild_ip6tables_dnat(desired)  # includes rebuild_ip6tables_snat
+    rebuild_nftables_nat(desired)
     write_state(
         {
             str(k): {
@@ -567,10 +540,11 @@ def sync_full():
             for k in desired
         }
     )
-    try:
-        run_jool(["session", "sync"], check=False)
-    except Exception:
-        pass
+    for _ingress_ipv4, instance in jool_targets():
+        try:
+            run_jool(instance, ["session", "sync"], check=False)
+        except Exception:
+            pass
     logger.info("Full sync done (%d servers)", len(desired))
 
 
@@ -622,7 +596,7 @@ def sync_single_vmid(
             apply_vm_jool(vmid, desired[vmid])
         except Exception as e:
             logger.warning("apply_vm_jool proxmoxId=%s: %s", vmid, e)
-    rebuild_ip6tables_dnat(desired)
+    rebuild_nftables_nat(desired)
     write_state(
         {
             str(k): {
@@ -633,10 +607,11 @@ def sync_single_vmid(
             for k in desired
         }
     )
-    try:
-        run_jool(["session", "sync"], check=False)
-    except Exception:
-        pass
+    for _ingress_ipv4, instance in jool_targets():
+        try:
+            run_jool(instance, ["session", "sync"], check=False)
+        except Exception:
+            pass
     logger.info(
         "Sync proxmoxId=%s done (desired=%d VMs; Jool updated for this id only)",
         vmid,
