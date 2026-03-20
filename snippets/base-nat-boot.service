@@ -1,13 +1,12 @@
 [Unit]
-Description=BASE NAT64 (Jool) + DNAT sync from Firestore
-After=network-online.target
-Wants=network-online.target
+Description=BASE nftables + nginx stream sync from Firestore
+After=network-online.target nginx.service
+Wants=network-online.target nginx.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Run via bash so curl -o installs (non-executable 644) still work; avoids 203/EXEC.
-ExecStart=/bin/bash /usr/local/sbin/base-nat-boot.sh
+ExecStart=/usr/local/sbin/base-nat-boot.sh
 StandardOutput=journal
 StandardError=journal
 

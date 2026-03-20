@@ -1,41 +1,32 @@
 #!/usr/bin/env python3
 """
-sync-base-nat: BASE server NAT64 (Jool) + IPv6 DNAT for Samba/RDP via Firestore.
+sync-base-nat: BASE server ingress sync using nftables + nginx stream (no Jool).
 
 Reads /etc/default/base-nat (shell KEY=value). Env overrides.
 
 Commands:
   sync-base-nat.py sync
-      Full sync: Firestore servers (proxmoxId + ipv6); remove stale rules; apply all.
+      Full sync: read Firestore "servers" (proxmoxId + ipv6), regenerate
+      nftables + nginx stream config, validate, apply, reload nginx.
+
   sync-base-nat.py sync <proxmoxId>
-      Single VM: one Firestore query + merge into STATE_FILE snapshot; full rebuild
-      of Jool/DNAT from that map. Run "sync" (no args) to refresh from Firestore
-      if servers were added only in the cloud.
+      Single VM: read one server from Firestore and merge into local state,
+      then rebuild/apply full generated config from that local desired map.
+
   sync-base-nat.py sync <proxmoxId> <publicVMIPv6>
-      Single VM with explicit IPv6 (no Firestore read for target).
+      Single VM override without Firestore read for that VM.
+
   sync-base-nat.py sync <proxmoxId> del
-      Remove rules for proxmoxId only (no Firestore).
+      Remove one VM from local desired map, rebuild/apply config.
 
   sync-base-nat.py sync nodes
-      PVE proxy: full sync from Firestore collection proxmox_nodes (doc id = node
-      slug, field ip = IPv6). Writes pve_nodes.json + nginx map; nginx reload.
-  sync-base-nat.py sync nodes <nodeId>
-      Merge one node from Firestore proxmox_nodes/<nodeId> (field ip).
-  sync-base-nat.py sync nodes add <nodeId> <ipv6>
-      Upsert node locally + nginx map (no Firestore read). For Cloud Function hooks.
-  sync-base-nat.py sync nodes del <nodeId>
-      Remove node from local map + nginx reload.
-  sync-base-nat.py sync nodes sync-firewall
-      Pull cluster.fw from Storage Box; replace [IPSET hosts-ipv6] with /64 per
-      pve_nodes.json; push back; SSH each node to pull + pve-firewall restart.
+      PVE proxy: full sync from Firestore "proxmox_nodes" (doc id -> field ip),
+      write nginx backend map, reload nginx.
 
-Ports, VMID in [0, VMID_MAX] (default VMID_MAX=9999):
-  Samba main:(10000+VMID) -> vm:445   TCP only (ports 10000-19999)
-  RDP    main:(20000+VMID) -> vm:3389 TCP+UDP (ports 20000-29999)
-IPv4 path: map MAIN/FAILOVER IPv4 to distinct IPv6 anchor addresses
-  (MAIN_IPV4_TARGET_IPV6 / FAILOVER_IPV4_TARGET_IPV6) on public ports, then
-  nftables DNAT forwards those ports to VM service ports.
-IPv6 path: nftables DNAT on MAIN/FAILOVER/anchor IPv6; POSTROUTING SNAT via MAIN_IPV6.
+  sync-base-nat.py sync nodes <nodeId>
+  sync-base-nat.py sync nodes add <nodeId> <ipv6>
+  sync-base-nat.py sync nodes del <nodeId>
+  sync-base-nat.py sync nodes sync-firewall
 """
 from __future__ import annotations
 
@@ -63,6 +54,7 @@ except ImportError:
     FIREBASE_AVAILABLE = False
     FIELD_FILTER_AVAILABLE = False
 
+
 LOG_FILE = Path("/var/log/sync-base-nat.log")
 MAX_LOG_SIZE = 1024 * 1024
 STATE_DIR = Path("/var/lib/base-nat")
@@ -70,7 +62,7 @@ DEFAULT_STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_ENV_FILE = Path("/etc/default/base-nat")
 
 
-def clean_log_if_needed():
+def clean_log_if_needed() -> bool:
     if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
         LOG_FILE.unlink()
         return True
@@ -106,28 +98,68 @@ def load_default_env(path: Path = DEFAULT_ENV_FILE):
                 os.environ[k] = v
 
 
+def parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_ipv4(addr: str) -> str:
+    return str(ipaddress.IPv4Address(addr))
+
+
+def normalize_ipv6(addr: str) -> str:
+    return str(ipaddress.IPv6Address(addr))
+
+
+def check_vmid(vmid: int) -> int:
+    if not (0 <= vmid <= VMID_MAX):
+        raise ValueError(f"proxmoxId/VMID {vmid} out of range [0, {VMID_MAX}]")
+    return vmid
+
+
 load_default_env()
 
-FAILOVER_IPV4 = os.environ.get("FAILOVER_IPV4", "").strip()
-FAILOVER_IPV6 = os.environ.get("FAILOVER_IPV6", "").strip()
-# Main/public IPs: NAT ingress (Jool pool4/BIB and nftables DNAT listen here).
+
 MAIN_IPV4 = os.environ.get("MAIN_IPV4", "").strip()
 MAIN_IPV6 = os.environ.get("MAIN_IPV6", "").strip()
-POOL6 = os.environ.get("POOL6", "").strip()
-JOOL_INSTANCE = os.environ.get("JOOL_INSTANCE", "base").strip()
-MAIN_IPV4_TARGET_IPV6 = os.environ.get("MAIN_IPV4_TARGET_IPV6", MAIN_IPV6).strip()
-FAILOVER_IPV4_TARGET_IPV6 = os.environ.get(
-    "FAILOVER_IPV4_TARGET_IPV6", FAILOVER_IPV6
-).strip()
+FAILOVER_IPV4 = os.environ.get("FAILOVER_IPV4", "").strip()
+FAILOVER_IPV6 = os.environ.get("FAILOVER_IPV6", "").strip()
+SNAT_IPV6 = os.environ.get("SNAT_IPV6", MAIN_IPV6).strip()
+
+FIREBASE_CREDENTIALS = os.environ.get(
+    "FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json"
+)
+
+SAMBA_PORT_BASE = int(os.environ.get("SAMBA_PORT_BASE", "10000"))
+RDP_PORT_BASE = int(os.environ.get("RDP_PORT_BASE", "20000"))
+VMID_MAX = int(os.environ.get("VMID_MAX", os.environ.get("PORT_MAX", "9999")))
+SAMBA_PORT_END = SAMBA_PORT_BASE + VMID_MAX
+RDP_PORT_END = RDP_PORT_BASE + VMID_MAX
+SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+INCLUDE_UDP_RDP = parse_bool_env("INCLUDE_UDP_RDP", True)
+
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(DEFAULT_STATE_FILE)))
 PVE_NODES_STATE_FILE = Path(
     os.environ.get("PVE_NODES_STATE_FILE", str(STATE_DIR / "pve_nodes.json"))
 )
 PVE_NGINX_MAP_FILE = Path(
     os.environ.get(
-        "PVE_NGINX_MAP_FILE", "/etc/nginx/conf.d/pve-proxy-backends.map.conf"
+        "PVE_NGINX_MAP_FILE",
+        "/etc/nginx/conf.d/pve-proxy-backends.map.conf",
     )
 )
+
+NFT_CONFIG_FILE = Path(
+    os.environ.get("NFT_CONFIG_FILE", "/etc/nftables.base-nat.generated.conf")
+)
+NGINX_STREAM_FILE = Path(
+    os.environ.get("NGINX_STREAM_FILE", "/etc/nginx/stream.d/base-nat.conf")
+)
+NFT_FILTER_TABLE_NAME = os.environ.get("NFT_FILTER_TABLE_NAME", "base_filter").strip()
+NFT_NAT_TABLE_NAME = os.environ.get("NFT_NAT_TABLE_NAME", "base_nat6").strip()
+
 # Storage Box: cluster.fw template (scp port 23). Override via env on BASE.
 FIREWALL_STORAGE_USER = os.environ.get("FIREWALL_STORAGE_USER", "u560363").strip()
 FIREWALL_STORAGE_HOST = os.environ.get(
@@ -137,63 +169,49 @@ FIREWALL_REMOTE_PATH = os.environ.get(
     "FIREWALL_REMOTE_PATH", "/home/firewall/cluster.fw"
 ).strip()
 FIREWALL_SCP_PORT = os.environ.get("FIREWALL_SCP_PORT", "23").strip()
-FIREBASE_CREDENTIALS = os.environ.get(
-    "FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json"
-)
-SAMBA_PORT_BASE = int(os.environ.get("SAMBA_PORT_BASE", "10000"))
-RDP_PORT_BASE = int(os.environ.get("RDP_PORT_BASE", "20000"))
-# Max proxmoxId/VMID; Samba uses SAMBA_PORT_BASE..SAMBA_PORT_BASE+VMID_MAX, RDP uses RDP_PORT_BASE..RDP_PORT_BASE+VMID_MAX
-VMID_MAX = int(os.environ.get("VMID_MAX", os.environ.get("PORT_MAX", "9999")))
-SAMBA_PORT_END = SAMBA_PORT_BASE + VMID_MAX
-RDP_PORT_END = RDP_PORT_BASE + VMID_MAX
-
-NFT_NAT_TABLE_FAMILY = "ip6"
-NFT_NAT_TABLE_NAME = "base_nat"
 
 FIREBASE_INITIALIZED = False
 
 
-def ingress_ipv4_hosts() -> tuple[str, ...]:
-    """IPv4s that carry direct Jool BIB mappings."""
-    hosts: list[str] = []
-    for ip in (MAIN_IPV4, FAILOVER_IPV4):
-        if ip and ip not in hosts:
-            hosts.append(ip)
-    return tuple(hosts)
+def validate_config():
+    if not MAIN_IPV4 or not MAIN_IPV6:
+        logger.error("MAIN_IPV4 and MAIN_IPV6 are required in /etc/default/base-nat")
+        sys.exit(1)
+    if not FAILOVER_IPV4 or not FAILOVER_IPV6:
+        logger.error(
+            "FAILOVER_IPV4 and FAILOVER_IPV6 are required in /etc/default/base-nat"
+        )
+        sys.exit(1)
+
+    normalize_ipv4(MAIN_IPV4)
+    normalize_ipv4(FAILOVER_IPV4)
+    normalize_ipv6(MAIN_IPV6)
+    normalize_ipv6(FAILOVER_IPV6)
+    normalize_ipv6(SNAT_IPV6)
+
+    if not (1 <= SSH_PORT <= 65535):
+        logger.error("SSH_PORT must be in [1, 65535]")
+        sys.exit(1)
+    if SAMBA_PORT_BASE < 1 or RDP_PORT_BASE < 1:
+        logger.error("SAMBA_PORT_BASE and RDP_PORT_BASE must be >= 1")
+        sys.exit(1)
+    if SAMBA_PORT_END > 65535 or RDP_PORT_END > 65535:
+        logger.error(
+            "Port range overflow: SMB=%s-%s RDP=%s-%s",
+            SAMBA_PORT_BASE,
+            SAMBA_PORT_END,
+            RDP_PORT_BASE,
+            RDP_PORT_END,
+        )
+        sys.exit(1)
 
 
-def jool_targets() -> tuple[tuple[str, str], ...]:
-    """(ingress_ipv4, jool_instance) pair(s) for static BIB operations."""
-    return tuple((ip, JOOL_INSTANCE) for ip in ingress_ipv4_hosts())
-
-
-def jool_ipv6_anchor_for_ingress(ingress_ipv4: str) -> str:
-    if ingress_ipv4 == MAIN_IPV4:
-        return MAIN_IPV4_TARGET_IPV6
-    if ingress_ipv4 == FAILOVER_IPV4:
-        return FAILOVER_IPV4_TARGET_IPV6
-    return MAIN_IPV4_TARGET_IPV6
-
-
-def ingress_ipv6_hosts() -> tuple[str, ...]:
-    """IPv6 ingress addresses for nftables DNAT prerouting."""
-    hosts: list[str] = []
-    for ip in (
-        MAIN_IPV6,
-        FAILOVER_IPV6,
-        MAIN_IPV4_TARGET_IPV6,
-        FAILOVER_IPV4_TARGET_IPV6,
-    ):
-        if ip and ip not in hosts:
-            hosts.append(ip)
-    return tuple(hosts)
-
-
-def initialize_firebase():
+def initialize_firebase() -> bool:
     global FIREBASE_INITIALIZED
     if not FIREBASE_AVAILABLE:
         return False
     if firebase_admin._apps:
+        FIREBASE_INITIALIZED = True
         return True
     p = Path(FIREBASE_CREDENTIALS)
     if not p.is_file():
@@ -209,105 +227,28 @@ def initialize_firebase():
         return False
 
 
-def ensure_firebase():
-    if FIREBASE_INITIALIZED or firebase_admin._apps:
+def ensure_firebase() -> bool:
+    if FIREBASE_INITIALIZED:
+        return True
+    if FIREBASE_AVAILABLE and firebase_admin._apps:
         return True
     return initialize_firebase()
 
 
 def run(cmd: list[str], check: bool = True) -> str:
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if check and r.returncode != 0:
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
-            r.returncode, cmd, r.stdout, r.stderr
+            result.returncode,
+            cmd,
+            result.stdout,
+            result.stderr,
         )
-    return (r.stdout or "").strip()
-
-
-def run_jool(instance: str, args: list[str], check: bool = True) -> str:
-    cmd = ["jool", "-i", instance] + args
-    return run(cmd, check=check)
-
-
-def run_nft(script: str, check: bool = True) -> str:
-    r = subprocess.run(
-        ["nft", "-f", "-"],
-        input=script,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if check and r.returncode != 0:
-        raise subprocess.CalledProcessError(
-            r.returncode, ["nft", "-f", "-"], r.stdout, r.stderr
-        )
-    return (r.stdout or "").strip()
-
-
-def jool_bib_add_tcp(
-    instance: str, ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: int
-):
-    # Syntax: bib add --tcp <IPv4>#port <IPv6>#port
-    run_jool(
-        instance,
-        [
-            "bib",
-            "add",
-            "--tcp",
-            f"{ipv4_host}#{ipv4_port}",
-            f"{ipv6_host}#{ipv6_port}",
-        ]
-    )
-
-
-def jool_bib_remove_tcp(instance: str, ipv4_host: str, ipv4_port: int):
-    run_jool(instance, ["bib", "remove", "--tcp", f"{ipv4_host}#{ipv4_port}"], check=False)
-
-
-def jool_bib_add_udp(
-    instance: str, ipv4_host: str, ipv4_port: int, ipv6_host: str, ipv6_port: int
-):
-    run_jool(
-        instance,
-        [
-            "bib",
-            "add",
-            "--udp",
-            f"{ipv4_host}#{ipv4_port}",
-            f"{ipv6_host}#{ipv6_port}",
-        ]
-    )
-
-
-def jool_bib_remove_udp(instance: str, ipv4_host: str, ipv4_port: int):
-    run_jool(instance, ["bib", "remove", "--udp", f"{ipv4_host}#{ipv4_port}"], check=False)
-
-
-def validate_config():
-    if not MAIN_IPV4 or not MAIN_IPV6:
-        logger.error("MAIN_IPV4 and MAIN_IPV6 required in /etc/default/base-nat")
-        sys.exit(1)
-    if not FAILOVER_IPV4 or not FAILOVER_IPV6:
-        logger.error("FAILOVER_IPV4 and FAILOVER_IPV6 required in /etc/default/base-nat")
-        sys.exit(1)
-    ipaddress.ip_address(MAIN_IPV4)
-    ipaddress.ip_address(MAIN_IPV6)
-    ipaddress.ip_address(FAILOVER_IPV4)
-    ipaddress.ip_address(FAILOVER_IPV6)
-    ipaddress.ip_address(MAIN_IPV4_TARGET_IPV6)
-    ipaddress.ip_address(FAILOVER_IPV4_TARGET_IPV6)
-    if MAIN_IPV4_TARGET_IPV6 == FAILOVER_IPV4_TARGET_IPV6:
-        logger.error(
-            "MAIN_IPV4_TARGET_IPV6 and FAILOVER_IPV4_TARGET_IPV6 must differ"
-        )
-        sys.exit(1)
-    if POOL6:
-        ipaddress.ip_network(POOL6, strict=False)
+    return (result.stdout or "").strip()
 
 
 def vm_ports(vmid: int) -> tuple[int, int]:
-    if vmid < 0 or vmid > VMID_MAX:
-        raise ValueError(f"proxmoxId/VMID {vmid} out of range [0, {VMID_MAX}]")
+    vmid = check_vmid(vmid)
     return SAMBA_PORT_BASE + vmid, RDP_PORT_BASE + vmid
 
 
@@ -323,13 +264,16 @@ def read_state() -> dict:
 
 def write_state(state: dict):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 def desired_from_state() -> dict[int, str]:
     """vmid -> ipv6 from STATE_FILE (on-box snapshot)."""
     out: dict[int, str] = {}
-    for k, d in read_state().items():
+    raw = read_state()
+    if not isinstance(raw, dict):
+        return out
+    for k, d in raw.items():
         try:
             vmid = int(k)
         except (TypeError, ValueError):
@@ -337,136 +281,31 @@ def desired_from_state() -> dict[int, str]:
         if not isinstance(d, dict):
             continue
         ipv6 = d.get("ipv6")
-        if ipv6:
-            try:
-                ipaddress.ip_address(str(ipv6).strip())
-            except ValueError:
-                continue
-            out[vmid] = str(ipv6).strip()
+        if not ipv6:
+            continue
+        s = str(ipv6).strip()
+        try:
+            normalize_ipv6(s)
+        except ValueError:
+            continue
+        if 0 <= vmid <= VMID_MAX:
+            out[vmid] = s
     return out
 
 
-def _nft_list(values: list[str]) -> str:
-    return ", ".join(values)
-
-
-def rebuild_nftables_nat(desired: dict[int, str]):
-    """
-    Rebuild nftables ip6 NAT table for BASE DNAT/SNAT.
-
-    - PREROUTING DNAT:
-      ingress IPv6 (main/failover/anchors) + public SMB/RDP ports -> VM service ports.
-    - POSTROUTING SNAT:
-      VM replies on TCP 445/3389 + UDP 3389 -> MAIN_IPV6.
-      Preserve Jool return identity by bypassing SNAT when source is POOL6.
-    """
-    ingress_v6 = list(ingress_ipv6_hosts())
-    if not ingress_v6:
-        logger.error("No ingress IPv6 addresses available for nftables DNAT")
-        sys.exit(1)
-    vm_targets = sorted(set(desired.values()))
-
-    run(["nft", "delete", "table", NFT_NAT_TABLE_FAMILY, NFT_NAT_TABLE_NAME], check=False)
-
-    rules: list[str] = [
-        f"add table {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME}",
-        f"add set {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} ingress_v6 {{ type ipv6_addr; }}",
-        (
-            f"add element {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} ingress_v6 "
-            f"{{ {_nft_list(ingress_v6)} }}"
-        ),
-        (
-            f"add chain {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
-            "{ type nat hook prerouting priority dstnat; policy accept; }"
-        ),
-        (
-            f"add chain {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
-            "{ type nat hook postrouting priority srcnat; policy accept; }"
-        ),
-    ]
-
-    for vmid in sorted(desired.keys()):
-        ipv6 = desired[vmid]
-        samba_p, rdp_p = vm_ports(vmid)
-        rules.extend(
-            [
-                (
-                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
-                    f"ip6 daddr @ingress_v6 tcp dport {samba_p} "
-                    f"dnat to [{ipv6}]:445"
-                ),
-                (
-                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
-                    f"ip6 daddr @ingress_v6 tcp dport {rdp_p} "
-                    f"dnat to [{ipv6}]:3389"
-                ),
-                (
-                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} prerouting "
-                    f"ip6 daddr @ingress_v6 udp dport {rdp_p} "
-                    f"dnat to [{ipv6}]:3389"
-                ),
-            ]
-        )
-
-    if POOL6:
-        rules.append(
-            f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
-            f"ip6 saddr {POOL6} return"
-        )
-
-    if vm_targets:
-        rules.extend(
-            [
-                (
-                    f"add set {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} vm_targets_v6 "
-                    "{ type ipv6_addr; }"
-                ),
-                (
-                    f"add element {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} vm_targets_v6 "
-                    f"{{ {_nft_list(vm_targets)} }}"
-                ),
-                (
-                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
-                    f"ip6 daddr @vm_targets_v6 tcp dport {{ 445, 3389 }} snat to {MAIN_IPV6}"
-                ),
-                (
-                    f"add rule {NFT_NAT_TABLE_FAMILY} {NFT_NAT_TABLE_NAME} postrouting "
-                    f"ip6 daddr @vm_targets_v6 udp dport 3389 snat to {MAIN_IPV6}"
-                ),
-            ]
-        )
-
-    run_nft("\n".join(rules) + "\n")
-    logger.info(
-        "nftables NAT rebuilt (%d VM targets, %d ingress IPv6)",
-        len(desired),
-        len(ingress_v6),
-    )
-
-
-def remove_vm_rules(vmid: int):
-    samba_p, rdp_p = vm_ports(vmid)
-    for ingress_ipv4, instance in jool_targets():
-        jool_bib_remove_tcp(instance, ingress_ipv4, samba_p)
-        jool_bib_remove_tcp(instance, ingress_ipv4, rdp_p)
-        jool_bib_remove_udp(instance, ingress_ipv4, rdp_p)
-
-
-def apply_vm_jool(vmid: int, ipv6: str):
-    samba_p, rdp_p = vm_ports(vmid)
-    for ingress_ipv4, instance in jool_targets():
-        jool_bib_remove_tcp(instance, ingress_ipv4, samba_p)
-        jool_bib_remove_tcp(instance, ingress_ipv4, rdp_p)
-        jool_bib_remove_udp(instance, ingress_ipv4, rdp_p)
-        anchor = jool_ipv6_anchor_for_ingress(ingress_ipv4)
-        # Anchor on public ports; nftables DNAT handles public_port -> service_port.
-        jool_bib_add_tcp(instance, ingress_ipv4, samba_p, anchor, samba_p)
-        jool_bib_add_tcp(instance, ingress_ipv4, rdp_p, anchor, rdp_p)
-        jool_bib_add_udp(instance, ingress_ipv4, rdp_p, anchor, rdp_p)
+def ingress_ipv6_hosts() -> list[str]:
+    hosts: list[str] = []
+    for ip_s in (MAIN_IPV6, FAILOVER_IPV6):
+        if not ip_s:
+            continue
+        norm = normalize_ipv6(ip_s)
+        if norm not in hosts:
+            hosts.append(norm)
+    return hosts
 
 
 def firestore_list_configured_servers() -> dict[int, str]:
-    """proxmoxId -> ipv6"""
+    """proxmoxId -> ipv6 from Firestore servers collection."""
     if not ensure_firebase():
         logger.error("Firebase required for full sync")
         sys.exit(1)
@@ -484,21 +323,17 @@ def firestore_list_configured_servers() -> dict[int, str]:
             continue
         if vmid < 0 or vmid > VMID_MAX:
             logger.warning(
-                "Skip server %s: proxmoxId %s outside SMB/RDP port range [0,%s]",
+                "Skip server %s: proxmoxId %s outside range [0,%s]",
                 doc.id,
                 vmid,
                 VMID_MAX,
             )
             continue
         s = str(ipv6).strip()
-        if not s:
-            continue
         try:
-            ipaddress.ip_address(s)
+            out[vmid] = normalize_ipv6(s)
         except ValueError:
             logger.warning("Skip server %s: bad ipv6 %s", doc.id, s)
-            continue
-        out[vmid] = s
     return out
 
 
@@ -507,29 +342,297 @@ def firestore_ipv6_for_vmid(vmid: int) -> str | None:
         return None
     db = firestore.client()
     if FIELD_FILTER_AVAILABLE:
-        q = db.collection("servers").where(
+        query = db.collection("servers").where(
             filter=FieldFilter("proxmoxId", "==", vmid)
         )
     else:
-        q = db.collection("servers").where("proxmoxId", "==", vmid)
-    for doc in q.limit(2).stream():
+        query = db.collection("servers").where("proxmoxId", "==", vmid)
+    for doc in query.limit(2).stream():
         d = doc.to_dict() or {}
         ipv6 = d.get("ipv6")
-        if ipv6:
-            return str(ipv6).strip()
+        if not ipv6:
+            continue
+        s = str(ipv6).strip()
+        try:
+            return normalize_ipv6(s)
+        except ValueError:
+            return None
     return None
+
+
+def tcp_server_block(
+    *,
+    listen_ip: str,
+    listen_port: int,
+    upstream_ipv6: str,
+    upstream_port: int,
+    connect_timeout: str = "1s",
+    session_timeout: str = "1h",
+) -> str:
+    return (
+        "server {\n"
+        f"    listen {listen_ip}:{listen_port} so_keepalive=on;\n"
+        f"    proxy_pass [{upstream_ipv6}]:{upstream_port};\n\n"
+        f"    proxy_connect_timeout {connect_timeout};\n"
+        f"    proxy_timeout {session_timeout};\n\n"
+        "    proxy_socket_keepalive on;\n"
+        "}"
+    )
+
+
+def udp_server_block(
+    *,
+    listen_ip: str,
+    listen_port: int,
+    upstream_ipv6: str,
+    upstream_port: int,
+    session_timeout: str = "1h",
+) -> str:
+    return (
+        "server {\n"
+        f"    listen {listen_ip}:{listen_port} udp reuseport;\n"
+        f"    proxy_pass [{upstream_ipv6}]:{upstream_port};\n\n"
+        f"    proxy_timeout {session_timeout};\n"
+        "}"
+    )
+
+
+def generate_nginx_stream_config(desired: dict[int, str]) -> str:
+    main_ipv4 = normalize_ipv4(MAIN_IPV4)
+    failover_ipv4 = normalize_ipv4(FAILOVER_IPV4)
+    blocks: list[str] = []
+
+    for vmid in sorted(desired.keys()):
+        vm_ipv6 = normalize_ipv6(desired[vmid])
+        samba_p, rdp_p = vm_ports(vmid)
+
+        blocks.append(
+            tcp_server_block(
+                listen_ip=main_ipv4,
+                listen_port=rdp_p,
+                upstream_ipv6=vm_ipv6,
+                upstream_port=3389,
+            )
+        )
+        blocks.append(
+            tcp_server_block(
+                listen_ip=failover_ipv4,
+                listen_port=rdp_p,
+                upstream_ipv6=vm_ipv6,
+                upstream_port=3389,
+            )
+        )
+        if INCLUDE_UDP_RDP:
+            blocks.append(
+                udp_server_block(
+                    listen_ip=main_ipv4,
+                    listen_port=rdp_p,
+                    upstream_ipv6=vm_ipv6,
+                    upstream_port=3389,
+                )
+            )
+            blocks.append(
+                udp_server_block(
+                    listen_ip=failover_ipv4,
+                    listen_port=rdp_p,
+                    upstream_ipv6=vm_ipv6,
+                    upstream_port=3389,
+                )
+            )
+
+        blocks.append(
+            tcp_server_block(
+                listen_ip=main_ipv4,
+                listen_port=samba_p,
+                upstream_ipv6=vm_ipv6,
+                upstream_port=445,
+            )
+        )
+        blocks.append(
+            tcp_server_block(
+                listen_ip=failover_ipv4,
+                listen_port=samba_p,
+                upstream_ipv6=vm_ipv6,
+                upstream_port=445,
+            )
+        )
+
+    header = (
+        "# Generated automatically by sync-base-nat.py. Do not edit manually.\n"
+        "# IPv4 ingress -> direct IPv6 VM upstreams.\n"
+    )
+    if not blocks:
+        return header + "\n"
+    return header + "\n" + "\n\n".join(blocks) + "\n"
+
+
+def generate_nftables_config(desired: dict[int, str]) -> str:
+    host_v6 = normalize_ipv6(MAIN_IPV6)
+    failover_v6 = normalize_ipv6(FAILOVER_IPV6)
+    snat_v6 = normalize_ipv6(SNAT_IPV6)
+
+    published_tcp_ports = {SSH_PORT, 80, 443}
+    published_udp_ports: set[int] = set()
+    forward_rules: list[str] = []
+    prerouting_rules: list[str] = []
+    postrouting_rules: list[str] = []
+
+    ingress_v6 = [host_v6]
+    if failover_v6 != host_v6:
+        ingress_v6.append(failover_v6)
+
+    for vmid in sorted(desired.keys()):
+        vm_ipv6 = normalize_ipv6(desired[vmid])
+        samba_p, rdp_p = vm_ports(vmid)
+
+        published_tcp_ports.update({samba_p, rdp_p})
+        if INCLUDE_UDP_RDP:
+            published_udp_ports.add(rdp_p)
+
+        forward_rules.append(
+            f"        ip6 daddr {vm_ipv6} tcp dport {{ 3389, 445 }} counter accept"
+        )
+        if INCLUDE_UDP_RDP:
+            forward_rules.append(
+                f"        ip6 daddr {vm_ipv6} udp dport 3389 counter accept"
+            )
+
+        for ingress in ingress_v6:
+            prerouting_rules.append(
+                f"        ip6 daddr {ingress} tcp dport {rdp_p} counter dnat to [{vm_ipv6}]:3389"
+            )
+            if INCLUDE_UDP_RDP:
+                prerouting_rules.append(
+                    f"        ip6 daddr {ingress} udp dport {rdp_p} counter dnat to [{vm_ipv6}]:3389"
+                )
+            prerouting_rules.append(
+                f"        ip6 daddr {ingress} tcp dport {samba_p} counter dnat to [{vm_ipv6}]:445"
+            )
+
+        postrouting_rules.append(
+            f"        ip6 daddr {vm_ipv6} tcp dport 3389 counter snat to {snat_v6}"
+        )
+        postrouting_rules.append(
+            f"        ip6 daddr {vm_ipv6} tcp dport 445 counter snat to {snat_v6}"
+        )
+        if INCLUDE_UDP_RDP:
+            postrouting_rules.append(
+                f"        ip6 daddr {vm_ipv6} udp dport 3389 counter snat to {snat_v6}"
+            )
+
+    tcp_ports = ", ".join(str(p) for p in sorted(published_tcp_ports))
+    if published_udp_ports:
+        udp_ports = ", ".join(str(p) for p in sorted(published_udp_ports))
+        udp_set_block = (
+            "    set published_udp_ports {\n"
+            "        type inet_service\n"
+            f"        elements = {{ {udp_ports} }}\n"
+            "    }\n"
+        )
+        udp_accept_rule = "        udp dport @published_udp_ports counter accept\n"
+    else:
+        udp_set_block = ""
+        udp_accept_rule = ""
+
+    return (
+        "#!/usr/sbin/nft -f\n\n"
+        "flush ruleset\n\n"
+        f"table inet {NFT_FILTER_TABLE_NAME} {{\n"
+        "    set published_tcp_ports {\n"
+        "        type inet_service\n"
+        f"        elements = {{ {tcp_ports} }}\n"
+        "    }\n\n"
+        f"{udp_set_block}"
+        "    chain input {\n"
+        "        type filter hook input priority filter; policy drop;\n\n"
+        "        iifname \"lo\" accept\n"
+        "        ct state established,related accept\n"
+        "        ct state invalid drop\n\n"
+        "        ip protocol icmp accept\n"
+        "        ip6 nexthdr ipv6-icmp accept\n\n"
+        "        tcp dport @published_tcp_ports counter accept\n"
+        f"{udp_accept_rule}"
+        "    }\n\n"
+        "    chain forward {\n"
+        "        type filter hook forward priority filter; policy drop;\n\n"
+        "        ct state established,related accept\n"
+        "        ct state invalid drop\n"
+        f"{chr(10).join(forward_rules)}\n"
+        "    }\n\n"
+        "    chain output {\n"
+        "        type filter hook output priority filter; policy accept;\n"
+        "    }\n"
+        "}\n\n"
+        f"table ip6 {NFT_NAT_TABLE_NAME} {{\n"
+        "    chain prerouting {\n"
+        "        type nat hook prerouting priority dstnat; policy accept;\n\n"
+        f"{chr(10).join(prerouting_rules)}\n"
+        "    }\n\n"
+        "    chain postrouting {\n"
+        "        type nat hook postrouting priority srcnat; policy accept;\n\n"
+        f"{chr(10).join(postrouting_rules)}\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def write_generated_configs(desired: dict[int, str]):
+    normalized: dict[int, str] = {}
+    for vmid, ipv6 in desired.items():
+        normalized[check_vmid(vmid)] = normalize_ipv6(ipv6)
+
+    nft_conf = generate_nftables_config(normalized)
+    nginx_stream = generate_nginx_stream_config(normalized)
+
+    NFT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NGINX_STREAM_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NFT_CONFIG_FILE.write_text(nft_conf)
+    NGINX_STREAM_FILE.write_text(nginx_stream)
+    logger.info("Wrote %s", NFT_CONFIG_FILE)
+    logger.info("Wrote %s", NGINX_STREAM_FILE)
+
+
+def apply_generated_configs(desired: dict[int, str]):
+    write_generated_configs(desired)
+
+    try:
+        run(["nginx", "-t"], check=True)
+    except FileNotFoundError:
+        logger.error("nginx binary not found")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        logger.error("nginx -t failed: %s", (e.stderr or e.stdout or "").strip())
+        sys.exit(1)
+
+    try:
+        run(["nft", "-f", str(NFT_CONFIG_FILE)], check=True)
+    except FileNotFoundError:
+        logger.error("nft binary not found")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        logger.error("nft apply failed: %s", (e.stderr or e.stdout or "").strip())
+        sys.exit(1)
+
+    reload_result = subprocess.run(
+        ["systemctl", "reload", "nginx"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if reload_result.returncode != 0:
+        logger.warning(
+            "systemctl reload nginx failed: %s",
+            (reload_result.stderr or reload_result.stdout or "").strip(),
+        )
+    else:
+        logger.info("nginx reloaded")
+
+    logger.info("Applied generated nft + nginx stream config (%d VMs)", len(desired))
 
 
 def sync_full():
     desired = firestore_list_configured_servers()
-    state = read_state()
-    state_ids = {int(k) for k in state.keys()}
-    for vmid in state_ids | set(desired.keys()):
-        remove_vm_rules(vmid)
-    for vmid, ipv6 in desired.items():
-        logger.info("Apply proxmoxId=%s -> %s", vmid, ipv6)
-    apply_all_jool(desired)
-    rebuild_nftables_nat(desired)
+    apply_generated_configs(desired)
     write_state(
         {
             str(k): {
@@ -537,21 +640,10 @@ def sync_full():
                 "samba": SAMBA_PORT_BASE + k,
                 "rdp": RDP_PORT_BASE + k,
             }
-            for k in desired
+            for k in sorted(desired.keys())
         }
     )
-    for _ingress_ipv4, instance in jool_targets():
-        try:
-            run_jool(instance, ["session", "sync"], check=False)
-        except Exception:
-            pass
     logger.info("Full sync done (%d servers)", len(desired))
-
-
-def apply_all_jool(desired: dict[int, str]):
-    """Reapply every BIB from desired (full sync of Jool static BIBs for our ports)."""
-    for vmid in sorted(desired.keys()):
-        apply_vm_jool(vmid, desired[vmid])
 
 
 def sync_single_vmid(
@@ -560,43 +652,26 @@ def sync_single_vmid(
     delete_only: bool,
     ipv6_override: bool = False,
 ):
-    """Patch one VMID into on-box desired map (state snapshot), then full Jool/DNAT rebuild.
-
-    Does not scan all Firestore servers: desired starts from STATE_FILE, then
-    delete_only / explicit ipv6 / ipv6 from caller (e.g. firestore_ipv6_for_vmid).
-    Run full ``sync`` to pull every server from Firestore into state.
-    """
-    if not delete_only and not ipv6_override:
-        if not ensure_firebase():
-            logger.error("Firebase required for sync <proxmoxId> (lookup)")
-            sys.exit(1)
+    if not delete_only and not ipv6_override and not ensure_firebase():
+        logger.error("Firebase required for sync <proxmoxId> (lookup)")
+        sys.exit(1)
     if ipv6_override and ipv6 is None:
         logger.error("Explicit IPv6 required for sync <proxmoxId> <ipv6>")
         sys.exit(2)
+
     desired = desired_from_state()
     if delete_only:
         desired.pop(vmid, None)
-        logger.info("proxmoxId=%s removed from maps", vmid)
+        logger.info("proxmoxId=%s removed from desired map", vmid)
     elif ipv6_override:
-        desired[vmid] = ipv6  # type: ignore[assignment]
+        desired[vmid] = normalize_ipv6(ipv6 or "")
     elif ipv6 is not None:
-        desired[vmid] = ipv6
+        desired[vmid] = normalize_ipv6(ipv6)
     else:
         desired.pop(vmid, None)
-        logger.info("proxmoxId=%s not in Firestore; dropping from maps", vmid)
+        logger.info("proxmoxId=%s not in Firestore; removed from desired map", vmid)
 
-    # Only touch Jool for this VMID (other BIBs unchanged). Full sync + boot still
-    # run apply_all_jool. Avoids ~6 Jool ops per server on every sync <id>.
-    try:
-        remove_vm_rules(vmid)
-    except Exception:
-        pass
-    if vmid in desired:
-        try:
-            apply_vm_jool(vmid, desired[vmid])
-        except Exception as e:
-            logger.warning("apply_vm_jool proxmoxId=%s: %s", vmid, e)
-    rebuild_nftables_nat(desired)
+    apply_generated_configs(desired)
     write_state(
         {
             str(k): {
@@ -604,22 +679,13 @@ def sync_single_vmid(
                 "samba": SAMBA_PORT_BASE + k,
                 "rdp": RDP_PORT_BASE + k,
             }
-            for k in desired
+            for k in sorted(desired.keys())
         }
     )
-    for _ingress_ipv4, instance in jool_targets():
-        try:
-            run_jool(instance, ["session", "sync"], check=False)
-        except Exception:
-            pass
-    logger.info(
-        "Sync proxmoxId=%s done (desired=%d VMs; Jool updated for this id only)",
-        vmid,
-        len(desired),
-    )
+    logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
 
-# --- PVE proxy: proxmox_nodes -> nginx map (no Jool) --------------------------------
+# --- PVE proxy: proxmox_nodes -> nginx map --------------------------------------------
 
 
 def _nginx_map_escape(s: str) -> str:
@@ -655,12 +721,14 @@ def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
             break
     if start is None:
         raise ValueError("cluster.fw: missing [IPSET hosts-ipv6] section")
+
     end = len(lines)
     for j in range(start + 1, len(lines)):
         stripped = lines[j].strip()
         if stripped.startswith("[") and stripped != IPSET_HOSTS_IPV6_HEADER:
             end = j
             break
+
     seen_net: dict[str, str] = {}
     dupes: list[tuple[str, str]] = []
     for node_id in sorted(nodes.keys()):
@@ -675,6 +743,7 @@ def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
             dupes.append((node_id, seen_net[net_s]))
             continue
         seen_net[net_s] = node_id
+
     if dupes:
         for node_id, first in dupes:
             logger.warning(
@@ -682,6 +751,7 @@ def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
                 node_id,
                 first,
             )
+
     body_lines = [f"{net_s} # {seen_net[net_s]}\n" for net_s in sorted(seen_net.keys())]
     new_block = IPSET_HOSTS_IPV6_HEADER + "\n" + "".join(body_lines)
     if end < len(lines) and lines[end].strip().startswith("["):
@@ -723,7 +793,7 @@ def write_pve_nodes_state(nodes: dict[str, str]):
 
 def write_pve_nginx_map(nodes: dict[str, str]):
     lines = [
-        "# generated by sync-base-nat.py — do not edit",
+        "# generated by sync-base-nat.py - do not edit",
         "map $pve_node_from_host $pve_backend_from_host {",
         '    default "";',
     ]
@@ -752,11 +822,17 @@ def nginx_test_and_reload():
     except subprocess.CalledProcessError as e:
         logger.error("nginx -t failed: %s", (e.stderr or e.stdout or "").strip())
         sys.exit(1)
-    r = subprocess.run(["systemctl", "reload", "nginx"], capture_output=True, text=True)
-    if r.returncode != 0:
+
+    reload_result = subprocess.run(
+        ["systemctl", "reload", "nginx"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if reload_result.returncode != 0:
         logger.warning(
             "systemctl reload nginx: %s",
-            (r.stderr or r.stdout or "failed").strip(),
+            (reload_result.stderr or reload_result.stdout or "failed").strip(),
         )
     else:
         logger.info("nginx reloaded")
@@ -877,19 +953,21 @@ def sync_nodes_sync_firewall():
     fd, tmp_path = tempfile.mkstemp(prefix="cluster.fw.", suffix=".tmp")
     os.close(fd)
     tmp = Path(tmp_path)
+
     try:
-        r = subprocess.run(
+        pull = subprocess.run(
             ["scp"] + scp_args + [remote, str(tmp)],
             capture_output=True,
             text=True,
             check=False,
         )
-        if r.returncode != 0:
+        if pull.returncode != 0:
             logger.error(
                 "sync-firewall: scp pull failed: %s",
-                (r.stderr or r.stdout or "").strip(),
+                (pull.stderr or pull.stdout or "").strip(),
             )
             sys.exit(1)
+
         text = tmp.read_text()
         try:
             new_text = replace_hosts_ipv6_section(text, nodes)
@@ -897,16 +975,17 @@ def sync_nodes_sync_firewall():
             logger.error("sync-firewall: %s", e)
             sys.exit(1)
         tmp.write_text(new_text)
-        r2 = subprocess.run(
+
+        push = subprocess.run(
             ["scp"] + scp_args + [str(tmp), remote],
             capture_output=True,
             text=True,
             check=False,
         )
-        if r2.returncode != 0:
+        if push.returncode != 0:
             logger.error(
                 "sync-firewall: scp push failed: %s",
-                (r2.stderr or r2.stdout or "").strip(),
+                (push.stderr or push.stdout or "").strip(),
             )
             sys.exit(1)
         logger.info("sync-firewall: Storage Box cluster.fw updated (%d nodes)", len(nodes))
@@ -920,7 +999,7 @@ def sync_nodes_sync_firewall():
         f"scp -P {FIREWALL_SCP_PORT} -o StrictHostKeyChecking=no "
         f"-o UserKnownHostsFile=/dev/null -o BatchMode=yes "
         f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{FIREWALL_REMOTE_PATH} "
-        f"/etc/pve/firewall/cluster.fw && pve-firewall restart"
+        "/etc/pve/firewall/cluster.fw && pve-firewall restart"
     )
     failed: list[str] = []
     for node_id, ipv6 in sorted(nodes.items()):
@@ -936,9 +1015,9 @@ def sync_nodes_sync_firewall():
             target,
             remote_scp_inner,
         ]
-        r3 = subprocess.run(ssh_cmd, capture_output=True, text=True, check=False)
-        if r3.returncode != 0:
-            err = (r3.stderr or r3.stdout or "").strip()
+        push_node = subprocess.run(ssh_cmd, capture_output=True, text=True, check=False)
+        if push_node.returncode != 0:
+            err = (push_node.stderr or push_node.stdout or "").strip()
             logger.warning("sync-firewall: node %s (%s): %s", node_id, target, err)
             failed.append(node_id)
         else:
@@ -1005,20 +1084,23 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+
     if len(sys.argv) >= 3 and sys.argv[2] == "nodes":
         main_sync_nodes()
         return
+
     validate_config()
     args = sys.argv[2:]
     if not args:
         sync_full()
         return
+
     try:
         vmid = int(args[0])
     except ValueError:
         logger.error("proxmoxId must be int (or use: sync nodes <nodeId>)")
         sys.exit(2)
-    is_del = len(args) >= 2 and args[1].lower() == "del"
+
     if vmid < 0 or vmid > VMID_MAX:
         logger.error(
             "proxmoxId must be in [0, %s] (SMB %s-%s, RDP %s-%s)",
@@ -1029,18 +1111,22 @@ def main():
             RDP_PORT_END,
         )
         sys.exit(2)
+
+    is_del = len(args) >= 2 and args[1].lower() == "del"
     if is_del:
         sync_single_vmid(vmid, None, delete_only=True)
         return
+
     if len(args) >= 2:
         ipv6 = args[1].strip()
         try:
-            ipaddress.ip_address(ipv6)
+            normalize_ipv6(ipv6)
         except ValueError:
             logger.error("Invalid IPv6")
             sys.exit(2)
         sync_single_vmid(vmid, ipv6, delete_only=False, ipv6_override=True)
         return
+
     ipv6 = firestore_ipv6_for_vmid(vmid)
     sync_single_vmid(vmid, ipv6, delete_only=False, ipv6_override=False)
 

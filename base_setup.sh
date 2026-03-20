@@ -1,212 +1,110 @@
-# 1) Install Debian 13 through the Hetzner installimage script
-# Leave 23 GB per disk for raw swap later on
+# Clean Debian 13 bootstrap for BASE ingress (nginx stream + nftables, no Jool)
 
+# 1) Install Debian 13 (Hetzner installimage), then install packages.
 apt update && apt upgrade -y
-reboot
-apt install -y nftables
-systemctl disable --now ufw 2>/dev/null || true
-apt purge -y ufw 2>/dev/null || true
-systemctl enable --now nftables
+apt install -y nftables nginx libnginx-mod-stream python3 python3-pip curl ca-certificates
+pip3 install --break-system-packages firebase-admin
 
-# configure SSH to allow only Neura SSH keys
-
-tasksel --new-install
-tasksel
-
-# List block devices and types
-lsblk -o NAME,TYPE,FSTYPE,SIZE,UUID
-# nvme0n1: create partition 3 in remaining space, type Linux swap (8200)
-sgdisk -n "3:0:0" -t "3:8200" /dev/nvme0n1
-# nvme1n1: same
-sgdisk -n "3:0:0" -t "3:8200" /dev/nvme1n1
-# Reload partition tables
-reboot
-# Format swap partitions
-mkswap -f /dev/nvme0n1p3
-mkswap -f /dev/nvme1n1p3
-blkid /dev/nvme0n1p3 /dev/nvme1n1p3
-
-# Add both to /etc/fstab
-#UUID=<uuid-of-nvme0n1p3>  none  swap  sw  0  0
-#UUID=<uuid-of-nvme1n1p3>  none  swap  sw  0  0
-
-swapon -a
-
-# =============================================================================
-# Network: failover + forwarding (post-up/post-down on enp1s0)
-# =============================================================================
-# Edit /etc/network/interfaces — example matching Hetzner installimage + failover:
+# 2) Keep host addressing stable (main + failover IPv4/IPv6).
+# Edit /etc/network/interfaces to include failover IPs for your host.
 #
-#### Hetzner Online GmbH installimage
-
-# source /etc/network/interfaces.d/*
-
-# auto lo
-# iface lo inet loopback
-# iface lo inet6 loopback
-
-# auto enp1s0
+# Example:
 # iface enp1s0 inet static
 #   address 46.62.188.207
 #   netmask 255.255.255.128
 #   gateway 46.62.188.129
-#   # route 46.62.188.128/25 via 46.62.188.129
-#   up route add -net 46.62.188.128 netmask 255.255.255.128 gw 46.62.188.129 dev enp1s0
-#   # Failover IPv4
 #   up ip addr add 77.42.49.79/32 dev enp1s0 preferred_lft 0
 #   down ip addr del 77.42.49.79/32 dev enp1s0
-#   post-up sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
-#   post-down sysctl -w net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
-
+#
 # iface enp1s0 inet6 static
 #   address 2a01:4f9:3090:2488::2
 #   netmask 64
 #   gateway fe80::1
-#   # Failover IPv6
 #   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp1s0 preferred_lft 0
 #   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp1s0
-#
-# POOL6 for Jool must be a /96 inside the MAIN inet6 /64 (same machine), e.g.:
-#   2a01:4f9:3090:2488:64:ff9b::/96
-# On another BASE, change only the first four hextets to match that host’s main /64.
+#   # Optional dedicated SNAT source inside main /64:
+#   up ip addr add 2a01:4f9:3090:2488::1/64 dev enp1s0 preferred_lft 0
+#   down ip addr del 2a01:4f9:3090:2488::1/64 dev enp1s0
 
-# Conntrack tuning (64 GB RAM / long-lived RDP sessions).
-cat >/etc/sysctl.d/99-conntrack-tuning.conf <<'EOF'
-net.netfilter.nf_conntrack_max=2097152
-net.netfilter.nf_conntrack_tcp_timeout_syn_sent=30
-net.netfilter.nf_conntrack_tcp_timeout_syn_recv=30
-net.netfilter.nf_conntrack_tcp_timeout_established=43200
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait=120
-net.netfilter.nf_conntrack_tcp_timeout_close_wait=120
-net.netfilter.nf_conntrack_tcp_timeout_time_wait=60
-net.netfilter.nf_conntrack_tcp_timeout_close=10
-net.netfilter.nf_conntrack_udp_timeout=30
-net.netfilter.nf_conntrack_udp_timeout_stream=300
+# 3) Router sysctl (persisted).
+cat >/etc/sysctl.d/99-base-nat-router.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
 EOF
 sysctl --system
 
-# =============================================================================
-# BASE NAT64 + IPv6 DNAT (Jool + sync-base-nat.py)
-# =============================================================================
-apt update
-apt install -y jool-tools jool-dkms linux-headers-amd64 python3-pip sshpass nftables conntrack
-pip3 install --break-system-packages firebase-admin
+# 4) Ensure nginx stream include exists (fresh Debian does not include stream.d by default).
+mkdir -p /etc/nginx/stream.d /var/lib/base-nat
+cat >/etc/nginx/stream-base-nat.conf <<'EOF'
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+EOF
 
-# Firebase (same as Proxmox nodes)
-# install -m 600 firebase-credentials.json /etc/firebase-credentials.json
-# or: cp /path/to/firebase-credentials.json /etc/firebase-credentials.json && chmod 600 ...
+if ! grep -q '^include /etc/nginx/stream-base-nat.conf;$' /etc/nginx/nginx.conf; then
+  sed -i '/^http {/i include /etc/nginx/stream-base-nat.conf;' /etc/nginx/nginx.conf
+fi
 
-# Config — MAIN_/FAILOVER_ IPv4 both ingress via Jool.
-# IPv4 traffic is anchored to MAIN_IPV4_TARGET_IPV6 / FAILOVER_IPV4_TARGET_IPV6
-# on public ports, then nftables DNAT maps to VM service ports.
-# POOL6 = main /64 + :64:ff9b::/96 (Jool NAT64).
+# 5) Runtime configuration for sync-base-nat.py.
 cat >/etc/default/base-nat <<'EOF'
-JOOL_INSTANCE=base
-# Main/public IPs: Jool pool4 + nftables NAT ingress.
+# Public ingress addresses.
 MAIN_IPV4=46.62.188.207
 MAIN_IPV6=2a01:4f9:3090:2488::2
-# Failover VIPs: same port map behavior as main ingress.
 FAILOVER_IPV4=77.42.49.79
 FAILOVER_IPV6=2a01:4f9:fff1:5f::2
-# Distinct IPv6 anchors for dual IPv4 ingress (must be different).
-MAIN_IPV4_TARGET_IPV6=2a01:4f9:3090:2488::3
-FAILOVER_IPV4_TARGET_IPV6=2a01:4f9:3090:2488::1
-# NAT64 pool: must lie inside iface inet6 static /64 (Hetzner-routed to this server)
-POOL6=2a01:4f9:3090:2488:64:ff9b::/96
-# SMB: ports SAMBA_PORT_BASE .. SAMBA_PORT_BASE+VMID_MAX (TCP only; default 10000-19999)
-# RDP: ports RDP_PORT_BASE .. RDP_PORT_BASE+VMID_MAX (TCP+UDP; default 20000-29999)
+
+# Source IPv6 for SNAT in postrouting (should be in main routed /64).
+SNAT_IPV6=2a01:4f9:3090:2488::1
+
+# Port contract:
+# SMB external port = SAMBA_PORT_BASE + proxmoxId -> VM 445 (TCP)
+# RDP external port = RDP_PORT_BASE + proxmoxId -> VM 3389 (TCP/UDP)
 SAMBA_PORT_BASE=10000
 RDP_PORT_BASE=20000
 VMID_MAX=9999
+INCLUDE_UDP_RDP=1
+SSH_PORT=22
+
+# Firebase + local state.
 FIREBASE_CREDENTIALS_FILE=/etc/firebase-credentials.json
 STATE_FILE=/var/lib/base-nat/state.json
+PVE_NODES_STATE_FILE=/var/lib/base-nat/pve_nodes.json
+PVE_NGINX_MAP_FILE=/etc/nginx/conf.d/pve-proxy-backends.map.conf
+
+# Generated config outputs.
+NFT_CONFIG_FILE=/etc/nftables.base-nat.generated.conf
+NGINX_STREAM_FILE=/etc/nginx/stream.d/base-nat.conf
 EOF
 
-# IMPORTANT: /etc/default/base-nat must exist BEFORE systemctl start (see heredoc above).
+# 6) Install Firebase credentials before starting service.
+# install -m 600 firebase-credentials.json /etc/firebase-credentials.json
 
-# Scripts from repo snippets/
+# 7) Install runtime scripts from this repository.
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-base-nat.py \
-    -o /usr/local/sbin/sync-base-nat.py
+  -o /usr/local/sbin/sync-base-nat.py
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat-boot.sh \
-    -o /usr/local/sbin/base-nat-boot.sh
+  -o /usr/local/sbin/base-nat-boot.sh
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat-boot.service \
-    -o /etc/systemd/system/base-nat-boot.service
+  -o /etc/systemd/system/base-nat-boot.service
 chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
-mkdir -p /var/lib/base-nat
+
+# 8) Enable boot-time sync/apply.
 systemctl daemon-reload
-systemctl enable base-nat-boot.service
-systemctl start base-nat-boot.service
-# Logs: journalctl -u base-nat-boot.service ; /var/log/sync-base-nat.log
-#
-# Jool on Debian: instance must use --netfilter (not --iptables). If you ever
-# see "Netfilter is the only available instance framework", redeploy base-nat-boot.sh
-# or run: jool instance remove base 2>/dev/null; systemctl start base-nat-boot.service
+systemctl enable --now base-nat-boot.service
 
-# -----------------------------------------------------------------------------
-# HA behavior: both BASE servers keep identical Jool+nftables config. Hetzner
-# panel decides which BASE receives FAILOVER_IPV4/FAILOVER_IPV6 at any time.
-# -----------------------------------------------------------------------------
+# 9) Validation.
+systemctl status --no-pager base-nat-boot.service
+python3 /usr/local/sbin/sync-base-nat.py sync
+nft list ruleset
+nginx -T | sed -n '/^stream {/,/^}/p'
 
-# Manual sync examples (after boot)
+# Manual sync examples:
 # /usr/local/sbin/sync-base-nat.py sync
 # /usr/local/sbin/sync-base-nat.py sync 400
 # /usr/local/sbin/sync-base-nat.py sync 400 2001:db8::1
 # /usr/local/sbin/sync-base-nat.py sync 400 del
-#
-# PVE wildcard proxy (Firestore collection proxmox_nodes: doc id = node slug e.g. 0000009-EX44, field ip = IPv6)
 # /usr/local/sbin/sync-base-nat.py sync nodes
-# /usr/local/sbin/sync-base-nat.py sync nodes 0000009-EX44
 # /usr/local/sbin/sync-base-nat.py sync nodes add 0000009-EX44 2a01:4f9:...
 # /usr/local/sbin/sync-base-nat.py sync nodes del 0000009-EX44
-
-# =============================================================================
-# BASE: PVE proxy (*.pve.neuravps.com) + set-ticket + Firestore proxmox_nodes
-# =============================================================================
-# Node firewalls must allow BASE -> Proxmox :8006. Backends are built from
-# Firestore proxmox_nodes (document ID = server id, field ip = public IPv6).
-# base-nat-boot runs "sync nodes" after Jool. Re-run after node changes (Cloud Function SSH:
-# sync nodes | sync nodes add <id> <ip> | sync nodes del <id>) — no periodic timer.
-
-apt update
-apt install -y nginx libnginx-mod-http-js certbot
-
-mkdir -p /var/www/letsencrypt /etc/nginx/njs /opt/pve-set-ticket
-
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-map.conf \
-  -o /etc/nginx/conf.d/pve-proxy-map.conf
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-backends.map.conf.example \
-  -o /etc/nginx/conf.d/pve-proxy-backends.map.conf
-
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/neuravps-redirects.conf \
-  -o /etc/nginx/sites-available/neuravps-redirects.conf
-ln -sf /etc/nginx/sites-available/neuravps-redirects.conf /etc/nginx/sites-enabled/neuravps-redirects.conf
-rm -f /etc/nginx/sites-enabled/default
-#
-# Wildcard TLS (DNS-01): scripts/certbot-namecheap-dns-hooks.py — see deprecated doc
-# docs/pve-proxy-base-server-setup.md (section 7) for Namecheap + certbot renew.
-
-rsync -avz -e ssh root@[2a01:4f9:3070:3984::2]:/etc/letsencrypt/ /etc/letsencrypt/
-
-# Until certs exist, comment out the ssl_certificate server blocks in neuravps-redirects.conf
-# or obtain certs first, then:
-
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/pve-set-ticket.py \
-  -o /opt/pve-set-ticket/pve-set-ticket.py
-chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
-tee /opt/pve-set-ticket/env << 'EOF'
-PVE_REDEEM_SECRET=...
-REDEEM_FUNCTION_URL=https://.../redeem_pve_ticket_token
-EOF
-chmod 600 /opt/pve-set-ticket/env
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-set-ticket.service \
-  -o /etc/systemd/system/pve-set-ticket.service
-systemctl daemon-reload && systemctl enable --now pve-set-ticket
-
-# After deploy or when Firestore proxmox_nodes changes (boot already syncs):
-#   /usr/local/sbin/sync-base-nat.py sync nodes
-#   nginx -t && systemctl reload nginx   # sync nodes reloads nginx itself if ok
-#
-# Cloud Function on node add/change/delete: SSH to BASE and run e.g.
-#   sync-base-nat.py sync nodes add <nodeId> <ip>
-#   sync-base-nat.py sync nodes del <nodeId>
-#   sync-base-nat.py sync nodes   (full refresh from Firestore)
