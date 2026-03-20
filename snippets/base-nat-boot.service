@@ -7,6 +7,10 @@ Wants=network-online.target nginx.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/base-nat-boot.sh
+LimitNOFILE=262144
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=10min
 StandardOutput=journal
 StandardError=journal
 

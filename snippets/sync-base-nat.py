@@ -34,10 +34,13 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import resource
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from glob import glob
 
 try:
     import firebase_admin
@@ -139,6 +142,22 @@ SAMBA_PORT_END = SAMBA_PORT_BASE + VMID_MAX
 RDP_PORT_END = RDP_PORT_BASE + VMID_MAX
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 INCLUDE_UDP_RDP = parse_bool_env("INCLUDE_UDP_RDP", True)
+NGINX_PROXY_BUFFER_SIZE = (
+    os.environ.get("NGINX_PROXY_BUFFER_SIZE", "128k").strip() or "128k"
+)
+NGINX_TCP_NODELAY = parse_bool_env("NGINX_TCP_NODELAY", True)
+NGINX_MIN_WORKER_CONNECTIONS = int(
+    os.environ.get("NGINX_MIN_WORKER_CONNECTIONS", "16384")
+)
+NGINX_WORKER_CONN_HEADROOM = int(os.environ.get("NGINX_WORKER_CONN_HEADROOM", "1024"))
+NGINX_WORKER_RLIMIT_NOFILE = int(os.environ.get("NGINX_WORKER_RLIMIT_NOFILE", "262144"))
+NGINX_TEST_NOFILE = int(os.environ.get("NGINX_TEST_NOFILE", "262144"))
+NGINX_PVE_STUB_FILE = Path(
+    os.environ.get(
+        "NGINX_PVE_STUB_FILE",
+        "/etc/nginx/conf.d/00-base-nat-pve-vars-stub.conf",
+    )
+)
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(DEFAULT_STATE_FILE)))
 PVE_NODES_STATE_FILE = Path(
@@ -368,13 +387,18 @@ def tcp_server_block(
     upstream_port: int,
     connect_timeout: str = "1s",
     session_timeout: str = "1h",
+    proxy_buffer_size: str = "128k",
+    tcp_nodelay: bool = True,
 ) -> str:
+    tcp_nodelay_value = "on" if tcp_nodelay else "off"
     return (
         "server {\n"
         f"    listen {listen_ip}:{listen_port} so_keepalive=on;\n"
         f"    proxy_pass [{upstream_ipv6}]:{upstream_port};\n\n"
         f"    proxy_connect_timeout {connect_timeout};\n"
         f"    proxy_timeout {session_timeout};\n\n"
+        f"    proxy_buffer_size {proxy_buffer_size};\n"
+        f"    tcp_nodelay {tcp_nodelay_value};\n"
         "    proxy_socket_keepalive on;\n"
         "}"
     )
@@ -412,6 +436,8 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 listen_port=rdp_p,
                 upstream_ipv6=vm_ipv6,
                 upstream_port=3389,
+                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
+                tcp_nodelay=NGINX_TCP_NODELAY,
             )
         )
         blocks.append(
@@ -420,6 +446,8 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 listen_port=rdp_p,
                 upstream_ipv6=vm_ipv6,
                 upstream_port=3389,
+                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
+                tcp_nodelay=NGINX_TCP_NODELAY,
             )
         )
         if INCLUDE_UDP_RDP:
@@ -446,6 +474,8 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 listen_port=samba_p,
                 upstream_ipv6=vm_ipv6,
                 upstream_port=445,
+                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
+                tcp_nodelay=NGINX_TCP_NODELAY,
             )
         )
         blocks.append(
@@ -454,6 +484,8 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 listen_port=samba_p,
                 upstream_ipv6=vm_ipv6,
                 upstream_port=445,
+                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
+                tcp_nodelay=NGINX_TCP_NODELAY,
             )
         )
 
@@ -592,8 +624,152 @@ def write_generated_configs(desired: dict[int, str]):
     logger.info("Wrote %s", NGINX_STREAM_FILE)
 
 
+def ensure_nginx_capacity(required_listen_sockets: int):
+    """
+    Ensure nginx has enough capacity for many stream listeners.
+
+    Nginx validates that worker_connections >= listening sockets.
+    """
+    nginx_conf = Path("/etc/nginx/nginx.conf")
+    if not nginx_conf.is_file():
+        logger.warning("nginx.conf not found at %s; skip capacity tuning", nginx_conf)
+        return
+
+    text = nginx_conf.read_text()
+
+    required_connections = max(
+        NGINX_MIN_WORKER_CONNECTIONS,
+        required_listen_sockets + NGINX_WORKER_CONN_HEADROOM,
+    )
+    required_nofile = max(NGINX_WORKER_RLIMIT_NOFILE, required_connections * 2)
+
+    changed = False
+
+    wc_pattern = re.compile(r"(^\s*worker_connections\s+)(\d+)(\s*;)", re.MULTILINE)
+    wc_match = wc_pattern.search(text)
+    if wc_match:
+        current_wc = int(wc_match.group(2))
+        if current_wc < required_connections:
+            text = wc_pattern.sub(
+                rf"\g<1>{required_connections}\3",
+                text,
+                count=1,
+            )
+            changed = True
+            logger.info(
+                "Raised nginx worker_connections: %s -> %s",
+                current_wc,
+                required_connections,
+            )
+    else:
+        logger.warning("worker_connections directive not found; skip tuning")
+
+    wr_pattern = re.compile(r"(^\s*worker_rlimit_nofile\s+)(\d+)(\s*;)", re.MULTILINE)
+    wr_match = wr_pattern.search(text)
+    if wr_match:
+        current_wr = int(wr_match.group(2))
+        if current_wr < required_nofile:
+            text = wr_pattern.sub(
+                rf"\g<1>{required_nofile}\3",
+                text,
+                count=1,
+            )
+            changed = True
+            logger.info(
+                "Raised nginx worker_rlimit_nofile: %s -> %s",
+                current_wr,
+                required_nofile,
+            )
+    else:
+        inject_after = re.compile(
+            r"(^\s*worker_processes\s+\S+\s*;[^\n]*\n)",
+            re.MULTILINE,
+        )
+        if inject_after.search(text):
+            text = inject_after.sub(
+                rf"\1worker_rlimit_nofile {required_nofile};\n",
+                text,
+                count=1,
+            )
+            changed = True
+            logger.info("Inserted nginx worker_rlimit_nofile=%s", required_nofile)
+        else:
+            text = f"worker_rlimit_nofile {required_nofile};\n{text}"
+            changed = True
+            logger.info("Prepended nginx worker_rlimit_nofile=%s", required_nofile)
+
+    if changed:
+        nginx_conf.write_text(text)
+
+
+def ensure_pve_node_var_stub():
+    """
+    Ensure $pve_node_from_host is defined for nginx -t on hosts that do not
+    have the full PVE wildcard proxy snippets installed.
+    """
+    conf_paths = ["/etc/nginx/**/*.conf"]
+    var_defined = False
+    for pattern in conf_paths:
+        for path in glob(pattern, recursive=True):
+            p = Path(path)
+            if not p.is_file():
+                continue
+            try:
+                text = p.read_text()
+            except Exception:
+                continue
+            if "map $host $pve_node_from_host" in text:
+                var_defined = True
+                break
+        if var_defined:
+            break
+
+    if var_defined:
+        if NGINX_PVE_STUB_FILE.exists():
+            # Remove stale stub once real config exists to avoid duplicate map vars.
+            try:
+                NGINX_PVE_STUB_FILE.unlink()
+            except OSError:
+                pass
+        return
+
+    NGINX_PVE_STUB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NGINX_PVE_STUB_FILE.write_text(
+        "# generated by sync-base-nat.py to satisfy optional PVE vars\n"
+        "map $host $pve_node_from_host {\n"
+        '    default "";\n'
+        "}\n"
+    )
+
+
+def ensure_process_nofile_limit(min_limit: int):
+    """Raise current process RLIMIT_NOFILE so nginx -t can open many sockets."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+
+    target = max(min_limit, NGINX_WORKER_RLIMIT_NOFILE)
+    if soft >= target:
+        return
+
+    new_soft = min(target, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        logger.info("Raised process RLIMIT_NOFILE: %s -> %s (hard=%s)", soft, new_soft, hard)
+    except (ValueError, OSError) as e:
+        logger.warning("Could not raise RLIMIT_NOFILE to %s: %s", target, e)
+
+
 def apply_generated_configs(desired: dict[int, str]):
     write_generated_configs(desired)
+    stream_conf = NGINX_STREAM_FILE.read_text() if NGINX_STREAM_FILE.is_file() else ""
+    required_listeners = sum(
+        1 for line in stream_conf.splitlines() if line.strip().startswith("listen ")
+    )
+    ensure_nginx_capacity(required_listeners)
+    ensure_pve_node_var_stub()
+    ensure_process_nofile_limit(max(NGINX_TEST_NOFILE, required_listeners + 1024))
 
     try:
         run(["nginx", "-t"], check=True)
