@@ -146,6 +146,7 @@ NGINX_PROXY_BUFFER_SIZE = (
     os.environ.get("NGINX_PROXY_BUFFER_SIZE", "128k").strip() or "128k"
 )
 NGINX_TCP_NODELAY = parse_bool_env("NGINX_TCP_NODELAY", True)
+NGINX_TCP_REUSEPORT = parse_bool_env("NGINX_TCP_REUSEPORT", True)
 NGINX_MIN_WORKER_CONNECTIONS = int(
     os.environ.get("NGINX_MIN_WORKER_CONNECTIONS", "16384")
 )
@@ -389,11 +390,13 @@ def tcp_server_block(
     session_timeout: str = "1h",
     proxy_buffer_size: str = "128k",
     tcp_nodelay: bool = True,
+    tcp_reuseport: bool = True,
 ) -> str:
     tcp_nodelay_value = "on" if tcp_nodelay else "off"
+    listen_opts = "so_keepalive=on reuseport" if tcp_reuseport else "so_keepalive=on"
     return (
         "server {\n"
-        f"    listen {listen_ip}:{listen_port} so_keepalive=on;\n"
+        f"    listen {listen_ip}:{listen_port} {listen_opts};\n"
         f"    proxy_pass [{upstream_ipv6}]:{upstream_port};\n\n"
         f"    proxy_connect_timeout {connect_timeout};\n"
         f"    proxy_timeout {session_timeout};\n\n"
@@ -438,6 +441,7 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 upstream_port=3389,
                 proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
                 tcp_nodelay=NGINX_TCP_NODELAY,
+                tcp_reuseport=NGINX_TCP_REUSEPORT,
             )
         )
         blocks.append(
@@ -448,6 +452,7 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 upstream_port=3389,
                 proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
                 tcp_nodelay=NGINX_TCP_NODELAY,
+                tcp_reuseport=NGINX_TCP_REUSEPORT,
             )
         )
         if INCLUDE_UDP_RDP:
@@ -476,6 +481,7 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 upstream_port=445,
                 proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
                 tcp_nodelay=NGINX_TCP_NODELAY,
+                tcp_reuseport=NGINX_TCP_REUSEPORT,
             )
         )
         blocks.append(
@@ -486,6 +492,7 @@ def generate_nginx_stream_config(desired: dict[int, str]) -> str:
                 upstream_port=445,
                 proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
                 tcp_nodelay=NGINX_TCP_NODELAY,
+                tcp_reuseport=NGINX_TCP_REUSEPORT,
             )
         )
 

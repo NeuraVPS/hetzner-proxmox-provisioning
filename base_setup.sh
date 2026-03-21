@@ -32,10 +32,18 @@ net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
+net.core.default_qdisc=fq
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=262144
+net.core.netdev_max_backlog=250000
 net.core.rmem_max=16777216
 net.core.wmem_max=16777216
 EOF
 sysctl --system
+modprobe tcp_bbr 2>/dev/null || true
+if sysctl net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
+  sysctl -w net.ipv4.tcp_congestion_control=bbr
+fi
 
 # 4) Ensure nginx stream include exists (fresh Debian does not include stream.d by default).
 mkdir -p /etc/nginx/stream.d /var/lib/base-nat
@@ -72,11 +80,13 @@ SSH_PORT=22
 # Stream tuning (Samba/RDP). proxy_buffers is http-only, stream uses proxy_buffer_size.
 NGINX_PROXY_BUFFER_SIZE=128k
 NGINX_TCP_NODELAY=1
+NGINX_TCP_REUSEPORT=1
 NGINX_MIN_WORKER_CONNECTIONS=16384
 NGINX_WORKER_CONN_HEADROOM=1024
 NGINX_WORKER_RLIMIT_NOFILE=262144
 NGINX_TEST_NOFILE=262144
 NGINX_LIMIT_NOFILE=262144
+TCP_CONGESTION_CONTROL=bbr
 SYSCTL_RMEM_MAX=16777216
 SYSCTL_WMEM_MAX=16777216
 SYNC_PVE_NODES_ON_BOOT=auto

@@ -22,6 +22,7 @@ set +a
 : "${SYSCTL_WMEM_MAX:=16777216}"
 : "${NGINX_LIMIT_NOFILE:=262144}"
 : "${SYNC_PVE_NODES_ON_BOOT:=auto}"
+: "${TCP_CONGESTION_CONTROL:=bbr}"
 : "${WAIT_FOR_IPS_SEC:=120}"
 
 ulimit -n "${NGINX_LIMIT_NOFILE}" 2>/dev/null || true
@@ -83,12 +84,24 @@ net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
+net.core.default_qdisc=fq
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=262144
+net.core.netdev_max_backlog=250000
 EOF
 cat >>/etc/sysctl.d/99-base-nat-router.conf <<EOF
 net.core.rmem_max=${SYSCTL_RMEM_MAX}
 net.core.wmem_max=${SYSCTL_WMEM_MAX}
 EOF
 sysctl --system >/dev/null
+
+# Prefer BBR when available for better queue/latency behavior.
+if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "$TCP_CONGESTION_CONTROL"; then
+  modprobe "tcp_${TCP_CONGESTION_CONTROL}" 2>/dev/null || true
+fi
+if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "$TCP_CONGESTION_CONTROL"; then
+  sysctl -w "net.ipv4.tcp_congestion_control=${TCP_CONGESTION_CONTROL}" >/dev/null || true
+fi
 
 # Keep nginx active; sync script validates and reloads it.
 systemctl daemon-reload >/dev/null 2>&1 || true
