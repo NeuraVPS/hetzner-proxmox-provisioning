@@ -53,6 +53,58 @@ detect_disks() {
   lsblk -dpno NAME,TYPE,TRAN | awk '$2=="disk" && $3!="usb"{print $1}'
 }
 
+disk_size_bytes() {
+  local d="$1"
+  blockdev --getsize64 "$d" 2>/dev/null || echo ""
+}
+
+select_zfs_mirror_disks() {
+  local -a candidates=("$@")
+  local -a sized=()
+  local d bytes
+
+  [ "${#candidates[@]}" -ge 2 ] || return 1
+
+  for d in "${candidates[@]}"; do
+    bytes="$(disk_size_bytes "$d")"
+    [ -n "$bytes" ] || continue
+    sized+=("${bytes}:${d}")
+  done
+
+  [ "${#sized[@]}" -ge 2 ] || return 1
+
+  # Choose the largest size bucket that has at least 2 disks.
+  local -A size_count=()
+  local entry size
+  for entry in "${sized[@]}"; do
+    size="${entry%%:*}"
+    size_count["$size"]=$(( ${size_count["$size"]:-0} + 1 ))
+  done
+
+  local best_size=""
+  local count
+  for size in "${!size_count[@]}"; do
+    count="${size_count[$size]}"
+    if [ "$count" -ge 2 ] && { [ -z "$best_size" ] || [ "$size" -gt "$best_size" ]; }; then
+      best_size="$size"
+    fi
+  done
+
+  [ -n "$best_size" ] || return 1
+
+  local picked=0
+  for d in "${candidates[@]}"; do
+    bytes="$(disk_size_bytes "$d")"
+    if [ "$bytes" = "$best_size" ]; then
+      echo "$d"
+      picked=$((picked + 1))
+      [ "$picked" -eq 2 ] && break
+    fi
+  done
+
+  [ "$picked" -eq 2 ] || return 1
+}
+
 detect_firmware() {
   if [ -d /sys/firmware/efi ]; then
     echo "UEFI"
@@ -93,13 +145,38 @@ done
 
 [ "${#DISKS[@]}" -ge 2 ] || die "At least 2 disks required for ZFS mirror"
 
-# Disks used for ZFS: when 3 disks, use only first two (third reserved for swap in first_boot)
-if [ "${#DISKS[@]}" -eq 3 ]; then
-  ZFS_DISKS=( "${DISKS[0]}" "${DISKS[1]}" )
-  log "Three disks detected: using first two for ZFS, third left for swap"
-else
-  ZFS_DISKS=( "${DISKS[@]}" )
+# Disks used for ZFS mirror: pick a same-size pair (required by installer).
+mapfile -t ZFS_DISKS < <(select_zfs_mirror_disks "${DISKS[@]}" || true)
+if [ "${#ZFS_DISKS[@]}" -ne 2 ]; then
+  log "Detected disk sizes:"
+  for d in "${DISKS[@]}"; do
+    bytes="$(disk_size_bytes "$d")"
+    if [ -n "$bytes" ]; then
+      gib=$((bytes / 1024 / 1024 / 1024))
+      log "  $d -> ${gib} GiB (${bytes} bytes)"
+    else
+      log "  $d -> unknown size"
+    fi
+  done
+  die "Could not find two same-size disks for ZFS mirror (installer requires equal-sized mirror disks)"
+  exit 1
 fi
+log "Selected ZFS mirror disks: ${ZFS_DISKS[*]}"
+
+# Ensure the selected ZFS disks are first in QEMU, so they map to vda/vdb (disk-list in answer.toml).
+REMAINING_DISKS=()
+for d in "${DISKS[@]}"; do
+  skip=0
+  for zd in "${ZFS_DISKS[@]}"; do
+    if [ "$d" = "$zd" ]; then
+      skip=1
+      break
+    fi
+  done
+  [ "$skip" -eq 1 ] || REMAINING_DISKS+=("$d")
+done
+QEMU_DISKS=( "${ZFS_DISKS[@]}" "${REMAINING_DISKS[@]}" )
+log "QEMU disk order (vda,vdb first): ${QEMU_DISKS[*]}"
 
 # Reserve 23 GB per disk for raw swap on ZFS disks (only when 2 disks; with 3 disks we use first two fully)
 log "Computing ZFS hdsize for disks: ${ZFS_DISKS[*]}"
@@ -201,7 +278,7 @@ if [ "$FIRMWARE" = "UEFI" ]; then
 fi
 
 DRIVE_ARGS=()
-for d in "${DISKS[@]}"; do
+for d in "${QEMU_DISKS[@]}"; do
   DRIVE_ARGS+=(-drive "file=${d},format=raw,if=virtio")
 done
 
