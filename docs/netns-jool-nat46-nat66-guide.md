@@ -132,6 +132,7 @@ Create `/etc/nftables.conf`:
 
 > Replace `enp6s0` with your real WAN interface (for example `enp1s0`).
 > Replace `37.27.135.250` and `77.42.49.79` with your two public IPv4 addresses.
+> Replace `2a01:4f9:3070:3984::2` with your **main** public IPv6.
 > Do **not** put an IPv6 address in `table ip nat` rules.
 
 ```nft
@@ -164,9 +165,8 @@ table ip6 nat {
 
     chain postrouting {
         type nat hook postrouting priority srcnat;
-        # Global rule: for DNAT'ed IPv6 flows, preserve ingress destination IP
-        # (main/failover) as source on return traffic.
-        ct status dnat snat to ct original daddr
+        # Global rule: always present main IPv6 to backend VMs for DNAT'ed flows.
+        ct status dnat snat to 2a01:4f9:3070:3984::2
     }
 }
 
@@ -325,7 +325,7 @@ nft add rule ip6 nat prerouting tcp dport $PORT dnat to $TARGET:3389
 nft add rule ip6 nat prerouting udp dport $PORT dnat to $TARGET:3389
 ```
 
-SNAT symmetry and forward acceptance are handled globally in section 8.
+SNAT-to-main-IPv6 and forward acceptance are handled globally in section 8.
 
 ### Remove rule
 
