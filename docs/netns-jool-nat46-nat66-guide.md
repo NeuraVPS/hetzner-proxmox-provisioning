@@ -52,6 +52,13 @@ net.ipv6.conf.all.forwarding=1
 # Keep RA processing on WAN while forwarding is enabled
 # (replace enp6s0 if your WAN interface is different)
 net.ipv6.conf.enp6s0.accept_ra=2
+
+net.netfilter.nf_conntrack_max=524288
+net.netfilter.nf_conntrack_buckets=131072
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=250000
+net.ipv4.tcp_max_syn_backlog=262144
+net.ipv4.ip_local_port_range=10240 65535
 EOF
 
 sysctl --system
