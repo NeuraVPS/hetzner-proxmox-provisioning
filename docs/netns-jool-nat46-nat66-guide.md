@@ -178,6 +178,9 @@ table inet filter {
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
         tcp dport 22 accept
+        # Required if nginx terminates TLS / handles HTTP redirects or ACME.
+        tcp dport 80 accept
+        tcp dport 443 accept
     }
 
     chain forward {
