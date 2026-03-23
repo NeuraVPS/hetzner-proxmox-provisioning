@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-sync-base-nat: BASE server ingress sync using nftables + nginx stream (no Jool).
+sync-base-nat: BASE dynamic forwarding sync for Jool+nftables.
 
 Reads /etc/default/base-nat (shell KEY=value). Env overrides.
 
 Commands:
   sync-base-nat.py sync
-      Full sync: read Firestore "servers" (proxmoxId + ipv6), regenerate
-      nftables + nginx stream config, validate, apply, reload nginx.
+      Full sync: read Firestore "servers" (proxmoxId + ipv6), then
+      reconcile managed dynamic DNAT rules in nftables ip6 nat prerouting.
 
   sync-base-nat.py sync <proxmoxId>
       Single VM: read one server from Firestore and merge into local state,
-      then rebuild/apply full generated config from that local desired map.
+      then reconcile managed dynamic DNAT rules.
 
   sync-base-nat.py sync <proxmoxId> <publicVMIPv6>
       Single VM override without Firestore read for that VM.
 
   sync-base-nat.py sync <proxmoxId> del
-      Remove one VM from local desired map, rebuild/apply config.
+      Remove one VM from local desired map, reconcile rules.
 
   sync-base-nat.py sync nodes
       PVE proxy: full sync from Firestore "proxmox_nodes" (doc id -> field ip),
@@ -35,12 +35,11 @@ import json
 import logging
 import os
 import re
-import resource
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from glob import glob
 
 try:
     import firebase_admin
@@ -125,12 +124,6 @@ def check_vmid(vmid: int) -> int:
 load_default_env()
 
 
-MAIN_IPV4 = os.environ.get("MAIN_IPV4", "").strip()
-MAIN_IPV6 = os.environ.get("MAIN_IPV6", "").strip()
-FAILOVER_IPV4 = os.environ.get("FAILOVER_IPV4", "").strip()
-FAILOVER_IPV6 = os.environ.get("FAILOVER_IPV6", "").strip()
-SNAT_IPV6 = os.environ.get("SNAT_IPV6", MAIN_IPV6).strip()
-
 FIREBASE_CREDENTIALS = os.environ.get(
     "FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json"
 )
@@ -140,25 +133,7 @@ RDP_PORT_BASE = int(os.environ.get("RDP_PORT_BASE", "20000"))
 VMID_MAX = int(os.environ.get("VMID_MAX", os.environ.get("PORT_MAX", "9999")))
 SAMBA_PORT_END = SAMBA_PORT_BASE + VMID_MAX
 RDP_PORT_END = RDP_PORT_BASE + VMID_MAX
-SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 INCLUDE_UDP_RDP = parse_bool_env("INCLUDE_UDP_RDP", True)
-NGINX_PROXY_BUFFER_SIZE = (
-    os.environ.get("NGINX_PROXY_BUFFER_SIZE", "128k").strip() or "128k"
-)
-NGINX_TCP_NODELAY = parse_bool_env("NGINX_TCP_NODELAY", True)
-NGINX_TCP_REUSEPORT = parse_bool_env("NGINX_TCP_REUSEPORT", True)
-NGINX_MIN_WORKER_CONNECTIONS = int(
-    os.environ.get("NGINX_MIN_WORKER_CONNECTIONS", "16384")
-)
-NGINX_WORKER_CONN_HEADROOM = int(os.environ.get("NGINX_WORKER_CONN_HEADROOM", "1024"))
-NGINX_WORKER_RLIMIT_NOFILE = int(os.environ.get("NGINX_WORKER_RLIMIT_NOFILE", "262144"))
-NGINX_TEST_NOFILE = int(os.environ.get("NGINX_TEST_NOFILE", "262144"))
-NGINX_PVE_STUB_FILE = Path(
-    os.environ.get(
-        "NGINX_PVE_STUB_FILE",
-        "/etc/nginx/conf.d/00-base-nat-pve-vars-stub.conf",
-    )
-)
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(DEFAULT_STATE_FILE)))
 PVE_NODES_STATE_FILE = Path(
@@ -171,14 +146,12 @@ PVE_NGINX_MAP_FILE = Path(
     )
 )
 
-NFT_CONFIG_FILE = Path(
-    os.environ.get("NFT_CONFIG_FILE", "/etc/nftables.base-nat.generated.conf")
-)
-NGINX_STREAM_FILE = Path(
-    os.environ.get("NGINX_STREAM_FILE", "/etc/nginx/stream.d/base-nat.conf")
-)
-NFT_FILTER_TABLE_NAME = os.environ.get("NFT_FILTER_TABLE_NAME", "base_filter").strip()
-NFT_NAT_TABLE_NAME = os.environ.get("NFT_NAT_TABLE_NAME", "base_nat6").strip()
+NFT_DNAT_FAMILY = os.environ.get("NFT_DNAT_FAMILY", "ip6").strip()
+NFT_DNAT_TABLE = os.environ.get("NFT_DNAT_TABLE", "nat").strip()
+NFT_DNAT_CHAIN = os.environ.get("NFT_DNAT_CHAIN", "prerouting").strip()
+MANAGED_RULE_COMMENT_PREFIX = os.environ.get(
+    "NFT_MANAGED_RULE_COMMENT_PREFIX", "sync-base-nat"
+).strip()
 
 # Storage Box: cluster.fw template (scp port 23). Override via env on BASE.
 FIREWALL_STORAGE_USER = os.environ.get("FIREWALL_STORAGE_USER", "u560363").strip()
@@ -194,23 +167,11 @@ FIREBASE_INITIALIZED = False
 
 
 def validate_config():
-    if not MAIN_IPV4 or not MAIN_IPV6:
-        logger.error("MAIN_IPV4 and MAIN_IPV6 are required in /etc/default/base-nat")
+    if not NFT_DNAT_FAMILY or not NFT_DNAT_TABLE or not NFT_DNAT_CHAIN:
+        logger.error("NFT_DNAT_FAMILY, NFT_DNAT_TABLE and NFT_DNAT_CHAIN are required")
         sys.exit(1)
-    if not FAILOVER_IPV4 or not FAILOVER_IPV6:
-        logger.error(
-            "FAILOVER_IPV4 and FAILOVER_IPV6 are required in /etc/default/base-nat"
-        )
-        sys.exit(1)
-
-    normalize_ipv4(MAIN_IPV4)
-    normalize_ipv4(FAILOVER_IPV4)
-    normalize_ipv6(MAIN_IPV6)
-    normalize_ipv6(FAILOVER_IPV6)
-    normalize_ipv6(SNAT_IPV6)
-
-    if not (1 <= SSH_PORT <= 65535):
-        logger.error("SSH_PORT must be in [1, 65535]")
+    if not MANAGED_RULE_COMMENT_PREFIX:
+        logger.error("NFT_MANAGED_RULE_COMMENT_PREFIX cannot be empty")
         sys.exit(1)
     if SAMBA_PORT_BASE < 1 or RDP_PORT_BASE < 1:
         logger.error("SAMBA_PORT_BASE and RDP_PORT_BASE must be >= 1")
@@ -313,17 +274,6 @@ def desired_from_state() -> dict[int, str]:
     return out
 
 
-def ingress_ipv6_hosts() -> list[str]:
-    hosts: list[str] = []
-    for ip_s in (MAIN_IPV6, FAILOVER_IPV6):
-        if not ip_s:
-            continue
-        norm = normalize_ipv6(ip_s)
-        if norm not in hosts:
-            hosts.append(norm)
-    return hosts
-
-
 def firestore_list_configured_servers() -> dict[int, str]:
     """proxmoxId -> ipv6 from Firestore servers collection."""
     if not ensure_firebase():
@@ -380,442 +330,263 @@ def firestore_ipv6_for_vmid(vmid: int) -> str | None:
     return None
 
 
-def tcp_server_block(
-    *,
-    listen_ip: str,
-    listen_port: int,
-    upstream_ipv6: str,
-    upstream_port: int,
-    connect_timeout: str = "1s",
-    session_timeout: str = "1h",
-    proxy_buffer_size: str = "128k",
-    tcp_nodelay: bool = True,
-    tcp_reuseport: bool = True,
-) -> str:
-    tcp_nodelay_value = "on" if tcp_nodelay else "off"
-    listen_opts = "so_keepalive=on reuseport" if tcp_reuseport else "so_keepalive=on"
+@dataclass(frozen=True)
+class ManagedDnatRuleSpec:
+    vmid: int
+    service: str  # rdp | smb
+    proto: str  # tcp | udp
+    external_port: int
+    target_ipv6: str
+    target_port: int
+
+
+@dataclass(frozen=True)
+class ExistingManagedRule:
+    handle: int
+    raw_line: str
+    spec: ManagedDnatRuleSpec | None
+
+
+def _rule_comment(spec: ManagedDnatRuleSpec) -> str:
     return (
-        "server {\n"
-        f"    listen {listen_ip}:{listen_port} {listen_opts};\n"
-        f"    proxy_pass [{upstream_ipv6}]:{upstream_port};\n\n"
-        f"    proxy_connect_timeout {connect_timeout};\n"
-        f"    proxy_timeout {session_timeout};\n\n"
-        f"    proxy_buffer_size {proxy_buffer_size};\n"
-        f"    tcp_nodelay {tcp_nodelay_value};\n"
-        "    proxy_socket_keepalive on;\n"
-        "}"
+        f"{MANAGED_RULE_COMMENT_PREFIX}:"
+        f"vmid={spec.vmid}:svc={spec.service}:proto={spec.proto}"
     )
 
 
-def udp_server_block(
-    *,
-    listen_ip: str,
-    listen_port: int,
-    upstream_ipv6: str,
-    upstream_port: int,
-    session_timeout: str = "1h",
-) -> str:
-    return (
-        "server {\n"
-        f"    listen {listen_ip}:{listen_port} udp reuseport;\n"
-        f"    proxy_pass [{upstream_ipv6}]:{upstream_port};\n\n"
-        f"    proxy_timeout {session_timeout};\n"
-        "}"
-    )
-
-
-def generate_nginx_stream_config(desired: dict[int, str]) -> str:
-    main_ipv4 = normalize_ipv4(MAIN_IPV4)
-    failover_ipv4 = normalize_ipv4(FAILOVER_IPV4)
-    blocks: list[str] = []
-
+def _desired_dnat_specs(desired: dict[int, str]) -> set[ManagedDnatRuleSpec]:
+    specs: set[ManagedDnatRuleSpec] = set()
     for vmid in sorted(desired.keys()):
-        vm_ipv6 = normalize_ipv6(desired[vmid])
+        vmid = check_vmid(vmid)
+        target_ipv6 = normalize_ipv6(desired[vmid])
         samba_p, rdp_p = vm_ports(vmid)
-
-        blocks.append(
-            tcp_server_block(
-                listen_ip=main_ipv4,
-                listen_port=rdp_p,
-                upstream_ipv6=vm_ipv6,
-                upstream_port=3389,
-                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
-                tcp_nodelay=NGINX_TCP_NODELAY,
-                tcp_reuseport=NGINX_TCP_REUSEPORT,
-            )
-        )
-        blocks.append(
-            tcp_server_block(
-                listen_ip=failover_ipv4,
-                listen_port=rdp_p,
-                upstream_ipv6=vm_ipv6,
-                upstream_port=3389,
-                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
-                tcp_nodelay=NGINX_TCP_NODELAY,
-                tcp_reuseport=NGINX_TCP_REUSEPORT,
+        specs.add(
+            ManagedDnatRuleSpec(
+                vmid=vmid,
+                service="rdp",
+                proto="tcp",
+                external_port=rdp_p,
+                target_ipv6=target_ipv6,
+                target_port=3389,
             )
         )
         if INCLUDE_UDP_RDP:
-            blocks.append(
-                udp_server_block(
-                    listen_ip=main_ipv4,
-                    listen_port=rdp_p,
-                    upstream_ipv6=vm_ipv6,
-                    upstream_port=3389,
+            specs.add(
+                ManagedDnatRuleSpec(
+                    vmid=vmid,
+                    service="rdp",
+                    proto="udp",
+                    external_port=rdp_p,
+                    target_ipv6=target_ipv6,
+                    target_port=3389,
                 )
             )
-            blocks.append(
-                udp_server_block(
-                    listen_ip=failover_ipv4,
-                    listen_port=rdp_p,
-                    upstream_ipv6=vm_ipv6,
-                    upstream_port=3389,
-                )
-            )
-
-        blocks.append(
-            tcp_server_block(
-                listen_ip=main_ipv4,
-                listen_port=samba_p,
-                upstream_ipv6=vm_ipv6,
-                upstream_port=445,
-                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
-                tcp_nodelay=NGINX_TCP_NODELAY,
-                tcp_reuseport=NGINX_TCP_REUSEPORT,
+        specs.add(
+            ManagedDnatRuleSpec(
+                vmid=vmid,
+                service="smb",
+                proto="tcp",
+                external_port=samba_p,
+                target_ipv6=target_ipv6,
+                target_port=445,
             )
         )
-        blocks.append(
-            tcp_server_block(
-                listen_ip=failover_ipv4,
-                listen_port=samba_p,
-                upstream_ipv6=vm_ipv6,
-                upstream_port=445,
-                proxy_buffer_size=NGINX_PROXY_BUFFER_SIZE,
-                tcp_nodelay=NGINX_TCP_NODELAY,
-                tcp_reuseport=NGINX_TCP_REUSEPORT,
-            )
-        )
-
-    header = (
-        "# Generated automatically by sync-base-nat.py. Do not edit manually.\n"
-        "# IPv4 ingress -> direct IPv6 VM upstreams.\n"
-    )
-    if not blocks:
-        return header + "\n"
-    return header + "\n" + "\n\n".join(blocks) + "\n"
+    return specs
 
 
-def generate_nftables_config(desired: dict[int, str]) -> str:
-    host_v6 = normalize_ipv6(MAIN_IPV6)
-    failover_v6 = normalize_ipv6(FAILOVER_IPV6)
-    snat_v6 = normalize_ipv6(SNAT_IPV6)
+def _parse_managed_spec_from_line(line: str) -> ManagedDnatRuleSpec | None:
+    comment_match = re.search(r'comment "([^"]+)"', line)
+    if not comment_match:
+        return None
+    comment = comment_match.group(1).strip()
+    prefix = f"{MANAGED_RULE_COMMENT_PREFIX}:"
+    if not comment.startswith(prefix):
+        return None
 
-    published_tcp_ports = {SSH_PORT, 80, 443}
-    published_udp_ports: set[int] = set()
-    forward_rules: list[str] = []
-    prerouting_rules: list[str] = []
-    postrouting_rules: list[str] = []
-
-    ingress_v6 = [host_v6]
-    if failover_v6 != host_v6:
-        ingress_v6.append(failover_v6)
-
-    for vmid in sorted(desired.keys()):
-        vm_ipv6 = normalize_ipv6(desired[vmid])
-        samba_p, rdp_p = vm_ports(vmid)
-
-        published_tcp_ports.update({samba_p, rdp_p})
-        if INCLUDE_UDP_RDP:
-            published_udp_ports.add(rdp_p)
-
-        forward_rules.append(
-            f"        ip6 daddr {vm_ipv6} tcp dport {{ 3389, 445 }} counter accept"
-        )
-        if INCLUDE_UDP_RDP:
-            forward_rules.append(
-                f"        ip6 daddr {vm_ipv6} udp dport 3389 counter accept"
-            )
-
-        for ingress in ingress_v6:
-            prerouting_rules.append(
-                f"        ip6 daddr {ingress} tcp dport {rdp_p} counter dnat to [{vm_ipv6}]:3389"
-            )
-            if INCLUDE_UDP_RDP:
-                prerouting_rules.append(
-                    f"        ip6 daddr {ingress} udp dport {rdp_p} counter dnat to [{vm_ipv6}]:3389"
-                )
-            prerouting_rules.append(
-                f"        ip6 daddr {ingress} tcp dport {samba_p} counter dnat to [{vm_ipv6}]:445"
-            )
-
-        postrouting_rules.append(
-            f"        ip6 daddr {vm_ipv6} tcp dport 3389 counter snat to {snat_v6}"
-        )
-        postrouting_rules.append(
-            f"        ip6 daddr {vm_ipv6} tcp dport 445 counter snat to {snat_v6}"
-        )
-        if INCLUDE_UDP_RDP:
-            postrouting_rules.append(
-                f"        ip6 daddr {vm_ipv6} udp dport 3389 counter snat to {snat_v6}"
-            )
-
-    tcp_ports = ", ".join(str(p) for p in sorted(published_tcp_ports))
-    if published_udp_ports:
-        udp_ports = ", ".join(str(p) for p in sorted(published_udp_ports))
-        udp_set_block = (
-            "    set published_udp_ports {\n"
-            "        type inet_service\n"
-            f"        elements = {{ {udp_ports} }}\n"
-            "    }\n"
-        )
-        udp_accept_rule = "        udp dport @published_udp_ports counter accept\n"
-    else:
-        udp_set_block = ""
-        udp_accept_rule = ""
-
-    return (
-        "#!/usr/sbin/nft -f\n\n"
-        "flush ruleset\n\n"
-        f"table inet {NFT_FILTER_TABLE_NAME} {{\n"
-        "    set published_tcp_ports {\n"
-        "        type inet_service\n"
-        f"        elements = {{ {tcp_ports} }}\n"
-        "    }\n\n"
-        f"{udp_set_block}"
-        "    chain input {\n"
-        "        type filter hook input priority filter; policy drop;\n\n"
-        "        iifname \"lo\" accept\n"
-        "        ct state established,related accept\n"
-        "        ct state invalid drop\n\n"
-        "        ip protocol icmp accept\n"
-        "        ip6 nexthdr ipv6-icmp accept\n\n"
-        "        tcp dport @published_tcp_ports counter accept\n"
-        f"{udp_accept_rule}"
-        "    }\n\n"
-        "    chain forward {\n"
-        "        type filter hook forward priority filter; policy drop;\n\n"
-        "        ct state established,related accept\n"
-        "        ct state invalid drop\n"
-        f"{chr(10).join(forward_rules)}\n"
-        "    }\n\n"
-        "    chain output {\n"
-        "        type filter hook output priority filter; policy accept;\n"
-        "    }\n"
-        "}\n\n"
-        f"table ip6 {NFT_NAT_TABLE_NAME} {{\n"
-        "    chain prerouting {\n"
-        "        type nat hook prerouting priority dstnat; policy accept;\n\n"
-        f"{chr(10).join(prerouting_rules)}\n"
-        "    }\n\n"
-        "    chain postrouting {\n"
-        "        type nat hook postrouting priority srcnat; policy accept;\n\n"
-        f"{chr(10).join(postrouting_rules)}\n"
-        "    }\n"
-        "}\n"
-    )
-
-
-def write_generated_configs(desired: dict[int, str]):
-    normalized: dict[int, str] = {}
-    for vmid, ipv6 in desired.items():
-        normalized[check_vmid(vmid)] = normalize_ipv6(ipv6)
-
-    nft_conf = generate_nftables_config(normalized)
-    nginx_stream = generate_nginx_stream_config(normalized)
-
-    NFT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    NGINX_STREAM_FILE.parent.mkdir(parents=True, exist_ok=True)
-    NFT_CONFIG_FILE.write_text(nft_conf)
-    NGINX_STREAM_FILE.write_text(nginx_stream)
-    logger.info("Wrote %s", NFT_CONFIG_FILE)
-    logger.info("Wrote %s", NGINX_STREAM_FILE)
-
-
-def ensure_nginx_capacity(required_listen_sockets: int):
-    """
-    Ensure nginx has enough capacity for many stream listeners.
-
-    Nginx validates that worker_connections >= listening sockets.
-    """
-    nginx_conf = Path("/etc/nginx/nginx.conf")
-    if not nginx_conf.is_file():
-        logger.warning("nginx.conf not found at %s; skip capacity tuning", nginx_conf)
-        return
-
-    text = nginx_conf.read_text()
-
-    required_connections = max(
-        NGINX_MIN_WORKER_CONNECTIONS,
-        required_listen_sockets + NGINX_WORKER_CONN_HEADROOM,
-    )
-    required_nofile = max(NGINX_WORKER_RLIMIT_NOFILE, required_connections * 2)
-
-    changed = False
-
-    wc_pattern = re.compile(r"(^\s*worker_connections\s+)(\d+)(\s*;)", re.MULTILINE)
-    wc_match = wc_pattern.search(text)
-    if wc_match:
-        current_wc = int(wc_match.group(2))
-        if current_wc < required_connections:
-            text = wc_pattern.sub(
-                rf"\g<1>{required_connections}\3",
-                text,
-                count=1,
-            )
-            changed = True
-            logger.info(
-                "Raised nginx worker_connections: %s -> %s",
-                current_wc,
-                required_connections,
-            )
-    else:
-        logger.warning("worker_connections directive not found; skip tuning")
-
-    wr_pattern = re.compile(r"(^\s*worker_rlimit_nofile\s+)(\d+)(\s*;)", re.MULTILINE)
-    wr_match = wr_pattern.search(text)
-    if wr_match:
-        current_wr = int(wr_match.group(2))
-        if current_wr < required_nofile:
-            text = wr_pattern.sub(
-                rf"\g<1>{required_nofile}\3",
-                text,
-                count=1,
-            )
-            changed = True
-            logger.info(
-                "Raised nginx worker_rlimit_nofile: %s -> %s",
-                current_wr,
-                required_nofile,
-            )
-    else:
-        inject_after = re.compile(
-            r"(^\s*worker_processes\s+\S+\s*;[^\n]*\n)",
-            re.MULTILINE,
-        )
-        if inject_after.search(text):
-            text = inject_after.sub(
-                rf"\1worker_rlimit_nofile {required_nofile};\n",
-                text,
-                count=1,
-            )
-            changed = True
-            logger.info("Inserted nginx worker_rlimit_nofile=%s", required_nofile)
-        else:
-            text = f"worker_rlimit_nofile {required_nofile};\n{text}"
-            changed = True
-            logger.info("Prepended nginx worker_rlimit_nofile=%s", required_nofile)
-
-    if changed:
-        nginx_conf.write_text(text)
-
-
-def ensure_pve_node_var_stub():
-    """
-    Ensure $pve_node_from_host is defined for nginx -t on hosts that do not
-    have the full PVE wildcard proxy snippets installed.
-    """
-    conf_paths = ["/etc/nginx/**/*.conf"]
-    var_defined = False
-    for pattern in conf_paths:
-        for path in glob(pattern, recursive=True):
-            p = Path(path)
-            if not p.is_file():
-                continue
-            try:
-                text = p.read_text()
-            except Exception:
-                continue
-            if "map $host $pve_node_from_host" in text:
-                var_defined = True
-                break
-        if var_defined:
-            break
-
-    if var_defined:
-        if NGINX_PVE_STUB_FILE.exists():
-            # Remove stale stub once real config exists to avoid duplicate map vars.
-            try:
-                NGINX_PVE_STUB_FILE.unlink()
-            except OSError:
-                pass
-        return
-
-    NGINX_PVE_STUB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    NGINX_PVE_STUB_FILE.write_text(
-        "# generated by sync-base-nat.py to satisfy optional PVE vars\n"
-        "map $host $pve_node_from_host {\n"
-        '    default "";\n'
-        "}\n"
-    )
-
-
-def ensure_process_nofile_limit(min_limit: int):
-    """Raise current process RLIMIT_NOFILE so nginx -t can open many sockets."""
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    except (ValueError, OSError):
-        return
-
-    target = max(min_limit, NGINX_WORKER_RLIMIT_NOFILE)
-    if soft >= target:
-        return
-
-    new_soft = min(target, hard)
-    try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
-        logger.info("Raised process RLIMIT_NOFILE: %s -> %s (hard=%s)", soft, new_soft, hard)
-    except (ValueError, OSError) as e:
-        logger.warning("Could not raise RLIMIT_NOFILE to %s: %s", target, e)
-
-
-def apply_generated_configs(desired: dict[int, str]):
-    write_generated_configs(desired)
-    stream_conf = NGINX_STREAM_FILE.read_text() if NGINX_STREAM_FILE.is_file() else ""
-    required_listeners = sum(
-        1 for line in stream_conf.splitlines() if line.strip().startswith("listen ")
-    )
-    ensure_nginx_capacity(required_listeners)
-    ensure_pve_node_var_stub()
-    ensure_process_nofile_limit(max(NGINX_TEST_NOFILE, required_listeners + 1024))
+    kv: dict[str, str] = {}
+    for piece in comment[len(prefix) :].split(":"):
+        if "=" not in piece:
+            continue
+        k, v = piece.split("=", 1)
+        kv[k.strip()] = v.strip()
 
     try:
-        run(["nginx", "-t"], check=True)
-    except FileNotFoundError:
-        logger.error("nginx binary not found")
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        logger.error("nginx -t failed: %s", (e.stderr or e.stdout or "").strip())
-        sys.exit(1)
+        vmid = int(kv["vmid"])
+    except (KeyError, ValueError):
+        return None
+    service = kv.get("svc", "")
+    proto = kv.get("proto", "")
+    if service not in {"rdp", "smb"} or proto not in {"tcp", "udp"}:
+        return None
+
+    dport_match = re.search(r"\bdport\s+(\d+)\b", line)
+    dnat_match = re.search(r"dnat to \[([0-9a-fA-F:]+)\]:(\d+)", line)
+    if not dport_match or not dnat_match:
+        return None
 
     try:
-        run(["nft", "-f", str(NFT_CONFIG_FILE)], check=True)
+        external_port = int(dport_match.group(1))
+        target_ipv6 = normalize_ipv6(dnat_match.group(1))
+        target_port = int(dnat_match.group(2))
+    except ValueError:
+        return None
+
+    try:
+        vmid = check_vmid(vmid)
+    except ValueError:
+        return None
+
+    return ManagedDnatRuleSpec(
+        vmid=vmid,
+        service=service,
+        proto=proto,
+        external_port=external_port,
+        target_ipv6=target_ipv6,
+        target_port=target_port,
+    )
+
+
+def _list_existing_managed_rules() -> list[ExistingManagedRule]:
+    try:
+        output = run(
+            ["nft", "-a", "list", "chain", NFT_DNAT_FAMILY, NFT_DNAT_TABLE, NFT_DNAT_CHAIN],
+            check=True,
+        )
     except FileNotFoundError:
         logger.error("nft binary not found")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
-        logger.error("nft apply failed: %s", (e.stderr or e.stdout or "").strip())
+        logger.error(
+            "Failed to list nft chain %s %s %s: %s",
+            NFT_DNAT_FAMILY,
+            NFT_DNAT_TABLE,
+            NFT_DNAT_CHAIN,
+            (e.stderr or e.stdout or "").strip(),
+        )
         sys.exit(1)
 
-    reload_result = subprocess.run(
-        ["systemctl", "reload", "nginx"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if reload_result.returncode != 0:
-        logger.warning(
-            "systemctl reload nginx failed: %s",
-            (reload_result.stderr or reload_result.stdout or "").strip(),
-        )
-    else:
-        logger.info("nginx reloaded")
+    managed: list[ExistingManagedRule] = []
+    for line in output.splitlines():
+        if MANAGED_RULE_COMMENT_PREFIX not in line:
+            continue
+        handle_match = re.search(r"# handle (\d+)\s*$", line.strip())
+        if not handle_match:
+            logger.warning("Skipping managed-looking rule without handle: %s", line.strip())
+            continue
+        handle = int(handle_match.group(1))
+        spec = _parse_managed_spec_from_line(line)
+        managed.append(ExistingManagedRule(handle=handle, raw_line=line.strip(), spec=spec))
+    return managed
 
-    logger.info("Applied generated nft + nginx stream config (%d VMs)", len(desired))
+
+def _add_dnat_rule(spec: ManagedDnatRuleSpec):
+    comment_value = _rule_comment(spec).replace('"', "")
+    cmd = [
+        "nft",
+        "add",
+        "rule",
+        NFT_DNAT_FAMILY,
+        NFT_DNAT_TABLE,
+        NFT_DNAT_CHAIN,
+        spec.proto,
+        "dport",
+        str(spec.external_port),
+        "dnat",
+        "to",
+        f"[{spec.target_ipv6}]:{spec.target_port}",
+        "comment",
+        f'"{comment_value}"',
+    ]
+    run(cmd, check=True)
+
+
+def _delete_rule_by_handle(handle: int):
+    run(
+        [
+            "nft",
+            "delete",
+            "rule",
+            NFT_DNAT_FAMILY,
+            NFT_DNAT_TABLE,
+            NFT_DNAT_CHAIN,
+            "handle",
+            str(handle),
+        ],
+        check=True,
+    )
+
+
+def reconcile_dynamic_dnat_rules(desired: dict[int, str]):
+    desired_specs = _desired_dnat_specs(desired)
+    existing_rules = _list_existing_managed_rules()
+
+    existing_by_spec: dict[ManagedDnatRuleSpec, int] = {}
+    delete_handles: set[int] = set()
+    malformed_count = 0
+    duplicate_count = 0
+
+    for rule in existing_rules:
+        if rule.spec is None:
+            malformed_count += 1
+            delete_handles.add(rule.handle)
+            continue
+        if rule.spec in existing_by_spec:
+            duplicate_count += 1
+            delete_handles.add(rule.handle)
+            continue
+        existing_by_spec[rule.spec] = rule.handle
+
+    for spec, handle in existing_by_spec.items():
+        if spec not in desired_specs:
+            delete_handles.add(handle)
+
+    existing_specs = set(existing_by_spec.keys())
+    to_add = sorted(
+        desired_specs - existing_specs,
+        key=lambda s: (s.external_port, s.proto, s.service, s.vmid),
+    )
+
+    removed = 0
+    for handle in sorted(delete_handles, reverse=True):
+        try:
+            _delete_rule_by_handle(handle)
+            removed += 1
+        except subprocess.CalledProcessError as e:
+            logger.error("Failed deleting nft handle %s: %s", handle, (e.stderr or "").strip())
+            sys.exit(1)
+
+    added = 0
+    for spec in to_add:
+        try:
+            _add_dnat_rule(spec)
+            added += 1
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "Failed adding rule vmid=%s %s/%s ext=%s -> [%s]:%s: %s",
+                spec.vmid,
+                spec.service,
+                spec.proto,
+                spec.external_port,
+                spec.target_ipv6,
+                spec.target_port,
+                (e.stderr or "").strip(),
+            )
+            sys.exit(1)
+
+    logger.info(
+        "Dynamic DNAT reconcile done: desired=%d existing_managed=%d added=%d removed=%d malformed=%d duplicates=%d",
+        len(desired_specs),
+        len(existing_rules),
+        added,
+        removed,
+        malformed_count,
+        duplicate_count,
+    )
 
 
 def sync_full():
     desired = firestore_list_configured_servers()
-    apply_generated_configs(desired)
+    reconcile_dynamic_dnat_rules(desired)
     write_state(
         {
             str(k): {
@@ -854,7 +625,7 @@ def sync_single_vmid(
         desired.pop(vmid, None)
         logger.info("proxmoxId=%s not in Firestore; removed from desired map", vmid)
 
-    apply_generated_configs(desired)
+    reconcile_dynamic_dnat_rules(desired)
     write_state(
         {
             str(k): {

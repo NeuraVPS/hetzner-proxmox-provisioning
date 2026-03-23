@@ -1,7 +1,7 @@
 [Unit]
-Description=BASE nftables + nginx stream sync from Firestore
-After=network-online.target nginx.service
-Wants=network-online.target nginx.service
+Description=BASE dynamic forwarding sync from Firestore
+After=network-online.target nftables.service jool-nat46.service
+Wants=network-online.target nftables.service
 
 [Service]
 Type=oneshot
