@@ -80,3 +80,115 @@ Optional cleanup:
 - **App launches but no GUI**: expected for some apps with `-Djava.awt.headless=true`; remove the flag if GUI is required.
 - **Quoting issues in `reg add`**: copy the command exactly, including escaped quotes (`\"`).
 - **Recursion concerns**: `sqx-hook.ps1` already prevents IFEO recursion by temporarily removing and restoring the `Debugger` value around process launch.
+
+## MT5 Portable Hook Deployment
+
+This is the new MT5 model for Windows VMs:
+
+- Keep standard executable-based associations (no `mt5_open.vbs` dependency).
+- Set first-time default associations to instance `001` executables.
+- Enforce `/portable` at runtime using IFEO hooks for `terminal64.exe` and `metaeditor64.exe`.
+
+### 1) Install hook scripts on the VM
+
+Place both scripts on the VM (example location):
+
+- `C:\MetaTrader\hooks\mt5_terminal_hook.ps1`
+- `C:\MetaTrader\hooks\mt5_metaeditor_hook.ps1`
+
+Each hook should:
+
+- Accept IFEO arguments (`originalExePath` first, then original args).
+- Add `/portable` if missing.
+- If a passed file is under `C:\MetaTrader\MetaTrader 5 - 001..010\...`, reroute to the matching instance executable.
+- Temporarily remove and restore its own IFEO `Debugger` entry before/after launch (recursion-safe).
+
+### 2) Register IFEO hooks
+
+Run in **Command Prompt as Administrator**:
+
+```bat
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\terminal64.exe" ^
+ /v Debugger /t REG_SZ ^
+ /d "\"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"C:\MetaTrader\hooks\mt5_terminal_hook.ps1\"" /f
+
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\metaeditor64.exe" ^
+ /v Debugger /t REG_SZ ^
+ /d "\"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"C:\MetaTrader\hooks\mt5_metaeditor_hook.ps1\"" /f
+```
+
+### 3) Set first-time default associations to instance 001
+
+Run in **PowerShell as Administrator**:
+
+```powershell
+$classes = "HKLM:\SOFTWARE\Classes"
+$terminalExe = "C:\MetaTrader\MetaTrader 5 - 001\terminal64.exe"
+$editorExe = "C:\MetaTrader\MetaTrader 5 - 001\metaeditor64.exe"
+
+$extMap = @{
+    ".ex5" = "EX5.File"
+    ".mq5" = "MQL5.File"
+    ".mqh" = "MQL5.Header"
+    ".mt5" = "MetaTrader 5 Export File"
+}
+
+foreach ($ext in $extMap.Keys) {
+    $extKey = Join-Path $classes $ext
+    New-Item -Path $extKey -Force | Out-Null
+    Set-ItemProperty -Path $extKey -Name "(Default)" -Value $extMap[$ext] -Type String
+}
+
+$openCommands = @{
+    "EX5.File" = "`"$terminalExe`" `"%1`""
+    "MQL5.File" = "`"$editorExe`" `"%1`""
+    "MQL5.Header" = "`"$editorExe`" `"%1`""
+    "MetaTrader 5 Export File" = "`"$terminalExe`" `"%1`""
+    "mql5buy" = "`"$terminalExe`" `"%1`""
+    "metaeditor5" = "`"$editorExe`" `"%1`""
+}
+
+foreach ($progId in $openCommands.Keys) {
+    $progPath = Join-Path $classes $progId
+    New-Item -Path $progPath -Force | Out-Null
+
+    if ($progId -in @("mql5buy", "metaeditor5")) {
+        Set-ItemProperty -Path $progPath -Name "URL Protocol" -Value "" -Type String
+    }
+
+    $cmdPath = Join-Path $progPath "shell\open\command"
+    New-Item -Path $cmdPath -Force | Out-Null
+    Set-ItemProperty -Path $cmdPath -Name "(Default)" -Value $openCommands[$progId] -Type String
+}
+```
+
+### 4) Verify
+
+Run in **Command Prompt as Administrator**:
+
+```bat
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\terminal64.exe" /v Debugger
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\metaeditor64.exe" /v Debugger
+
+reg query "HKLM\SOFTWARE\Classes\EX5.File\shell\open\command" /ve
+reg query "HKLM\SOFTWARE\Classes\MQL5.File\shell\open\command" /ve
+reg query "HKLM\SOFTWARE\Classes\mql5buy\shell\open\command" /ve
+reg query "HKLM\SOFTWARE\Classes\metaeditor5\shell\open\command" /ve
+```
+
+Then manually test:
+
+- Launch `terminal64.exe` and `metaeditor64.exe` directly.
+- Open `.mq5`/`.ex5` files and protocol links.
+- Confirm `/portable` is always enforced by the hook.
+
+### 5) Rollback IFEO hooks
+
+Run in **Command Prompt as Administrator**:
+
+```bat
+reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\terminal64.exe" /v Debugger /f
+reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\metaeditor64.exe" /v Debugger /f
+```
+
+This removes launch-time `/portable` injection, but keeps default associations in place.
