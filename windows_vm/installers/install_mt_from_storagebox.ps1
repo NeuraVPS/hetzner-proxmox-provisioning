@@ -135,7 +135,52 @@ try {
     }
 
     if ($MetaTraderVersion -eq 4) {
-        # MT4 file associations (instance 001): add $extMap / $openCommands and registry loop when extensions are defined.
+        # Default file associations for MQL4 types -> instance 001.
+        $classes = 'HKLM:\SOFTWARE\Classes'
+        $terminalExe = Join-Path -Path $firstPath -ChildPath $TerminalExeName
+        $editorExe = Join-Path -Path $firstPath -ChildPath $EditorExeName
+        if (-not (Test-Path -LiteralPath $editorExe)) {
+            throw "Expected editor missing for associations: $editorExe"
+        }
+
+        # .mq4 -> MQL4.File and basic ShellNew.
+        $mq4ExtKey = Join-Path $classes '.mq4'
+        New-Item -Path $mq4ExtKey -Force | Out-Null
+        Set-ItemProperty -Path $mq4ExtKey -Name '(Default)' -Value 'MQL4.File' -Type String
+        $mq4ShellNewKey = Join-Path $mq4ExtKey 'ShellNew'
+        New-Item -Path $mq4ShellNewKey -Force | Out-Null
+        New-ItemProperty -Path $mq4ShellNewKey -Name 'NullFile' -Value '' -PropertyType String -Force | Out-Null
+
+        # MQL4.File ProgID.
+        $mql4ProgKey = Join-Path $classes 'MQL4.File'
+        New-Item -Path $mql4ProgKey -Force | Out-Null
+        Set-ItemProperty -Path $mql4ProgKey -Name '(Default)' -Value 'MQL4 Source File' -Type String
+
+        $mql4DefaultIconKey = Join-Path $mql4ProgKey 'DefaultIcon'
+        New-Item -Path $mql4DefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $mql4DefaultIconKey -Name '(Default)' -Value "$editorExe,1" -Type String
+
+        $mql4CmdKey = Join-Path $mql4ProgKey 'shell\open\command'
+        New-Item -Path $mql4CmdKey -Force | Out-Null
+        Set-ItemProperty -Path $mql4CmdKey -Name '(Default)' -Value "`"$editorExe`" `"%1`"" -Type String
+
+        $mql4ShellNewKey = Join-Path $mql4ProgKey 'ShellNew'
+        New-Item -Path $mql4ShellNewKey -Force | Out-Null
+        New-ItemProperty -Path $mql4ShellNewKey -Name 'NullFile' -Value '' -PropertyType String -Force | Out-Null
+
+        # mql4buy URL protocol.
+        $mql4BuyKey = Join-Path $classes 'mql4buy'
+        New-Item -Path $mql4BuyKey -Force | Out-Null
+        Set-ItemProperty -Path $mql4BuyKey -Name '(Default)' -Value 'URL:MQL4 Buy Protocol' -Type String
+        Set-ItemProperty -Path $mql4BuyKey -Name 'URL Protocol' -Value '' -Type String
+
+        $mql4BuyDefaultIconKey = Join-Path $mql4BuyKey 'DefaultIcon'
+        New-Item -Path $mql4BuyDefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $mql4BuyDefaultIconKey -Name '(Default)' -Value "$terminalExe,1" -Type String
+
+        $mql4BuyCmdKey = Join-Path $mql4BuyKey 'shell\open\command'
+        New-Item -Path $mql4BuyCmdKey -Force | Out-Null
+        Set-ItemProperty -Path $mql4BuyCmdKey -Name '(Default)' -Value "`"$terminalExe`" `"%1`"" -Type String
     } elseif ($MetaTraderVersion -eq 5) {
         # Default file associations for MQL/MT5 types -> instance 001 (see WINDOWS_PREPARATION.md).
         $classes = 'HKLM:\SOFTWARE\Classes'
