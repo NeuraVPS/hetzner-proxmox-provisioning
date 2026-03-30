@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Maps the Hetzner Storage Box SMB share, extracts QuantAnalyzer4.zip to C:\QuantAnalyzer4, and adds symlinks on the desktop and Start Menu.
+  Maps the Hetzner Storage Box SMB share, extracts QuantAnalyzer4.zip to C:\QuantAnalyzer4, and adds desktop and Start Menu shortcuts (.lnk).
 
 .DESCRIPTION
   Remote run (no local .ps1): iex (irm URL) does not pass arguments into this script's param block.
@@ -110,6 +110,40 @@ function Connect-StorageBoxUnc {
     throw "SMB connect failed for $RemotePath. $($errs -join ' | ')"
 }
 
+function New-ShellShortcutLnk {
+    <#
+    .NOTES
+      Start Menu "All apps" expects .lnk shell links; symlinks are often not listed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ShortcutPath,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$WorkingDirectory
+    )
+    if (-not $ShortcutPath.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $ShortcutPath = "$ShortcutPath.lnk"
+    }
+    $legacyNoExt = $ShortcutPath -replace '\.lnk$', ''
+    $dir = Split-Path -Parent $ShortcutPath
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $ShortcutPath) {
+        Remove-Item -LiteralPath $ShortcutPath -Force
+    }
+    if (-not [string]::Equals($legacyNoExt, $ShortcutPath, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $legacyNoExt)) {
+        Remove-Item -LiteralPath $legacyNoExt -Force -ErrorAction SilentlyContinue
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $sc = $shell.CreateShortcut($ShortcutPath)
+    $sc.TargetPath = $TargetPath
+    $sc.WorkingDirectory = $WorkingDirectory
+    if (Test-Path -LiteralPath $TargetPath) {
+        $sc.IconLocation = "$TargetPath,0"
+    }
+    $sc.Save()
+}
+
 $ExtractRoot = "C:\QuantAnalyzer4"
 $ExeTarget   = Join-Path -Path $ExtractRoot -ChildPath "QuantAnalyzer4.exe"
 $DesktopLink = "C:\Users\Public\Desktop\QuantAnalyzer4"
@@ -132,12 +166,8 @@ try {
         throw "Expected executable missing after extract: $ExeTarget (check zip layout)."
     }
 
-    foreach ($linkPath in @($DesktopLink, $StartMenuLink)) {
-        if (Test-Path -LiteralPath $linkPath) {
-            Remove-Item -LiteralPath $linkPath -Force
-        }
-        New-Item -ItemType SymbolicLink -Path $linkPath -Target $ExeTarget | Out-Null
-    }
+    New-ShellShortcutLnk -ShortcutPath $DesktopLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
+    New-ShellShortcutLnk -ShortcutPath $StartMenuLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
 }
 finally {
     if (Get-Command Remove-SmbGlobalMapping -ErrorAction SilentlyContinue) {
@@ -146,4 +176,4 @@ finally {
     Remove-SmbMapping -RemotePath $UncRoot -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host 'Done: extracted to' $ExtractRoot 'and symlinks created.'
+Write-Host 'Done: extracted to' $ExtractRoot 'and shortcuts (.lnk) created.'
