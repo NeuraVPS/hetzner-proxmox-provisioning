@@ -332,8 +332,14 @@ try {
         New-Item -Path $mql4BuyCmdKey -Force | Out-Null
         Set-ItemProperty -Path $mql4BuyCmdKey -Name '(Default)' -Value "`"$terminalExe`" `"%1`"" -Type String
 
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL4.File\DefaultIcon' -ExePath $editorExe -IconIndex 0
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql4buy\DefaultIcon' -ExePath $terminalExe -IconIndex 0
+        # DefaultIcon: MQL4.File = metaeditor (001), index 3; mql4buy = terminal from instance 002, index 1 (fallback 001 if single instance).
+        $mql4BuyIconTerminalExe = Join-Path -Path (Get-MtInstancePath -Index 2) -ChildPath $TerminalExeName
+        if (-not (Test-Path -LiteralPath $mql4BuyIconTerminalExe)) {
+            $mql4BuyIconTerminalExe = $terminalExe
+        }
+
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL4.File\DefaultIcon' -ExePath $editorExe -IconIndex 3
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql4buy\DefaultIcon' -ExePath $mql4BuyIconTerminalExe -IconIndex 1
         Update-MtShellIconCache
     } elseif ($MetaTraderVersion -eq 5) {
         # Default file associations for MQL/MT5 types -> instance 001 (see WINDOWS_PREPARATION.md).
