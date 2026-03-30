@@ -34,16 +34,89 @@ $ZipName = "QuantAnalyzer4.zip"
 $ZipUnc  = Join-Path -Path $UncRoot -ChildPath $ZipName
 $SmbUser = 'u560363-sub1'
 
+function Connect-StorageBoxUnc {
+    <#
+    .NOTES
+      Error 1312 (no logon session) hits New-SmbMapping and plain net use under QEMU guest agent / SYSTEM.
+      New-SmbGlobalMapping is intended for machine-wide SMB access (services, SYSTEM).
+      Fallback: cmdkey stores creds, then net use without inline password; then explicit net use variants.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RemotePath,
+        [Parameter(Mandatory)][string]$User,
+        [Parameter(Mandatory)][string]$Password
+    )
+    if (Get-Command Remove-SmbGlobalMapping -ErrorAction SilentlyContinue) {
+        Remove-SmbGlobalMapping -RemotePath $RemotePath -Force -ErrorAction SilentlyContinue
+    }
+    Remove-SmbMapping -RemotePath $RemotePath -Force -ErrorAction SilentlyContinue
+    try { net use $RemotePath /delete /y 2>$null | Out-Null } catch {}
+
+    $server = $null
+    if ($RemotePath -match '^\\\\([^\\]+)\\') {
+        $server = $Matches[1]
+    }
+
+    $errs = @()
+    Import-Module SmbShare -ErrorAction SilentlyContinue | Out-Null
+
+    if (Get-Command New-SmbGlobalMapping -ErrorAction SilentlyContinue) {
+        try {
+            New-SmbGlobalMapping -RemotePath $RemotePath -UserName $User -Password $Password -Persistent:$false -ErrorAction Stop | Out-Null
+            return
+        } catch {
+            $errs += "New-SmbGlobalMapping: $($_.Exception.Message)"
+        }
+    } else {
+        $errs += 'New-SmbGlobalMapping: cmdlet not available'
+    }
+
+    try {
+        New-SmbMapping -RemotePath $RemotePath -UserName $User -Password $Password -Persistent:$false -ErrorAction Stop | Out-Null
+        return
+    } catch {
+        $errs += "New-SmbMapping: $($_.Exception.Message)"
+    }
+
+    $cmdkey = Join-Path $env:SystemRoot 'System32\cmdkey.exe'
+    if ($server -and (Test-Path -LiteralPath $cmdkey)) {
+        $ck = Start-Process -FilePath $cmdkey -ArgumentList @("/add:$server", "/user:$User", "/pass:$Password") -Wait -NoNewWindow -PassThru
+        try {
+            if ($ck.ExitCode -eq 0) {
+                $p = Start-Process -FilePath 'net.exe' -ArgumentList @('use', $RemotePath, '/persistent:no') -Wait -NoNewWindow -PassThru
+                if ($p.ExitCode -eq 0) { return }
+                $errs += "net use after cmdkey exit $($p.ExitCode)"
+            } else {
+                $errs += "cmdkey add exit $($ck.ExitCode)"
+            }
+        } finally {
+            try {
+                Start-Process -FilePath $cmdkey -ArgumentList @("/delete:$server") -Wait -NoNewWindow | Out-Null
+            } catch { }
+        }
+    }
+
+    $netVariants = @(
+        @('use', $RemotePath, "/user:$User", $Password),
+        @('use', $RemotePath, "/user:WORKGROUP\$User", $Password),
+        @('use', $RemotePath, "/user:.\$User", $Password)
+    )
+    foreach ($na in $netVariants) {
+        $p = Start-Process -FilePath 'net.exe' -ArgumentList $na -Wait -NoNewWindow -PassThru
+        if ($p.ExitCode -eq 0) { return }
+    }
+    $errs += 'net use explicit variants failed'
+
+    throw "SMB connect failed for $RemotePath. $($errs -join ' | ')"
+}
+
 $ExtractRoot = "C:\QuantAnalyzer4"
 $ExeTarget   = Join-Path -Path $ExtractRoot -ChildPath "QuantAnalyzer4.exe"
 $DesktopLink = "C:\Users\Public\Desktop\QuantAnalyzer4"
 $StartMenuLink = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\QuantAnalyzer4"
 
-$securePass = ConvertTo-SecureString -String $SmbPassword -AsPlainText -Force
-$credential = New-Object System.Management.Automation.PSCredential ($SmbUser, $securePass)
-
 try {
-    New-SmbMapping -RemotePath $UncRoot -Credential $credential -Persistent:$false | Out-Null
+    Connect-StorageBoxUnc -RemotePath $UncRoot -User $SmbUser -Password $SmbPassword
 
     if (-not (Test-Path -LiteralPath $ZipUnc)) {
         throw "Zip not found at: $ZipUnc"
@@ -67,6 +140,9 @@ try {
     }
 }
 finally {
+    if (Get-Command Remove-SmbGlobalMapping -ErrorAction SilentlyContinue) {
+        Remove-SmbGlobalMapping -RemotePath $UncRoot -Force -ErrorAction SilentlyContinue
+    }
     Remove-SmbMapping -RemotePath $UncRoot -Force -ErrorAction SilentlyContinue
 }
 
