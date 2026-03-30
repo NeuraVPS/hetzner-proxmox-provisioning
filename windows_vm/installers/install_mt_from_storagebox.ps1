@@ -158,6 +158,30 @@ try {
             Set-ItemProperty -Path $extKey -Name '(Default)' -Value $extMap[$ext] -Type String
         }
 
+        $ex5DefaultIconKey = Join-Path (Join-Path $classes 'EX5.File') 'DefaultIcon'
+        New-Item -Path $ex5DefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $ex5DefaultIconKey -Name '(Default)' -Value "$terminalExe,2" -Type String
+
+        $mql5DefaultIconKey = Join-Path (Join-Path $classes 'MQL5.File') 'DefaultIcon'
+        New-Item -Path $mql5DefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $mql5DefaultIconKey -Name '(Default)' -Value "$editorExe,1" -Type String
+
+        $mql5HeaderDefaultIconKey = Join-Path (Join-Path $classes 'MQL5.Header') 'DefaultIcon'
+        New-Item -Path $mql5HeaderDefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $mql5HeaderDefaultIconKey -Name '(Default)' -Value "$editorExe,2" -Type String
+
+        $mt5ExportDefaultIconKey = Join-Path (Join-Path $classes 'MetaTrader 5 Export File') 'DefaultIcon'
+        New-Item -Path $mt5ExportDefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $mt5ExportDefaultIconKey -Name '(Default)' -Value "$terminalExe,15" -Type String
+
+        $mql5BuyDefaultIconKey = Join-Path (Join-Path $classes 'mql5buy') 'DefaultIcon'
+        New-Item -Path $mql5BuyDefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $mql5BuyDefaultIconKey -Name '(Default)' -Value "$terminalExe,1" -Type String
+
+        $metaeditor5DefaultIconKey = Join-Path (Join-Path $classes 'metaeditor5') 'DefaultIcon'
+        New-Item -Path $metaeditor5DefaultIconKey -Force | Out-Null
+        Set-ItemProperty -Path $metaeditor5DefaultIconKey -Name '(Default)' -Value "$editorExe,1" -Type String
+
         $openCommands = @{
             'EX5.File'                   = "`"$terminalExe`" `"%1`""
             'MQL5.File'                  = "`"$editorExe`" `"%1`""
