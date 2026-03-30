@@ -65,6 +65,8 @@ attrib +s 'C:\My Servers'
 attrib +h 'C:\My Servers\desktop.ini'
 ```
 
+- Crear C:\NeuraData
+
 - Prepare for Autologin
 
 ```powershell
