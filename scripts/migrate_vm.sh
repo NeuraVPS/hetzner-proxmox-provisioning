@@ -2,7 +2,7 @@
 # Migrate a Proxmox VM to another node using native remote_migrate API.
 # Uses: apt upgrade, Firestore prep, hookscript detach, token creation, pvesh remote_migrate, sync-dnat, hookscript reattach, token cleanup.
 
-MIGRATE_SCRIPT_URL="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh"
+MIGRATE_SCRIPT_URL="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/migrate_vm.sh"
 
 pve_zfs_migrate_vm() {
   local USAGE="Usage: pve_zfs_migrate_vm <vmid> <dest_ssh> [options]  (run on source node). Or: <vmid> <source_ssh> <dest_ssh> [options]  (SSH to source, then migrate). Use --help for details."
@@ -461,6 +461,6 @@ fi
 #   With options:
 #     bash migrate_vm.sh 1008 root@10.64.0.7 --dest-node=0000007-AX162-R --target-storage=local-zfs
 #   One-liner (curl; add ?t=$(date +%s) to avoid CDN cache):
-#     curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/migrate_vm.sh?t=$(date +%s)" | bash -s -- 830 2a01:4f9:3070:2ccf::2
+#     curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/migrate_vm.sh?t=$(date +%s)" | bash -s -- 830 2a01:4f9:3070:2ccf::2
 #
 pve_zfs_migrate_vm "$@"
