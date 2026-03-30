@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Maps the Storage Box SMB share, installs MetaTrader 4 or 5 into numbered folders, adds desktop and Start Menu symlinks, and registers file associations for instance 001 (MT5 only).
+  Maps the Storage Box SMB share, installs MetaTrader 4 or 5 into numbered folders, adds desktop and Start Menu shortcuts (.lnk) under Programs\MetaTrader\, and registers file associations for instance 001 (MT5 only).
 
 .DESCRIPTION
   Remote run (no local .ps1): iex (irm URL) does not pass arguments into this script's param block.
@@ -133,7 +133,8 @@ function Connect-StorageBoxUnc {
 }
 
 $MtRoot        = 'C:\MetaTrader'
-$StartMenuMt   = Join-Path -Path 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs' -ChildPath "MetaTrader $MetaTraderVersion"
+# Start Menu folder name is always "MetaTrader"; version (4/5) appears only in each shortcut label (Get-MtInstanceFolderName).
+$StartMenuMt   = Join-Path -Path 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs' -ChildPath 'MetaTrader'
 $PublicDesktop = 'C:\Users\Public\Desktop'
 
 if ($MetaTraderVersion -eq 5) {
@@ -152,6 +153,64 @@ function Get-MtInstanceFolderName {
 function Get-MtInstancePath {
     param([int]$Index)
     return Join-Path -Path $MtRoot -ChildPath (Get-MtInstanceFolderName -Index $Index)
+}
+
+function New-MtShellShortcut {
+    <#
+    .NOTES
+      Start Menu "All apps" lists .lnk shell links; symlinks (SymbolicLink) are often not shown.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ShortcutPath,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$WorkingDirectory
+    )
+    if (-not $ShortcutPath.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $ShortcutPath = "$ShortcutPath.lnk"
+    }
+    $legacyNoExt = $ShortcutPath -replace '\.lnk$', ''
+    $dir = Split-Path -Parent $ShortcutPath
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $ShortcutPath) {
+        Remove-Item -LiteralPath $ShortcutPath -Force
+    }
+    if (-not [string]::Equals($legacyNoExt, $ShortcutPath, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $legacyNoExt)) {
+        Remove-Item -LiteralPath $legacyNoExt -Force -ErrorAction SilentlyContinue
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $sc = $shell.CreateShortcut($ShortcutPath)
+    $sc.TargetPath = $TargetPath
+    $sc.WorkingDirectory = $WorkingDirectory
+    if (Test-Path -LiteralPath $TargetPath) {
+        $sc.IconLocation = "$TargetPath,0"
+    }
+    $sc.Save()
+}
+
+function Remove-MtRegistryKeyIfExists {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    if (Test-Path -LiteralPath $LiteralPath) {
+        Remove-Item -LiteralPath $LiteralPath -Recurse -Force
+    }
+}
+
+function Format-MtDefaultIconRegValue {
+    <#
+    .NOTES
+      HKCR\...\DefaultIcon must use the form "C:\path with spaces\app.exe",index
+      If the path is not quoted, Windows parses only up to the first space and icons show as generic/wrong.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ExePath,
+        [int]$IconIndex = 0
+    )
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        throw "DefaultIcon source missing: $ExePath"
+    }
+    $full = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ExePath).Path)
+    return '"' + $full + '",' + $IconIndex
 }
 
 try {
@@ -199,12 +258,8 @@ try {
         $desktopLink = Join-Path -Path $PublicDesktop -ChildPath $label
         $startMenuLink = Join-Path -Path $StartMenuMt -ChildPath $label
 
-        foreach ($linkPath in @($desktopLink, $startMenuLink)) {
-            if (Test-Path -LiteralPath $linkPath) {
-                Remove-Item -LiteralPath $linkPath -Force
-            }
-            New-Item -ItemType SymbolicLink -Path $linkPath -Target $terminalExe | Out-Null
-        }
+        New-MtShellShortcut -ShortcutPath $desktopLink -TargetPath $terminalExe -WorkingDirectory $folder
+        New-MtShellShortcut -ShortcutPath $startMenuLink -TargetPath $terminalExe -WorkingDirectory $folder
     }
 
     if ($MetaTraderVersion -eq 4) {
@@ -215,6 +270,11 @@ try {
         if (-not (Test-Path -LiteralPath $editorExe)) {
             throw "Expected editor missing for associations: $editorExe"
         }
+
+        # Drop stale ProgIDs / extensions so DefaultIcon and commands are recreated cleanly.
+        Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes 'MQL4.File')
+        Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes 'mql4buy')
+        Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes '.mq4')
 
         # .mq4 -> MQL4.File and basic ShellNew.
         $mq4ExtKey = Join-Path $classes '.mq4'
@@ -231,7 +291,7 @@ try {
 
         $mql4DefaultIconKey = Join-Path $mql4ProgKey 'DefaultIcon'
         New-Item -Path $mql4DefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $mql4DefaultIconKey -Name '(Default)' -Value "$editorExe,1" -Type String
+        Set-ItemProperty -Path $mql4DefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $editorExe -IconIndex 0) -Type String
 
         $mql4CmdKey = Join-Path $mql4ProgKey 'shell\open\command'
         New-Item -Path $mql4CmdKey -Force | Out-Null
@@ -249,7 +309,7 @@ try {
 
         $mql4BuyDefaultIconKey = Join-Path $mql4BuyKey 'DefaultIcon'
         New-Item -Path $mql4BuyDefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $mql4BuyDefaultIconKey -Name '(Default)' -Value "$terminalExe,1" -Type String
+        Set-ItemProperty -Path $mql4BuyDefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $terminalExe -IconIndex 0) -Type String
 
         $mql4BuyCmdKey = Join-Path $mql4BuyKey 'shell\open\command'
         New-Item -Path $mql4BuyCmdKey -Force | Out-Null
@@ -270,6 +330,21 @@ try {
             '.mt5' = 'MetaTrader 5 Export File'
         }
 
+        $mt5ProgIds = @(
+            'EX5.File'
+            'MQL5.File'
+            'MQL5.Header'
+            'MetaTrader 5 Export File'
+            'mql5buy'
+            'metaeditor5'
+        )
+        foreach ($id in $mt5ProgIds) {
+            Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes $id)
+        }
+        foreach ($ext in $extMap.Keys) {
+            Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes $ext)
+        }
+
         foreach ($ext in $extMap.Keys) {
             $extKey = Join-Path $classes $ext
             New-Item -Path $extKey -Force | Out-Null
@@ -278,27 +353,27 @@ try {
 
         $ex5DefaultIconKey = Join-Path (Join-Path $classes 'EX5.File') 'DefaultIcon'
         New-Item -Path $ex5DefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $ex5DefaultIconKey -Name '(Default)' -Value "$terminalExe,2" -Type String
+        Set-ItemProperty -Path $ex5DefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $terminalExe -IconIndex 0) -Type String
 
         $mql5DefaultIconKey = Join-Path (Join-Path $classes 'MQL5.File') 'DefaultIcon'
         New-Item -Path $mql5DefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $mql5DefaultIconKey -Name '(Default)' -Value "$editorExe,1" -Type String
+        Set-ItemProperty -Path $mql5DefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $editorExe -IconIndex 0) -Type String
 
         $mql5HeaderDefaultIconKey = Join-Path (Join-Path $classes 'MQL5.Header') 'DefaultIcon'
         New-Item -Path $mql5HeaderDefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $mql5HeaderDefaultIconKey -Name '(Default)' -Value "$editorExe,2" -Type String
+        Set-ItemProperty -Path $mql5HeaderDefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $editorExe -IconIndex 0) -Type String
 
         $mt5ExportDefaultIconKey = Join-Path (Join-Path $classes 'MetaTrader 5 Export File') 'DefaultIcon'
         New-Item -Path $mt5ExportDefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $mt5ExportDefaultIconKey -Name '(Default)' -Value "$terminalExe,15" -Type String
+        Set-ItemProperty -Path $mt5ExportDefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $terminalExe -IconIndex 0) -Type String
 
         $mql5BuyDefaultIconKey = Join-Path (Join-Path $classes 'mql5buy') 'DefaultIcon'
         New-Item -Path $mql5BuyDefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $mql5BuyDefaultIconKey -Name '(Default)' -Value "$terminalExe,1" -Type String
+        Set-ItemProperty -Path $mql5BuyDefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $terminalExe -IconIndex 0) -Type String
 
         $metaeditor5DefaultIconKey = Join-Path (Join-Path $classes 'metaeditor5') 'DefaultIcon'
         New-Item -Path $metaeditor5DefaultIconKey -Force | Out-Null
-        Set-ItemProperty -Path $metaeditor5DefaultIconKey -Name '(Default)' -Value "$editorExe,1" -Type String
+        Set-ItemProperty -Path $metaeditor5DefaultIconKey -Name '(Default)' -Value (Format-MtDefaultIconRegValue -ExePath $editorExe -IconIndex 0) -Type String
 
         $openCommands = @{
             'EX5.File'                   = "`"$terminalExe`" `"%1`""
@@ -330,7 +405,7 @@ finally {
     Remove-SmbMapping -RemotePath $UncRoot -Force -ErrorAction SilentlyContinue
 }
 
-$summary = "Done: $InstanceCount MetaTrader $MetaTraderVersion instance(s) under $MtRoot; symlinks applied."
+$summary = "Done: $InstanceCount MetaTrader $MetaTraderVersion instance(s) under $MtRoot; desktop and Start Menu shortcuts applied."
 if ($MetaTraderVersion -eq 5) {
     $summary += ' File associations (001) applied.'
 }
