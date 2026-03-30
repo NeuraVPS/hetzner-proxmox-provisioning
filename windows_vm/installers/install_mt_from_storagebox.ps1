@@ -160,6 +160,9 @@ function New-MtShellShortcut {
     <#
     .NOTES
       Start Menu "All apps" lists .lnk shell links; symlinks (SymbolicLink) are often not shown.
+      WScript.Shell CreateShortcut must run in an STA thread; PowerShell 7+ or non-interactive
+      hosts may use MTA and produce shortcuts that do not behave like Explorer-created .lnk files.
+      We delegate to Windows PowerShell 5.1 with -STA when available.
     #>
     param(
         [Parameter(Mandatory)][string]$ShortcutPath,
@@ -169,25 +172,80 @@ function New-MtShellShortcut {
     if (-not $ShortcutPath.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) {
         $ShortcutPath = "$ShortcutPath.lnk"
     }
-    $legacyNoExt = $ShortcutPath -replace '\.lnk$', ''
-    $dir = Split-Path -Parent $ShortcutPath
+    $lnkFull = [System.IO.Path]::GetFullPath($ShortcutPath)
+    $targetFull = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $TargetPath).Path)
+    $workFull = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $WorkingDirectory).Path)
+
+    $legacyNoExt = $lnkFull -replace '\.lnk$', ''
+    $dir = Split-Path -Parent $lnkFull
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    if (Test-Path -LiteralPath $ShortcutPath) {
-        Remove-Item -LiteralPath $ShortcutPath -Force
+    if (Test-Path -LiteralPath $lnkFull) {
+        Remove-Item -LiteralPath $lnkFull -Force
     }
-    if (-not [string]::Equals($legacyNoExt, $ShortcutPath, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $legacyNoExt)) {
+    if (-not [string]::Equals($legacyNoExt, $lnkFull, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $legacyNoExt)) {
         Remove-Item -LiteralPath $legacyNoExt -Force -ErrorAction SilentlyContinue
     }
-    $shell = New-Object -ComObject WScript.Shell
-    $sc = $shell.CreateShortcut($ShortcutPath)
-    $sc.TargetPath = $TargetPath
-    $sc.WorkingDirectory = $WorkingDirectory
-    if (Test-Path -LiteralPath $TargetPath) {
-        $sc.IconLocation = "$TargetPath,0"
+
+    $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path -LiteralPath $winPs) {
+        # Embed paths as UTF-8 Base64 in the helper file only: no extra argv (spaces break Start-Process),
+        # and no reliance on env inheritance into the child (RDP / some hosts drop inherited vars).
+        $encLnk = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($lnkFull))
+        $encTgt = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($targetFull))
+        $encWrk = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($workFull))
+        $helper = @"
+`$ErrorActionPreference = 'Stop'
+`$Lnk = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encLnk'))
+`$Tgt = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encTgt'))
+`$Wrk = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encWrk'))
+`$w = New-Object -ComObject WScript.Shell
+`$s = `$w.CreateShortcut(`$Lnk)
+`$s.TargetPath = `$Tgt
+`$s.WorkingDirectory = `$Wrk
+if (Test-Path -LiteralPath `$Tgt) { `$s.IconLocation = (`$Tgt + ',0') }
+`$s.Save()
+"@
+        $tmp = Join-Path $env:TEMP ("neuravps-lnk-{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($tmp, $helper, $utf8NoBom)
+        try {
+            $p = Start-Process -FilePath $winPs -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $tmp
+            ) -Wait -NoNewWindow -PassThru
+            if ($p.ExitCode -ne 0) {
+                throw "Shell shortcut helper exited with code $($p.ExitCode)"
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($lnkFull)
+        $sc.TargetPath = $targetFull
+        $sc.WorkingDirectory = $workFull
+        if (Test-Path -LiteralPath $targetFull) {
+            $sc.IconLocation = "$targetFull,0"
+        }
+        $sc.Save()
     }
-    $sc.Save()
+
+    if (-not (Test-Path -LiteralPath $lnkFull)) {
+        throw "Shortcut was not created: $lnkFull"
+    }
+    $item = Get-Item -LiteralPath $lnkFull
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Shortcut path is a reparse point, not a shell .lnk: $lnkFull"
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($lnkFull)
+    if ($bytes.Length -lt 4) {
+        throw "Shortcut file is empty or unreadable: $lnkFull"
+    }
+    $headerSize = [BitConverter]::ToUInt32($bytes, 0)
+    if ($headerSize -ne 76) {
+        throw "File is not a valid shell link (.lnk header size 76 expected): $lnkFull"
+    }
 }
 
 function Remove-MtRegistryKeyIfExists {
