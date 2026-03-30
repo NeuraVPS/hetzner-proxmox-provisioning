@@ -394,12 +394,13 @@ try {
             Set-ItemProperty -Path $cmdPath -Name '(Default)' -Value $openCommands[$progId] -Type String
         }
 
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\EX5.File\DefaultIcon' -ExePath $terminalExe -IconIndex 0
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.File\DefaultIcon' -ExePath $editorExe -IconIndex 0
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.Header\DefaultIcon' -ExePath $editorExe -IconIndex 0
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MetaTrader 5 Export File\DefaultIcon' -ExePath $terminalExe -IconIndex 0
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql5buy\DefaultIcon' -ExePath $terminalExe -IconIndex 0
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\metaeditor5\DefaultIcon' -ExePath $editorExe -IconIndex 0
+        # DefaultIcon resource indices in terminal64.exe / metaeditor64.exe (MT5 shell expectations).
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\EX5.File\DefaultIcon' -ExePath $terminalExe -IconIndex 2
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.File\DefaultIcon' -ExePath $editorExe -IconIndex 1
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.Header\DefaultIcon' -ExePath $editorExe -IconIndex 2
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MetaTrader 5 Export File\DefaultIcon' -ExePath $terminalExe -IconIndex 15
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql5buy\DefaultIcon' -ExePath $terminalExe -IconIndex 1
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\metaeditor5\DefaultIcon' -ExePath $editorExe -IconIndex 1
         Update-MtShellIconCache
     }
 }
