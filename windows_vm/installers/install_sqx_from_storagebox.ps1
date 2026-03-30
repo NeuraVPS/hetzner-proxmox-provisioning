@@ -11,6 +11,8 @@
 
   & ([scriptblock]::Create((Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/windows_vm/installers/install_sqx_from_storagebox.ps1' -UseBasicParsing))) -SmbPassword $env:STORAGEBOX_SMB_PASSWORD -Version 142
 
+  & ([scriptblock]::Create((Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/windows_vm/installers/install_sqx_from_storagebox.ps1' -UseBasicParsing))) -SmbPassword $env:STORAGEBOX_SMB_PASSWORD -MaxRamGb 55
+
   Only use URLs and revisions you trust; this executes code from the network. #Requires Administrator.
 
 .PARAMETER SmbPassword
@@ -19,11 +21,17 @@
 .PARAMETER Version
   SQX build number: 142 or 143 only. Used for the zip name (SQX_<Version>.zip), install folder (C:\SQX_<Version>), and shortcut labels. Defaults to 143.
 
+.PARAMETER MaxRamGb
+  When set, writes a line "option -Xmx<MaxRamGb>g" into C:\SQX_<Version>\StrategyQuantX_nocheck.config (replacing any existing option -Xmx...g line). When omitted, that file is not modified.
+
 .EXAMPLE
   .\install_sqx_from_storagebox.ps1 -SmbPassword $env:STORAGEBOX_SMB_PASSWORD
 
 .EXAMPLE
   .\install_sqx_from_storagebox.ps1 -SmbPassword $env:STORAGEBOX_SMB_PASSWORD -Version 142
+
+.EXAMPLE
+  .\install_sqx_from_storagebox.ps1 -SmbPassword $env:STORAGEBOX_SMB_PASSWORD -MaxRamGb 55
 
 .NOTES
   Run elevated. SmbPassword must be supplied every time (no default).
@@ -35,7 +43,11 @@ param(
     [string]$SmbPassword,
 
     [ValidateSet('142', '143')]
-    [string]$Version = '143'
+    [string]$Version = '143',
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 1024)]
+    [int]$MaxRamGb = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -233,6 +245,19 @@ try {
 
     if (-not (Test-Path -LiteralPath $ExeTarget)) {
         throw "Expected executable missing after extract: $ExeTarget (check zip layout)."
+    }
+
+    if ($PSBoundParameters.ContainsKey('MaxRamGb')) {
+        $nocheckConfig = Join-Path -Path $ExtractRoot -ChildPath 'StrategyQuantX_nocheck.config'
+        $xmxLine = "option -Xmx${MaxRamGb}g"
+        $lines = @()
+        if (Test-Path -LiteralPath $nocheckConfig) {
+            $lines = @(Get-Content -LiteralPath $nocheckConfig -Encoding UTF8)
+        }
+        $filtered = $lines | Where-Object { $_ -notmatch '^\s*option\s+-Xmx\d+g\s*$' }
+        $outLines = @($filtered) + $xmxLine
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllLines($nocheckConfig, $outLines, $utf8NoBom)
     }
 
     New-ShellShortcutLnk -ShortcutPath $DesktopLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
