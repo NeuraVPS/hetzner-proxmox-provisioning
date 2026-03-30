@@ -35,10 +35,7 @@
 
 .NOTES
   Run elevated. SmbPassword must be supplied every time (no default).
-
-  Debug file associations / icons: set environment variable MT_INSTALL_DEBUG_FILEASSOC=1 before running.
-  The script writes C:\MetaTrader\_FileAssocIcons\debug_fileassoc.txt with reg query output. After changes,
-  restart Explorer or sign out so the shell icon cache picks up new DefaultIcon values.
+  If file association icons do not update immediately, sign out or restart Explorer.
 #>
 
 param(
@@ -200,90 +197,37 @@ function Remove-MtRegistryKeyIfExists {
     }
 }
 
-function Export-MtAssocIconToIco {
+function Format-MtDefaultIconRegValue {
     <#
     .NOTES
-      DefaultIcon pointing at .exe,iconIndex is fragile (wrong index => generic/wrong icon).
-      Extract the shell-associated icon to a small .ico and reference that in DefaultIcon.
+      HKCR\...\DefaultIcon uses "C:\path with spaces\app.exe",index — quotes required when the path has spaces.
     #>
     param(
         [Parameter(Mandatory)][string]$ExePath,
-        [Parameter(Mandatory)][string]$IconPath
+        [int]$IconIndex = 0
     )
     if (-not (Test-Path -LiteralPath $ExePath)) {
-        throw "Cannot extract icon; missing exe: $ExePath"
+        throw "DefaultIcon source missing: $ExePath"
     }
-    Add-Type -AssemblyName System.Drawing
-    $dir = Split-Path -Parent $IconPath
-    if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-    $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($ExePath)
-    try {
-        $fs = [System.IO.File]::Create($IconPath)
-        try {
-            $icon.Save($fs)
-        } finally {
-            $fs.Dispose()
-        }
-    } finally {
-        $icon.Dispose()
-    }
-}
-
-function Initialize-MtAssocIconFiles {
-    param(
-        [Parameter(Mandatory)][string]$TerminalExe,
-        [Parameter(Mandatory)][string]$EditorExe
-    )
-    $dir = Join-Path $MtRoot '_FileAssocIcons'
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $tIco = Join-Path $dir 'terminal_assoc.ico'
-    $eIco = Join-Path $dir 'editor_assoc.ico'
-    Export-MtAssocIconToIco -ExePath $TerminalExe -IconPath $tIco
-    Export-MtAssocIconToIco -ExePath $EditorExe -IconPath $eIco
-    return @{ TerminalIco = $tIco; EditorIco = $eIco }
+    $full = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ExePath).Path)
+    return '"' + $full + '",' + $IconIndex
 }
 
 function Set-MtDefaultIconRegValueRegExe {
     <#
     .NOTES
-      Use reg.exe so the (default) value under DefaultIcon is written exactly as Windows expects.
-      Data is "C:\path to\file.ico",0 — quotes around the path are required when the path contains spaces.
+      Writes DefaultIcon via reg.exe so the stored string matches Explorer (quoted exe path, comma, icon index).
     #>
     param(
         [Parameter(Mandatory)][string]$KeyPathUnderHKLM,
-        [Parameter(Mandatory)][string]$IcoFilePath
+        [Parameter(Mandatory)][string]$ExePath,
+        [int]$IconIndex = 0
     )
-    if (-not (Test-Path -LiteralPath $IcoFilePath)) {
-        throw "DefaultIcon ico missing: $IcoFilePath"
-    }
-    $fullIco = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $IcoFilePath).Path)
-    $data = '"' + $fullIco + '",0'
+    $data = Format-MtDefaultIconRegValue -ExePath $ExePath -IconIndex $IconIndex
     $regFull = 'HKLM\' + ($KeyPathUnderHKLM -replace '^HKLM\\', '' -replace '^\\', '')
     & reg.exe @('add', $regFull, '/ve', '/t', 'REG_SZ', '/d', $data, '/f') | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "reg.exe add DefaultIcon failed ($LASTEXITCODE): $regFull"
-    }
-}
-
-function Write-MtFileAssocDebugLog {
-    param([Parameter(Mandatory)][string]$PhaseLabel)
-    if ($env:MT_INSTALL_DEBUG_FILEASSOC -ne '1') {
-        return
-    }
-    $logDir = Join-Path $MtRoot '_FileAssocIcons'
-    if (-not (Test-Path -LiteralPath $logDir)) {
-        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-    }
-    $log = Join-Path $logDir 'debug_fileassoc.txt'
-    $ts = Get-Date -Format 'o'
-    Add-Content -Path $log -Encoding utf8 -Value "[$ts] $PhaseLabel"
-    foreach ($sub in @('MQL5.File', 'EX5.File', 'MQL5.Header', 'MQL4.File')) {
-        $p = "HKLM\SOFTWARE\Classes\$sub"
-        $out = & reg.exe @('query', $p, '/s') 2>&1
-        Add-Content -Path $log -Encoding utf8 -Value "---- reg query $p ----"
-        Add-Content -Path $log -Encoding utf8 -Value ($out | Out-String)
     }
 }
 
@@ -352,8 +296,6 @@ try {
             throw "Expected editor missing for associations: $editorExe"
         }
 
-        $ico = Initialize-MtAssocIconFiles -TerminalExe $terminalExe -EditorExe $editorExe
-
         # Drop stale ProgIDs / extensions so DefaultIcon and commands are recreated cleanly.
         Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes 'MQL4.File')
         Remove-MtRegistryKeyIfExists -LiteralPath (Join-Path $classes 'mql4buy')
@@ -390,9 +332,8 @@ try {
         New-Item -Path $mql4BuyCmdKey -Force | Out-Null
         Set-ItemProperty -Path $mql4BuyCmdKey -Name '(Default)' -Value "`"$terminalExe`" `"%1`"" -Type String
 
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL4.File\DefaultIcon' -IcoFilePath $ico.EditorIco
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql4buy\DefaultIcon' -IcoFilePath $ico.TerminalIco
-        Write-MtFileAssocDebugLog -PhaseLabel 'MT4 associations'
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL4.File\DefaultIcon' -ExePath $editorExe -IconIndex 0
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql4buy\DefaultIcon' -ExePath $terminalExe -IconIndex 0
         Update-MtShellIconCache
     } elseif ($MetaTraderVersion -eq 5) {
         # Default file associations for MQL/MT5 types -> instance 001 (see WINDOWS_PREPARATION.md).
@@ -402,8 +343,6 @@ try {
         if (-not (Test-Path -LiteralPath $editorExe)) {
             throw "Expected editor missing for associations: $editorExe"
         }
-
-        $ico = Initialize-MtAssocIconFiles -TerminalExe $terminalExe -EditorExe $editorExe
 
         $extMap = @{
             '.ex5' = 'EX5.File'
@@ -455,13 +394,12 @@ try {
             Set-ItemProperty -Path $cmdPath -Name '(Default)' -Value $openCommands[$progId] -Type String
         }
 
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\EX5.File\DefaultIcon' -IcoFilePath $ico.TerminalIco
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.File\DefaultIcon' -IcoFilePath $ico.EditorIco
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.Header\DefaultIcon' -IcoFilePath $ico.EditorIco
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MetaTrader 5 Export File\DefaultIcon' -IcoFilePath $ico.TerminalIco
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql5buy\DefaultIcon' -IcoFilePath $ico.TerminalIco
-        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\metaeditor5\DefaultIcon' -IcoFilePath $ico.EditorIco
-        Write-MtFileAssocDebugLog -PhaseLabel 'MT5 associations'
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\EX5.File\DefaultIcon' -ExePath $terminalExe -IconIndex 0
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.File\DefaultIcon' -ExePath $editorExe -IconIndex 0
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MQL5.Header\DefaultIcon' -ExePath $editorExe -IconIndex 0
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\MetaTrader 5 Export File\DefaultIcon' -ExePath $terminalExe -IconIndex 0
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\mql5buy\DefaultIcon' -ExePath $terminalExe -IconIndex 0
+        Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\metaeditor5\DefaultIcon' -ExePath $editorExe -IconIndex 0
         Update-MtShellIconCache
     }
 }
