@@ -153,26 +153,154 @@ for iface in interfaces:
     return 1
   }
 
+  _firestore_update() {
+    # Wrapper around inline python helper to avoid external downloads.
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$@" <<'PY'
+import argparse
+import os
+import sys
+from pathlib import Path
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    try:
+        from google.cloud.firestore_v1 import FieldFilter
+        FIELD_FILTER_AVAILABLE = True
+    except ImportError:
+        FIELD_FILTER_AVAILABLE = False
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
+    FIELD_FILTER_AVAILABLE = False
+
+
+def initialize_firebase():
+    if not FIREBASE_AVAILABLE:
+        return False
+    if firebase_admin._apps:
+        return True
+    creds_file = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+    creds_path = Path(creds_file)
+    if not creds_path.exists() or not creds_path.is_file():
+        return False
+    try:
+        cred = credentials.Certificate(str(creds_path))
+        firebase_admin.initialize_app(cred)
+        return True
+    except Exception:
+        return False
+
+
+def _query_servers_by_vmid(db, vmid):
+    servers_ref = db.collection("servers")
+    if FIELD_FILTER_AVAILABLE:
+        query = servers_ref.where(filter=FieldFilter("proxmoxId", "==", vmid))
+    else:
+        query = servers_ref.where("proxmoxId", "==", vmid)
+    return list(query.stream())
+
+
+def update_server_maintenance(vmid: int, maintenance: bool) -> bool:
+    if not initialize_firebase():
+        return False
+    try:
+        db = firestore.client()
+        docs = _query_servers_by_vmid(db, vmid)
+        if not docs:
+            return False
+        for doc_snapshot in docs:
+            db.collection("servers").document(doc_snapshot.id).update({"maintenance": maintenance})
+        return True
+    except Exception:
+        return False
+
+
+def update_server_migration_prep(vmid: int, node_id: str) -> bool:
+    if not initialize_firebase():
+        return False
+    try:
+        db = firestore.client()
+        docs = _query_servers_by_vmid(db, vmid)
+        if not docs:
+            return False
+        for doc_snapshot in docs:
+            db.collection("servers").document(doc_snapshot.id).update({
+                "maintenance": True,
+                "nodeId": node_id,
+            })
+        return True
+    except Exception:
+        return False
+
+
+def update_server_migration(vmid: int, connection_url: str, node_id: str) -> bool:
+    if not initialize_firebase():
+        return False
+    try:
+        db = firestore.client()
+        docs = _query_servers_by_vmid(db, vmid)
+        if not docs:
+            return False
+        for doc_snapshot in docs:
+            db.collection("servers").document(doc_snapshot.id).update({
+                "connectionUrl": connection_url,
+                "nodeId": node_id,
+                "maintenance": False,
+            })
+        return True
+    except Exception:
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Update Firestore server for migration (connectionUrl, nodeId, maintenance)")
+    parser.add_argument("--set-maintenance", choices=("true", "false"), metavar="BOOL",
+                        help="Only set maintenance field (requires only vmid)")
+    parser.add_argument("--set-migration-prep", metavar="NODE_ID",
+                        help="Set maintenance=True and nodeId (requires only vmid). Used before migration.")
+    parser.add_argument("vmid", type=int, help="Proxmox VM ID (proxmoxId)")
+    parser.add_argument("connection_url", nargs="?", default="", help="connectionUrl")
+    parser.add_argument("node_id", nargs="?", default="", help="Destination node hostname (nodeId)")
+    args = parser.parse_args()
+
+    if args.set_migration_prep is not None:
+        if not update_server_migration_prep(args.vmid, args.set_migration_prep):
+            sys.stderr.write("update_firestore_migration: set migration prep failed\n")
+            sys.exit(1)
+        sys.exit(0)
+
+    if args.set_maintenance is not None:
+        maintenance = args.set_maintenance == "true"
+        if not update_server_maintenance(args.vmid, maintenance):
+            sys.stderr.write("update_firestore_migration: set maintenance failed\n")
+            sys.exit(1)
+        sys.exit(0)
+
+    if not args.connection_url or not args.node_id:
+        parser.error("connection_url and node_id required when not using --set-maintenance")
+    if not update_server_migration(args.vmid, args.connection_url, args.node_id):
+        sys.stderr.write("update_firestore_migration: failed (no creds, no doc, or Firestore error)\n")
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+PY
+  }
+
   _cleanup_on_failure() {
     set +e
     _info "Migration failed; cleaning up and restoring state..."
     if [[ "$UPDATE_FIRESTORE" == "true" ]] && [[ -n "${SOURCE_CONNECTION_URL:-}" ]] && [[ -n "${SOURCE_NODE:-}" ]]; then
       _info "Reverting Firestore to source (connectionUrl, nodeId)..."
-      local HELPER
-      HELPER="$(mktemp -t update_firestore_migration_XXXXXX.py)"
-      if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER" 2>/dev/null; then
-        python3 "$HELPER" "$VMID" "$SOURCE_CONNECTION_URL" "$SOURCE_NODE" 2>/dev/null || true
-      fi
-      rm -f "$HELPER"
+      _firestore_update "$VMID" "$SOURCE_CONNECTION_URL" "$SOURCE_NODE" 2>/dev/null || true
     fi
     if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
       _info "Setting server maintenance=false in Firestore..."
-      local HELPER_MAINT
-      HELPER_MAINT="$(mktemp -t update_firestore_migration_XXXXXX.py)"
-      if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER_MAINT" 2>/dev/null; then
-        python3 "$HELPER_MAINT" --set-maintenance false "$VMID" 2>/dev/null || true
-      fi
-      rm -f "$HELPER_MAINT"
+      _firestore_update --set-maintenance false "$VMID" 2>/dev/null || true
     fi
     _info "Reattaching hookscript on source..."
     qm set "$VMID" --hookscript shared:snippets/sync-dnat.py 2>/dev/null || true
@@ -230,17 +358,10 @@ for iface in interfaces:
   # 2) Firestore: maintenance=true, nodeId=DEST_NODE
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
     _info "Setting Firestore: maintenance=true, nodeId=${DEST_NODE}..."
-    local HELPER_PREP
-    HELPER_PREP="$(mktemp -t update_firestore_migration_XXXXXX.py)"
-    if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER_PREP" 2>/dev/null; then
-      if python3 "$HELPER_PREP" --set-migration-prep "$DEST_NODE" "$VMID" 2>/dev/null; then
-        _ok "Firestore prep set."
-      else
-        _info "Could not set Firestore prep (no creds or doc); continuing."
-      fi
-      rm -f "$HELPER_PREP"
+    if _firestore_update --set-migration-prep "$DEST_NODE" "$VMID" 2>/dev/null; then
+      _ok "Firestore prep set."
     else
-      _info "Could not download Firestore helper; skipping."
+      _info "Could not set Firestore prep (no creds or doc); continuing."
     fi
   fi
 
@@ -297,7 +418,24 @@ for iface in interfaces:
   trap - EXIT
   MIGRATION_SUCCESS=1
 
-  # 6 success) Run sync-dnat.py post-start on destination if VM is running
+  # 6 success) Update Firestore: connectionUrl, nodeId, maintenance=false
+  if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
+    _info "Updating Firestore (connectionUrl, nodeId, maintenance=false)..."
+    local DEST_PUBLIC_IP
+    DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
+    if [[ -z "$DEST_PUBLIC_IP" ]]; then
+      _info "Could not get destination public IP; Firestore connectionUrl may be stale."
+    else
+      DEST_CONNECTION_URL="${DEST_PUBLIC_IP}:$((BASE_PORT + VMID))"
+      if _firestore_update "$VMID" "$DEST_CONNECTION_URL" "$DEST_NODE"; then
+        _ok "Firestore updated: connectionUrl=${DEST_CONNECTION_URL}, nodeId=${DEST_NODE}"
+      else
+        _info "Firestore update failed; check credentials."
+      fi
+    fi
+  fi
+
+  # 7 success) Run sync-dnat.py post-start on destination if VM is running
   local DEST_STATUS
   DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
   if [[ "$DEST_STATUS" == "running" ]]; then
@@ -389,28 +527,6 @@ if not printed:
   _info "Adding hookscript on destination..."
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm set '${VMID}' --hookscript shared:snippets/sync-dnat.py" || _die "Failed to add hookscript on destination."
   _ok "Hookscript added on destination."
-
-  # Update Firestore: connectionUrl, nodeId, maintenance=false
-  if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
-    _info "Updating Firestore (connectionUrl, nodeId, maintenance=false)..."
-    local DEST_PUBLIC_IP
-    DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
-    if [[ -z "$DEST_PUBLIC_IP" ]]; then
-      _info "Could not get destination public IP; Firestore connectionUrl may be stale."
-    else
-      DEST_CONNECTION_URL="${DEST_PUBLIC_IP}:$((BASE_PORT + VMID))"
-      local HELPER
-      HELPER="$(mktemp -t update_firestore_migration_XXXXXX.py)"
-      if command -v python3 >/dev/null 2>&1 && curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/update_firestore_migration.py" -o "$HELPER" 2>/dev/null; then
-        if python3 "$HELPER" "$VMID" "$DEST_CONNECTION_URL" "$DEST_NODE"; then
-          _ok "Firestore updated: connectionUrl=${DEST_CONNECTION_URL}, nodeId=${DEST_NODE}"
-        else
-          _info "Firestore update failed; check credentials."
-        fi
-        rm -f "$HELPER"
-      fi
-    fi
-  fi
 
   # Run sync-dnat after Firestore update (NAT must point to new host/IP)
   if [[ "$DEST_STATUS" == "running" ]]; then
