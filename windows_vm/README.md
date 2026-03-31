@@ -4,6 +4,12 @@
 
 - Apply Windows and Winget updates
 - Uninstall unneeded apps and software
+
+```powershell
+# Disable WindowsFeedbackHub installation for new users
+Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "Microsoft.WindowsFeedbackHub" | Remove-AppxProvisionedPackage -Online
+```
+
 - Install .NET framework legacy for myfxbook installed to work
 - Remove winget for sysprep to work
 
@@ -83,7 +89,7 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 
 ```powershell
 cd C:\Windows\System32\Sysprep
-.\sysprep.exe /generalize /oobe /shutdown /unattend:C:\Windows\unattend_cleanup.xml
+.\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend_cleanup.xml
 ```
 
 - UI and Edge tweaks
@@ -96,5 +102,5 @@ cd C:\Windows\System32\Sysprep
 
 ```powershell
 cd C:\Windows\System32\Sysprep
-.\sysprep.exe /generalize /oobe /shutdown /unattend:C:\Windows\unattend.xml
+.\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend.xml
 ```
