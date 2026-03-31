@@ -355,13 +355,13 @@ PY
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "apt-get update -qq && apt-get -y upgrade -qq" || _info "apt upgrade on dest had issues; continuing."
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "apt-get install -y -qq netcat-openbsd" || _info "netcat-openbsd install on dest had issues; continuing."
 
-  # 2) Firestore: maintenance=true, nodeId=DEST_NODE
+  # 2) Firestore: maintenance=true (do not change nodeId before migration completes)
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
-    _info "Setting Firestore: maintenance=true, nodeId=${DEST_NODE}..."
-    if _firestore_update --set-migration-prep "$DEST_NODE" "$VMID" 2>/dev/null; then
-      _ok "Firestore prep set."
+    _info "Setting Firestore: maintenance=true..."
+    if _firestore_update --set-maintenance true "$VMID" 2>/dev/null; then
+      _ok "Firestore maintenance=true set."
     else
-      _info "Could not set Firestore prep (no creds or doc); continuing."
+      _info "Could not set Firestore maintenance=true (no creds or doc); continuing."
     fi
   fi
 
