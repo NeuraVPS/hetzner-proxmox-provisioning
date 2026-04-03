@@ -2,9 +2,9 @@
 
 ## Overview
 
-This setup implements:
+This guide assumes a **clean install of Debian 13** (trixie) on the router host. It implements:
 
-- **NAT46 (IPv4 → IPv6)** using Jool (stateless SIIT)
+- **NAT46 (IPv4 → IPv6)** using Jool (stateless SIIT) in **netfilter** mode
 - **NAT66 (IPv6 → IPv6)** using nftables for dynamic port forwarding
 
 Flow:
@@ -99,9 +99,23 @@ ip -6 route add 64:ff9b:1::/96 via fd00::2 dev veth-host
 
 ---
 
-## 5. Install Jool
+## 5. Install Jool (Debian packages)
 
-See `scripts/build-jool-from-source.sh`
+Install the kernel module (DKMS) and userspace tools from Debian. The packaged Jool targets **netfilter** for SIIT; you do **not** need iptables or ip6tables rules inside the `jool` netns for translation.
+
+```bash
+apt update
+apt install -y jool-dkms jool-tools linux-headers-amd64
+```
+
+Sanity check:
+
+```bash
+modprobe jool_siit
+jool_siit --version
+```
+
+Complete **§5** before **§6** and before enabling `jool-nat46.service` later, so `jool_siit` and `jool_siit.ko` are available.
 
 ---
 
@@ -115,18 +129,11 @@ ip netns exec jool jool_siit -i br46 global update pool6 64:ff9b:1::/96
 ip netns exec jool jool_siit -i br46 eamt add <ROUTER_IPV6>/128 10.0.0.3/32
 ```
 
----
-
-## 7. Hook Jool into Netfilter
-
-```bash
-ip netns exec jool iptables -t mangle -A PREROUTING -d 10.0.0.3 -j JOOL_SIIT --instance br46
-ip netns exec jool ip6tables -t mangle -A PREROUTING -d 64:ff9b:1::/96 -j JOOL_SIIT --instance br46
-```
+With `jool_siit instance add … --netfilter`, Jool registers SIIT in that network namespace via the netfilter framework.
 
 ---
 
-## 8. nftables Rules
+## 7. nftables Rules
 
 Create `/etc/nftables.conf`:
 
@@ -202,15 +209,16 @@ systemctl start nftables
 
 ---
 
-## 9. Persist NAT46/Jool Across Reboots
+## 8. Persist NAT46/Jool Across Reboots
 
 The following makes everything persistent except **Dynamic NAT66 Rules**:
 
 - netns + veth addresses/routes
 - host static routes for Jool
-- Jool SIIT instance + EAMT mapping
-- Jool netfilter hooks inside netns
+- Jool SIIT instance (`--netfilter`) + EAMT mapping (hooks attach in the netns automatically)
 - kernel module load at boot
+
+Install **`jool-dkms`** and **`jool-tools`** (see §5) before enabling this service.
 
 Create a boot script:
 
@@ -243,7 +251,7 @@ ip netns exec jool ip -6 route replace default via fd00::1
 ip route replace 10.0.0.3 via 10.0.0.2 dev veth-host
 ip -6 route replace 64:ff9b:1::/96 via fd00::2 dev veth-host
 
-# 3) jool module + instance
+# 3) jool module + SIIT instance (netfilter; no iptables rules in netns)
 modprobe jool_siit
 
 if ! ip netns exec jool jool_siit instance display | grep -q " br46 "; then
@@ -257,13 +265,6 @@ if ip netns exec jool jool_siit -i br46 eamt display | grep -q "${ROUTER_IPV6}/1
 else
   ip netns exec jool jool_siit -i br46 eamt add "${ROUTER_IPV6}/128" 10.0.0.3/32
 fi
-
-# 4) netfilter hooks inside jool netns
-ip netns exec jool iptables -t mangle -C PREROUTING -d 10.0.0.3 -j JOOL_SIIT --instance br46 2>/dev/null || \
-ip netns exec jool iptables -t mangle -A PREROUTING -d 10.0.0.3 -j JOOL_SIIT --instance br46
-
-ip netns exec jool ip6tables -t mangle -C PREROUTING -d 64:ff9b:1::/96 -j JOOL_SIIT --instance br46 2>/dev/null || \
-ip netns exec jool ip6tables -t mangle -A PREROUTING -d 64:ff9b:1::/96 -j JOOL_SIIT --instance br46
 EOF
 
 chmod +x /usr/local/sbin/jool-nat46-setup.sh
@@ -303,16 +304,17 @@ Verify after reboot:
 ip netns list
 ip route | grep 10.0.0.3
 ip -6 route | grep 64:ff9b:1::/96
+jool_siit --version
 ip netns exec jool jool_siit instance display
-ip netns exec jool iptables -t mangle -S PREROUTING
-ip netns exec jool ip6tables -t mangle -S PREROUTING
 ```
+
+Confirm `jool_siit instance display` lists `br46` with **Framework** `netfilter` inside the `jool` netns (namespace column will show an opaque id).
 
 > Dynamic NAT66 rules are intentionally not persisted in this guide.
 
 ---
 
-## 10. Dynamic NAT66 Rules
+## 9. Dynamic NAT66 Rules
 
 ### Add rule
 
@@ -325,7 +327,7 @@ nft add rule ip6 nat prerouting tcp dport $PORT dnat to $TARGET:3389
 nft add rule ip6 nat prerouting udp dport $PORT dnat to $TARGET:3389
 ```
 
-SNAT-to-main-IPv6 and forward acceptance are handled globally in section 8.
+SNAT-to-main-IPv6 and forward acceptance are handled globally in section 7.
 
 ### Remove rule
 
@@ -340,7 +342,7 @@ nft delete rule ip6 nat prerouting handle <DNAT_UDP_HANDLE>
 
 ---
 
-## 11. Key Properties
+## 10. Key Properties
 
 - Jool translates **ALL IPv4 traffic**
 - nftables decides allowed ports
