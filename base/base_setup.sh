@@ -85,11 +85,11 @@ EOF
 # install -m 600 firebase-credentials.json /etc/firebase-credentials.json
 
 # 4) Install runtime scripts from this repository.
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-base-nat.py \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/sync-base-nat.py \
   -o /usr/local/sbin/sync-base-nat.py
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat-boot.sh \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/base-nat-boot.sh \
   -o /usr/local/sbin/base-nat-boot.sh
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/base-nat-boot.service \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/base-nat-boot.service \
   -o /etc/systemd/system/base-nat-boot.service
 chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
 
@@ -124,11 +124,11 @@ nft -a list chain ip6 nat prerouting
 
 mkdir -p /var/www/letsencrypt /etc/nginx/njs /opt/pve-set-ticket
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-map.conf \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-proxy-map.conf \
   -o /etc/nginx/conf.d/pve-proxy-map.conf
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-proxy-backends.map.conf.example \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-proxy-backends.map.conf.example \
   -o /etc/nginx/conf.d/pve-proxy-backends.map.conf
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/neuravps-redirects.conf \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-redirects.conf \
   -o /etc/nginx/sites-available/neuravps-redirects.conf
 
 ln -sf /etc/nginx/sites-available/neuravps-redirects.conf /etc/nginx/sites-enabled/neuravps-redirects.conf
@@ -139,7 +139,7 @@ rm -f /etc/nginx/sites-enabled/default
 
 rsync -avz -e ssh root@[2a01:4f9:3070:3984::2]:/etc/letsencrypt/ /etc/letsencrypt/
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/pve-set-ticket.py \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-set-ticket.py \
   -o /opt/pve-set-ticket/pve-set-ticket.py
 chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
 
@@ -149,7 +149,7 @@ REDEEM_FUNCTION_URL=https://.../redeem_pve_ticket_token
 EOF
 chmod 600 /opt/pve-set-ticket/env
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/pve-set-ticket.service \
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-set-ticket.service \
   -o /etc/systemd/system/pve-set-ticket.service
 systemctl daemon-reload
 systemctl enable --now pve-set-ticket
