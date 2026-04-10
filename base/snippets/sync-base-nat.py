@@ -38,7 +38,6 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -330,257 +329,178 @@ def firestore_ipv6_for_vmid(vmid: int) -> str | None:
     return None
 
 
-@dataclass(frozen=True)
-class ManagedDnatRuleSpec:
-    vmid: int
-    service: str  # rdp | smb
-    proto: str  # tcp | udp
-    external_port: int
-    target_ipv6: str
-    target_port: int
+# --- Dynamic DNAT via nftables maps -------------------------------------------
+#
+# The NAT chain contains three persistent rules declared in
+# /etc/nftables.conf (see base/docs/netns-jool-nat46-nat66-guide.md §7):
+#
+#   tcp dport @rdp_tcp_map dnat ip6 to tcp dport map @rdp_tcp_map
+#   udp dport @rdp_udp_map dnat ip6 to udp dport map @rdp_udp_map
+#   tcp dport @smb_tcp_map dnat ip6 to tcp dport map @smb_tcp_map
+#
+# This script only populates the ELEMENTS of those maps; structure stays
+# in nftables.conf so it survives reboots and full rule reloads. Each
+# reconcile is applied as a single atomic `nft -f -` transaction.
+
+DNAT_MAP_RDP_TCP = "rdp_tcp_map"
+DNAT_MAP_RDP_UDP = "rdp_udp_map"
+DNAT_MAP_SMB_TCP = "smb_tcp_map"
+DNAT_MAPS = (DNAT_MAP_RDP_TCP, DNAT_MAP_RDP_UDP, DNAT_MAP_SMB_TCP)
+
+RDP_TARGET_PORT = 3389
+SMB_TARGET_PORT = 445
 
 
-@dataclass(frozen=True)
-class ExistingManagedRule:
-    handle: int
-    raw_line: str
-    spec: ManagedDnatRuleSpec | None
-
-
-def _rule_comment(spec: ManagedDnatRuleSpec) -> str:
-    return (
-        f"{MANAGED_RULE_COMMENT_PREFIX}:"
-        f"vmid={spec.vmid}:svc={spec.service}:proto={spec.proto}"
-    )
-
-
-def _desired_dnat_specs(desired: dict[int, str]) -> set[ManagedDnatRuleSpec]:
-    specs: set[ManagedDnatRuleSpec] = set()
+def _build_desired_map_elements(
+    desired: dict[int, str],
+) -> dict[str, dict[int, tuple[str, int]]]:
+    """Build {map_name: {external_port: (target_ipv6, target_port)}}."""
+    out: dict[str, dict[int, tuple[str, int]]] = {m: {} for m in DNAT_MAPS}
     for vmid in sorted(desired.keys()):
         vmid = check_vmid(vmid)
         target_ipv6 = normalize_ipv6(desired[vmid])
         samba_p, rdp_p = vm_ports(vmid)
-        specs.add(
-            ManagedDnatRuleSpec(
-                vmid=vmid,
-                service="rdp",
-                proto="tcp",
-                external_port=rdp_p,
-                target_ipv6=target_ipv6,
-                target_port=3389,
-            )
-        )
+        out[DNAT_MAP_RDP_TCP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
         if INCLUDE_UDP_RDP:
-            specs.add(
-                ManagedDnatRuleSpec(
-                    vmid=vmid,
-                    service="rdp",
-                    proto="udp",
-                    external_port=rdp_p,
-                    target_ipv6=target_ipv6,
-                    target_port=3389,
-                )
-            )
-        specs.add(
-            ManagedDnatRuleSpec(
-                vmid=vmid,
-                service="smb",
-                proto="tcp",
-                external_port=samba_p,
-                target_ipv6=target_ipv6,
-                target_port=445,
-            )
-        )
-    return specs
+            out[DNAT_MAP_RDP_UDP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
+        out[DNAT_MAP_SMB_TCP][samba_p] = (target_ipv6, SMB_TARGET_PORT)
+    return out
 
 
-def _parse_managed_spec_from_line(line: str) -> ManagedDnatRuleSpec | None:
-    comment_match = re.search(r'comment "([^"]+)"', line)
-    if not comment_match:
-        return None
-    comment = comment_match.group(1).strip()
-    prefix = f"{MANAGED_RULE_COMMENT_PREFIX}:"
-    if not comment.startswith(prefix):
-        return None
-
-    kv: dict[str, str] = {}
-    for piece in comment[len(prefix) :].split(":"):
-        if "=" not in piece:
-            continue
-        k, v = piece.split("=", 1)
-        kv[k.strip()] = v.strip()
-
-    try:
-        vmid = int(kv["vmid"])
-    except (KeyError, ValueError):
-        return None
-    service = kv.get("svc", "")
-    proto = kv.get("proto", "")
-    if service not in {"rdp", "smb"} or proto not in {"tcp", "udp"}:
-        return None
-
-    dport_match = re.search(r"\bdport\s+(\d+)\b", line)
-    dnat_match = re.search(r"dnat to \[([0-9a-fA-F:]+)\]:(\d+)", line)
-    if not dport_match or not dnat_match:
-        return None
-
-    try:
-        external_port = int(dport_match.group(1))
-        target_ipv6 = normalize_ipv6(dnat_match.group(1))
-        target_port = int(dnat_match.group(2))
-    except ValueError:
-        return None
-
-    try:
-        vmid = check_vmid(vmid)
-    except ValueError:
-        return None
-
-    return ManagedDnatRuleSpec(
-        vmid=vmid,
-        service=service,
-        proto=proto,
-        external_port=external_port,
-        target_ipv6=target_ipv6,
-        target_port=target_port,
+def _map_exists(map_name: str) -> bool:
+    result = subprocess.run(
+        ["nft", "list", "map", NFT_DNAT_FAMILY, NFT_DNAT_TABLE, map_name],
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    return result.returncode == 0
 
 
-def _list_existing_managed_rules() -> list[ExistingManagedRule]:
+def _ensure_maps_exist():
     try:
-        output = run(
-            ["nft", "-a", "list", "chain", NFT_DNAT_FAMILY, NFT_DNAT_TABLE, NFT_DNAT_CHAIN],
-            check=True,
-        )
+        missing = [m for m in DNAT_MAPS if not _map_exists(m)]
     except FileNotFoundError:
         logger.error("nft binary not found")
         sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        logger.error(
-            "Failed to list nft chain %s %s %s: %s",
-            NFT_DNAT_FAMILY,
-            NFT_DNAT_TABLE,
-            NFT_DNAT_CHAIN,
-            (e.stderr or e.stdout or "").strip(),
-        )
-        sys.exit(1)
-
-    managed: list[ExistingManagedRule] = []
-    for line in output.splitlines():
-        if MANAGED_RULE_COMMENT_PREFIX not in line:
-            continue
-        handle_match = re.search(r"# handle (\d+)\s*$", line.strip())
-        if not handle_match:
-            logger.warning("Skipping managed-looking rule without handle: %s", line.strip())
-            continue
-        handle = int(handle_match.group(1))
-        spec = _parse_managed_spec_from_line(line)
-        managed.append(ExistingManagedRule(handle=handle, raw_line=line.strip(), spec=spec))
-    return managed
-
-
-def _add_dnat_rule(spec: ManagedDnatRuleSpec):
-    comment_value = _rule_comment(spec).replace('"', "")
-    cmd = [
-        "nft",
-        "add",
-        "rule",
+    if not missing:
+        return
+    logger.error(
+        "Missing nftables map(s) in %s/%s: %s. Declare them in "
+        "/etc/nftables.conf (see netns-jool-nat46-nat66-guide.md §7) and "
+        "reload nftables before running sync.",
         NFT_DNAT_FAMILY,
         NFT_DNAT_TABLE,
-        NFT_DNAT_CHAIN,
-        spec.proto,
-        "dport",
-        str(spec.external_port),
-        "dnat",
-        "to",
-        f"[{spec.target_ipv6}]:{spec.target_port}",
-        "comment",
-        f'"{comment_value}"',
-    ]
-    run(cmd, check=True)
+        ", ".join(missing),
+    )
+    sys.exit(1)
 
 
-def _delete_rule_by_handle(handle: int):
-    run(
+def _apply_nft_transaction(lines: list[str]):
+    if not lines:
+        return
+    payload = "\n".join(lines) + "\n"
+    result = subprocess.run(
+        ["nft", "-f", "-"],
+        input=payload,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logger.error(
+            "nft transaction failed: %s",
+            (result.stderr or result.stdout or "").strip(),
+        )
+        logger.error("Transaction was:\n%s", payload)
+        sys.exit(1)
+
+
+def _cleanup_legacy_managed_rules() -> int:
+    """Remove per-rule managed DNAT entries from the pre-map version.
+
+    Earlier versions added one nft rule per VM/service/protocol in
+    `ip6 nat prerouting` tagged with a comment starting with
+    ``MANAGED_RULE_COMMENT_PREFIX``. The map-based design makes those
+    obsolete; this function drops them on first run after upgrade.
+    """
+    result = subprocess.run(
         [
             "nft",
-            "delete",
-            "rule",
+            "-a",
+            "list",
+            "chain",
             NFT_DNAT_FAMILY,
             NFT_DNAT_TABLE,
             NFT_DNAT_CHAIN,
-            "handle",
-            str(handle),
         ],
-        check=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    if result.returncode != 0:
+        return 0
+    handles: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        if MANAGED_RULE_COMMENT_PREFIX not in line:
+            continue
+        m = re.search(r"# handle (\d+)\s*$", line.strip())
+        if m:
+            handles.append(int(m.group(1)))
+    if not handles:
+        return 0
+    logger.info("Removing %d legacy per-rule managed DNAT entries", len(handles))
+    removed = 0
+    for handle in sorted(handles, reverse=True):
+        delete_result = subprocess.run(
+            [
+                "nft",
+                "delete",
+                "rule",
+                NFT_DNAT_FAMILY,
+                NFT_DNAT_TABLE,
+                NFT_DNAT_CHAIN,
+                "handle",
+                str(handle),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if delete_result.returncode == 0:
+            removed += 1
+        else:
+            logger.warning(
+                "Failed deleting legacy handle %s: %s",
+                handle,
+                (delete_result.stderr or "").strip(),
+            )
+    return removed
 
 
 def reconcile_dynamic_dnat_rules(desired: dict[int, str]):
-    desired_specs = _desired_dnat_specs(desired)
-    existing_rules = _list_existing_managed_rules()
+    _ensure_maps_exist()
+    _cleanup_legacy_managed_rules()
 
-    existing_by_spec: dict[ManagedDnatRuleSpec, int] = {}
-    delete_handles: set[int] = set()
-    malformed_count = 0
-    duplicate_count = 0
+    desired_by_map = _build_desired_map_elements(desired)
 
-    for rule in existing_rules:
-        if rule.spec is None:
-            malformed_count += 1
-            delete_handles.add(rule.handle)
-            continue
-        if rule.spec in existing_by_spec:
-            duplicate_count += 1
-            delete_handles.add(rule.handle)
-            continue
-        existing_by_spec[rule.spec] = rule.handle
-
-    for spec, handle in existing_by_spec.items():
-        if spec not in desired_specs:
-            delete_handles.add(handle)
-
-    existing_specs = set(existing_by_spec.keys())
-    to_add = sorted(
-        desired_specs - existing_specs,
-        key=lambda s: (s.external_port, s.proto, s.service, s.vmid),
-    )
-
-    removed = 0
-    for handle in sorted(delete_handles, reverse=True):
-        try:
-            _delete_rule_by_handle(handle)
-            removed += 1
-        except subprocess.CalledProcessError as e:
-            logger.error("Failed deleting nft handle %s: %s", handle, (e.stderr or "").strip())
-            sys.exit(1)
-
-    added = 0
-    for spec in to_add:
-        try:
-            _add_dnat_rule(spec)
-            added += 1
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                "Failed adding rule vmid=%s %s/%s ext=%s -> [%s]:%s: %s",
-                spec.vmid,
-                spec.service,
-                spec.proto,
-                spec.external_port,
-                spec.target_ipv6,
-                spec.target_port,
-                (e.stderr or "").strip(),
+    lines: list[str] = []
+    for map_name in DNAT_MAPS:
+        lines.append(f"flush map {NFT_DNAT_FAMILY} {NFT_DNAT_TABLE} {map_name}")
+        for ext_port in sorted(desired_by_map[map_name].keys()):
+            ipv6, tgt_port = desired_by_map[map_name][ext_port]
+            lines.append(
+                f"add element {NFT_DNAT_FAMILY} {NFT_DNAT_TABLE} {map_name} "
+                f"{{ {ext_port} : {ipv6} . {tgt_port} }}"
             )
-            sys.exit(1)
+
+    _apply_nft_transaction(lines)
 
     logger.info(
-        "Dynamic DNAT reconcile done: desired=%d existing_managed=%d added=%d removed=%d malformed=%d duplicates=%d",
-        len(desired_specs),
-        len(existing_rules),
-        added,
-        removed,
-        malformed_count,
-        duplicate_count,
+        "Dynamic DNAT reconcile (maps): rdp_tcp=%d rdp_udp=%d smb_tcp=%d",
+        len(desired_by_map[DNAT_MAP_RDP_TCP]),
+        len(desired_by_map[DNAT_MAP_RDP_UDP]),
+        len(desired_by_map[DNAT_MAP_SMB_TCP]),
     )
 
 

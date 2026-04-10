@@ -59,6 +59,60 @@ net.core.somaxconn=65535
 net.core.netdev_max_backlog=250000
 net.ipv4.tcp_max_syn_backlog=262144
 net.ipv4.ip_local_port_range=10240 65535
+
+# --- TCP buffer auto-tuning (min / default / max bytes) ---
+# Larger buffers prevent stalls on bursty RDP graphics updates and SMB
+# file transfers. Default max (212992) is far too small for a NAT forwarder.
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 131072 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+
+# --- UDP buffer sizes (critical for RDP UDP transport) ---
+# UDP has no auto-tuning; the default must be large enough for RDP-over-UDP
+# (used by modern mstsc for lower latency on lossy links).
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
+
+# --- BBR congestion control + fair queueing ---
+# BBR achieves higher throughput at lower latency than CUBIC. Mostly benefits
+# the BASE box's own TCP (nginx, Firestore), but also improves any locally
+# terminated RDP flows. Windows VMs should be tuned separately.
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+# --- Conntrack timeout tuning for NAT forwarding ---
+# Default tcp_timeout_established is 432000s (5 days); 1h reclaims dead
+# RDP/SMB entries much faster and prevents conntrack table exhaustion.
+net.netfilter.nf_conntrack_tcp_timeout_established=3600
+net.netfilter.nf_conntrack_udp_timeout=30
+net.netfilter.nf_conntrack_udp_timeout_stream=120
+
+# --- Faster socket recycling & keepalives ---
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+# --- SMB throughput hardening ---
+# tcp_sack recovers from loss without full retransmit; tcp_no_metrics_save
+# prevents the kernel from caching pessimistic metrics from a single bad
+# SMB session and degrading all subsequent connections to the same VM.
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_no_metrics_save=1
+
+# --- Disable slow-path features on a dedicated forwarder ---
+net.ipv4.conf.all.log_martians=0
+net.ipv4.conf.default.log_martians=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
 EOF
 
 sysctl --system
@@ -165,9 +219,27 @@ table ip nat {
 }
 
 table ip6 nat {
+    # O(1) DNAT via maps. Structure lives here; element population is
+    # handled by sync-base-nat.py (which only touches map elements, never
+    # rules or the map declarations themselves).
+    map rdp_tcp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
+    map rdp_udp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
+    map smb_tcp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
+
     chain prerouting {
         type nat hook prerouting priority dstnat;
-        # dynamic rules here
+        # Match-then-lookup: `@map` acts as a set over the map's keys so the
+        # rule only fires for known ports, then `map @map` performs the
+        # lookup and produces the target `ipv6_addr . inet_service` value.
+        tcp dport @rdp_tcp_map dnat ip6 to tcp dport map @rdp_tcp_map
+        udp dport @rdp_udp_map dnat ip6 to udp dport map @rdp_udp_map
+        tcp dport @smb_tcp_map dnat ip6 to tcp dport map @smb_tcp_map
     }
 
     chain postrouting {
@@ -178,6 +250,16 @@ table ip6 nat {
 }
 
 table inet filter {
+    # Fast-path: kernel flowtable for offloading established flows.
+    # Once a connection is added to @ft, subsequent packets bypass the full
+    # netfilter hook traversal (including NAT), cutting per-packet latency
+    # significantly on long-lived RDP and SMB sessions. NAT transformations
+    # are replayed in the fast path.
+    flowtable ft {
+        hook ingress priority filter;
+        devices = { enp6s0, veth-host };
+    }
+
     chain input {
         type filter hook input priority filter; policy drop;
         iifname "lo" accept
@@ -192,6 +274,9 @@ table inet filter {
 
     chain forward {
         type filter hook forward priority filter; policy drop;
+        # Offload established flows to the flowtable fast path.
+        ip protocol { tcp, udp } ct state established flow add @ft
+        ip6 nexthdr { tcp, udp } ct state established flow add @ft
         ct state established,related accept
         # Allow any flow that was explicitly DNAT'ed in prerouting.
         iifname "enp6s0" ct status dnat accept
@@ -228,6 +313,7 @@ cat >/usr/local/sbin/jool-nat46-setup.sh <<'EOF'
 set -euo pipefail
 
 ROUTER_IPV6="<ROUTER_IPV6>"
+WAN_IF="enp6s0"
 
 # 1) netns + veth
 ip netns add jool 2>/dev/null || true
@@ -265,6 +351,32 @@ if ip netns exec jool jool_siit -i br46 eamt display | grep -q "${ROUTER_IPV6}/1
 else
   ip netns exec jool jool_siit -i br46 eamt add "${ROUTER_IPV6}/128" 10.0.0.3/32
 fi
+
+# 4) Consistent 1500 MTU on the forwarding path.
+# Jool SIIT is stateless and adds no headers, so the veth pair must match
+# the WAN MTU to avoid fragmentation in the NAT46 step.
+ip link set veth-host mtu 1500
+ip netns exec jool ip link set veth-ns mtu 1500
+
+# 5) NIC offload tuning.
+# GRO/GSO/TSO on the physical NIC reduces interrupt load. On the veth pair
+# they add latency without throughput benefit, so disable them there.
+ethtool -K "${WAN_IF}" gro on gso on tso on 2>/dev/null || true
+ethtool -K veth-host gro off gso off tso off 2>/dev/null || true
+ip netns exec jool ethtool -K veth-ns gro off gso off tso off 2>/dev/null || true
+
+# 6) RPS (Receive Packet Steering) on veth-host.
+# veth is single-queue, so packet processing is pinned to one CPU. RPS
+# spreads softirq load across all cores, removing a bottleneck for the
+# IPv4 RDP/SMB path that crosses the veth pair.
+CPU_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+RPS_MASK=$(printf '%x' $(( (1 << CPU_COUNT) - 1 )))
+for q in /sys/class/net/veth-host/queues/rx-*; do
+  [ -d "$q" ] || continue
+  echo "$RPS_MASK" > "$q/rps_cpus" 2>/dev/null || true
+  echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
+done
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 EOF
 
 chmod +x /usr/local/sbin/jool-nat46-setup.sh
@@ -316,29 +428,52 @@ Confirm `jool_siit instance display` lists `br46` with **Framework** `netfilter`
 
 ## 9. Dynamic NAT66 Rules
 
-### Add rule
+Dynamic DNAT targets live as **map elements** (see §7 for the map
+declarations). `sync-base-nat.py` only touches elements; the maps and the
+rules that reference them stay in `/etc/nftables.conf`.
+
+### Add / replace a single element
 
 ```bash
 PORT=20201
 TARGET="2a01:4f9:3100:4bdb:43a9:a22e:ac8f:87c4"
 
-# Applies to both main and failover IPv6 because no `ip6 daddr` filter is used.
-nft add rule ip6 nat prerouting tcp dport $PORT dnat to $TARGET:3389
-nft add rule ip6 nat prerouting udp dport $PORT dnat to $TARGET:3389
+# RDP TCP
+nft add element ip6 nat rdp_tcp_map "{ $PORT : $TARGET . 3389 }"
+# RDP UDP (only if INCLUDE_UDP_RDP=1)
+nft add element ip6 nat rdp_udp_map "{ $PORT : $TARGET . 3389 }"
+# SMB TCP (port 10000+VMID)
+nft add element ip6 nat smb_tcp_map "{ 10201 : $TARGET . 445 }"
 ```
 
 SNAT-to-main-IPv6 and forward acceptance are handled globally in section 7.
 
-### Remove rule
+### Remove a single element
 
 ```bash
-# Dynamic management only touches ip6 nat prerouting handles.
-nft -a list chain ip6 nat prerouting
-
-# Delete matching DNAT handles for the published port.
-nft delete rule ip6 nat prerouting handle <DNAT_TCP_HANDLE>
-nft delete rule ip6 nat prerouting handle <DNAT_UDP_HANDLE>
+nft delete element ip6 nat rdp_tcp_map "{ 20201 }"
+nft delete element ip6 nat rdp_udp_map "{ 20201 }"
+nft delete element ip6 nat smb_tcp_map "{ 10201 }"
 ```
+
+### Inspect current state
+
+```bash
+nft list map ip6 nat rdp_tcp_map
+nft list map ip6 nat rdp_udp_map
+nft list map ip6 nat smb_tcp_map
+```
+
+### Full reconcile from Firestore
+
+```bash
+/usr/local/sbin/sync-base-nat.py sync
+```
+
+The sync script does an **atomic** `flush map` + `add element` transaction
+per map, so there is no visible gap where a published port stops working.
+On first run after upgrading from the rule-based version, any legacy
+per-rule managed entries in `ip6 nat prerouting` are removed automatically.
 
 ---
 
@@ -348,6 +483,48 @@ nft delete rule ip6 nat prerouting handle <DNAT_UDP_HANDLE>
 - nftables decides allowed ports
 - Dynamic rule changes **DO NOT DROP EXISTING CONNECTIONS**
 - Stateless design → highly scalable
+
+---
+
+## 11. Performance Notes
+
+### Flowtable fast path
+
+Section 7 installs a flowtable (`inet filter ft`) and adds established flows
+to it from the forward chain. Once a TCP/UDP connection is established, the
+kernel processes subsequent packets in the software fast path, bypassing the
+full netfilter hook traversal. This is the single biggest win for RDP and
+SMB latency through the NAT path. Verify offload is active:
+
+```bash
+nft list table inet filter
+conntrack -L 2>/dev/null | grep -c OFFLOAD
+```
+
+Dynamic rule changes in `ip6 nat prerouting` do not affect already-offloaded
+flows; only new connections re-enter the slow path.
+
+### Map-based dynamic DNAT
+
+`sync-base-nat.py` populates three nftables maps in `ip6 nat` (see §7):
+
+- `rdp_tcp_map` — external port `20000+VMID` → VM IPv6 `.` 3389
+- `rdp_udp_map` — same, UDP (only when `INCLUDE_UDP_RDP=1`)
+- `smb_tcp_map` — external port `10000+VMID` → VM IPv6 `.` 445
+
+Three static rules in `prerouting` turn new-connection lookup into an O(1)
+hash lookup regardless of VM count, and the whole reconcile is applied as
+a single atomic `nft -f -` transaction per sync run. Flowtable offload
+(above) already eliminates per-packet cost for established flows, so this
+primarily tightens new-connection setup — which is also what matters for
+RDP reconnect and initial SMB handshakes.
+
+Inspect element counts:
+
+```bash
+nft list map ip6 nat rdp_tcp_map | grep -c ':'
+nft list map ip6 nat smb_tcp_map | grep -c ':'
+```
 
 ---
 
