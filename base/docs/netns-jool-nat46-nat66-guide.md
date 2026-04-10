@@ -219,9 +219,27 @@ table ip nat {
 }
 
 table ip6 nat {
+    # O(1) DNAT via maps. Structure lives here; element population is
+    # handled by sync-base-nat.py (which only touches map elements, never
+    # rules or the map declarations themselves).
+    map rdp_tcp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
+    map rdp_udp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
+    map smb_tcp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
+
     chain prerouting {
         type nat hook prerouting priority dstnat;
-        # dynamic rules here
+        # Match-then-lookup: `@map` acts as a set over the map's keys so the
+        # rule only fires for known ports, then `map @map` performs the
+        # lookup and produces the target `ipv6_addr . inet_service` value.
+        tcp dport @rdp_tcp_map dnat ip6 to tcp dport map @rdp_tcp_map
+        udp dport @rdp_udp_map dnat ip6 to udp dport map @rdp_udp_map
+        tcp dport @smb_tcp_map dnat ip6 to tcp dport map @smb_tcp_map
     }
 
     chain postrouting {
@@ -410,29 +428,52 @@ Confirm `jool_siit instance display` lists `br46` with **Framework** `netfilter`
 
 ## 9. Dynamic NAT66 Rules
 
-### Add rule
+Dynamic DNAT targets live as **map elements** (see §7 for the map
+declarations). `sync-base-nat.py` only touches elements; the maps and the
+rules that reference them stay in `/etc/nftables.conf`.
+
+### Add / replace a single element
 
 ```bash
 PORT=20201
 TARGET="2a01:4f9:3100:4bdb:43a9:a22e:ac8f:87c4"
 
-# Applies to both main and failover IPv6 because no `ip6 daddr` filter is used.
-nft add rule ip6 nat prerouting tcp dport $PORT dnat to $TARGET:3389
-nft add rule ip6 nat prerouting udp dport $PORT dnat to $TARGET:3389
+# RDP TCP
+nft add element ip6 nat rdp_tcp_map "{ $PORT : $TARGET . 3389 }"
+# RDP UDP (only if INCLUDE_UDP_RDP=1)
+nft add element ip6 nat rdp_udp_map "{ $PORT : $TARGET . 3389 }"
+# SMB TCP (port 10000+VMID)
+nft add element ip6 nat smb_tcp_map "{ 10201 : $TARGET . 445 }"
 ```
 
 SNAT-to-main-IPv6 and forward acceptance are handled globally in section 7.
 
-### Remove rule
+### Remove a single element
 
 ```bash
-# Dynamic management only touches ip6 nat prerouting handles.
-nft -a list chain ip6 nat prerouting
-
-# Delete matching DNAT handles for the published port.
-nft delete rule ip6 nat prerouting handle <DNAT_TCP_HANDLE>
-nft delete rule ip6 nat prerouting handle <DNAT_UDP_HANDLE>
+nft delete element ip6 nat rdp_tcp_map "{ 20201 }"
+nft delete element ip6 nat rdp_udp_map "{ 20201 }"
+nft delete element ip6 nat smb_tcp_map "{ 10201 }"
 ```
+
+### Inspect current state
+
+```bash
+nft list map ip6 nat rdp_tcp_map
+nft list map ip6 nat rdp_udp_map
+nft list map ip6 nat smb_tcp_map
+```
+
+### Full reconcile from Firestore
+
+```bash
+/usr/local/sbin/sync-base-nat.py sync
+```
+
+The sync script does an **atomic** `flush map` + `add element` transaction
+per map, so there is no visible gap where a published port stops working.
+On first run after upgrading from the rule-based version, any legacy
+per-rule managed entries in `ip6 nat prerouting` are removed automatically.
 
 ---
 
@@ -463,32 +504,27 @@ conntrack -L 2>/dev/null | grep -c OFFLOAD
 Dynamic rule changes in `ip6 nat prerouting` do not affect already-offloaded
 flows; only new connections re-enter the slow path.
 
-### Future: vmap-based dynamic DNAT (not yet implemented)
+### Map-based dynamic DNAT
 
-The current `sync-base-nat.py` adds one rule per VM per protocol in
-`ip6 nat prerouting`. With many VMs this becomes a linear scan on every
-new connection. A future optimization is to use nftables maps:
+`sync-base-nat.py` populates three nftables maps in `ip6 nat` (see §7):
 
-```nft
-table ip6 nat {
-    map rdp_tcp_map { type inet_service : ipv6_addr . inet_service; }
-    map rdp_udp_map { type inet_service : ipv6_addr . inet_service; }
-    map smb_tcp_map { type inet_service : ipv6_addr . inet_service; }
+- `rdp_tcp_map` — external port `20000+VMID` → VM IPv6 `.` 3389
+- `rdp_udp_map` — same, UDP (only when `INCLUDE_UDP_RDP=1`)
+- `smb_tcp_map` — external port `10000+VMID` → VM IPv6 `.` 445
 
-    chain prerouting {
-        type nat hook prerouting priority dstnat;
-        tcp dport @rdp_tcp_map dnat ip6 to tcp dport map @rdp_tcp_map
-        udp dport @rdp_udp_map dnat ip6 to udp dport map @rdp_udp_map
-        tcp dport @smb_tcp_map dnat ip6 to tcp dport map @smb_tcp_map
-    }
-}
+Three static rules in `prerouting` turn new-connection lookup into an O(1)
+hash lookup regardless of VM count, and the whole reconcile is applied as
+a single atomic `nft -f -` transaction per sync run. Flowtable offload
+(above) already eliminates per-packet cost for established flows, so this
+primarily tightens new-connection setup — which is also what matters for
+RDP reconnect and initial SMB handshakes.
+
+Inspect element counts:
+
+```bash
+nft list map ip6 nat rdp_tcp_map | grep -c ':'
+nft list map ip6 nat smb_tcp_map | grep -c ':'
 ```
-
-This replaces O(N) rule scans with O(1) hash lookups. Worthwhile when the
-VM count exceeds ~50 and would require `sync-base-nat.py` to manage map
-elements instead of individual rules. Flowtable offload (above) already
-eliminates this cost for established flows, so the impact is limited to
-new-connection setup.
 
 ---
 
