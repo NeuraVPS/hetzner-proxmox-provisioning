@@ -473,6 +473,57 @@ EOF
 
 pve-firewall restart || true
 
+############################################
+# smartd: suppress NVMe wear/reliability alerts (0x04)
+# Samsung NVMe drives report Critical Warning 0x04 once they hit their
+# manufacturer TBW limit. The drive continues to work fine (spare capacity
+# intact, zero media errors), but smartd sends emails every 30 min.
+# This filter silences exactly that alert on all detected NVMe devices
+# while forwarding every other SMART alert normally.
+############################################
+log "Installing smartd NVMe wear-alert filter"
+
+cat >/usr/local/sbin/smartd-filter.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MESSAGE="${SMARTD_MESSAGE:-}"
+FAILTYPE="${SMARTD_FAILTYPE:-}"
+DEVICE="${SMARTD_DEVICE:-}"
+DEVICESTRING="${SMARTD_DEVICESTRING:-}"
+FULLMESSAGE="${SMARTD_FULLMESSAGE:-}"
+
+combined_text="$(printf '%s\n%s\n%s\n%s\n%s\n' \
+  "$MESSAGE" "$FULLMESSAGE" "$FAILTYPE" "$DEVICE" "$DEVICESTRING")"
+
+if grep -qiE 'Critical Warning \(0x04\): Reliability|NVM subsystem reliability has been degraded' <<<"$combined_text"; then
+  logger -t smartd-filter "Suppressed known NVMe reliability/wear alert for ${DEVICE:-unknown}: ${MESSAGE:-$FAILTYPE}"
+  exit 0
+fi
+
+exec /usr/share/smartmontools/smartd-runner
+EOF
+
+chmod 755 /usr/local/sbin/smartd-filter.sh
+cp -a /etc/smartd.conf /etc/smartd.conf.bak.$(date +%Y%m%d-%H%M%S) 2>/dev/null || true
+
+{
+  for dev in /dev/nvme*; do
+    [[ -b "$dev" ]] || continue
+    echo "${dev} -d nvme -a -n standby -m root -M exec /usr/local/sbin/smartd-filter.sh"
+  done
+} >/etc/smartd.conf
+
+if [[ ! -s /etc/smartd.conf ]]; then
+  log "WARNING: no NVMe block devices found; smartd.conf left empty"
+else
+  log "smartd.conf written for: $(awk '{print $1}' /etc/smartd.conf | tr '\n' ' ')"
+fi
+
+smartd -q onecheck 2>/dev/null || true
+systemctl restart smartd || true
+log "smartd NVMe filter installed"
+
 log "first_boot.sh finished"
 
 # manually add with: qm set 100 --hookscript shared:snippets/sync-dnat.py
