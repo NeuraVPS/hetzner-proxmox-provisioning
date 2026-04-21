@@ -104,3 +104,10 @@ cd C:\Windows\System32\Sysprep
 cd C:\Windows\System32\Sysprep
 .\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend.xml
 ```
+
+Disable Windows Update
+```
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoUpdate' -Value 1 -Type DWord;
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'AUOptions' -Value 1 -Type DWord;
+Set-Service -Name wuauserv -StartupType Disabled;
+Stop-Service -Name wuauserv```
