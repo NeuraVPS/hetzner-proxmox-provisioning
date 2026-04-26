@@ -1,7 +1,17 @@
 [Unit]
 Description=BASE dynamic forwarding sync from Firestore
 After=network-online.target nftables.service jool-nat46.service
-Wants=network-online.target nftables.service
+Wants=network-online.target
+# Hard dependency: if nftables hasn't loaded the maps, sync has nothing to
+# populate. Requires= (vs. Wants=) makes systemd wait for nftables to be
+# fully active before invoking us, so the first attempt succeeds when the
+# nftables.service drop-in (10-base-nat.conf) gets the boot order right.
+Requires=nftables.service
+# Allow up to 20 fast retries within 10 minutes. Default StartLimitBurst=5
+# can be exhausted in seconds when nftables is slow to come up, after which
+# systemd gives up and the host stays unsynced until manual intervention.
+StartLimitBurst=20
+StartLimitIntervalSec=600
 
 [Service]
 Type=oneshot
@@ -9,7 +19,7 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/base-nat-boot.sh
 LimitNOFILE=262144
 Restart=on-failure
-RestartSec=15s
+RestartSec=30s
 TimeoutStartSec=10min
 StandardOutput=journal
 StandardError=journal

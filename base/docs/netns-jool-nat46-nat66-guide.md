@@ -232,6 +232,12 @@ table ip6 nat {
         type inet_service : ipv6_addr . inet_service
     }
 
+    # Persisted map elements (written by sync-base-nat.py). Restoring this
+    # file on every nftables reload is what keeps DNAT alive across reboots
+    # and manual reloads when Firestore is unreachable. The file is created
+    # empty on first install and is rewritten atomically on every sync.
+    include "/etc/nftables.d/base-nat-elements.nft"
+
     chain prerouting {
         type nat hook prerouting priority dstnat;
         # Match-then-lookup: `@map` acts as a set over the map's keys so the
@@ -288,8 +294,49 @@ table inet filter {
 Enable:
 
 ```bash
+# Required: the include directive above will fail if this file is missing.
+mkdir -p /etc/nftables.d
+: > /etc/nftables.d/base-nat-elements.nft
+
 systemctl enable nftables
 systemctl start nftables
+```
+
+### 7.1 nftables.service drop-in (boot race + auto-resync)
+
+`nftables.service` is loaded very early in boot, before the WAN interface
+is registered. Because the flowtable in `table inet filter` references
+the WAN device by name, an early load fails with
+`Could not process rule: No such file or directory` and **the entire
+ruleset is rejected** — leaving the box with zero firewall/DNAT until a
+later retry succeeds. Even when that retry succeeds, the maps come up
+empty.
+
+The drop-in below fixes both problems:
+
+- `After=/Wants=network-online.target` — wait until interfaces are up
+  before loading `/etc/nftables.conf`, so the flowtable resolves on the
+  first try.
+- `ExecStartPost=` — re-run sync whenever nftables starts. Combined with
+  the include file (§7), this guarantees the maps are populated after
+  every (re)load, regardless of the trigger (boot, manual restart,
+  package upgrade hook).
+
+```bash
+mkdir -p /etc/systemd/system/nftables.service.d
+cat >/etc/systemd/system/nftables.service.d/10-base-nat.conf <<'EOF'
+[Unit]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Best-effort resync on every (re)start. The leading "-" means a sync
+# failure (e.g. Firestore unreachable) does not fail nftables itself —
+# the include file from §7 already provides the last-known-good state.
+ExecStartPost=-/usr/bin/python3 /usr/local/sbin/sync-base-nat.py sync
+EOF
+
+systemctl daemon-reload
 ```
 
 ---

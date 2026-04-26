@@ -93,9 +93,27 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
   -o /etc/systemd/system/base-nat-boot.service
 chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
 
+# 4a) nftables include file for persisted DNAT map elements.
+# /etc/nftables.conf has `include "/etc/nftables.d/base-nat-elements.nft"`
+# inside `table ip6 nat` (see docs/netns-jool-nat46-nat66-guide.md §7).
+# nftables fails to load if the include target is missing, so create an
+# empty file before the first reload. sync-base-nat.py rewrites it
+# atomically on every reconcile.
+mkdir -p /etc/nftables.d
+[ -f /etc/nftables.d/base-nat-elements.nft ] || : > /etc/nftables.d/base-nat-elements.nft
+
+# 4b) nftables.service drop-in: wait for WAN before loading the ruleset
+# (avoids "Could not process rule" failure when the flowtable references
+# an interface that doesn't exist yet) and re-run sync after every
+# (re)start so map elements are always populated. See guide §7.1.
+mkdir -p /etc/systemd/system/nftables.service.d
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/nftables-base-nat.conf \
+  -o /etc/systemd/system/nftables.service.d/10-base-nat.conf
+
 # 5) Enable boot-time dynamic sync.
 mkdir -p /var/lib/base-nat
 systemctl daemon-reload
+systemctl restart nftables.service
 systemctl enable --now base-nat-boot.service
 
 # 6) Validation.
