@@ -232,12 +232,6 @@ table ip6 nat {
         type inet_service : ipv6_addr . inet_service
     }
 
-    # Persisted map elements (written by sync-base-nat.py). Restoring this
-    # file on every nftables reload is what keeps DNAT alive across reboots
-    # and manual reloads when Firestore is unreachable. The file is created
-    # empty on first install and is rewritten atomically on every sync.
-    include "/etc/nftables.d/base-nat-elements.nft"
-
     chain prerouting {
         type nat hook prerouting priority dstnat;
         # Match-then-lookup: `@map` acts as a set over the map's keys so the
@@ -254,6 +248,15 @@ table ip6 nat {
         ct status dnat snat to 2a01:4f9:3070:3984::2
     }
 }
+
+# Persisted dynamic DNAT map elements (written by sync-base-nat.py).
+# MUST sit at the top level (outside any `table { }`) and AFTER the
+# `table ip6 nat` declaration, because `add element` is a top-level
+# command that references the table by name. Restoring this file on every
+# nftables reload is what keeps DNAT alive across reboots and manual
+# reloads when Firestore is unreachable. The file is created empty on
+# first install and is rewritten atomically on every sync.
+include "/etc/nftables.d/base-nat-elements.nft"
 
 table inet filter {
     # Fast-path: kernel flowtable for offloading established flows.
