@@ -18,6 +18,8 @@ if [[ ! -f "$NODES_FILE" ]]; then
     exit 1
 fi
 
+# Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
+ONLY_HOST_NUMS=(3)
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
 SKIP_HOST_NUMS=()
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
@@ -26,6 +28,13 @@ HOST_NUM_LTE=
 
 while read -r hostname ip; do
     host_num=$((10#${hostname%%-*}))
+    if (( ${#ONLY_HOST_NUMS[@]} > 0 )); then
+        in_only=0
+        for o in "${ONLY_HOST_NUMS[@]}"; do
+            if [[ $host_num -eq $o ]]; then in_only=1; break; fi
+        done
+        if [[ $in_only -eq 0 ]]; then continue; fi
+    fi
     skip=0
     for s in "${SKIP_HOST_NUMS[@]}"; do
         if [[ $host_num -eq $s ]]; then skip=1; break; fi

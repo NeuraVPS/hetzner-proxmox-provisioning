@@ -88,14 +88,25 @@ dhcp-range=10.0.0.100,10.0.255.254,255.255.0.0,720h
 dhcp-option=3,10.0.0.1
 dhcp-option=6,185.12.64.1,185.12.64.2
 
-# ==== IPv6 DHCPv6 (stateful only; SLAAC disabled) ====
+# ==== IPv6: stateful DHCPv6, no SLAAC. Per-VM addresses pinned in vm-pins.conf ====
+# `static` modifier => only dhcp-host pinned addresses are handed out, AND the
+# advertised prefix in the RA has A=0 (no SLAAC). M=1 stays set, so Windows
+# will run its DHCPv6 client and receive the pin instead of generating a
+# stable-privacy SLAAC address.
 enable-ra
-dhcp-range=::100,::1ff,constructor:vmbr0,ra-stateless,720h
-ra-param=constructor:vmbr0,0,0
+dhcp-range=::ff00,::fffe,constructor:vmbr0,static,64,720h
 dhcp-option=option6:dns-server,[2a01:4ff:ff00::add:1],[2a01:4ff:ff00::add:2]
 EOF
 
+# Ensure vm-pins.conf exists (sync-dnat.py regen-pins will populate it)
+touch /etc/dnsmasq.d/vm-pins.conf
+
 systemctl restart dnsmasq
+
+# Generate initial pins from any existing VM configs (idempotent; empty on a fresh node)
+if [ -x /var/lib/svz/snippets/sync-dnat.py ]; then
+  /var/lib/svz/snippets/sync-dnat.py regen-pins || true
+fi
 
 ############################################
 # Raw swap: 23 GB per disk (reserved by install via zfs.hdsize)
