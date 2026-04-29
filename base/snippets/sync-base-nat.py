@@ -13,8 +13,10 @@ Commands:
       Single VM: read one server from Firestore and merge into local state,
       then reconcile managed dynamic DNAT rules.
 
-  sync-base-nat.py sync <proxmoxId> <publicVMIPv6>
-      Single VM override without Firestore read for that VM.
+  sync-base-nat.py sync <proxmoxId> <publicVMIPv6> [rdp=0|1] [samba=0|1]
+      Single VM override without Firestore read. Optional rdp/samba
+      flags force the matching service on/off; flags not passed are
+      preserved from on-disk state (or default enabled for new VMs).
 
   sync-base-nat.py sync <proxmoxId> del
       Remove one VM from local desired map, reconcile rules.
@@ -611,14 +613,19 @@ def sync_single_vmid(
     server: dict | None,
     delete_only: bool,
     ipv6_override: bool = False,
+    flags_override: dict | None = None,
 ):
     """Reconcile a single VM in the desired map.
 
     `server` is a `_server_entry` dict (ipv6 + flags) or None.
-    `ipv6_override=True` skips Firestore (use `server` as-is, defaults
-    flags=enabled if missing). Otherwise `server` is the Firestore
-    snapshot (already includes firewall flags) or None when the VM is
-    not configured anymore.
+    `ipv6_override=True` skips Firestore (use `server` as-is). Otherwise
+    `server` is the Firestore snapshot (already includes firewall flags)
+    or None when the VM is not configured anymore.
+
+    `flags_override` (only meaningful with `ipv6_override`) lets the
+    caller force specific service flags by key (`rdp` and/or `samba`).
+    Keys not present fall back to the previous on-disk state, or to
+    enabled when the VM is new.
     """
     if not delete_only and not ipv6_override and not ensure_firebase():
         logger.error("Firebase required for sync <proxmoxId> (lookup)")
@@ -632,14 +639,17 @@ def sync_single_vmid(
         desired.pop(vmid, None)
         logger.info("proxmoxId=%s removed from desired map", vmid)
     elif server is not None:
-        # ipv6_override (caller didn't fetch flags from Firestore): keep
-        # whatever flags we already had in state for this VM, so an IPv6
-        # change doesn't accidentally re-enable a service the user
-        # previously toggled off. Default to enabled when the VM is new.
-        if ipv6_override and vmid in desired:
-            existing = desired[vmid]
-            rdp_flag = bool(existing.get("rdp", True))
-            samba_flag = bool(existing.get("samba", True))
+        if ipv6_override:
+            # Override path: caller is authoritative when it supplied a
+            # flag, otherwise preserve the previous state so an IPv6
+            # change doesn't accidentally re-enable a service the user
+            # previously toggled off.
+            existing = desired.get(vmid)
+            rdp_default = bool(existing.get("rdp", True)) if existing else True
+            samba_default = bool(existing.get("samba", True)) if existing else True
+            override = flags_override or {}
+            rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
+            samba_flag = bool(override["samba"]) if "samba" in override else samba_default
         else:
             rdp_flag = bool(server.get("rdp", True))
             samba_flag = bool(server.get("samba", True))
@@ -1045,12 +1055,44 @@ def main_sync_nodes():
     sync_nodes_single(args[0])
 
 
+_FLAG_TRUE = {"1", "true", "yes", "on"}
+_FLAG_FALSE = {"0", "false", "no", "off"}
+
+
+def _parse_flag_args(extra: list[str]) -> dict:
+    """Parse `key=value` args into a flag override dict.
+
+    Accepts `rdp` and `samba` keys with boolean-ish values. Unknown keys
+    or unparseable values are a hard error so a typo never silently
+    leaves DNAT in a wrong state.
+    """
+    out: dict = {}
+    for arg in extra:
+        if "=" not in arg:
+            logger.error("Unexpected argument %r (expected key=value)", arg)
+            sys.exit(2)
+        k, _, v = arg.partition("=")
+        k = k.strip().lower()
+        v = v.strip().lower()
+        if k not in ("rdp", "samba"):
+            logger.error("Unknown flag %r (allowed: rdp, samba)", k)
+            sys.exit(2)
+        if v in _FLAG_TRUE:
+            out[k] = True
+        elif v in _FLAG_FALSE:
+            out[k] = False
+        else:
+            logger.error("Invalid value for %s: %r", k, v)
+            sys.exit(2)
+    return out
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] != "sync":
         print(
             "Usage: sync-base-nat.py sync\n"
             "       sync-base-nat.py sync <proxmoxId>\n"
-            "       sync-base-nat.py sync <proxmoxId> <ipv6>\n"
+            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
             "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,
@@ -1096,14 +1138,16 @@ def main():
         except ValueError:
             logger.error("Invalid IPv6")
             sys.exit(2)
-        # Override path: caller wins on ipv6, flags default to enabled.
-        # Firewall toggles still arrive via the no-arg `sync <vmid>` flow,
-        # which reads the latest flags from Firestore.
+        # Override path: caller wins on ipv6 (and on whichever flags it
+        # supplies). Flags not passed are preserved from the on-disk
+        # state so an IPv6-only refresh doesn't clobber a user toggle.
+        flags_override = _parse_flag_args(args[2:])
         sync_single_vmid(
             vmid,
             _server_entry(ipv6, rdp=True, samba=True),
             delete_only=False,
             ipv6_override=True,
+            flags_override=flags_override or None,
         )
         return
 
