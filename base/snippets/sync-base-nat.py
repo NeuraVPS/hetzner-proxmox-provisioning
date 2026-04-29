@@ -13,8 +13,10 @@ Commands:
       Single VM: read one server from Firestore and merge into local state,
       then reconcile managed dynamic DNAT rules.
 
-  sync-base-nat.py sync <proxmoxId> <publicVMIPv6>
-      Single VM override without Firestore read for that VM.
+  sync-base-nat.py sync <proxmoxId> <publicVMIPv6> [rdp=0|1] [samba=0|1]
+      Single VM override without Firestore read. Optional rdp/samba
+      flags force the matching service on/off; flags not passed are
+      preserved from on-disk state (or default enabled for new VMs).
 
   sync-base-nat.py sync <proxmoxId> del
       Remove one VM from local desired map, reconcile rules.
@@ -253,9 +255,30 @@ def write_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
-def desired_from_state() -> dict[int, str]:
-    """vmid -> ipv6 from STATE_FILE (on-box snapshot)."""
-    out: dict[int, str] = {}
+# Per-VM desired entry: ipv6 + which services BASE should redirect.
+# Defaults: rdp/samba enabled when the field is missing (back-compat with
+# pre-firewall-flag state files and Firestore docs).
+def _server_entry(ipv6: str, rdp: bool = True, samba: bool = True) -> dict:
+    return {"ipv6": ipv6, "rdp": bool(rdp), "samba": bool(samba)}
+
+
+def _firewall_flag(firewall: object, key: str, default: bool = True) -> bool:
+    if not isinstance(firewall, dict):
+        return default
+    val = firewall.get(key)
+    if not isinstance(val, bool):
+        return default
+    return val
+
+
+def desired_from_state() -> dict[int, dict]:
+    """vmid -> {ipv6, rdp, samba} from STATE_FILE (on-box snapshot).
+
+    Reads `rdpEnabled` / `sambaEnabled` flags. Older state files written
+    before per-service flags existed only carry `ipv6` plus the `rdp` /
+    `samba` port numbers — for those, we default both flags to True.
+    """
+    out: dict[int, dict] = {}
     raw = read_state()
     if not isinstance(raw, dict):
         return out
@@ -274,18 +297,30 @@ def desired_from_state() -> dict[int, str]:
             normalize_ipv6(s)
         except ValueError:
             continue
-        if 0 <= vmid <= VMID_MAX:
-            out[vmid] = s
+        if not (0 <= vmid <= VMID_MAX):
+            continue
+        rdp_flag = d.get("rdpEnabled", True)
+        samba_flag = d.get("sambaEnabled", True)
+        out[vmid] = _server_entry(
+            s,
+            rdp=bool(rdp_flag) if isinstance(rdp_flag, bool) else True,
+            samba=bool(samba_flag) if isinstance(samba_flag, bool) else True,
+        )
     return out
 
 
-def firestore_list_configured_servers() -> dict[int, str]:
-    """proxmoxId -> ipv6 from Firestore servers collection."""
+def firestore_list_configured_servers() -> dict[int, dict]:
+    """proxmoxId -> {ipv6, rdp, samba} from Firestore servers collection.
+
+    `rdp`/`samba` come from the server's `firewall.rdpEnabled` /
+    `firewall.sambaEnabled` boolean fields and default to True when
+    missing or non-boolean.
+    """
     if not ensure_firebase():
         logger.error("Firebase required for full sync")
         sys.exit(1)
     db = firestore.client()
-    out: dict[int, str] = {}
+    out: dict[int, dict] = {}
     for doc in db.collection("servers").stream():
         d = doc.to_dict() or {}
         pid = d.get("proxmoxId")
@@ -306,13 +341,21 @@ def firestore_list_configured_servers() -> dict[int, str]:
             continue
         s = str(ipv6).strip()
         try:
-            out[vmid] = normalize_ipv6(s)
+            normalized = normalize_ipv6(s)
         except ValueError:
             logger.warning("Skip server %s: bad ipv6 %s", doc.id, s)
+            continue
+        firewall = d.get("firewall")
+        out[vmid] = _server_entry(
+            normalized,
+            rdp=_firewall_flag(firewall, "rdpEnabled", True),
+            samba=_firewall_flag(firewall, "sambaEnabled", True),
+        )
     return out
 
 
-def firestore_ipv6_for_vmid(vmid: int) -> str | None:
+def firestore_server_for_vmid(vmid: int) -> dict | None:
+    """Return {ipv6, rdp, samba} for a single Firestore server, or None."""
     if not ensure_firebase():
         return None
     db = firestore.client()
@@ -329,9 +372,15 @@ def firestore_ipv6_for_vmid(vmid: int) -> str | None:
             continue
         s = str(ipv6).strip()
         try:
-            return normalize_ipv6(s)
+            normalized = normalize_ipv6(s)
         except ValueError:
             return None
+        firewall = d.get("firewall")
+        return _server_entry(
+            normalized,
+            rdp=_firewall_flag(firewall, "rdpEnabled", True),
+            samba=_firewall_flag(firewall, "sambaEnabled", True),
+        )
     return None
 
 
@@ -358,18 +407,28 @@ SMB_TARGET_PORT = 445
 
 
 def _build_desired_map_elements(
-    desired: dict[int, str],
+    desired: dict[int, dict],
 ) -> dict[str, dict[int, tuple[str, int]]]:
-    """Build {map_name: {external_port: (target_ipv6, target_port)}}."""
+    """Build {map_name: {external_port: (target_ipv6, target_port)}}.
+
+    A VM only contributes RDP and/or SMB elements when the matching
+    firewall flag in `desired[vmid]` is True. Disabled services are
+    omitted entirely so BASE drops the connection (no DNAT match in
+    prerouting => no entry in the forward chain's `ct status dnat`
+    accept rule => packet hits the default drop policy).
+    """
     out: dict[str, dict[int, tuple[str, int]]] = {m: {} for m in DNAT_MAPS}
     for vmid in sorted(desired.keys()):
         vmid = check_vmid(vmid)
-        target_ipv6 = normalize_ipv6(desired[vmid])
+        entry = desired[vmid]
+        target_ipv6 = normalize_ipv6(entry["ipv6"])
         samba_p, rdp_p = vm_ports(vmid)
-        out[DNAT_MAP_RDP_TCP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
-        if INCLUDE_UDP_RDP:
-            out[DNAT_MAP_RDP_UDP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
-        out[DNAT_MAP_SMB_TCP][samba_p] = (target_ipv6, SMB_TARGET_PORT)
+        if entry.get("rdp", True):
+            out[DNAT_MAP_RDP_TCP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
+            if INCLUDE_UDP_RDP:
+                out[DNAT_MAP_RDP_UDP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
+        if entry.get("samba", True):
+            out[DNAT_MAP_SMB_TCP][samba_p] = (target_ipv6, SMB_TARGET_PORT)
     return out
 
 
@@ -528,32 +587,50 @@ def reconcile_dynamic_dnat_rules(desired: dict[int, str]):
     )
 
 
+def _state_payload(desired: dict[int, dict]) -> dict:
+    """Serializable view of the desired map for STATE_FILE."""
+    return {
+        str(k): {
+            "ipv6": desired[k]["ipv6"],
+            "samba": SAMBA_PORT_BASE + k,
+            "rdp": RDP_PORT_BASE + k,
+            "rdpEnabled": bool(desired[k].get("rdp", True)),
+            "sambaEnabled": bool(desired[k].get("samba", True)),
+        }
+        for k in sorted(desired.keys())
+    }
+
+
 def sync_full():
     desired = firestore_list_configured_servers()
     reconcile_dynamic_dnat_rules(desired)
-    write_state(
-        {
-            str(k): {
-                "ipv6": desired[k],
-                "samba": SAMBA_PORT_BASE + k,
-                "rdp": RDP_PORT_BASE + k,
-            }
-            for k in sorted(desired.keys())
-        }
-    )
+    write_state(_state_payload(desired))
     logger.info("Full sync done (%d servers)", len(desired))
 
 
 def sync_single_vmid(
     vmid: int,
-    ipv6: str | None,
+    server: dict | None,
     delete_only: bool,
     ipv6_override: bool = False,
+    flags_override: dict | None = None,
 ):
+    """Reconcile a single VM in the desired map.
+
+    `server` is a `_server_entry` dict (ipv6 + flags) or None.
+    `ipv6_override=True` skips Firestore (use `server` as-is). Otherwise
+    `server` is the Firestore snapshot (already includes firewall flags)
+    or None when the VM is not configured anymore.
+
+    `flags_override` (only meaningful with `ipv6_override`) lets the
+    caller force specific service flags by key (`rdp` and/or `samba`).
+    Keys not present fall back to the previous on-disk state, or to
+    enabled when the VM is new.
+    """
     if not delete_only and not ipv6_override and not ensure_firebase():
         logger.error("Firebase required for sync <proxmoxId> (lookup)")
         sys.exit(1)
-    if ipv6_override and ipv6 is None:
+    if ipv6_override and (server is None or not server.get("ipv6")):
         logger.error("Explicit IPv6 required for sync <proxmoxId> <ipv6>")
         sys.exit(2)
 
@@ -561,25 +638,32 @@ def sync_single_vmid(
     if delete_only:
         desired.pop(vmid, None)
         logger.info("proxmoxId=%s removed from desired map", vmid)
-    elif ipv6_override:
-        desired[vmid] = normalize_ipv6(ipv6 or "")
-    elif ipv6 is not None:
-        desired[vmid] = normalize_ipv6(ipv6)
+    elif server is not None:
+        if ipv6_override:
+            # Override path: caller is authoritative when it supplied a
+            # flag, otherwise preserve the previous state so an IPv6
+            # change doesn't accidentally re-enable a service the user
+            # previously toggled off.
+            existing = desired.get(vmid)
+            rdp_default = bool(existing.get("rdp", True)) if existing else True
+            samba_default = bool(existing.get("samba", True)) if existing else True
+            override = flags_override or {}
+            rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
+            samba_flag = bool(override["samba"]) if "samba" in override else samba_default
+        else:
+            rdp_flag = bool(server.get("rdp", True))
+            samba_flag = bool(server.get("samba", True))
+        desired[vmid] = _server_entry(
+            normalize_ipv6(server["ipv6"]),
+            rdp=rdp_flag,
+            samba=samba_flag,
+        )
     else:
         desired.pop(vmid, None)
         logger.info("proxmoxId=%s not in Firestore; removed from desired map", vmid)
 
     reconcile_dynamic_dnat_rules(desired)
-    write_state(
-        {
-            str(k): {
-                "ipv6": desired[k],
-                "samba": SAMBA_PORT_BASE + k,
-                "rdp": RDP_PORT_BASE + k,
-            }
-            for k in sorted(desired.keys())
-        }
-    )
+    write_state(_state_payload(desired))
     logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
 
@@ -971,12 +1055,44 @@ def main_sync_nodes():
     sync_nodes_single(args[0])
 
 
+_FLAG_TRUE = {"1", "true", "yes", "on"}
+_FLAG_FALSE = {"0", "false", "no", "off"}
+
+
+def _parse_flag_args(extra: list[str]) -> dict:
+    """Parse `key=value` args into a flag override dict.
+
+    Accepts `rdp` and `samba` keys with boolean-ish values. Unknown keys
+    or unparseable values are a hard error so a typo never silently
+    leaves DNAT in a wrong state.
+    """
+    out: dict = {}
+    for arg in extra:
+        if "=" not in arg:
+            logger.error("Unexpected argument %r (expected key=value)", arg)
+            sys.exit(2)
+        k, _, v = arg.partition("=")
+        k = k.strip().lower()
+        v = v.strip().lower()
+        if k not in ("rdp", "samba"):
+            logger.error("Unknown flag %r (allowed: rdp, samba)", k)
+            sys.exit(2)
+        if v in _FLAG_TRUE:
+            out[k] = True
+        elif v in _FLAG_FALSE:
+            out[k] = False
+        else:
+            logger.error("Invalid value for %s: %r", k, v)
+            sys.exit(2)
+    return out
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] != "sync":
         print(
             "Usage: sync-base-nat.py sync\n"
             "       sync-base-nat.py sync <proxmoxId>\n"
-            "       sync-base-nat.py sync <proxmoxId> <ipv6>\n"
+            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
             "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,
@@ -1022,11 +1138,21 @@ def main():
         except ValueError:
             logger.error("Invalid IPv6")
             sys.exit(2)
-        sync_single_vmid(vmid, ipv6, delete_only=False, ipv6_override=True)
+        # Override path: caller wins on ipv6 (and on whichever flags it
+        # supplies). Flags not passed are preserved from the on-disk
+        # state so an IPv6-only refresh doesn't clobber a user toggle.
+        flags_override = _parse_flag_args(args[2:])
+        sync_single_vmid(
+            vmid,
+            _server_entry(ipv6, rdp=True, samba=True),
+            delete_only=False,
+            ipv6_override=True,
+            flags_override=flags_override or None,
+        )
         return
 
-    ipv6 = firestore_ipv6_for_vmid(vmid)
-    sync_single_vmid(vmid, ipv6, delete_only=False, ipv6_override=False)
+    server = firestore_server_for_vmid(vmid)
+    sync_single_vmid(vmid, server, delete_only=False, ipv6_override=False)
 
 
 if __name__ == "__main__":
