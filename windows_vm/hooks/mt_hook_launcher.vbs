@@ -9,26 +9,27 @@ If args.Count < 1 Then
   WScript.Quit 2
 End If
 
-Dim target, exeName, ifeoKey, forwardArgs, launchTarget
+Dim target, exeName, ifeoKey, forwardArgs, launchTarget, isUpdate
 target = Replace(CStr(args(0)), """", "")
 exeName = LCase(fso.GetFileName(target))
 ifeoKey = ""
-forwardArgs = BuildForwardArgs(args)
+isUpdate = HasUpdateFlag(args)
+forwardArgs = BuildForwardArgs(args, isUpdate)
 launchTarget = target
 
 Select Case exeName
   Case "terminal64.exe"
     ifeoKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\terminal64.exe"
-    launchTarget = ResolveMT5Target(forwardArgs, "terminal64.exe", target)
+    If Not isUpdate Then launchTarget = ResolveMT5Target(forwardArgs, "terminal64.exe", target)
   Case "metaeditor64.exe"
     ifeoKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\metaeditor64.exe"
-    launchTarget = ResolveMT5Target(forwardArgs, "metaeditor64.exe", target)
+    If Not isUpdate Then launchTarget = ResolveMT5Target(forwardArgs, "metaeditor64.exe", target)
   Case "terminal.exe"
     ifeoKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\terminal.exe"
-    launchTarget = ResolveMT5Target(forwardArgs, "terminal.exe", target)
+    If Not isUpdate Then launchTarget = ResolveMT5Target(forwardArgs, "terminal.exe", target)
   Case "metaeditor.exe"
     ifeoKey = "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\metaeditor.exe"
-    launchTarget = ResolveMT5Target(forwardArgs, "metaeditor.exe", target)
+    If Not isUpdate Then launchTarget = ResolveMT5Target(forwardArgs, "metaeditor.exe", target)
   Case Else
     WScript.Quit 4
 End Select
@@ -72,7 +73,7 @@ Function QuoteArg(value)
   QuoteArg = """" & Replace(value, """", """""") & """"
 End Function
 
-Function BuildForwardArgs(arguments)
+Function BuildForwardArgs(arguments, preserveOriginal)
   Dim i, raw, item, parts, hasPortable
   parts = ""
   hasPortable = False
@@ -82,15 +83,63 @@ Function BuildForwardArgs(arguments)
     item = Trim(raw)
     If LCase(item) = "/portable" Then hasPortable = True
     If Len(parts) > 0 Then parts = parts & " "
-    parts = parts & QuoteArg(raw)
+    parts = parts & FormatForwardArg(raw)
   Next
 
-  If Not hasPortable Then
+  If Not preserveOriginal And Not hasPortable Then
     If Len(parts) > 0 Then parts = parts & " "
-    parts = parts & QuoteArg("/portable")
+    parts = parts & "/portable"
   End If
 
   BuildForwardArgs = parts
+End Function
+
+' MT5's /updateadmin parser scans GetCommandLineW() looking for /flag:"value"
+' (quotes around the value, not around the whole arg). Wrapping the entire
+' "/path:VALUE" in quotes makes it grab past the closing quote into the next
+' token and produces a corrupted path. Preserve the original shape instead.
+Function FormatForwardArg(value)
+  Dim colonPos, flagPart, valuePart
+  If Len(value) > 0 And Left(value, 1) = "/" Then
+    colonPos = InStr(value, ":")
+    If colonPos > 1 Then
+      flagPart = Left(value, colonPos)
+      valuePart = Mid(value, colonPos + 1)
+      If NeedsQuoting(valuePart) Then
+        FormatForwardArg = flagPart & QuoteArg(valuePart)
+      Else
+        FormatForwardArg = value
+      End If
+      Exit Function
+    End If
+  End If
+  If NeedsQuoting(value) Then
+    FormatForwardArg = QuoteArg(value)
+  Else
+    FormatForwardArg = value
+  End If
+End Function
+
+Function NeedsQuoting(value)
+  NeedsQuoting = False
+  If Len(value) = 0 Then NeedsQuoting = True : Exit Function
+  If InStr(value, " ") > 0 Then NeedsQuoting = True : Exit Function
+  If InStr(value, vbTab) > 0 Then NeedsQuoting = True : Exit Function
+  If InStr(value, """") > 0 Then NeedsQuoting = True : Exit Function
+End Function
+
+Function HasUpdateFlag(arguments)
+  Dim i, item
+  HasUpdateFlag = False
+  For i = 1 To arguments.Count - 1
+    item = LCase(Trim(CStr(arguments(i))))
+    If Len(item) >= 7 Then
+      If Left(item, 7) = "/update" Then
+        HasUpdateFlag = True
+        Exit Function
+      End If
+    End If
+  Next
 End Function
 
 Function ResolveMT5Target(forwardArgs, executableName, defaultTarget)

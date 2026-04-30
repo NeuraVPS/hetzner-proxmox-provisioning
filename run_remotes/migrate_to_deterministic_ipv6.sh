@@ -250,7 +250,7 @@ FAILURE_LOG="${FAILURE_LOG:-$(pwd)/migrate_to_deterministic_ipv6.failures.log}"
 echo "Failure log: $FAILURE_LOG"
 
 # Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
-ONLY_HOST_NUMS=(3)
+ONLY_HOST_NUMS=(52)
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
 SKIP_HOST_NUMS=()
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
