@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 """
-sync-dnat: Sync VM running/stopped status to Firestore.
+sync-dnat: Sync VM running/stopped status to Firestore + maintain DHCPv6 pins.
 
-IPv6 model (post-EUI64 migration): VMs are created with MACs encoding their VMID
-(`52:54:00:00:HH:LL` where HHLL = vmid in hex), and Windows guests have RFC 7217
-stable-privacy disabled so they auto-configure via EUI-64 SLAAC. Result: every
-VM's IPv6 is `<node_/64_prefix>::5054:ff:fe00:<vmid_hex>` — derivable from the
-VMID alone, no DHCPv6 server roundtrip on boot, no pin database to maintain.
-
-This script therefore does NOT manage dnsmasq dhcp-host pins. dnsmasq is in
-ra-stateless mode (RA + stateless DHCPv6 for DNS options only).
+IPv6 model: stateful DHCPv6. Each VM is pinned to <prefix>::<vmid_hex> by MAC
+in /etc/dnsmasq.d/vm-pins.conf. dnsmasq RA flags M=1, A=0 → Windows uses ONLY
+DHCPv6 for addresses (no SLAAC), and the pinned IP is reissued on every boot
+via DHCPv6 SOLICIT — self-healing against any in-guest config drift.
 
 Commands:
   Hook (Proxmox):
-    sync-dnat.py <VMID> post-start         — Set status running.
-    sync-dnat.py <VMID> post-stop          — Set status stopped.
+    sync-dnat.py <VMID> post-start         — Status=running + regen pins.
+    sync-dnat.py <VMID> post-stop          — Status=stopped + regen pins.
   Manual sync:
-    sync-dnat.py                           — Sync all local VMs' status.
+    sync-dnat.py                           — Sync all VM statuses + regen pins.
   Node boot:
-    sync-dnat.py node-boot                 — Set proxmox_nodes/<hostname>.lastNodeBootAt
-                                              and sync all VM statuses.
+    sync-dnat.py node-boot                 — Set lastNodeBootAt, sync all
+                                              statuses, regen pins.
+  DHCPv6 pin file regeneration:
+    sync-dnat.py regen-pins                — Rewrite /etc/dnsmasq.d/vm-pins.conf
+                                              from /etc/pve/qemu-server/*.conf
+                                              and reload dnsmasq.
   Firestore IPv6 update (one VM):
     sync-dnat.py set-server-ipv6 <VMID> <IPV6>
-                                            — Set servers/{id}.ipv6 for the local-node
-                                              VM matching (proxmoxId, nodeId). Used by
-                                              the EUI-64 migration tool.
+                                            — Set servers/{id}.ipv6 for the
+                                              local-node VM matching
+                                              (proxmoxId, nodeId).
 """
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -240,6 +241,91 @@ def sync_all_statuses():
             update_status_in_firestore(vmid, actual_status)
 
 # ---------------------------------------------------------------
+# DHCPv6 pin file
+# ---------------------------------------------------------------
+_MAC_RE = re.compile(r'\b([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\b')
+
+def _vmbr0_prefix():
+    """Return '<a:b:c:d>::' from vmbr0's first global v6 address, or None."""
+    try:
+        out = subprocess.run(
+            ["ip", "-6", "-o", "addr", "show", "vmbr0", "scope", "global"],
+            capture_output=True, text=True, check=True
+        ).stdout
+        first = (out.splitlines() or [""])[0].split()
+        if len(first) < 4:
+            return None
+        addr = first[3].split("/")[0]
+        parts = addr.split(":")
+        if len(parts) < 4:
+            return None
+        return ":".join(parts[:4]) + "::"
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
+        return None
+
+def _extract_net0_mac(conf_text):
+    for line in conf_text.splitlines():
+        if line.startswith("net0:"):
+            m = _MAC_RE.search(line)
+            return m.group(1).lower() if m else None
+    return None
+
+def regen_dhcp_pins():
+    """Rewrite /etc/dnsmasq-vm-pins.hosts from /etc/pve/qemu-server/*.conf and
+    SIGHUP dnsmasq. The file is referenced by `dhcp-hostsfile=` in the main
+    dnsmasq config — SIGHUP re-reads it (whereas /etc/dnsmasq.d/*.conf is only
+    re-read on full restart). Each VM 100..9999 with a parseable net0 MAC
+    gets a pin `<mac>,[<prefix>::<vmid_hex>],vm<vmid>,infinite`. Idempotent."""
+    prefix = _vmbr0_prefix()
+    if not prefix:
+        logger.error("regen-pins: cannot derive vmbr0 /64 prefix")
+        return False
+
+    lines = []
+    for cfg in sorted(Path("/etc/pve/qemu-server").glob("*.conf")):
+        try:
+            vmid = int(cfg.stem)
+        except ValueError:
+            continue
+        if not 100 <= vmid <= 9999:
+            continue
+        try:
+            mac = _extract_net0_mac(cfg.read_text())
+        except OSError:
+            continue
+        if not mac:
+            continue
+        ipv6 = f"{prefix}{vmid:x}"
+        lines.append(f"{mac},[{ipv6}],vm{vmid},infinite\n")
+
+    out_path = Path("/etc/dnsmasq-vm-pins.hosts")
+    tmp = out_path.with_suffix(".tmp")
+    try:
+        tmp.write_text("".join(lines))
+        tmp.replace(out_path)
+    except OSError as e:
+        logger.error(f"regen-pins: write failed: {e}")
+        return False
+
+    # Clean up legacy file from when pins lived in /etc/dnsmasq.d/ (where
+    # SIGHUP didn't re-read them, the bug we're fixing).
+    legacy = Path("/etc/dnsmasq.d/vm-pins.conf")
+    if legacy.exists():
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+
+    try:
+        subprocess.run(["systemctl", "reload", "dnsmasq"], check=False,
+                       capture_output=True, timeout=10)
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        logger.warning(f"regen-pins: dnsmasq reload failed: {e}")
+
+    logger.info(f"regen-pins: wrote {len(lines)} pins to {out_path}")
+    return True
+
+# ---------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------
 def main():
@@ -259,11 +345,16 @@ def main():
         ok = set_server_ipv6(target_vmid, sys.argv[3])
         sys.exit(0 if ok else 1)
 
-    # node-boot: stamp lastNodeBootAt, then sync all statuses
+    # regen-pins: rewrite vm-pins.conf and reload dnsmasq
+    if len(sys.argv) >= 2 and sys.argv[1] == "regen-pins":
+        sys.exit(0 if regen_dhcp_pins() else 1)
+
+    # node-boot: stamp lastNodeBootAt, sync all statuses, regen pins
     if len(sys.argv) >= 2 and sys.argv[1] == "node-boot":
         logger.info("node-boot: updating lastNodeBootAt and syncing VM statuses")
         update_proxmox_node_last_boot_at()
         sync_all_statuses()
+        regen_dhcp_pins()
         logger.info("Sync complete.")
         return
 
@@ -279,21 +370,24 @@ def main():
         if phase == "post-start":
             logger.info(f"Hook: VM {triggered_vmid} post-start")
             update_status_in_firestore(triggered_vmid, "running")
+            regen_dhcp_pins()
             logger.info("Sync complete.")
             return
 
         if phase == "post-stop":
             logger.info(f"Hook: VM {triggered_vmid} post-stop")
             update_status_in_firestore(triggered_vmid, "stopped")
+            regen_dhcp_pins()
             logger.info("Sync complete.")
             return
 
         # Other phases (pre-start, pre-stop): nothing to do
         return
 
-    # Manual mode (no args): sync all statuses
+    # Manual mode (no args): sync all statuses + regen pins
     logger.info("Manual sync: reconciling all VM statuses")
     sync_all_statuses()
+    regen_dhcp_pins()
     logger.info("Sync complete.")
 
 if __name__ == "__main__":

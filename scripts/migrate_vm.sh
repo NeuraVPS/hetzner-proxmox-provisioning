@@ -515,7 +515,18 @@ PY
 
   local SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
 
-  # 6 success) Compute the deterministic ipv6 the VM should have on dest.
+  # 6 success) Regenerate dnsmasq DHCPv6 pins on source (drops stale entry)
+  # and dest (adds new entry). Must happen BEFORE the in-guest DHCPv6 renew
+  # so the SOLICIT lands on a dnsmasq that already has the right pin.
+  _info "Regenerating dnsmasq pins on source..."
+  if [[ -x "$SYNC_DNAT" ]]; then
+    "$SYNC_DNAT" regen-pins 2>/dev/null || _info "Source regen-pins had issues; continuing."
+  fi
+  _info "Regenerating dnsmasq pins on destination..."
+  ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}' && '${SYNC_DNAT}' regen-pins" 2>/dev/null \
+    || _info "Dest regen-pins had issues; continuing."
+
+  # 6.5 success) Compute the deterministic ipv6 the VM should have on dest.
   # Try Firestore first (proxmox_nodes/{node_id}.ip → derive prefix). If missing,
   # fall back to deriving the prefix from dest's vmbr0 over SSH. Done now (not
   # later) so it's available for both the Windows reset verification AND the
@@ -538,70 +549,67 @@ PY
     fi
   fi
 
-  # 7 success) Assign deterministic static IPv6 + renew DHCPv4 on dest VM.
-  # Uses _run_dest_ps (-EncodedCommand base64) + Get-NetAdapter -Physical so we
-  # don't depend on an adapter literally named "Ethernet" (renames are common)
-  # and so we don't have to fight nested bash/ssh/PowerShell quoting.
+  # 7 success) Force DHCPv6 + DHCPv4 renewal on dest VM.
+  # The dest dnsmasq has the new pin (regen-pins above), so a fresh DHCPv6
+  # SOLICIT will return <dest_prefix>::<vmid_hex>. The source node's DHCPv4
+  # lease is also no longer valid, so /release + /renew picks up a v4 from
+  # the dest node's dnsmasq.
   #
   # PS:
   #   1. Find the active physical adapter
-  #   2. Remove any prior Manual IPv6 in PersistentStore/ActiveStore that doesn't
-  #      match expected (clears the OLD node's static IPv6 left over after the
-  #      hot-migration; otherwise both old + new addresses would coexist).
-  #   3. Add the expected IPv6 to BOTH stores (PersistentStore = survive reboots,
-  #      ActiveStore = bound now without restart). Idempotent.
-  #   4. Release/renew DHCPv4 so the VM gets a fresh lease from the dest node's
-  #      dnsmasq (the source node's lease is no longer valid).
+  #   2. Re-enable DHCPv6 on the interface (idempotent; the previous static-
+  #      in-guest attempt may have left it Disabled on some VMs).
+  #   3. Remove any leftover Manual IPv6 in PersistentStore/ActiveStore from
+  #      the previous static-in-guest attempt.
+  #   4. ipconfig /release6 + /renew6 + /release + /renew → fresh leases on
+  #      the dest node for both address families.
   local DEST_STATUS
   DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
   if [[ "$DEST_STATUS" == "running" ]]; then
     local ostype
     ostype="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)"
-    if [[ "$ostype" == win* && -n "$EXPECTED_IPV6" ]]; then
-      _info "Assigning static IPv6 ${EXPECTED_IPV6} + renewing DHCPv4 lease on dest VM..."
-      local PS_ASSIGN
-      PS_ASSIGN=$(cat <<PSEOF
-\$ErrorActionPreference = 'SilentlyContinue'
-\$exp = '${EXPECTED_IPV6}'
-\$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
-if (-not \$a) { Write-Error 'no active physical adapter'; exit 1 }
-\$idx = \$a.ifIndex
-Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -Dhcp Disabled -ErrorAction SilentlyContinue | Out-Null
-foreach (\$st in 'PersistentStore', 'ActiveStore') {
-  Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -PolicyStore \$st -ErrorAction SilentlyContinue |
-    Where-Object { \$_.PrefixOrigin -eq 'Manual' -and \$_.IPAddress -ne \$exp } |
+    if [[ "$ostype" == win* ]]; then
+      _info "Forcing DHCPv6 + DHCPv4 renewal on dest VM..."
+      local PS_RENEW
+      PS_RENEW=$(cat <<'PSEOF'
+$ErrorActionPreference = 'SilentlyContinue'
+$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
+if (-not $a) { Write-Error 'no active physical adapter'; exit 1 }
+$idx = $a.ifIndex
+Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -Dhcp Enabled -ErrorAction SilentlyContinue | Out-Null
+foreach ($st in 'PersistentStore', 'ActiveStore') {
+  Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv6 -PolicyStore $st -ErrorAction SilentlyContinue |
+    Where-Object { $_.PrefixOrigin -eq 'Manual' } |
     ForEach-Object {
-      Remove-NetIPAddress -InterfaceIndex \$idx -IPAddress \$_.IPAddress -PolicyStore \$st -Confirm:\$false -ErrorAction SilentlyContinue
+      Remove-NetIPAddress -InterfaceIndex $idx -IPAddress $_.IPAddress -PolicyStore $st -Confirm:$false -ErrorAction SilentlyContinue
     }
 }
-foreach (\$st in 'PersistentStore', 'ActiveStore') {
-  Remove-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore \$st -Confirm:\$false -ErrorAction SilentlyContinue
-  New-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PrefixLength 64 -AddressFamily IPv6 -PolicyStore \$st -ErrorAction SilentlyContinue | Out-Null
-}
+ipconfig /release6 | Out-Null
+ipconfig /renew6 | Out-Null
 ipconfig /release | Out-Null
 ipconfig /renew | Out-Null
 exit 0
 PSEOF
 )
-      if _run_dest_ps "$PS_ASSIGN" 90; then
-        _ok "Static IPv6 + DHCPv4 renewal completed."
+      if _run_dest_ps "$PS_RENEW" 90; then
+        _ok "DHCPv6 + DHCPv4 renewal completed."
       else
-        _warn "Static IPv6 assignment did not complete cleanly (guest agent unavailable or exec timed out)."
+        _warn "Renewal PS did not complete cleanly (guest agent unavailable or exec timed out)."
       fi
 
-      _info "Verifying dest VM has deterministic ipv6 ${EXPECTED_IPV6}..."
-      if _verify_dest_ipv6 "$EXPECTED_IPV6" 30; then
-        _ok "ipv6 ${EXPECTED_IPV6} verified on dest VM."
-      else
-        _warn "ipv6 ${EXPECTED_IPV6} not visible after assignment (within 30s). Proceeding with Firestore update anyway."
+      if [[ -n "$EXPECTED_IPV6" ]]; then
+        _info "Verifying dest VM has deterministic ipv6 ${EXPECTED_IPV6}..."
+        if _verify_dest_ipv6 "$EXPECTED_IPV6" 60; then
+          _ok "ipv6 ${EXPECTED_IPV6} verified on dest VM."
+        else
+          _warn "ipv6 ${EXPECTED_IPV6} not visible after renewal (within 60s). Proceeding with Firestore update anyway."
+        fi
       fi
-    elif [[ "$ostype" == win* ]]; then
-      _warn "Windows VM but EXPECTED_IPV6 could not be derived; skipping in-guest static assignment."
     else
-      _info "VM ostype is '${ostype}' (not Windows); skipping in-guest IPv6 assignment."
+      _info "VM ostype is '${ostype}' (not Windows); skipping in-guest renewal."
     fi
   else
-    _info "VM ${VMID} is not running on destination (status: ${DEST_STATUS:-unknown}); skipping in-guest IPv6 assignment."
+    _info "VM ${VMID} is not running on destination (status: ${DEST_STATUS:-unknown}); skipping in-guest renewal."
   fi
 
   # 8 success) Update Firestore: nodeId + maintenance=false + deterministic ipv6 ALWAYS;
