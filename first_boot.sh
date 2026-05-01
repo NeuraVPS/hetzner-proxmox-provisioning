@@ -91,28 +91,25 @@ dhcp-range=10.0.0.100,10.0.255.254,255.255.0.0,720h
 dhcp-option=3,10.0.0.1
 dhcp-option=6,185.12.64.1,185.12.64.2
 
-# ==== IPv6: stateful DHCPv6, no SLAAC. Per-VM addresses pinned in vm-pins.conf ====
-# `static` modifier => only dhcp-host pinned addresses are handed out, AND the
-# advertised prefix in the RA has A=0 (no SLAAC). M=1 stays set, so Windows
-# will run its DHCPv6 client and receive the pin instead of generating a
-# stable-privacy SLAAC address.
-# `ra-param=vmbr0,30,1800` => unsolicited RA every ~30s (default would be 200-600s);
-# protects against Windows missing the first RA on boot.
+# ==== IPv6: stateless RA (SLAAC) — guests self-configure via EUI-64 ====
+# VMs are created with MACs encoding their VMID (52:54:00:00:HH:LL where HHLL =
+# vmid in hex), and Windows guests are configured (template + first-boot) to
+# disable RFC 7217 stable-privacy and privacy extensions. Result: every VM
+# auto-derives a deterministic IPv6 of <prefix>::5054:ff:fe00:<vmid_hex> from
+# its own MAC via EUI-64 SLAAC. No DHCPv6 server roundtrip on guest boot —
+# the SLAAC mechanism is passive (RA from dnsmasq, address derived locally),
+# so reboots/resets always recover IPv6 immediately without our intervention.
+# ra-stateless = RA with M=0 (no DHCPv6 addresses), A=1 (SLAAC), O=1 (DHCPv6
+# only for stateless options like DNS).
 enable-ra
-ra-param=vmbr0,30,1800
-dhcp-range=::ff00,::fffe,constructor:vmbr0,static,64,720h
+dhcp-range=::100,::1ff,constructor:vmbr0,ra-stateless,720h
 dhcp-option=option6:dns-server,[2a01:4ff:ff00::add:1],[2a01:4ff:ff00::add:2]
 EOF
 
-# Ensure vm-pins.conf exists (sync-dnat.py regen-pins will populate it)
-touch /etc/dnsmasq.d/vm-pins.conf
+# Clean up any stale vm-pins.conf left over from the old DHCPv6-pin model.
+rm -f /etc/dnsmasq.d/vm-pins.conf
 
 systemctl restart dnsmasq
-
-# Generate initial pins from any existing VM configs (idempotent; empty on a fresh node)
-if [ -x /var/lib/svz/snippets/sync-dnat.py ]; then
-  /var/lib/svz/snippets/sync-dnat.py regen-pins || true
-fi
 
 ############################################
 # Raw swap: 23 GB per disk (reserved by install via zfs.hdsize)
