@@ -103,14 +103,30 @@ remote_task() {
         # Parse exitcode + out-data + err-data robustly (JSON has escapes).
         local _parsed
         _parsed=$(echo "$_st" | python3 -c '
-import json, sys
+import json, re, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
     print("0||||"); sys.exit(0)
 ec = d.get("exitcode", 0) or 0
-od = (d.get("out-data") or "")[:200].replace("\n"," ").replace("\r"," ").replace("|","/")
-ed = (d.get("err-data") or "")[:200].replace("\n"," ").replace("\r"," ").replace("|","/")
+def clean(s):
+    s = (s or "")
+    if "#< CLIXML" in s:
+        # PowerShell wraps error/warning streams in CLIXML XML when emitted via
+        # the agent. The actual error text lives inside <S>...</S> elements
+        # (and sometimes <ToString>...</ToString>). Extract only those, ignore
+        # progress objects + XML structure.
+        parts = re.findall(r"<(?:S|ToString)(?:\s+[^>]*)?>([^<]*)</(?:S|ToString)>", s)
+        s = " ".join(parts)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = (s.replace("&lt;","<").replace("&gt;",">").replace("&amp;","&")
+           .replace("&quot;","\"").replace("&apos;","\x27"))
+    s = re.sub(r"_x([0-9a-fA-F]{4})_", lambda m: chr(int(m.group(1),16)), s)
+    s = re.sub(r"[\x00-\x08\x0e-\x1f]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.replace("|","/")[:500]
+od = clean(d.get("out-data"))
+ed = clean(d.get("err-data"))
 print(f"{ec}||||{od}||||{ed}")
 ' 2>/dev/null)
         local _ec="${_parsed%%\|\|\|\|*}"
@@ -228,6 +244,7 @@ CONF
     local PS_CONFIGURE
     PS_CONFIGURE=$(cat <<PSEOF
 \$ErrorActionPreference = 'SilentlyContinue'
+\$ProgressPreference = 'SilentlyContinue'
 \$exp   = '${EXPECTED_IPV6}'
 \$gw    = '${NODE_GATEWAY}'
 \$dns1  = '${DNS6_PRIMARY}'
@@ -239,12 +256,16 @@ if (-not \$a) { [Console]::Error.WriteLine('no active physical adapter'); exit 1
 \$alias = \$a.InterfaceAlias
 
 function Test-Configured {
-  foreach (\$store in 'ActiveStore', 'PersistentStore') {
-    \$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore \$store -ErrorAction SilentlyContinue
-    if (-not (\$ac -and \$ac.PrefixOrigin -eq 'Manual')) { return \$false }
-    \$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue | Where-Object { \$_.NextHop -eq \$gw }
-    if (-not \$rc) { return \$false }
-  }
+  # Reboot persistence requires the address to be in NSI PolicyStore
+  # PersistentStore (verified empirically on Server 2025: Windows reads from
+  # NSI Persistent, NOT from HKLM\\...\\Tcpip6\\Parameters\\Interfaces\\<guid>
+  # legacy registry). Active store is what's bound right now.
+  \$pp = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+  if (-not (\$pp -and \$pp.PrefixOrigin -eq 'Manual')) { return \$false }
+  \$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+  if (-not (\$ac -and \$ac.PrefixOrigin -eq 'Manual')) { return \$false }
+  \$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object { \$_.NextHop -eq \$gw }
+  if (-not \$rc) { return \$false }
   \$d = (Get-DnsClientServerAddress -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue).ServerAddresses
   if (-not \$d -or -not (\$d -contains \$dns1)) { return \$false }
   return \$true
@@ -274,42 +295,51 @@ Get-NetRoute -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyCont
     Remove-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -Confirm:\$false -ErrorAction SilentlyContinue
   }
 
-foreach (\$store in 'active', 'persistent') {
-  & netsh interface ipv6 delete address "\$alias" "\$exp"        store=\$store 2>&1 | Out-Null
-  & netsh interface ipv6 add    address "\$alias" "\$exp/64"     store=\$store 2>&1 | Out-Null
-  & netsh interface ipv6 delete route   "::/0" "\$alias" "\$gw"  store=\$store 2>&1 | Out-Null
-  & netsh interface ipv6 add    route   "::/0" "\$alias" "\$gw"  store=\$store 2>&1 | Out-Null
+# A) Address + route via New-NetIPAddress / New-NetRoute WITHOUT -PolicyStore.
+# Server 2025's NetTCPIP CIM provider rejects 'New-NetIPAddress -PolicyStore
+# PersistentStore' with "Invalid parameter PolicyStore PersistentStore", but
+# the default (no -PolicyStore) writes to BOTH ActiveStore AND PersistentStore
+# — that's what Network Properties GUI does internally and what produces
+# entries that survive reboot in NSI Persistent (verified in a known-working
+# VM on another node).
+\$createErrors = @()
+try {
+  New-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PrefixLength 64 -AddressFamily IPv6 -ErrorAction Stop | Out-Null
+} catch {
+  \$createErrors += "New-NetIPAddress: \$(\$_.Exception.Message)"
 }
+try {
+  New-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -NextHop \$gw -AddressFamily IPv6 -ErrorAction Stop | Out-Null
+} catch {
+  \$createErrors += "New-NetRoute: \$(\$_.Exception.Message)"
+}
+
+# B) DNS via netsh (set/add dnsserver are persistent by default and survive
+# reboot in this build — confirmed by VM diagnostics).
 & netsh interface ipv6 set dnsserver "\$alias" static \$dns1 primary validate=no 2>&1 | Out-Null
 & netsh interface ipv6 add dnsserver "\$alias" \$dns2 index=2 validate=no 2>&1 | Out-Null
 
-# 4b) ALSO write via NSI cmdlets so Get-NetIPAddress/Get-NetRoute see the
-# entry. netsh's persistent store and NSI's PersistentStore aren't always
-# synced on Server 2025 — netsh provides reboot-reliable persistence, but
-# NSI is what we verify against. New-NetIP* fail silently if the entry
-# already exists (-ErrorAction SilentlyContinue swallows it).
-foreach (\$store in 'PersistentStore', 'ActiveStore') {
-  New-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PrefixLength 64 -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
-  New-NetRoute     -InterfaceIndex \$idx -DestinationPrefix '::/0' -NextHop \$gw -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
-}
-
+# Verify both PersistentStore (what survives reboot) and ActiveStore (live).
 \$errors = @()
-foreach (\$pair in @(@{Store='ActiveStore'; Tag='active'}, @{Store='PersistentStore'; Tag='persistent'})) {
-  \$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore \$pair.Store -ErrorAction SilentlyContinue
-  if (-not \$ac) {
-    \$errors += "addr-\$(\$pair.Tag): not present"
-  } elseif (\$ac.PrefixOrigin -ne 'Manual') {
-    \$errors += "addr-\$(\$pair.Tag): origin=\$(\$ac.PrefixOrigin) (expected Manual)"
-  }
-  \$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore \$pair.Store -ErrorAction SilentlyContinue |
-    Where-Object { \$_.NextHop -eq \$gw }
-  if (-not \$rc) {
-    \$errors += "route-\$(\$pair.Tag): no ::/0 via \$gw"
-  }
+\$errors += \$createErrors
+\$pp = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+if (-not (\$pp -and \$pp.PrefixOrigin -eq 'Manual')) {
+  \$errors += "addr-persistent: not in NSI PersistentStore as Manual"
+}
+\$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+if (-not \$ac) {
+  \$errors += "addr-active: not bound"
+} elseif (\$ac.PrefixOrigin -ne 'Manual') {
+  \$errors += "addr-active: origin=\$(\$ac.PrefixOrigin) (expected Manual)"
+}
+\$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+  Where-Object { \$_.NextHop -eq \$gw }
+if (-not \$rc) {
+  \$errors += "route-active: no ::/0 via \$gw"
 }
 \$d = (Get-DnsClientServerAddress -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue).ServerAddresses
 if (-not \$d -or -not (\$d -contains \$dns1)) {
-  \$errors += "dns: \$dns1 missing (have='\$(\$d -join ',')')"
+  \$errors += "dns-active: \$dns1 missing"
 }
 
 if (\$errors.Count -gt 0) {
@@ -323,7 +353,7 @@ exit 0
 PSEOF
 )
 
-    _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 60
+    _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 180
     local _ps_rc=$? _kind=""
     if [[ "$_ps_rc" -eq 0 ]]; then
       _kind="configured"
@@ -355,13 +385,31 @@ PSEOF
   # and its outcome to a per-VM kind file in TMPDIR. After all workers finish
   # we replay the logs in qm-list order (so output isn't interleaved) and
   # aggregate the counters.
+  #
+  # Optional VMID filter: if the env var ONLY_VMIDS is set (whitespace-
+  # separated list, e.g. "237 261"), only those VMIDs are processed. Useful
+  # for re-running specific VMs that failed in a previous pass.
   local TMPDIR jobs=0
   TMPDIR=$(mktemp -d /tmp/migv6.XXXXXX)
   declare -a vm_order=()
+  declare -a _ONLY_VMIDS=()
+  if [[ -n "${ONLY_VMIDS:-}" ]]; then
+    read -ra _ONLY_VMIDS <<< "$ONLY_VMIDS"
+    echo "VMID filter active: only processing ${_ONLY_VMIDS[*]}"
+  fi
 
   while read -r vmid status; do
     [[ "$vmid" =~ ^[0-9]+$ ]] || continue
     [[ "$vmid" -ge 100 && "$vmid" -le 9999 ]] || continue
+
+    if (( ${#_ONLY_VMIDS[@]} > 0 )); then
+      local _match=0
+      for _v in "${_ONLY_VMIDS[@]}"; do
+        if [[ "$_v" == "$vmid" ]]; then _match=1; break; fi
+      done
+      (( _match == 0 )) && continue
+    fi
+
     vm_order+=("$vmid")
 
     ( _process_vm "$vmid" "$status" "$TMPDIR" ) > "$TMPDIR/${vmid}.log" 2>&1 &
@@ -413,6 +461,10 @@ SKIP_HOST_NUMS=(3 26 35)
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
 HOST_NUM_GTE=
 HOST_NUM_LTE=
+# Optional per-node VMID filter: only process these VMIDs on each node.
+# Useful for re-running specific VMs that failed in a previous pass.
+# Leave empty to process all VMs on the node.
+ONLY_VMIDS=(444) #(237 261)
 
 while read -r hostname ip; do
     host_num=$((10#${hostname%%-*}))
@@ -434,8 +486,12 @@ while read -r hostname ip; do
     echo "------------------------------------------------"
     echo "Connecting to $hostname ($ip)"
 
+    # Inject ONLY_VMIDS as an env var on the remote shell (single-quoted so
+    # the local array doesn't get re-expanded). Empty if unset.
+    only_vmids_str="${ONLY_VMIDS[*]:-}"
+
     ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$ip" \
-        "$FUNC_CONTENT; remote_task" \
+        "ONLY_VMIDS='${only_vmids_str}'; $FUNC_CONTENT; remote_task" \
         2>&1 \
         | tee >(grep -F 'RUNREMOTES_FAIL' \
                 | awk -v ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" '{print ts "\t" $0}' \
