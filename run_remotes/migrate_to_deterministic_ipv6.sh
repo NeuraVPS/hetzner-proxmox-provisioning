@@ -46,13 +46,13 @@
 remote_task() {
   set +e
 
-  local NODE_NAME SYNC_DNAT SYNC_DNAT_URL PER_VM_SLEEP DNS6_PRIMARY DNS6_SECONDARY
+  local NODE_NAME SYNC_DNAT SYNC_DNAT_URL DNS6_PRIMARY DNS6_SECONDARY MAX_PARALLEL
   NODE_NAME="$(hostname)"
   SYNC_DNAT="/var/lib/svz/snippets/sync-dnat.py"
   SYNC_DNAT_URL="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py"
-  PER_VM_SLEEP=1
   DNS6_PRIMARY="2a01:4ff:ff00::add:1"
   DNS6_SECONDARY="2a01:4ff:ff00::add:2"
+  MAX_PARALLEL=5
 
   # ----- Helpers -----
 
@@ -70,7 +70,7 @@ remote_task() {
     [[ -n "$_b64" ]] || { _PS_LAST_ERROR="iconv/base64 failed"; return 1; }
 
     local _exec_out _pid _attempt=0
-    while (( _attempt < 6 )); do
+    while (( _attempt < 3 )); do
       _exec_out=$(pvesh create "/nodes/${NODE_NAME}/qemu/${_vmid}/agent/exec" \
         --output-format json \
         --command powershell.exe \
@@ -84,14 +84,14 @@ remote_task() {
       fi
       if echo "$_exec_out" | grep -qi "guest agent is not running"; then
         (( _attempt++ )) || true
-        sleep 3
+        sleep 2
         continue
       fi
       _PS_LAST_ERROR="pvesh exec error: ${_exec_out:0:200}"
       return 1
     done
     if [[ -z "$_pid" || "$_pid" -le 0 ]]; then
-      _PS_LAST_ERROR="guest agent never came up after 6 retries"
+      _PS_LAST_ERROR="guest agent never came up after 3 retries"
       return 1
     fi
 
@@ -123,45 +123,10 @@ print(f"{ec}||||{od}||||{ed}")
         _PS_LAST_ERROR="PS exitcode=${_ec} stderr='${_err_data}' stdout='${_out_data}'"
         return 1
       fi
-      sleep 2
-      (( _elapsed += 2 )) || true
+      sleep 1
+      (( _elapsed += 1 )) || true
     done
     _PS_LAST_ERROR="PS timed out after ${_timeout}s"
-    return 1
-  }
-
-  # Verify VM has the expected IPv6 bound. Uses canonical IPv6 comparison.
-  # Returns 0 if found within $3 seconds (default 15).
-  _verify_vmid_ipv6() {
-    local _vmid="$1" _expected="$2" _timeout="${3:-15}" _elapsed=0 _ifaces
-    while (( _elapsed < _timeout )); do
-      _ifaces=$(qm guest cmd "$_vmid" network-get-interfaces 2>/dev/null || true)
-      if [[ -n "$_ifaces" ]] && EXPECTED="$_expected" JSON="$_ifaces" python3 -c '
-import ipaddress, json, os, sys
-try:
-    target = ipaddress.IPv6Address(os.environ["EXPECTED"])
-except ValueError: sys.exit(2)
-try:
-    data = json.loads(os.environ["JSON"])
-except Exception: sys.exit(1)
-ifaces = data.get("result", data) if isinstance(data, dict) else data
-if not isinstance(ifaces, list): sys.exit(1)
-for iface in ifaces:
-    if not isinstance(iface, dict): continue
-    for addr in iface.get("ip-addresses") or []:
-        if not isinstance(addr, dict): continue
-        ip = str(addr.get("ip-address", "") or "").strip().split("%")[0]
-        if not ip: continue
-        try:
-            if ipaddress.IPv6Address(ip) == target: sys.exit(0)
-        except ValueError: continue
-sys.exit(1)
-' 2>/dev/null; then
-        return 0
-      fi
-      sleep 3
-      (( _elapsed += 3 )) || true
-    done
     return 1
   }
 
@@ -237,66 +202,29 @@ CONF
   fi
   echo "node_prefix=${NODE_PREFIX} gateway=${NODE_GATEWAY}"
 
-  # 6) Per-VM static IPv6 configuration loop
-  local configured=0 already=0 skipped=0 failed=0
-  while read -r vmid status; do
-    [[ "$vmid" =~ ^[0-9]+$ ]] || continue
-    [[ "$vmid" -ge 100 && "$vmid" -le 9999 ]] || continue
-
-    local EXPECTED_IPV6
+  # Per-VM worker — runs in a subshell. Stdout is captured to a per-VM log
+  # file by the caller; the VM's outcome (configured/already/skipped/failed)
+  # is written to a per-VM kind file. The kind file is what the parent uses
+  # to aggregate counters at the end.
+  _process_vm() {
+    local vmid="$1" status="$2" tmpdir="$3"
+    local kind_file="$tmpdir/${vmid}.kind"
+    local EXPECTED_IPV6 OSTYPE
     EXPECTED_IPV6="${NODE_PREFIX}$(printf '%x' "$vmid")"
 
     if [[ "$status" != "running" ]]; then
       echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	stopped (re-run script after VM is started; expected ipv6=${EXPECTED_IPV6})"
-      (( skipped++ )) || true
-      continue
+      echo skipped > "$kind_file"
+      return
     fi
 
-    # Skip non-Windows VMs — handle Linux/other manually
-    local OSTYPE
     OSTYPE=$(qm config "$vmid" 2>/dev/null | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r')
     if [[ "$OSTYPE" != win* ]]; then
       echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	ostype='${OSTYPE}' (not Windows; handle manually; expected ipv6=${EXPECTED_IPV6})"
-      (( skipped++ )) || true
-      continue
+      echo skipped > "$kind_file"
+      return
     fi
 
-    # Fast path: expected v6 is bound AND its origin is Manual in BOTH stores
-    # (Persistent + Active). Plain "is bound" isn't enough — a VM could have
-    # the expected v6 from a leftover DHCPv6 lease cached in Windows; on next
-    # reboot Windows would lose it. We need to verify the address is in
-    # PolicyStore PersistentStore as a Manual entry.
-    local PS_CHECK_MANUAL
-    PS_CHECK_MANUAL=$(cat <<PSEOF
-\$ErrorActionPreference = 'SilentlyContinue'
-\$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
-if (-not \$a) { exit 1 }
-\$persisted = Get-NetIPAddress -InterfaceIndex \$a.ifIndex -IPAddress '${EXPECTED_IPV6}' -PolicyStore PersistentStore -ErrorAction SilentlyContinue
-\$active    = Get-NetIPAddress -InterfaceIndex \$a.ifIndex -IPAddress '${EXPECTED_IPV6}' -PolicyStore ActiveStore     -ErrorAction SilentlyContinue
-if (\$persisted -and \$persisted.PrefixOrigin -eq 'Manual' -and \$active -and \$active.PrefixOrigin -eq 'Manual') { exit 0 }
-exit 1
-PSEOF
-)
-    if _run_ps_via_agent "$vmid" "$PS_CHECK_MANUAL" 20; then
-      if "$SYNC_DNAT" set-server-ipv6 "$vmid" "$EXPECTED_IPV6" >/dev/null 2>&1; then
-        echo "VM $vmid: ${EXPECTED_IPV6} already manually bound; Firestore synced"
-        (( already++ )) || true
-      else
-        echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	firestore set-server-ipv6 failed (already-manual VM)"
-        (( failed++ )) || true
-      fi
-      sleep "$PER_VM_SLEEP"
-      continue
-    fi
-
-    echo "--- VM $vmid: configuring static ${EXPECTED_IPV6}/64 gw=${NODE_GATEWAY} ---"
-
-    # PowerShell: full manual IPv6 config via legacy netsh + Set-NetIPInterface.
-    # Writes go to BOTH the active and persistent stores (active=bound now,
-    # persistent=survives reboot). Each netsh call captures stdout/stderr +
-    # \$LASTEXITCODE — if any failed, the script exits with code 2 and a
-    # one-line stderr describing what broke (surfaced via _PS_LAST_ERROR).
-    # 'delete' before 'add' makes it idempotent against prior runs.
     local PS_CONFIGURE
     PS_CONFIGURE=$(cat <<PSEOF
 \$ErrorActionPreference = 'SilentlyContinue'
@@ -310,20 +238,29 @@ if (-not \$a) { [Console]::Error.WriteLine('no active physical adapter'); exit 1
 \$idx   = \$a.ifIndex
 \$alias = \$a.InterfaceAlias
 
-# 1) Reset RFC 7217 / randomizeidentifiers / privacy to defaults (irrelevant
-# once RouterDiscovery is Disabled, but keeps the VM clean).
+function Test-Configured {
+  foreach (\$store in 'ActiveStore', 'PersistentStore') {
+    \$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore \$store -ErrorAction SilentlyContinue
+    if (-not (\$ac -and \$ac.PrefixOrigin -eq 'Manual')) { return \$false }
+    \$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue | Where-Object { \$_.NextHop -eq \$gw }
+    if (-not \$rc) { return \$false }
+  }
+  \$d = (Get-DnsClientServerAddress -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue).ServerAddresses
+  if (-not \$d -or -not (\$d -contains \$dns1)) { return \$false }
+  return \$true
+}
+
+if (Test-Configured) { exit 10 }
+
 Set-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters" -Name "EnableStableAddresses" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue | Out-Null
 & netsh interface ipv6 set global randomizeidentifiers=enabled store=persistent 2>&1 | Out-Null
 & netsh interface ipv6 set privacy state=enabled store=persistent 2>&1 | Out-Null
 
-# 2) Disable RouterDiscovery + Dhcp on the IPv6 interface, BOTH stores.
 foreach (\$store in 'PersistentStore', 'ActiveStore') {
   Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -RouterDiscovery Disabled -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
   Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -Dhcp Disabled -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
 }
 
-# 3) Remove ALL non-link-local IPv6 from BOTH stores via NSI. Drops SLAAC,
-# DHCPv6 leases, and prior Manual entries — clean slate for the netsh add.
 foreach (\$store in 'PersistentStore', 'ActiveStore') {
   Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue |
     Where-Object { \$_.PrefixOrigin -ne 'WellKnown' -and \$_.IPAddress -notlike 'fe80*' } |
@@ -337,38 +274,43 @@ Get-NetRoute -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyCont
     Remove-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -Confirm:\$false -ErrorAction SilentlyContinue
   }
 
-# 4) Static address + default route via LEGACY netsh into BOTH stores.
-# 'already exists' from netsh is treated as success — that means the entry
-# was already in the store from a previous run, which is exactly what we
-# want. Real failures (bad alias, write permission, etc.) still surface.
-\$errors = @()
-function Try-Netsh {
-  param([string]\$Tag, [string[]]\$NetshArgs)
-  \$out = & netsh @NetshArgs 2>&1
-  \$ec = \$LASTEXITCODE
-  if (\$ec -eq 0) { return \$null }
-  \$outStr = (\$out -join ' ').Trim()
-  if (\$outStr -match 'already exists' -or \$outStr -match 'The object already exists') { return \$null }
-  if (\$outStr -match 'no matching' -or \$outStr -match 'not found' -or \$outStr -match 'cannot find') { return \$null }
-  return "\$Tag(\$ec):\$outStr"
-}
-
 foreach (\$store in 'active', 'persistent') {
-  # Try delete first (silently); 'no matching'/'not found' is fine
-  \$null = Try-Netsh "del-addr-\$store" @('interface','ipv6','delete','address',\$alias,\$exp,"store=\$store")
-  \$err  = Try-Netsh "addr-\$store"      @('interface','ipv6','add','address',\$alias,"\$exp/64","store=\$store")
-  if (\$err) { \$errors += \$err }
+  & netsh interface ipv6 delete address "\$alias" "\$exp"        store=\$store 2>&1 | Out-Null
+  & netsh interface ipv6 add    address "\$alias" "\$exp/64"     store=\$store 2>&1 | Out-Null
+  & netsh interface ipv6 delete route   "::/0" "\$alias" "\$gw"  store=\$store 2>&1 | Out-Null
+  & netsh interface ipv6 add    route   "::/0" "\$alias" "\$gw"  store=\$store 2>&1 | Out-Null
+}
+& netsh interface ipv6 set dnsserver "\$alias" static \$dns1 primary validate=no 2>&1 | Out-Null
+& netsh interface ipv6 add dnsserver "\$alias" \$dns2 index=2 validate=no 2>&1 | Out-Null
 
-  \$null = Try-Netsh "del-route-\$store" @('interface','ipv6','delete','route','::/0',\$alias,\$gw,"store=\$store")
-  \$err  = Try-Netsh "route-\$store"     @('interface','ipv6','add','route','::/0',\$alias,\$gw,"store=\$store")
-  if (\$err) { \$errors += \$err }
+# 4b) ALSO write via NSI cmdlets so Get-NetIPAddress/Get-NetRoute see the
+# entry. netsh's persistent store and NSI's PersistentStore aren't always
+# synced on Server 2025 — netsh provides reboot-reliable persistence, but
+# NSI is what we verify against. New-NetIP* fail silently if the entry
+# already exists (-ErrorAction SilentlyContinue swallows it).
+foreach (\$store in 'PersistentStore', 'ActiveStore') {
+  New-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PrefixLength 64 -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
+  New-NetRoute     -InterfaceIndex \$idx -DestinationPrefix '::/0' -NextHop \$gw -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
 }
 
-# 5) DNS (set/add dnsserver are persistent by default).
-\$err = Try-Netsh "dns1" @('interface','ipv6','set','dnsserver',\$alias,'static',\$dns1,'primary','validate=no')
-if (\$err) { \$errors += \$err }
-\$err = Try-Netsh "dns2" @('interface','ipv6','add','dnsserver',\$alias,\$dns2,'index=2','validate=no')
-if (\$err) { \$errors += \$err }
+\$errors = @()
+foreach (\$pair in @(@{Store='ActiveStore'; Tag='active'}, @{Store='PersistentStore'; Tag='persistent'})) {
+  \$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore \$pair.Store -ErrorAction SilentlyContinue
+  if (-not \$ac) {
+    \$errors += "addr-\$(\$pair.Tag): not present"
+  } elseif (\$ac.PrefixOrigin -ne 'Manual') {
+    \$errors += "addr-\$(\$pair.Tag): origin=\$(\$ac.PrefixOrigin) (expected Manual)"
+  }
+  \$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore \$pair.Store -ErrorAction SilentlyContinue |
+    Where-Object { \$_.NextHop -eq \$gw }
+  if (-not \$rc) {
+    \$errors += "route-\$(\$pair.Tag): no ::/0 via \$gw"
+  }
+}
+\$d = (Get-DnsClientServerAddress -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue).ServerAddresses
+if (-not \$d -or -not (\$d -contains \$dns1)) {
+  \$errors += "dns: \$dns1 missing (have='\$(\$d -join ',')')"
+}
 
 if (\$errors.Count -gt 0) {
   \$msg = (\$errors -join ' || ')
@@ -381,51 +323,71 @@ exit 0
 PSEOF
 )
 
-    if ! _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 60; then
+    _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 60
+    local _ps_rc=$? _kind=""
+    if [[ "$_ps_rc" -eq 0 ]]; then
+      _kind="configured"
+    elif [[ "$_PS_LAST_ERROR" == *"exitcode=10"* ]]; then
+      _kind="already"
+    else
       echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	netsh static IPv6 config failed: ${_PS_LAST_ERROR}"
-      (( failed++ )) || true
-      continue
+      echo failed > "$kind_file"
+      return
     fi
 
-    # Verify expected v6 is bound. If not, dump current ifaces into the failure
-    # log so the operator can see what Windows actually has bound.
-    if ! _verify_vmid_ipv6 "$vmid" "$EXPECTED_IPV6" 15; then
-      local _current_v6
-      _current_v6=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null | python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-except Exception:
-    print(""); sys.exit(0)
-ifaces = d.get("result", d) if isinstance(d, dict) else d
-if not isinstance(ifaces, list): print(""); sys.exit(0)
-out = []
-for i in ifaces:
-    if not isinstance(i, dict): continue
-    for a in (i.get("ip-addresses") or []):
-        if not isinstance(a, dict): continue
-        if a.get("ip-address-type") == "ipv6":
-            ip = str(a.get("ip-address",""))
-            if ip and not ip.lower().startswith("fe80"): out.append(ip)
-print(",".join(out) or "none")
-' 2>/dev/null)
-      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	expected ${EXPECTED_IPV6} not bound after netsh config; current_v6=[${_current_v6:-unknown}]"
-      (( failed++ )) || true
-      continue
-    fi
-
-    # Update Firestore (only after verification — keeps NAT46 pointing at the
-    # previous IPv6 if anything went wrong above).
     if ! "$SYNC_DNAT" set-server-ipv6 "$vmid" "$EXPECTED_IPV6" >/dev/null 2>&1; then
-      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	firestore set-server-ipv6 failed after verify"
-      (( failed++ )) || true
-      continue
+      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	firestore set-server-ipv6 failed (kind=${_kind})"
+      echo failed > "$kind_file"
+      return
     fi
 
-    echo "  ✅ VM $vmid: static ipv6=${EXPECTED_IPV6}"
-    (( configured++ )) || true
-    sleep "$PER_VM_SLEEP"
+    if [[ "$_kind" == "already" ]]; then
+      echo "VM $vmid: ${EXPECTED_IPV6} already configured; Firestore synced"
+      echo already > "$kind_file"
+    else
+      echo "  ✅ VM $vmid: static ipv6=${EXPECTED_IPV6}"
+      echo configured > "$kind_file"
+    fi
+  }
+
+  # 6) Per-VM static IPv6 configuration loop — parallelized, max MAX_PARALLEL
+  # workers concurrently. Each worker writes its stdout to a per-VM log file
+  # and its outcome to a per-VM kind file in TMPDIR. After all workers finish
+  # we replay the logs in qm-list order (so output isn't interleaved) and
+  # aggregate the counters.
+  local TMPDIR jobs=0
+  TMPDIR=$(mktemp -d /tmp/migv6.XXXXXX)
+  declare -a vm_order=()
+
+  while read -r vmid status; do
+    [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+    [[ "$vmid" -ge 100 && "$vmid" -le 9999 ]] || continue
+    vm_order+=("$vmid")
+
+    ( _process_vm "$vmid" "$status" "$TMPDIR" ) > "$TMPDIR/${vmid}.log" 2>&1 &
+    (( jobs++ )) || true
+    if (( jobs >= MAX_PARALLEL )); then
+      wait -n 2>/dev/null
+      (( jobs-- )) || true
+    fi
   done < <(qm list 2>/dev/null | tail -n +2 | awk '{print $1, $3}')
+
+  wait 2>/dev/null
+
+  # Replay logs in order; tally kinds.
+  local configured=0 already=0 skipped=0 failed=0
+  for vmid in "${vm_order[@]}"; do
+    [[ -f "$TMPDIR/${vmid}.log" ]] && cat "$TMPDIR/${vmid}.log"
+    local kind=""
+    [[ -f "$TMPDIR/${vmid}.kind" ]] && kind=$(<"$TMPDIR/${vmid}.kind")
+    case "$kind" in
+      configured) (( configured++ )) || true ;;
+      already)    (( already++ ))    || true ;;
+      skipped)    (( skipped++ ))    || true ;;
+      failed|"")  (( failed++ ))     || true ;;
+    esac
+  done
+  rm -rf "$TMPDIR"
 
   echo "== Finished: configured=${configured} already=${already} skipped=${skipped} failed=${failed} =="
 }
@@ -445,9 +407,9 @@ FAILURE_LOG="${FAILURE_LOG:-$(pwd)/migrate_to_deterministic_ipv6.failures.log}"
 echo "Failure log: $FAILURE_LOG"
 
 # Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
-ONLY_HOST_NUMS=(35)
+ONLY_HOST_NUMS=(62)
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
-SKIP_HOST_NUMS=(3)
+SKIP_HOST_NUMS=(3 26 35)
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
 HOST_NUM_GTE=
 HOST_NUM_LTE=
