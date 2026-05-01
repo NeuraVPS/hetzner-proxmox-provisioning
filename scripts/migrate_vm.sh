@@ -54,6 +54,7 @@ pve_zfs_migrate_vm() {
   _die()  { echo "❌ $*" >&2; exit 1; }
   _info() { echo "ℹ️  $*" >&2; }
   _ok()   { echo "✅ $*" >&2; }
+  _warn() { echo "⚠️  $*" >&2; }
 
   # Extract host from DEST_SSH (root@10.64.0.7 -> 10.64.0.7; root@fd00:4000::7 -> fd00:4000::7)
   _extract_dest_host() {
@@ -283,7 +284,19 @@ def _compute_deterministic_ipv6(db, node_id: str, vmid: int):
         return None
 
 
-def update_server_migration(vmid: int, connection_url: str, node_id: str) -> bool:
+def update_server_migration(vmid: int, connection_url: str, node_id: str,
+                             explicit_ipv6: str = "") -> bool:
+    """Update servers/{id} after a successful migration.
+
+    Always sets nodeId and maintenance=False. ipv6 is set if either:
+      (a) explicit_ipv6 is non-empty (passed in by caller, e.g. derived from
+          dest vmbr0 over SSH), or
+      (b) we can derive it from proxmox_nodes/{node_id}.ip in Firestore.
+
+    connection_url is set only if non-empty — if the dest's public IP couldn't
+    be determined, the critical fields (nodeId, ipv6) still flip so NAT46
+    retargets correctly; connectionUrl can be patched later.
+    """
     if not initialize_firebase():
         return False
     try:
@@ -292,11 +305,14 @@ def update_server_migration(vmid: int, connection_url: str, node_id: str) -> boo
         if not docs:
             return False
         update_data = {
-            "connectionUrl": connection_url,
             "nodeId": node_id,
             "maintenance": False,
         }
-        ipv6 = _compute_deterministic_ipv6(db, node_id, vmid)
+        if connection_url:
+            update_data["connectionUrl"] = connection_url
+        # Prefer explicit ipv6 (caller already validated/derived it); fall back
+        # to deriving from proxmox_nodes/{node_id}.ip in Firestore.
+        ipv6 = explicit_ipv6 or _compute_deterministic_ipv6(db, node_id, vmid)
         if ipv6:
             update_data["ipv6"] = ipv6
         for doc_snapshot in docs:
@@ -314,19 +330,34 @@ def main():
                         help="Set maintenance=True and nodeId (requires only vmid). Used before migration.")
     parser.add_argument("--print-ipv6", action="store_true",
                         help="Print deterministic ipv6 for (vmid, node_id) and exit. No Firestore write.")
+    parser.add_argument("--ipv6", default="",
+                        help="Explicit ipv6 to write (overrides Firestore-derived). Used when "
+                             "proxmox_nodes/{node_id}.ip is missing and the bash side derived "
+                             "the prefix from the dest's vmbr0 directly.")
     parser.add_argument("vmid", type=int, help="Proxmox VM ID (proxmoxId)")
     parser.add_argument("connection_url", nargs="?", default="", help="connectionUrl")
     parser.add_argument("node_id", nargs="?", default="", help="Destination node hostname (nodeId)")
     args = parser.parse_args()
 
     if args.print_ipv6:
-        if not args.node_id:
+        # Backward-compat: callers may invoke `--print-ipv6 <vmid> <node_id>` (skipping
+        # the optional connection_url positional). In that case argparse fills
+        # `connection_url` with what was meant to be `node_id`. If `node_id` is
+        # empty AND `connection_url` looks like a hostname (not an IP:PORT), treat it
+        # as the node_id.
+        node_id_for_ipv6 = args.node_id
+        if not node_id_for_ipv6 and args.connection_url and ":" not in args.connection_url:
+            node_id_for_ipv6 = args.connection_url
+        if not node_id_for_ipv6:
             parser.error("--print-ipv6 requires both vmid and node_id")
         if not initialize_firebase():
             sys.stderr.write("firebase init failed\n"); sys.exit(1)
-        ipv6 = _compute_deterministic_ipv6(firestore.client(), args.node_id, args.vmid)
+        ipv6 = _compute_deterministic_ipv6(firestore.client(), node_id_for_ipv6, args.vmid)
         if not ipv6:
-            sys.stderr.write("could not compute deterministic ipv6 (check proxmox_nodes/<node>.ip)\n")
+            sys.stderr.write(
+                f"could not compute deterministic ipv6 for node={node_id_for_ipv6!r} vmid={args.vmid} "
+                f"(check proxmox_nodes/<node>.ip exists and is well-formed)\n"
+            )
             sys.exit(1)
         print(ipv6)
         sys.exit(0)
@@ -344,9 +375,11 @@ def main():
             sys.exit(1)
         sys.exit(0)
 
-    if not args.connection_url or not args.node_id:
-        parser.error("connection_url and node_id required when not using --set-maintenance")
-    if not update_server_migration(args.vmid, args.connection_url, args.node_id):
+    # node_id is required for migration update; connection_url is optional
+    # (will be skipped in the Firestore write if empty — see update_server_migration).
+    if not args.node_id:
+        parser.error("node_id required when not using --set-maintenance/--set-migration-prep/--print-ipv6")
+    if not update_server_migration(args.vmid, args.connection_url, args.node_id, args.ipv6):
         sys.stderr.write("update_firestore_migration: failed (no creds, no doc, or Firestore error)\n")
         sys.exit(1)
     sys.exit(0)
@@ -492,117 +525,62 @@ PY
   ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}' && '${SYNC_DNAT}' regen-pins" 2>/dev/null \
     || _info "Dest regen-pins had issues; continuing."
 
-  # 7 success) Run network reset on destination if Windows + running, then add hookscript and update Firestore.
+  # 6.5 success) Compute the deterministic ipv6 the VM should have on dest.
+  # Try Firestore first (proxmox_nodes/{node_id}.ip → derive prefix). If missing,
+  # fall back to deriving the prefix from dest's vmbr0 over SSH. Done now (not
+  # later) so it's available for both the Windows reset verification AND the
+  # Firestore update at step 8 — regardless of OS type or running state.
+  local EXPECTED_IPV6=""
+  EXPECTED_IPV6="$(_firestore_update --print-ipv6 "$VMID" "$DEST_NODE" 2>/dev/null | tr -d '[:space:]\r')" || EXPECTED_IPV6=""
+  if [[ -z "$EXPECTED_IPV6" ]]; then
+    _info "proxmox_nodes/${DEST_NODE}.ip missing in Firestore; deriving prefix from dest vmbr0 directly..."
+    local DEST_PREFIX
+    DEST_PREFIX="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" \
+      "ip -6 -o addr show dev vmbr0 scope global 2>/dev/null | awk '{print \$4}' | head -1 | cut -d/ -f1 | awk -F: '{printf \"%s:%s:%s:%s::\", \$1, \$2, \$3, \$4}'" \
+      2>/dev/null | tr -d '\r')"
+    if [[ -n "$DEST_PREFIX" && "$DEST_PREFIX" != "::"* ]]; then
+      local VMID_HEX
+      VMID_HEX="$(printf '%x' "$VMID")"
+      EXPECTED_IPV6="${DEST_PREFIX}${VMID_HEX}"
+      _info "Derived deterministic ipv6 from dest vmbr0: ${EXPECTED_IPV6}"
+    else
+      _warn "Could not derive prefix from dest vmbr0 either; ipv6 won't be updated in Firestore."
+    fi
+  fi
+
+  # 7 success) Run network reset on destination if Windows + running.
+  # Uses _run_dest_ps (-EncodedCommand base64) + Get-NetAdapter -Physical so we
+  # don't depend on an adapter literally named "Ethernet" (which silently no-ops
+  # on customers who renamed it) and so we don't have to fight nested bash/ssh/
+  # PowerShell quoting.
   local DEST_STATUS
   DEST_STATUS="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm status '${VMID}' 2>/dev/null" | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)"
   if [[ "$DEST_STATUS" == "running" ]]; then
     local ostype
     ostype="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "qm config '${VMID}' 2>/dev/null" | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)"
     if [[ "$ostype" == win* ]]; then
-      local agent_poll_interval=5 agent_poll_max=90 agent_attempt=0 agent_pid=""
-      _info "Polling for guest agent (retry every ${agent_poll_interval}s, max ${agent_poll_max}s)..."
-      while (( agent_attempt * agent_poll_interval < agent_poll_max )); do
-        local exec_out
-        exec_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'pvesh create /nodes/'"${DEST_NODE}"'/qemu/'"${VMID}"'/agent/exec --output-format json --command powershell.exe --command -NoProfile --command -NonInteractive --command -Command --command "ipconfig /release; ipconfig /release6; Disable-NetAdapter -Name Ethernet -Confirm:\$false; Start-Sleep -Seconds 3; Enable-NetAdapter -Name Ethernet -Confirm:\$false; Start-Sleep -Seconds 2; ipconfig /renew; ipconfig /renew6"' 2>&1)" || true
-        agent_pid="$(echo "$exec_out" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-        if [[ -n "$agent_pid" && "$agent_pid" -gt 0 ]]; then
-          _ok "Guest agent exec started (PID ${agent_pid}); waiting for network reset to complete..."
-          local agent_exit_elapsed=0 agent_exit_timeout=120
-          while (( agent_exit_elapsed < agent_exit_timeout )); do
-            local status_out
-            status_out="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" "pvesh get /nodes/${DEST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${agent_pid}' 2>/dev/null" || true)"
-            if echo "$status_out" | grep -qE '"exited"\s*:\s*1'; then
-              _ok "Windows network reset (adapter disable/enable) completed."
-              _info "Command output:"
-              echo "$status_out" | python3 -c '
-import json,sys,base64
-raw=json.load(sys.stdin)
-d=raw.get("data",raw.get("result",raw)) if isinstance(raw,dict) else {}
-if not isinstance(d,dict): d={}
-printed=0
-for k in ("out-data","err-data"):
-  v=d.get(k)
-  if v:
-    try: text=base64.b64decode(v).decode("utf-8","replace")
-    except: text=str(v)
-    label="stdout" if k=="out-data" else "stderr"
-    print("---", label, "---")
-    print(text)
-    print()
-    printed+=1
-if not printed:
-  print("(no out-data/err-data in response; raw keys:", list(d.keys()) if isinstance(d,dict) else "?")
-  print("Full response:", json.dumps(raw)[:500])
-' || true
-              break 2
-            fi
-            sleep 5
-            (( agent_exit_elapsed += 5 )) || true
-          done
-          break
-        fi
-        if echo "$exec_out" | grep -qi "guest agent is not running"; then
-          (( agent_attempt++ )) || true
-          _info "Guest agent not ready (attempt ${agent_attempt}); retrying in ${agent_poll_interval}s..."
-          sleep "$agent_poll_interval"
-        else
-          _info "Guest exec failed or not available: ${exec_out:0:200}; skipping network reset."
-          break
-        fi
-      done
-      if [[ -z "${agent_pid}" || "${agent_pid:-0}" -le 0 ]]; then
-        _info "Could not run guest agent network reset within ${agent_poll_max}s; will try recovery."
-      else
-        _info "Waiting 5s for network to settle..."
+      _info "Running Windows network reset (release6/renew6 + cycle physical adapter)..."
+      local PS_RESET='$a = Get-NetAdapter -Physical | Where-Object { $_.Status -eq "Up" }; ipconfig /release; ipconfig /release6; $a | Disable-NetAdapter -Confirm:$false; Start-Sleep -Seconds 4; $a | Enable-NetAdapter -Confirm:$false; Start-Sleep -Seconds 2; ipconfig /renew; ipconfig /renew6'
+      if _run_dest_ps "$PS_RESET" 120; then
+        _ok "Network reset PowerShell completed."
         sleep 5
+      else
+        _warn "Network reset PowerShell did not complete cleanly (guest agent unavailable, or exec timed out)."
       fi
 
-      # Compute the deterministic ipv6 we expect Windows to acquire on dest.
-      local EXPECTED_IPV6=""
-      EXPECTED_IPV6="$(_firestore_update --print-ipv6 "$VMID" "$DEST_NODE" 2>/dev/null | tr -d '[:space:]\r')" || EXPECTED_IPV6=""
-
-      # Verification + recovery ladder. On success: log and proceed.
-      # On total failure: warn loudly and proceed anyway (Firestore update at step 8
-      # will still flip NAT46 to <dest_prefix>::<vmid_hex> — once Windows eventually
-      # renews, RDP recovers without further intervention).
-      local IPV6_VERIFIED=0
-      local VERIFY_NOTE="not attempted"
+      # Verify the deterministic ipv6 is now bound. Best-effort: if the verification
+      # times out we still update Firestore (step 8) so NAT46 retargets to the new
+      # prefix; Windows usually renews within minutes after the RA cadence kicks in.
       if [[ -z "$EXPECTED_IPV6" ]]; then
-        _info "Could not derive deterministic ipv6 (proxmox_nodes/${DEST_NODE}.ip missing?); skipping verification."
-        VERIFY_NOTE="no expected ipv6"
+        _info "No expected ipv6 to verify against; skipping verification."
       else
         _info "Verifying dest VM has deterministic ipv6 ${EXPECTED_IPV6}..."
-        if _verify_dest_ipv6 "$EXPECTED_IPV6" 90; then
-          IPV6_VERIFIED=1
-          VERIFY_NOTE="attempt 1: default reset"
-          _ok "ipv6 verified after default reset."
+        if _verify_dest_ipv6 "$EXPECTED_IPV6" 120; then
+          _ok "ipv6 ${EXPECTED_IPV6} verified on dest VM."
         else
-          _warn "ipv6 not visible after default reset; trying aggressive reset (any physical adapter, /release6+/renew6)."
-          # Re-run regen-pins on dest in case the pin missed the earlier reload window.
-          ssh "${SSH_OPTS[@]}" "$DEST_SSH" "test -x '${SYNC_DNAT}' && '${SYNC_DNAT}' regen-pins" 2>/dev/null || true
-          local PS_AGGRESSIVE='$a = Get-NetAdapter -Physical | Where-Object { $_.Status -eq "Up" }; $a | Disable-NetAdapter -Confirm:$false; Start-Sleep -Seconds 4; $a | Enable-NetAdapter -Confirm:$false; Start-Sleep -Seconds 2; ipconfig /release6; ipconfig /renew6; ipconfig /release; ipconfig /renew'
-          if _run_dest_ps "$PS_AGGRESSIVE" 120; then
-            sleep 5
-            if _verify_dest_ipv6 "$EXPECTED_IPV6" 90; then
-              IPV6_VERIFIED=1
-              VERIFY_NOTE="attempt 2: aggressive reset"
-              _ok "ipv6 verified after aggressive reset."
-            fi
-          else
-            _info "Aggressive reset PowerShell did not complete cleanly."
-          fi
-
-          if [[ "$IPV6_VERIFIED" -eq 0 ]]; then
-            VERIFY_NOTE="all attempts exhausted (default + aggressive reset)"
-          fi
+          _warn "ipv6 ${EXPECTED_IPV6} not visible after reset (within 120s). Proceeding with Firestore update anyway."
+          _warn "If RDP doesn't recover within ~5 min, manually: ssh ${DEST_SSH} '${SYNC_DNAT} regen-pins' and consider another network reset."
         fi
-      fi
-
-      if [[ "$IPV6_VERIFIED" -eq 1 ]]; then
-        _ok "Network verification: ${VERIFY_NOTE}"
-      else
-        _warn "Network verification: ${VERIFY_NOTE}. Proceeding with Firestore update anyway."
-        _warn "If RDP doesn't recover within ~5 min, manually re-run: ssh ${DEST_SSH} '${SYNC_DNAT} regen-pins' and consider another network reset or VM reboot."
       fi
     else
       _info "VM ostype is '${ostype}' (not Windows); skipping guest agent network reset."
@@ -611,20 +589,43 @@ if not printed:
     _info "VM ${VMID} is not running on destination (status: ${DEST_STATUS:-unknown}); skipping network reset."
   fi
 
-  # 8 success) Update Firestore: connectionUrl, nodeId, maintenance=false, deterministic ipv6
+  # 8 success) Update Firestore: nodeId + maintenance=false + deterministic ipv6 ALWAYS;
+  # connectionUrl best-effort (skipped if dest public IP can't be determined, but the
+  # critical fields still flip so NAT46 retargets correctly).
   if [[ "$UPDATE_FIRESTORE" == "true" ]]; then
-    _info "Updating Firestore (connectionUrl, nodeId, maintenance=false, ipv6)..."
-    local DEST_PUBLIC_IP
-    DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" 'curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || ip route get 8.8.8.8 2>/dev/null | awk "{print \$7; exit}"' | tr -d '\r')"
-    if [[ -z "$DEST_PUBLIC_IP" ]]; then
-      _info "Could not get destination public IP; Firestore connectionUrl may be stale."
-    else
+    _info "Resolving destination public IP for connectionUrl..."
+    local DEST_PUBLIC_IP=""
+    # Try multiple services; fall back to nothing if all fail.
+    DEST_PUBLIC_IP="$(ssh "${SSH_OPTS[@]}" "$DEST_SSH" '
+      for svc in https://ifconfig.me https://api.ipify.org https://icanhazip.com; do
+        ip=$(curl -4 -s --connect-timeout 5 "$svc" 2>/dev/null)
+        if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+          echo "$ip"
+          exit 0
+        fi
+      done
+      exit 1
+    ' 2>/dev/null | tr -d '\r' || true)"
+
+    if [[ -n "$DEST_PUBLIC_IP" ]]; then
       DEST_CONNECTION_URL="${DEST_PUBLIC_IP}:$((BASE_PORT + VMID))"
-      if _firestore_update "$VMID" "$DEST_CONNECTION_URL" "$DEST_NODE"; then
-        _ok "Firestore updated: connectionUrl=${DEST_CONNECTION_URL}, nodeId=${DEST_NODE} (ipv6 set deterministically)"
-      else
-        _info "Firestore update failed; check credentials."
-      fi
+      _info "Updating Firestore (connectionUrl=${DEST_CONNECTION_URL}, nodeId=${DEST_NODE}, maintenance=false, ipv6)..."
+    else
+      DEST_CONNECTION_URL=""
+      _warn "Could not resolve destination public IP; updating Firestore WITHOUT connectionUrl (nodeId+ipv6+maintenance still updated)."
+    fi
+
+    # Pass the explicit ipv6 we already derived (either from Firestore or from
+    # dest vmbr0). This way the update succeeds even if proxmox_nodes/{node}.ip
+    # is missing in Firestore — without it, the helper would silently skip ipv6.
+    local FIRESTORE_ARGS=()
+    if [[ -n "${EXPECTED_IPV6:-}" ]]; then
+      FIRESTORE_ARGS+=(--ipv6 "$EXPECTED_IPV6")
+    fi
+    if _firestore_update "${FIRESTORE_ARGS[@]}" "$VMID" "$DEST_CONNECTION_URL" "$DEST_NODE"; then
+      _ok "Firestore updated: nodeId=${DEST_NODE}${EXPECTED_IPV6:+, ipv6=${EXPECTED_IPV6}}${DEST_CONNECTION_URL:+, connectionUrl=${DEST_CONNECTION_URL}}"
+    else
+      _warn "Firestore update FAILED. Migration succeeded but server doc may be stale (check credentials, or run /var/lib/svz/snippets/sync-dnat.py manually)."
     fi
   fi
 
