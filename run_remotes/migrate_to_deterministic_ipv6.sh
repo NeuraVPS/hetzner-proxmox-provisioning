@@ -237,10 +237,15 @@ CONF
 
     # PowerShell:
     #   1. Find active physical adapter
-    #   2. Remove any prior Manual IPv6 in PersistentStore/ActiveStore that
-    #      doesn't match the expected one (cleans up addresses from prior
-    #      mistakes / past prefixes)
-    #   3. Add expected IPv6 to BOTH stores (PersistentStore = survive reboots,
+    #   2. Switch IPv6 interface to "manual" mode (Dhcp Disabled). Without
+    #      this, Windows treats the interface as DHCP-managed for v6 and
+    #      flushes/de-prioritizes manual PolicyStore addresses on boot.
+    #      RA processing (gateway via fe80::) is governed by RouterDiscovery,
+    #      NOT by Dhcp, so the default route still works. DNS comes from the
+    #      DHCPv4 option (option 6) so we don't lose name resolution either.
+    #   3. Remove any prior Manual IPv6 in PersistentStore/ActiveStore that
+    #      doesn't match the expected one (cleans up past prefixes / mistakes)
+    #   4. Add expected IPv6 to BOTH stores (PersistentStore = survive reboots,
     #      ActiveStore = bound now without restart). Idempotent.
     local PS_ASSIGN
     PS_ASSIGN=$(cat <<PSEOF
@@ -249,6 +254,7 @@ CONF
 \$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
 if (-not \$a) { Write-Error 'no active physical adapter'; exit 1 }
 \$idx = \$a.ifIndex
+Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -Dhcp Disabled -ErrorAction SilentlyContinue | Out-Null
 foreach (\$st in 'PersistentStore', 'ActiveStore') {
   Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -PolicyStore \$st -ErrorAction SilentlyContinue |
     Where-Object { \$_.PrefixOrigin -eq 'Manual' -and \$_.IPAddress -ne \$exp } |

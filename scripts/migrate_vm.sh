@@ -566,6 +566,7 @@ PY
 \$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
 if (-not \$a) { Write-Error 'no active physical adapter'; exit 1 }
 \$idx = \$a.ifIndex
+Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -Dhcp Disabled -ErrorAction SilentlyContinue | Out-Null
 foreach (\$st in 'PersistentStore', 'ActiveStore') {
   Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -PolicyStore \$st -ErrorAction SilentlyContinue |
     Where-Object { \$_.PrefixOrigin -eq 'Manual' -and \$_.IPAddress -ne \$exp } |
