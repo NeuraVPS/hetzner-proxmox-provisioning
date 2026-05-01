@@ -37,8 +37,11 @@
 # update Firestore for that VM (so existing NAT46 keeps pointing at whatever
 # IPv6 was there before — fail-safe).
 #
-# Stopped VMs and non-Windows VMs are LOGGED to RUNREMOTES_FAIL for review.
-# Re-run the script after stopped VMs are started.
+# Stopped Windows VMs are auto-handled: started → configured → gracefully
+# shutdown. Only failures in that flow (qm start, agent ping, PS_CONFIGURE,
+# Firestore sync, or shutdown) are logged to RUNREMOTES_FAIL.
+#
+# Non-Windows VMs are skipped + logged to RUNREMOTES_FAIL for manual handling.
 #
 # Idempotent: if the expected IPv6 is already bound, just sync Firestore.
 ############################################################
@@ -146,6 +149,32 @@ print(f"{ec}||||{od}||||{ed}")
     return 1
   }
 
+  # Poll `qm status` until it reports the desired value. Returns 0 on match,
+  # 1 on timeout. Used to confirm graceful shutdown completed.
+  _qm_wait_status() {
+    local _vmid="$1" _want="$2" _timeout="${3:-300}" _elapsed=0 _cur
+    while (( _elapsed < _timeout )); do
+      _cur=$(qm status "$_vmid" 2>/dev/null | awk '{print $2}' | tr -d '\r')
+      if [[ "$_cur" == "$_want" ]]; then return 0; fi
+      sleep 2
+      (( _elapsed += 2 )) || true
+    done
+    return 1
+  }
+
+  # Poll the qemu-guest-agent ping until it responds. Returns 0 once the agent
+  # is up, 1 on timeout. Used after `qm start` for stopped VMs we need to
+  # configure on a one-shot basis.
+  _qm_wait_agent() {
+    local _vmid="$1" _timeout="${2:-300}" _elapsed=0
+    while (( _elapsed < _timeout )); do
+      if qm guest cmd "$_vmid" ping >/dev/null 2>&1; then return 0; fi
+      sleep 3
+      (( _elapsed += 3 )) || true
+    done
+    return 1
+  }
+
   # ----- Main flow -----
   echo "== Running remote task on ${NODE_NAME} =="
 
@@ -225,20 +254,33 @@ CONF
   _process_vm() {
     local vmid="$1" status="$2" tmpdir="$3"
     local kind_file="$tmpdir/${vmid}.kind"
-    local EXPECTED_IPV6 OSTYPE
+    local EXPECTED_IPV6 OSTYPE was_stopped=0
     EXPECTED_IPV6="${NODE_PREFIX}$(printf '%x' "$vmid")"
 
-    if [[ "$status" != "running" ]]; then
-      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	stopped (re-run script after VM is started; expected ipv6=${EXPECTED_IPV6})"
-      echo skipped > "$kind_file"
-      return
-    fi
-
+    # ostype check works for both running and stopped VMs — read from config.
     OSTYPE=$(qm config "$vmid" 2>/dev/null | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r')
     if [[ "$OSTYPE" != win* ]]; then
       echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	ostype='${OSTYPE}' (not Windows; handle manually; expected ipv6=${EXPECTED_IPV6})"
       echo skipped > "$kind_file"
       return
+    fi
+
+    # Stopped Windows VM: start it, apply config, then gracefully shut it back
+    # down. Any failure in this flow → log + return without further side-effects
+    # (Firestore is updated only after PS_CONFIGURE succeeds, below).
+    if [[ "$status" != "running" ]]; then
+      echo "VM $vmid: stopped → starting to apply static IPv6 config"
+      if ! qm start "$vmid" >/dev/null 2>&1; then
+        echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	qm start failed"
+        echo failed > "$kind_file"
+        return
+      fi
+      if ! _qm_wait_agent "$vmid" 300; then
+        echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	guest-agent never responded after start (5m timeout); leaving VM running for triage"
+        echo failed > "$kind_file"
+        return
+      fi
+      was_stopped=1
     fi
 
     local PS_CONFIGURE
@@ -353,7 +395,7 @@ exit 0
 PSEOF
 )
 
-    _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 180
+    _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 60
     local _ps_rc=$? _kind=""
     if [[ "$_ps_rc" -eq 0 ]]; then
       _kind="configured"
@@ -368,6 +410,22 @@ PSEOF
     if ! "$SYNC_DNAT" set-server-ipv6 "$vmid" "$EXPECTED_IPV6" >/dev/null 2>&1; then
       echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	firestore set-server-ipv6 failed (kind=${_kind})"
       echo failed > "$kind_file"
+      return
+    fi
+
+    # If we started this VM ourselves (was_stopped=1), shut it back down to
+    # restore the original power state. Failure to shut down → log + fail (the
+    # IPv6 was configured + persisted, but the VM is left running for triage).
+    if (( was_stopped )); then
+      echo "VM $vmid: gracefully shutting down (was originally stopped)"
+      qm shutdown "$vmid" --timeout 300 >/dev/null 2>&1 || true
+      if ! _qm_wait_status "$vmid" "stopped" 60; then
+        echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	graceful shutdown failed (still running after qm shutdown 5m + 1m wait); IPv6 configured, VM left running for triage"
+        echo failed > "$kind_file"
+        return
+      fi
+      echo "  ✅ VM $vmid: static ipv6=${EXPECTED_IPV6} (started + configured + shut down)"
+      echo configured > "$kind_file"
       return
     fi
 
@@ -455,16 +513,16 @@ FAILURE_LOG="${FAILURE_LOG:-$(pwd)/migrate_to_deterministic_ipv6.failures.log}"
 echo "Failure log: $FAILURE_LOG"
 
 # Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
-ONLY_HOST_NUMS=(62)
+ONLY_HOST_NUMS=()
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
-SKIP_HOST_NUMS=(3 26 35)
+SKIP_HOST_NUMS=(3 26 35 52 62)
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
 HOST_NUM_GTE=
 HOST_NUM_LTE=
 # Optional per-node VMID filter: only process these VMIDs on each node.
 # Useful for re-running specific VMs that failed in a previous pass.
 # Leave empty to process all VMs on the node.
-ONLY_VMIDS=(444) #(237 261)
+ONLY_VMIDS=()
 
 while read -r hostname ip; do
     host_num=$((10#${hostname%%-*}))
