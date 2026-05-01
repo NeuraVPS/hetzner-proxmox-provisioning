@@ -57,12 +57,17 @@ remote_task() {
   # ----- Helpers -----
 
   # Run a PowerShell snippet via guest-agent using -EncodedCommand (UTF-16LE base64).
-  # Returns 0 if exec exits within $3 seconds (default 60), 1 otherwise.
+  # Returns 0 only if PS exits with exitcode==0 within $3 seconds (default 60).
+  # On any non-success path, sets _PS_LAST_ERROR to a single-line description
+  # (exitcode + truncated stdout/stderr from agent exec-status, or the agent
+  # error reason) so the caller can include it in RUNREMOTES_FAIL log lines.
+  _PS_LAST_ERROR=""
   _run_ps_via_agent() {
+    _PS_LAST_ERROR=""
     local _vmid="$1" _ps="$2" _timeout="${3:-60}"
     local _b64
     _b64=$(printf '%s' "$_ps" | iconv -t UTF-16LE | base64 -w0)
-    [[ -n "$_b64" ]] || { echo "  _run_ps: iconv/base64 failed" >&2; return 1; }
+    [[ -n "$_b64" ]] || { _PS_LAST_ERROR="iconv/base64 failed"; return 1; }
 
     local _exec_out _pid _attempt=0
     while (( _attempt < 6 )); do
@@ -82,21 +87,46 @@ remote_task() {
         sleep 3
         continue
       fi
-      echo "  _run_ps: pvesh exec error: ${_exec_out:0:200}" >&2
+      _PS_LAST_ERROR="pvesh exec error: ${_exec_out:0:200}"
       return 1
     done
-    [[ -n "$_pid" && "$_pid" -gt 0 ]] || { echo "  _run_ps: guest agent never came up" >&2; return 1; }
+    if [[ -z "$_pid" || "$_pid" -le 0 ]]; then
+      _PS_LAST_ERROR="guest agent never came up after 6 retries"
+      return 1
+    fi
 
     local _elapsed=0 _st
     while (( _elapsed < _timeout )); do
       _st=$(pvesh get "/nodes/${NODE_NAME}/qemu/${_vmid}/agent/exec-status" \
         --output-format json --pid "$_pid" 2>/dev/null || true)
       if echo "$_st" | grep -qE '"exited"\s*:\s*1'; then
-        return 0
+        # Parse exitcode + out-data + err-data robustly (JSON has escapes).
+        local _parsed
+        _parsed=$(echo "$_st" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print("0||||"); sys.exit(0)
+ec = d.get("exitcode", 0) or 0
+od = (d.get("out-data") or "")[:200].replace("\n"," ").replace("\r"," ").replace("|","/")
+ed = (d.get("err-data") or "")[:200].replace("\n"," ").replace("\r"," ").replace("|","/")
+print(f"{ec}||||{od}||||{ed}")
+' 2>/dev/null)
+        local _ec="${_parsed%%\|\|\|\|*}"
+        local _rest="${_parsed#*\|\|\|\|}"
+        local _out_data="${_rest%%\|\|\|\|*}"
+        local _err_data="${_rest##*\|\|\|\|}"
+        if [[ "$_ec" == "0" ]]; then
+          return 0
+        fi
+        _PS_LAST_ERROR="PS exitcode=${_ec} stderr='${_err_data}' stdout='${_out_data}'"
+        return 1
       fi
       sleep 2
       (( _elapsed += 2 )) || true
     done
+    _PS_LAST_ERROR="PS timed out after ${_timeout}s"
     return 1
   }
 
@@ -309,14 +339,34 @@ PSEOF
 )
 
     if ! _run_ps_via_agent "$vmid" "$PS_CONFIGURE" 60; then
-      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	guest-agent static IPv6 config failed (agent down or PS error)"
+      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	netsh static IPv6 config failed: ${_PS_LAST_ERROR}"
       (( failed++ )) || true
       continue
     fi
 
-    # Verify expected v6 is bound
+    # Verify expected v6 is bound. If not, dump current ifaces into the failure
+    # log so the operator can see what Windows actually has bound.
     if ! _verify_vmid_ipv6 "$vmid" "$EXPECTED_IPV6" 15; then
-      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	${EXPECTED_IPV6} not bound after netsh config"
+      local _current_v6
+      _current_v6=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print(""); sys.exit(0)
+ifaces = d.get("result", d) if isinstance(d, dict) else d
+if not isinstance(ifaces, list): print(""); sys.exit(0)
+out = []
+for i in ifaces:
+    if not isinstance(i, dict): continue
+    for a in (i.get("ip-addresses") or []):
+        if not isinstance(a, dict): continue
+        if a.get("ip-address-type") == "ipv6":
+            ip = str(a.get("ip-address",""))
+            if ip and not ip.lower().startswith("fe80"): out.append(ip)
+print(",".join(out) or "none")
+' 2>/dev/null)
+      echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	expected ${EXPECTED_IPV6} not bound after netsh config; current_v6=[${_current_v6:-unknown}]"
       (( failed++ )) || true
       continue
     fi
@@ -352,9 +402,9 @@ FAILURE_LOG="${FAILURE_LOG:-$(pwd)/migrate_to_deterministic_ipv6.failures.log}"
 echo "Failure log: $FAILURE_LOG"
 
 # Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
-ONLY_HOST_NUMS=(3)
+ONLY_HOST_NUMS=()
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
-SKIP_HOST_NUMS=()
+SKIP_HOST_NUMS=(3)
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
 HOST_NUM_GTE=
 HOST_NUM_LTE=
