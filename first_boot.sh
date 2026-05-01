@@ -79,7 +79,10 @@ apt-get install -y dnsmasq
 
 cat > /etc/dnsmasq.d/vmbr0.conf <<EOF
 interface=vmbr0
-bind-interfaces
+# bind-dynamic (NOT bind-interfaces): bind-interfaces breaks RA/RS multicast on
+# Proxmox where fwbr<vmid> bridges come and go. With bind-dynamic dnsmasq
+# subscribes to ff02::2 and replies to Router Solicitations within ms.
+bind-dynamic
 dhcp-authoritative
 dhcp-rapid-commit
 
@@ -93,7 +96,10 @@ dhcp-option=6,185.12.64.1,185.12.64.2
 # advertised prefix in the RA has A=0 (no SLAAC). M=1 stays set, so Windows
 # will run its DHCPv6 client and receive the pin instead of generating a
 # stable-privacy SLAAC address.
+# `ra-param=vmbr0,30,1800` => unsolicited RA every ~30s (default would be 200-600s);
+# protects against Windows missing the first RA on boot.
 enable-ra
+ra-param=vmbr0,30,1800
 dhcp-range=::ff00,::fffe,constructor:vmbr0,static,64,720h
 dhcp-option=option6:dns-server,[2a01:4ff:ff00::add:1],[2a01:4ff:ff00::add:2]
 EOF

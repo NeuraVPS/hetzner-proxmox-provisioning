@@ -12,7 +12,7 @@ Designed to run on a Proxmox base node that has:
 Per-VM credentials are read from Firestore:
   servers/{id}.proxmoxId      (VMID)
   servers/{id}.ipv6           (target IPv6)
-  servers/{id}.userName       (SMB username)
+  servers/{id}.serverUser     (SMB username, mirrors the doc id)
   servers/{id}.serverPassword (SMB password)
 
 Concrete tasks (one-shot or recurring) live in their own scripts; this
@@ -80,7 +80,7 @@ def _list_running_targets(db, logger: logging.Logger) -> List[VMTarget]:
         d = doc.to_dict() or {}
         vmid = d.get("proxmoxId")
         ipv6 = d.get("ipv6")
-        username = d.get("userName")
+        username = d.get("serverUser")
         password = d.get("serverPassword")
         if not (vmid and ipv6 and username and password):
             incomplete += 1
@@ -98,7 +98,7 @@ def _list_running_targets(db, logger: logging.Logger) -> List[VMTarget]:
         )
     if incomplete:
         logger.warning(
-            "skipped %d running servers with missing proxmoxId/ipv6/userName/serverPassword",
+            "skipped %d running servers with missing proxmoxId/ipv6/serverUser/serverPassword",
             incomplete,
         )
     return targets
@@ -182,6 +182,14 @@ def run_on_fleet(
             logger.warning("vmid=%s: port 445 unreachable on %s", t.vmid, t.ipv6)
             results.append(TaskResult(t.vmid, "unreachable", "port 445 closed"))
             continue
+        logger.info(
+            "vmid=%s firestore_id=%s ipv6=%s username=%r share=\\\\%s\\c$",
+            t.vmid,
+            t.firestore_id,
+            t.ipv6,
+            t.username,
+            t.ipv6,
+        )
         try:
             smbclient.register_session(
                 t.ipv6,

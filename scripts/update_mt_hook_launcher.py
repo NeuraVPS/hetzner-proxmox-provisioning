@@ -13,6 +13,7 @@ Usage on a base node:
 from __future__ import annotations
 
 import argparse
+import errno
 from pathlib import Path
 
 import smbclient
@@ -26,8 +27,7 @@ from smb_fleet import (
     smb_path,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_VBS = REPO_ROOT / "windows_vm" / "hooks" / "mt_hook_launcher.vbs"
+SOURCE_VBS = Path("mt_hook_launcher.vbs")
 REMOTE_REL = r"ProgramData\NeuraVPS\mt_hook_launcher.vbs"
 
 
@@ -36,8 +36,13 @@ def _build_task(payload: bytes):
         path = smb_path(target, REMOTE_REL)
         try:
             smbclient.stat(path)
-        except FileNotFoundError:
-            return TaskResult(target.vmid, "skipped", "file not present")
+        except OSError as e:
+            # smbprotocol raises SMBOSError (sibling of FileNotFoundError) for
+            # both "file missing" (NtStatus 0xc0000034) and "parent folder
+            # missing" (0xc000003a). Both surface as errno=ENOENT.
+            if e.errno == errno.ENOENT:
+                return TaskResult(target.vmid, "skipped", "file not present")
+            return TaskResult(target.vmid, "error", f"stat failed: {e}")
 
         try:
             with smbclient.open_file(path, mode="rb") as f:
