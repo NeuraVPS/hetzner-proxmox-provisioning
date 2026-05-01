@@ -86,23 +86,17 @@ bind-dynamic
 dhcp-authoritative
 dhcp-rapid-commit
 
-# IPv4 DHCP pool for guests
-dhcp-range=10.0.0.100,10.0.255.254,255.255.0.0,720h
+# IPv4 DHCP fallback pool for guests. v4 is DHCP-only; address may change.
+dhcp-range=10.0.0.100,10.0.255.254,255.255.0.0,12h
 dhcp-option=3,10.0.0.1
 dhcp-option=6,185.12.64.1,185.12.64.2
 
-# ==== IPv6: stateless RA (SLAAC) — guests self-configure via EUI-64 ====
-# VMs are created with MACs encoding their VMID (52:54:00:00:HH:LL where HHLL =
-# vmid in hex), and Windows guests are configured (template + first-boot) to
-# disable RFC 7217 stable-privacy and privacy extensions. Result: every VM
-# auto-derives a deterministic IPv6 of <prefix>::5054:ff:fe00:<vmid_hex> from
-# its own MAC via EUI-64 SLAAC. No DHCPv6 server roundtrip on guest boot —
-# the SLAAC mechanism is passive (RA from dnsmasq, address derived locally),
-# so reboots/resets always recover IPv6 immediately without our intervention.
-# ra-stateless = RA with M=0 (no DHCPv6 addresses), A=1 (SLAAC), O=1 (DHCPv6
-# only for stateless options like DNS).
+# IPv6: RA + SLAAC fallback only. Each VM gets a deterministic static IPv6
+# (<prefix>::<vmid_hex>) set in-guest via PolicyStore PersistentStore — that
+# is what Firestore servers/{id}.ipv6 stores and BASE NAT46 routes to. SLAAC
+# is just a safety net so VMs without the static still get a routable v6+DNS.
 enable-ra
-dhcp-range=::100,::1ff,constructor:vmbr0,ra-stateless,720h
+dhcp-range=::100,::1ff,constructor:vmbr0,ra-stateless,12h
 dhcp-option=option6:dns-server,[2a01:4ff:ff00::add:1],[2a01:4ff:ff00::add:2]
 EOF
 
