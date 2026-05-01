@@ -261,13 +261,28 @@ CONF
       continue
     fi
 
-    # Fast path: expected v6 already bound → just sync Firestore
-    if _verify_vmid_ipv6 "$vmid" "$EXPECTED_IPV6" 3; then
+    # Fast path: expected v6 is bound AND its origin is Manual in BOTH stores
+    # (Persistent + Active). Plain "is bound" isn't enough — a VM could have
+    # the expected v6 from a leftover DHCPv6 lease cached in Windows; on next
+    # reboot Windows would lose it. We need to verify the address is in
+    # PolicyStore PersistentStore as a Manual entry.
+    local PS_CHECK_MANUAL
+    PS_CHECK_MANUAL=$(cat <<PSEOF
+\$ErrorActionPreference = 'SilentlyContinue'
+\$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
+if (-not \$a) { exit 1 }
+\$persisted = Get-NetIPAddress -InterfaceIndex \$a.ifIndex -IPAddress '${EXPECTED_IPV6}' -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+\$active    = Get-NetIPAddress -InterfaceIndex \$a.ifIndex -IPAddress '${EXPECTED_IPV6}' -PolicyStore ActiveStore     -ErrorAction SilentlyContinue
+if (\$persisted -and \$persisted.PrefixOrigin -eq 'Manual' -and \$active -and \$active.PrefixOrigin -eq 'Manual') { exit 0 }
+exit 1
+PSEOF
+)
+    if _run_ps_via_agent "$vmid" "$PS_CHECK_MANUAL" 20; then
       if "$SYNC_DNAT" set-server-ipv6 "$vmid" "$EXPECTED_IPV6" >/dev/null 2>&1; then
-        echo "VM $vmid: ${EXPECTED_IPV6} already bound; Firestore synced"
+        echo "VM $vmid: ${EXPECTED_IPV6} already manually bound; Firestore synced"
         (( already++ )) || true
       else
-        echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	firestore set-server-ipv6 failed (already-bound VM)"
+        echo "RUNREMOTES_FAIL	${NODE_NAME}	${vmid}	firestore set-server-ipv6 failed (already-manual VM)"
         (( failed++ )) || true
       fi
       sleep "$PER_VM_SLEEP"
@@ -276,10 +291,12 @@ CONF
 
     echo "--- VM $vmid: configuring static ${EXPECTED_IPV6}/64 gw=${NODE_GATEWAY} ---"
 
-    # PowerShell: full manual IPv6 config via legacy netsh + Set-NetIPInterface,
-    # all writes persistent. Adapter alias is read dynamically from the active
-    # physical adapter (no hardcoded "Ethernet" — it may be "Ethernet 2",
-    # "Local Area Connection", etc. on customer-customized VMs).
+    # PowerShell: full manual IPv6 config via legacy netsh + Set-NetIPInterface.
+    # Writes go to BOTH the active and persistent stores (active=bound now,
+    # persistent=survives reboot). Each netsh call captures stdout/stderr +
+    # \$LASTEXITCODE — if any failed, the script exits with code 2 and a
+    # one-line stderr describing what broke (surfaced via _PS_LAST_ERROR).
+    # 'delete' before 'add' makes it idempotent against prior runs.
     local PS_CONFIGURE
     PS_CONFIGURE=$(cat <<PSEOF
 \$ErrorActionPreference = 'SilentlyContinue'
@@ -289,27 +306,24 @@ CONF
 \$dns2  = '${DNS6_SECONDARY}'
 
 \$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
-if (-not \$a) { Write-Error 'no active physical adapter'; exit 1 }
+if (-not \$a) { [Console]::Error.WriteLine('no active physical adapter'); exit 1 }
 \$idx   = \$a.ifIndex
 \$alias = \$a.InterfaceAlias
 
-# 1) Reset RFC 7217 / randomizeidentifiers / privacy to Windows defaults.
-# Irrelevant once RouterDiscovery is Disabled (no SLAAC happens), but keeps
-# the VM clean of toggles left over from previous experiments.
+# 1) Reset RFC 7217 / randomizeidentifiers / privacy to defaults (irrelevant
+# once RouterDiscovery is Disabled, but keeps the VM clean).
 Set-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters" -Name "EnableStableAddresses" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue | Out-Null
-& netsh interface ipv6 set global randomizeidentifiers=enabled store=persistent | Out-Null
-& netsh interface ipv6 set privacy state=enabled store=persistent | Out-Null
+& netsh interface ipv6 set global randomizeidentifiers=enabled store=persistent 2>&1 | Out-Null
+& netsh interface ipv6 set privacy state=enabled store=persistent 2>&1 | Out-Null
 
 # 2) Disable RouterDiscovery + Dhcp on the IPv6 interface, BOTH stores.
-# Without this, Windows still processes RA from any other source and may
-# flush manual addresses on RA events.
 foreach (\$store in 'PersistentStore', 'ActiveStore') {
   Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -RouterDiscovery Disabled -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
   Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -Dhcp Disabled -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
 }
 
-# 3) Remove ALL non-link-local IPv6 from BOTH stores. Cleans up SLAAC, manual,
-# DHCPv6, and PolicyStore leftovers from previous attempts.
+# 3) Remove ALL non-link-local IPv6 from BOTH stores via NSI. Drops SLAAC,
+# DHCPv6 leases, and prior Manual entries — clean slate for the netsh add.
 foreach (\$store in 'PersistentStore', 'ActiveStore') {
   Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue |
     Where-Object { \$_.PrefixOrigin -ne 'WellKnown' -and \$_.IPAddress -notlike 'fe80*' } |
@@ -317,22 +331,51 @@ foreach (\$store in 'PersistentStore', 'ActiveStore') {
       Remove-NetIPAddress -InterfaceIndex \$idx -IPAddress \$_.IPAddress -PolicyStore \$store -Confirm:\$false -ErrorAction SilentlyContinue
     }
 }
-
-# Also remove any stale default IPv6 route (we'll add our own below)
 Get-NetRoute -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue |
   Where-Object { \$_.DestinationPrefix -eq '::/0' } |
   ForEach-Object {
     Remove-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -Confirm:\$false -ErrorAction SilentlyContinue
   }
 
-# 4) Static address + default route + DNS via LEGACY netsh (store=persistent).
-# This writes to HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\<guid>
-# — the same registry path the Network Properties GUI uses. More reliable on
-# Server 2025 than New-NetIPAddress -PolicyStore PersistentStore (NSI).
-& netsh interface ipv6 add address  "\$alias" "\$exp/64"  store=persistent | Out-Null
-& netsh interface ipv6 add route    "::/0" "\$alias" "\$gw" store=persistent | Out-Null
-& netsh interface ipv6 set dnsserver "\$alias" static \$dns1 primary validate=no | Out-Null
-& netsh interface ipv6 add dnsserver "\$alias"        \$dns2 index=2 validate=no | Out-Null
+# 4) Static address + default route via LEGACY netsh into BOTH stores.
+# 'already exists' from netsh is treated as success — that means the entry
+# was already in the store from a previous run, which is exactly what we
+# want. Real failures (bad alias, write permission, etc.) still surface.
+\$errors = @()
+function Try-Netsh {
+  param([string]\$Tag, [string[]]\$NetshArgs)
+  \$out = & netsh @NetshArgs 2>&1
+  \$ec = \$LASTEXITCODE
+  if (\$ec -eq 0) { return \$null }
+  \$outStr = (\$out -join ' ').Trim()
+  if (\$outStr -match 'already exists' -or \$outStr -match 'The object already exists') { return \$null }
+  if (\$outStr -match 'no matching' -or \$outStr -match 'not found' -or \$outStr -match 'cannot find') { return \$null }
+  return "\$Tag(\$ec):\$outStr"
+}
+
+foreach (\$store in 'active', 'persistent') {
+  # Try delete first (silently); 'no matching'/'not found' is fine
+  \$null = Try-Netsh "del-addr-\$store" @('interface','ipv6','delete','address',\$alias,\$exp,"store=\$store")
+  \$err  = Try-Netsh "addr-\$store"      @('interface','ipv6','add','address',\$alias,"\$exp/64","store=\$store")
+  if (\$err) { \$errors += \$err }
+
+  \$null = Try-Netsh "del-route-\$store" @('interface','ipv6','delete','route','::/0',\$alias,\$gw,"store=\$store")
+  \$err  = Try-Netsh "route-\$store"     @('interface','ipv6','add','route','::/0',\$alias,\$gw,"store=\$store")
+  if (\$err) { \$errors += \$err }
+}
+
+# 5) DNS (set/add dnsserver are persistent by default).
+\$err = Try-Netsh "dns1" @('interface','ipv6','set','dnsserver',\$alias,'static',\$dns1,'primary','validate=no')
+if (\$err) { \$errors += \$err }
+\$err = Try-Netsh "dns2" @('interface','ipv6','add','dnsserver',\$alias,\$dns2,'index=2','validate=no')
+if (\$err) { \$errors += \$err }
+
+if (\$errors.Count -gt 0) {
+  \$msg = (\$errors -join ' || ')
+  if (\$msg.Length -gt 400) { \$msg = \$msg.Substring(0, 400) }
+  [Console]::Error.WriteLine(\$msg)
+  exit 2
+}
 
 exit 0
 PSEOF
@@ -402,7 +445,7 @@ FAILURE_LOG="${FAILURE_LOG:-$(pwd)/migrate_to_deterministic_ipv6.failures.log}"
 echo "Failure log: $FAILURE_LOG"
 
 # Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
-ONLY_HOST_NUMS=()
+ONLY_HOST_NUMS=(35)
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
 SKIP_HOST_NUMS=(3)
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
