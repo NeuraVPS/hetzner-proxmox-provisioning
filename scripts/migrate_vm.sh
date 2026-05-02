@@ -13,6 +13,69 @@
 # Idempotent. Re-running after success is a no-op (source == dest). Re-running
 # after a partial failure resumes from wherever it left off — if the VM is
 # already on the destination, only the post-migration sync runs.
+#
+# Stopped VMs are migrated offline (no --online), then briefly started on dest
+# to apply the in-guest IPv6 reconfig, then gracefully shut back down so the
+# original power state is preserved.
+#
+# wget https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/migrate_vm.sh
+#
+# ----- Error handling & logging -----------------------------------------------
+#
+# Every _die (fatal, exits non-zero) and _warn (non-fatal, continues) line is
+# mirrored to $ERROR_LOG with a UTC timestamp + VMID + PID prefix, e.g.:
+#   2026-05-02T12:17:41Z [ERROR] vmid=123 pid=22867 pvesh remote_migrate failed.
+#   2026-05-02T08:03:11Z [WARN]  vmid=455 pid=18120 Could not resolve dest public IPv4...
+#
+# Defaults:
+#   ERROR_LOG=/var/log/migrate_vm/errors.log     (parent dir is auto-created)
+#
+# Override per run:
+#   ERROR_LOG=/tmp/today.log ./migrate_vm.sh 123 99
+#
+# Logging never breaks the migration: if the log path can't be written, the
+# message still goes to stderr and the script continues. stdout/stderr go to
+# the terminal (or the calling process) unchanged — the file is purely an
+# additive review trail.
+#
+# ----- Batch / parallel runs --------------------------------------------------
+#
+# For multiple migrations, use the companion migrate_vms_batch.sh which reads
+# "VMID NEW_NODE_ID" pairs from a file or stdin, resolves all sources upfront,
+# parallelises with per-node + total concurrency caps, and aggregates errors
+# into one review log.
+#
+# Examples:
+#   # 1) From a file with comments + blank lines
+#   cat > migrations.txt <<'TXT'
+#   # one VMID NEW_NODE_ID pair per line
+#   123 99
+#   111 44
+#   145 7
+#   TXT
+#   ./migrate_vms_batch.sh -f migrations.txt              # defaults: -c 2 -m 8
+#
+#   # 2) Higher per-node concurrency on 10 Gbps fabric
+#   ./migrate_vms_batch.sh -f migrations.txt -c 3
+#
+#   # 3) From stdin
+#   echo "201 44
+#   202 44" | ./migrate_vms_batch.sh
+#
+#   # 4) Custom log directory
+#   ./migrate_vms_batch.sh -f migrations.txt -l /var/log/migrations/2026-05-02
+#
+# Batch log layout (default /var/log/migrate_vm/, override with -l DIR):
+#   batch-<ts>.log              master timeline: STARTED / OK / FAIL lines + summary
+#   jobs/vm-<vmid>-<ts>.log     full stdout+stderr of each job (success or fail)
+#   errors-<ts>.log             aggregated review log:
+#                                 - full body of every FAILED job
+#                                 - every WARN/ERROR line from any job
+#                                   (each child runs with ERROR_LOG pointed
+#                                    at this file, so non-fatal warnings from
+#                                    successful jobs land here too)
+#
+# Batch exits 0 if every job succeeded, 1 if any failed, 2 on usage error.
 
 set -euo pipefail
 
@@ -27,12 +90,24 @@ HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
 DNS6_SECONDARY="${DNS6_SECONDARY:-2a01:4ff:ff00::add:2}"
 CONNECTIVITY_HOST="${CONNECTIVITY_HOST:-sqx.neuravps.com}"
+ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
 # ----- Logging helpers ---------------------------------------------------------
-_die()  { printf '❌ %s\n' "$*" >&2; exit 1; }
+# All warnings + errors are mirrored to $ERROR_LOG with a timestamp + VMID for
+# post-run review. Failures during file writes are silently ignored — logging
+# must never break the migration.
+_log_to_file() {
+  local tag="$1" msg="$2" dir
+  dir=$(dirname "$ERROR_LOG")
+  [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s [%s] vmid=%s pid=%s %s\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$tag" "${VMID:-?}" "$$" "$msg" \
+    >> "$ERROR_LOG" 2>/dev/null || true
+}
+_die()  { _log_to_file ERROR "$*"; printf '❌ %s\n' "$*" >&2; exit 1; }
 _info() { printf 'ℹ️  %s\n' "$*" >&2; }
 _ok()   { printf '✅ %s\n' "$*" >&2; }
-_warn() { printf '⚠️  %s\n' "$*" >&2; }
+_warn() { _log_to_file WARN  "$*"; printf '⚠️  %s\n' "$*" >&2; }
 
 usage() {
   cat >&2 <<EOF
@@ -290,6 +365,25 @@ _dst_run_ps() {
   return 1
 }
 
+_wait_agent_dst() {
+  local timeout="${1:-300}" elapsed=0
+  while (( elapsed < timeout )); do
+    if dst_ssh "qm guest cmd '${VMID}' ping" >/dev/null 2>&1; then return 0; fi
+    sleep 3; (( elapsed += 3 ))
+  done
+  return 1
+}
+
+_wait_status_dst() {
+  local want="$1" timeout="${2:-60}" elapsed=0 cur
+  while (( elapsed < timeout )); do
+    cur=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
+    [[ "$cur" == "$want" ]] && return 0
+    sleep 3; (( elapsed += 3 ))
+  done
+  return 1
+}
+
 _verify_dest_ipv6() {
   local timeout="${1:-60}" elapsed=0 ifaces
   while (( elapsed < timeout )); do
@@ -330,6 +424,7 @@ TOKEN_CREATED=0
 HOOKSCRIPT_DETACHED=0
 MAINTENANCE_SET=0
 MIGRATION_DONE=0
+WAS_STOPPED=0  # 1 if the source VM was stopped pre-migration (we started it temporarily on dest)
 
 _rollback() {
   local rc=$?
@@ -378,6 +473,19 @@ fi
 if (( _vm_on_src == 1 )); then
   _info "VM is on source — performing migration."
 
+  # 0) Detect source run state to decide online vs offline migration. Stopped
+  # VMs are migrated offline (no --online); we'll start them on dest after
+  # migration to apply the in-guest IPv6 reconfig, then shut them back down.
+  SRC_STATUS=$(src_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
+  _info "Source VM status: ${SRC_STATUS:-unknown}"
+
+  ONLINE_FLAG="--online"
+  if [[ "$SRC_STATUS" != "running" ]]; then
+    ONLINE_FLAG=""
+    WAS_STOPPED=1
+    _info "Source VM is not running — using offline migration."
+  fi
+
   # 1) Firestore: set maintenance=true (advisory; non-fatal)
   if _firestore_update_servers --vmid "$VMID" --maintenance true 2>/dev/null; then
     MAINTENANCE_SET=1
@@ -414,14 +522,14 @@ if (( _vm_on_src == 1 )); then
     exit 1' | tr -d '\r ' || true)
   [[ -n "$FINGERPRINT" ]] || _die "Could not read dest pveproxy SSL fingerprint."
 
-  # 5) pvesh remote_migrate (online, deletes source after success)
+  # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   TARGET_HOST="[${DST_IPV6}]"
-  _info "Starting pvesh remote_migrate (${SRC_NODE} → ${DST_NODE})…"
+  _info "Starting pvesh remote_migrate (${SRC_NODE} → ${DST_NODE}, mode=${ONLINE_FLAG:-offline})…"
   src_ssh "pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate' \
             --target-bridge=1 \
             --target-endpoint='apitoken=PVEAPIToken=root@pam!${TOKEN_NAME}=${TOKEN_SECRET},host=${TARGET_HOST},fingerprint=${FINGERPRINT}' \
             --target-storage='${TARGET_STORAGE}' \
-            --online \
+            ${ONLINE_FLAG} \
             --delete" \
     || _die "pvesh remote_migrate failed."
   _ok "remote_migrate completed."
@@ -436,6 +544,22 @@ fi
 MIGRATION_DONE=1
 
 # ----- Post-migration sync (always idempotent) ---------------------------------
+
+# If we migrated a stopped VM (offline), start it on dest so the guest agent
+# is reachable for the in-guest IPv6 reconfig. We restore "stopped" at the end.
+if (( WAS_STOPPED == 1 )); then
+  _info "Starting VM ${VMID} on dest to apply in-guest reconfig (was stopped pre-migration)…"
+  if dst_ssh "qm start '${VMID}'" >/dev/null 2>&1; then
+    _ok "qm start issued."
+    if _wait_agent_dst 300; then
+      _ok "Guest agent is responding on dest."
+    else
+      _warn "Guest agent did not respond within 5m — in-guest reconfig will likely fail; continuing."
+    fi
+  else
+    _warn "qm start failed on dest; in-guest reconfig will be skipped — VM will remain stopped."
+  fi
+fi
 
 DST_STATUS=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
 OSTYPE=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)
@@ -587,6 +711,20 @@ if [[ "$DST_STATUS" == "running" ]] && command -v nc >/dev/null; then
     _ok "Connectivity check passed (IPv4+IPv6) on ${CONNECTIVITY_HOST}:${RDP_PORT}."
   else
     _info "Connectivity check incomplete (v6 rc=${rc6}, v4 rc=${rc4}); NAT/routing may still be propagating."
+  fi
+fi
+
+# Restore original power state: if we started this VM ourselves to apply
+# in-guest config, gracefully shut it back down. The hookscript on dest will
+# fire post-stop and update Firestore status accordingly.
+if (( WAS_STOPPED == 1 )); then
+  _info "Restoring original power state — gracefully shutting down VM ${VMID}…"
+  dst_ssh "qm shutdown '${VMID}' --timeout 300" >/dev/null 2>&1 \
+    || _warn "qm shutdown returned non-zero; will still poll for stopped state."
+  if _wait_status_dst stopped 60; then
+    _ok "VM gracefully shut down on dest."
+  else
+    _warn "VM ${VMID} still running after shutdown timeout — left running for triage."
   fi
 fi
 
