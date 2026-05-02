@@ -89,8 +89,8 @@ TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
 DNS6_SECONDARY="${DNS6_SECONDARY:-2a01:4ff:ff00::add:2}"
-CONNECTIVITY_HOST="${CONNECTIVITY_HOST:-sqx.neuravps.com}"
-CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — NAT can take a while to propagate
+RDP_GUEST_PORT="${RDP_GUEST_PORT:-3389}"
+CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — RDP listener can take a moment after the in-guest IPv6 rebind
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
 # ----- Logging helpers ---------------------------------------------------------
@@ -744,27 +744,24 @@ else
   _warn "$SYNC_BASE_NAT not executable; skipping local NAT reconcile."
 fi
 
-# Connectivity check: poll IPv4+IPv6 reachability until both succeed or
-# CONNECTIVITY_TIMEOUT runs out. Soft check — RDP-port specific, so a Linux
-# VM (or any guest not listening on RDP) will fail this even when fully
-# migrated. Persistent failure on a Windows VM is a real signal worth a
-# warning, but we don't gate Firestore on it.
-if [[ "$DST_STATUS" == "running" ]] && command -v nc >/dev/null; then
-  _info "Probing ${CONNECTIVITY_HOST}:${RDP_PORT} (retrying up to ${CONNECTIVITY_TIMEOUT}s)…"
+# Reachability check: probe the VM's IPv6 directly on RDP (3389) from BASE.
+# BASE routes the VM's /48 (that's how NAT64 works), so no hairpin — this
+# tests "Windows brought the new IPv6 up and RDP is listening". Soft warning;
+# does not gate Firestore. Skipped for non-Windows guests (3389 is RDP).
+if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/dev/null; then
+  _info "Probing [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} from BASE (retrying up to ${CONNECTIVITY_TIMEOUT}s)…"
   conn_start=$SECONDS
-  conn_rc6=1; conn_rc4=1
+  conn_rc=1
   while (( SECONDS - conn_start < CONNECTIVITY_TIMEOUT )); do
-    conn_rc6=0; conn_rc4=0
-    nc -w 5 -6 -zv "$CONNECTIVITY_HOST" "$RDP_PORT" >/dev/null 2>&1 || conn_rc6=$?
-    nc -w 5 -4 -zv "$CONNECTIVITY_HOST" "$RDP_PORT" >/dev/null 2>&1 || conn_rc4=$?
-    if (( conn_rc6 == 0 && conn_rc4 == 0 )); then
-      _ok "Connectivity check passed (IPv4+IPv6) on ${CONNECTIVITY_HOST}:${RDP_PORT} after $((SECONDS - conn_start))s."
+    if nc -w 5 -6 -z "$EXPECTED_VM_IPV6" "$RDP_GUEST_PORT" >/dev/null 2>&1; then
+      _ok "VM reachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after $((SECONDS - conn_start))s."
+      conn_rc=0
       break
     fi
     sleep 5
   done
-  if (( conn_rc6 != 0 || conn_rc4 != 0 )); then
-    _warn "Connectivity check FAILED after $((SECONDS - conn_start))s on ${CONNECTIVITY_HOST}:${RDP_PORT} (v6 rc=${conn_rc6}, v4 rc=${conn_rc4}). VM ${VMID} on ${DST_NODE} is unreachable from the internet — manual investigation required."
+  if (( conn_rc != 0 )); then
+    _warn "VM ${VMID} unreachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after ${CONNECTIVITY_TIMEOUT}s. Most likely the in-guest IPv6 reconfig didn't apply — check the VM's network interface on ${DST_NODE}."
   fi
 fi
 
