@@ -90,6 +90,7 @@ HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
 DNS6_SECONDARY="${DNS6_SECONDARY:-2a01:4ff:ff00::add:2}"
 CONNECTIVITY_HOST="${CONNECTIVITY_HOST:-sqx.neuravps.com}"
+CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — NAT can take a while to propagate
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
 # ----- Logging helpers ---------------------------------------------------------
@@ -566,18 +567,21 @@ OSTYPE=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | awk -F': ' '/^ostype:/{prin
 _info "Dest VM: status=${DST_STATUS:-unknown} ostype=${OSTYPE:-unknown}"
 
 # In-guest IPv6 reconfig (Windows only, running VM only).
-# Gateway = dest's vmbr0 IPv6 from pve_nodes.json (whatever it actually is —
-# we don't assume ::1 vs ::2). The PS script is idempotent: Test-Configured
+# Gateway is the canonical "<prefix>::1" of the dest /64. We derive it from
+# EXPECTED_VM_IPV6 ("<prefix>::<vmid_hex>") rather than DST_IPV6 because
+# pve_nodes.json sometimes records the node's host address (::2) which is
+# NOT the gateway VMs should use. The PS script is idempotent: Test-Configured
 # short-circuits the rewrite, but DHCPv4 is always renewed because the node
 # changed and the old lease comes from a different dnsmasq.
+DST_GATEWAY="${EXPECTED_VM_IPV6%::*}::1"
 if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
-  _info "Reconfiguring static IPv6 in guest: addr=${EXPECTED_VM_IPV6}/64 gw=${DST_IPV6}…"
+  _info "Reconfiguring static IPv6 in guest: addr=${EXPECTED_VM_IPV6}/64 gw=${DST_GATEWAY}…"
 
   PS_RECONFIG=$(cat <<PSEOF
 \$ErrorActionPreference = 'SilentlyContinue'
 \$ProgressPreference   = 'SilentlyContinue'
 \$exp  = '${EXPECTED_VM_IPV6}'
-\$gw   = '${DST_IPV6}'
+\$gw   = '${DST_GATEWAY}'
 \$dns1 = '${DNS6_PRIMARY}'
 \$dns2 = '${DNS6_SECONDARY}'
 
@@ -700,17 +704,27 @@ if (( TOKEN_CREATED == 1 )); then
   _ok "Token removed on dest."
 fi
 
-# Connectivity check (best-effort, runs from BASE itself).
+# Connectivity check: poll IPv4+IPv6 reachability until both succeed or
+# CONNECTIVITY_TIMEOUT runs out. Persistent failure means NAT didn't reconcile
+# or the in-guest config is wrong — the VM is unreachable from the public
+# internet and needs manual investigation, so we _warn (lands in $ERROR_LOG)
+# rather than _info on final failure.
 if [[ "$DST_STATUS" == "running" ]] && command -v nc >/dev/null; then
-  _info "Waiting 5s for NAT to settle, then probing ${CONNECTIVITY_HOST}:${RDP_PORT}…"
-  sleep 5
-  rc6=0; rc4=0
-  nc -w 5 -6 -zv "$CONNECTIVITY_HOST" "$RDP_PORT" >/dev/null 2>&1 || rc6=$?
-  nc -w 5 -4 -zv "$CONNECTIVITY_HOST" "$RDP_PORT" >/dev/null 2>&1 || rc4=$?
-  if (( rc6 == 0 && rc4 == 0 )); then
-    _ok "Connectivity check passed (IPv4+IPv6) on ${CONNECTIVITY_HOST}:${RDP_PORT}."
-  else
-    _info "Connectivity check incomplete (v6 rc=${rc6}, v4 rc=${rc4}); NAT/routing may still be propagating."
+  _info "Probing ${CONNECTIVITY_HOST}:${RDP_PORT} (retrying up to ${CONNECTIVITY_TIMEOUT}s)…"
+  conn_start=$SECONDS
+  conn_rc6=1; conn_rc4=1
+  while (( SECONDS - conn_start < CONNECTIVITY_TIMEOUT )); do
+    conn_rc6=0; conn_rc4=0
+    nc -w 5 -6 -zv "$CONNECTIVITY_HOST" "$RDP_PORT" >/dev/null 2>&1 || conn_rc6=$?
+    nc -w 5 -4 -zv "$CONNECTIVITY_HOST" "$RDP_PORT" >/dev/null 2>&1 || conn_rc4=$?
+    if (( conn_rc6 == 0 && conn_rc4 == 0 )); then
+      _ok "Connectivity check passed (IPv4+IPv6) on ${CONNECTIVITY_HOST}:${RDP_PORT} after $((SECONDS - conn_start))s."
+      break
+    fi
+    sleep 5
+  done
+  if (( conn_rc6 != 0 || conn_rc4 != 0 )); then
+    _warn "Connectivity check FAILED after $((SECONDS - conn_start))s on ${CONNECTIVITY_HOST}:${RDP_PORT} (v6 rc=${conn_rc6}, v4 rc=${conn_rc4}). VM ${VMID} on ${DST_NODE} is unreachable from the internet — manual investigation required."
   fi
 fi
 
