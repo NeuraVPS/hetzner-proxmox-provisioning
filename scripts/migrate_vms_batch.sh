@@ -214,12 +214,19 @@ pending=("${JOBS[@]}")
 
 ok_count=0; fail_count=0
 
-# Trap: on Ctrl-C or fatal, kill all in-flight children.
+# Trap: on Ctrl-C or fatal, kill all in-flight children, wait for their
+# rollbacks to finish, and exit. The trap *must* terminate the script — if it
+# returns to the main loop, the next `wait -n -p` call has nothing to reap
+# (the trap's `wait` already did that) and would trip the BUG path with an
+# empty `finished` pid.
 _kill_children() {
+  log "Signal received — terminating ${#pid_meta[@]} in-flight job(s) and exiting."
   for p in "${!pid_meta[@]}"; do
     kill -TERM "$p" 2>/dev/null || true
   done
   wait 2>/dev/null || true
+  pid_meta=()
+  exit 130
 }
 trap _kill_children INT TERM
 

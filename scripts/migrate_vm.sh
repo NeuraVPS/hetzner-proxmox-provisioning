@@ -85,7 +85,7 @@ STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
-TOKEN_NAME="${TOKEN_NAME:-migrate-full}"
+TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
 DNS6_SECONDARY="${DNS6_SECONDARY:-2a01:4ff:ff00::add:2}"
@@ -130,6 +130,11 @@ EOF
 [[ "$2" =~ ^[0-9]+$ ]] || _die "NEW_NODE_ID must be a non-negative integer; got: $2"
 VMID=$1
 NEW_NODE_NUM=$2
+
+# Per-VMID token name avoids "Token already exists" races when multiple jobs
+# target the same destination in parallel (batch runner). Honour an explicit
+# TOKEN_NAME if the caller set one.
+TOKEN_NAME="${TOKEN_NAME:-${TOKEN_NAME_PREFIX}-${VMID}}"
 
 [[ -f "$PVE_NODES_FILE" ]] || _die "Missing $PVE_NODES_FILE — is this a BASE server? Run sync-base-nat.py sync nodes."
 [[ -f "$STATE_FILE" ]]     || _die "Missing $STATE_FILE — run sync-base-nat.py sync first."
@@ -216,25 +221,35 @@ PY
 ) || {
   rc=$?
   if [[ $rc -eq 99 ]]; then
-    _ok "Source equals destination — nothing to do."
-    exit 0
+    # state.json says VM is already in dest's /64. Defer the Firestore
+    # reconcile until after _firestore_update_servers is defined further
+    # below — covers the case where a prior run was interrupted between NAT
+    # sync (which writes state.json) and the Firestore update.
+    SRC_EQ_DST=1
+  else
+    _die "Could not resolve source/destination from local state (rc=$rc)."
   fi
-  _die "Could not resolve source/destination from local state (rc=$rc)."
 }
-[[ -n "$RESOLVED" ]] || _die "Resolver produced empty output."
+SRC_EQ_DST="${SRC_EQ_DST:-0}"
 
-read -r SRC_NODE SRC_IPV6 DST_NODE DST_IPV6 EXPECTED_VM_IPV6 OLD_VM_IPV6 <<< "$RESOLVED"
-RDP_PORT=$((RDP_BASE_PORT + VMID))
-
-_info "VMID:           ${VMID}"
-_info "Source node:    ${SRC_NODE} (${SRC_IPV6})"
-_info "Dest node:      ${DST_NODE} (${DST_IPV6})"
-_info "Old VM IPv6:    ${OLD_VM_IPV6}"
-_info "New VM IPv6:    ${EXPECTED_VM_IPV6}"
-_info "Public RDP port: ${RDP_PORT}"
+if (( SRC_EQ_DST == 0 )); then
+  [[ -n "$RESOLVED" ]] || _die "Resolver produced empty output."
+  read -r SRC_NODE SRC_IPV6 DST_NODE DST_IPV6 EXPECTED_VM_IPV6 OLD_VM_IPV6 <<< "$RESOLVED"
+  RDP_PORT=$((RDP_BASE_PORT + VMID))
+  _info "VMID:           ${VMID}"
+  _info "Source node:    ${SRC_NODE} (${SRC_IPV6})"
+  _info "Dest node:      ${DST_NODE} (${DST_IPV6})"
+  _info "Old VM IPv6:    ${OLD_VM_IPV6}"
+  _info "New VM IPv6:    ${EXPECTED_VM_IPV6}"
+  _info "Public RDP port: ${RDP_PORT}"
+fi
 
 # ----- SSH multiplexing: one persistent control connection per host ------------
-SSH_CTL_DIR=$(mktemp -d -t mvm.XXXXXX)
+# Only allocate the control dir when we'll actually do SSH (skipped in the
+# SRC_EQ_DST short-circuit path which only touches Firestore).
+if (( SRC_EQ_DST == 0 )); then
+  SSH_CTL_DIR=$(mktemp -d -t mvm.XXXXXX)
+fi
 SSH_BASE_OPTS=(
   -o LogLevel=ERROR
   -o StrictHostKeyChecking=no
@@ -322,6 +337,40 @@ for d in docs:
 sys.exit(0)
 PY
 }
+
+# Deferred from the resolver: state.json says VM is already in dest's /64,
+# but Firestore may still be stale (e.g. previous run was interrupted between
+# NAT sync and the Firestore update). Reconcile the doc and exit before any
+# SSH or rollback machinery initialises.
+if (( SRC_EQ_DST == 1 )); then
+  RECONCILE=$(VMID="$VMID" NEW_NODE_NUM="$NEW_NODE_NUM" PVE_NODES_FILE="$PVE_NODES_FILE" \
+              python3 - <<'PY' 2>/dev/null || true
+import ipaddress, json, os, sys
+vmid       = int(os.environ["VMID"])
+target_num = int(os.environ["NEW_NODE_NUM"])
+nodes      = json.load(open(os.environ["PVE_NODES_FILE"]))
+for h, ip in nodes.items():
+    head = h.split("-", 1)[0]
+    if head.isdigit() and int(head) == target_num:
+        parts = ipaddress.IPv6Address(ip).exploded.split(":")
+        prefix = ":".join(p.lstrip("0") or "0" for p in parts[:4]) + "::"
+        print(h, f"{prefix}{vmid:x}"); sys.exit(0)
+sys.exit(1)
+PY
+)
+  if [[ -n "$RECONCILE" ]]; then
+    read -r RC_DST_NODE RC_EXPECTED_IPV6 <<< "$RECONCILE"
+    _info "Source equals destination (${RC_DST_NODE}); reconciling Firestore in case a prior run was interrupted…"
+    if _firestore_update_servers --vmid "$VMID" --node-id "$RC_DST_NODE" --ipv6 "$RC_EXPECTED_IPV6" --maintenance false 2>/dev/null; then
+      _ok "Firestore reconciled (or was already up-to-date)."
+    else
+      _warn "Firestore reconcile failed; check /etc/firebase-credentials.json."
+    fi
+  else
+    _ok "Source equals destination — nothing to do."
+  fi
+  exit 0
+fi
 
 # ----- Guest-agent helpers (run PowerShell on dest VM) -------------------------
 # Returns: PS process exit code (0 success, anything else = failure / signal).
@@ -450,6 +499,12 @@ _rollback() {
   _ssh_close
 }
 trap _rollback EXIT
+# Signal traps make $? at EXIT-trap entry deterministic. Without these, a
+# SIGTERM/SIGINT mid-command (e.g. during pvesh remote_migrate) leaves $?
+# at the value of the last *completed* command — which is often 0 — so the
+# rollback message would misleadingly read "Aborting (rc=0)".
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ----- SSH reachability + tool checks ------------------------------------------
 src_ssh 'command -v qm && command -v pvesh' >/dev/null \
@@ -672,43 +727,28 @@ else
   _warn "Could not resolve dest public IPv4; connectionUrl will not be updated."
 fi
 
-# Firestore: nodeId + ipv6 + maintenance=false (always); connectionUrl only if known.
-_info "Updating Firestore servers/{${VMID}}: nodeId=${DST_NODE}, ipv6=${EXPECTED_VM_IPV6}…"
-fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6" --maintenance false)
-[[ -n "$DST_CONNECTION_URL" ]] && fs_args+=(--connection-url "$DST_CONNECTION_URL")
-if _firestore_update_servers "${fs_args[@]}"; then
-  _ok "Firestore updated."
-  MAINTENANCE_SET=0  # cleared by the update itself, no rollback needed
-else
-  _warn "Firestore update failed. NAT may still point to old node — investigate /etc/firebase-credentials.json."
-fi
-
-# Reconcile this BASE's local NAT immediately. sync-base-nat.py reads Firestore,
-# rewrites the nftables map elements, and persists state.json + the include file.
+# Reconcile this BASE's local NAT immediately. We use the explicit-IPv6 path
+# (sync <vmid> <ipv6>) so this works WITHOUT Firestore being updated yet —
+# Firestore is the very last step, so a Ctrl-C between here and the Firestore
+# update doesn't leave the doc claiming the VM lives on a node it isn't on.
+NAT_OK=0
 if [[ -x "$SYNC_BASE_NAT" ]]; then
-  _info "Reconciling local NAT via $SYNC_BASE_NAT sync ${VMID}…"
-  if "$SYNC_BASE_NAT" sync "$VMID" >/dev/null 2>&1; then
+  _info "Reconciling local NAT via $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6}…"
+  if "$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" >/dev/null 2>&1; then
     _ok "Local NAT reconciled."
+    NAT_OK=1
   else
-    _warn "$SYNC_BASE_NAT sync ${VMID} failed; run it manually."
+    _warn "$SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6} failed; run it manually."
   fi
 else
   _warn "$SYNC_BASE_NAT not executable; skipping local NAT reconcile."
 fi
 
-# Cleanup the migration token (only if we created it this run).
-if (( TOKEN_CREATED == 1 )); then
-  dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 \
-    || _warn "Token cleanup had issues (may already be removed)."
-  TOKEN_CREATED=0
-  _ok "Token removed on dest."
-fi
-
 # Connectivity check: poll IPv4+IPv6 reachability until both succeed or
-# CONNECTIVITY_TIMEOUT runs out. Persistent failure means NAT didn't reconcile
-# or the in-guest config is wrong — the VM is unreachable from the public
-# internet and needs manual investigation, so we _warn (lands in $ERROR_LOG)
-# rather than _info on final failure.
+# CONNECTIVITY_TIMEOUT runs out. Soft check — RDP-port specific, so a Linux
+# VM (or any guest not listening on RDP) will fail this even when fully
+# migrated. Persistent failure on a Windows VM is a real signal worth a
+# warning, but we don't gate Firestore on it.
 if [[ "$DST_STATUS" == "running" ]] && command -v nc >/dev/null; then
   _info "Probing ${CONNECTIVITY_HOST}:${RDP_PORT} (retrying up to ${CONNECTIVITY_TIMEOUT}s)…"
   conn_start=$SECONDS
@@ -726,6 +766,32 @@ if [[ "$DST_STATUS" == "running" ]] && command -v nc >/dev/null; then
   if (( conn_rc6 != 0 || conn_rc4 != 0 )); then
     _warn "Connectivity check FAILED after $((SECONDS - conn_start))s on ${CONNECTIVITY_HOST}:${RDP_PORT} (v6 rc=${conn_rc6}, v4 rc=${conn_rc4}). VM ${VMID} on ${DST_NODE} is unreachable from the internet — manual investigation required."
   fi
+fi
+
+# Firestore: nodeId + ipv6 + maintenance=false (LAST step). Gated on NAT_OK so
+# we don't claim the VM lives on the new node until NAT actually points there.
+# If we skip, the doc keeps the old nodeId + maintenance=true, signalling
+# "in-flux" so a re-run can reconcile.
+if (( NAT_OK == 1 )); then
+  _info "Updating Firestore servers/{${VMID}}: nodeId=${DST_NODE}, ipv6=${EXPECTED_VM_IPV6}…"
+  fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6" --maintenance false)
+  [[ -n "$DST_CONNECTION_URL" ]] && fs_args+=(--connection-url "$DST_CONNECTION_URL")
+  if _firestore_update_servers "${fs_args[@]}"; then
+    _ok "Firestore updated."
+    MAINTENANCE_SET=0  # cleared by the update itself, no rollback needed
+  else
+    _warn "Firestore update failed. Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} to retry."
+  fi
+else
+  _warn "Skipping Firestore nodeId update (NAT reconcile failed). Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} once $SYNC_BASE_NAT is working."
+fi
+
+# Cleanup the migration token (only if we created it this run).
+if (( TOKEN_CREATED == 1 )); then
+  dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 \
+    || _warn "Token cleanup had issues (may already be removed)."
+  TOKEN_CREATED=0
+  _ok "Token removed on dest."
 fi
 
 # Restore original power state: if we started this VM ourselves to apply
