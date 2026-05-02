@@ -146,6 +146,9 @@ PVE_NGINX_MAP_FILE = Path(
         "/etc/nginx/conf.d/pve-proxy-backends.map.conf",
     )
 )
+HOSTS_FILE = Path(os.environ.get("HOSTS_FILE", "/etc/hosts"))
+HOSTS_BLOCK_BEGIN = "# BEGIN sync-base-nat (managed; do not edit)"
+HOSTS_BLOCK_END = "# END sync-base-nat"
 NFT_INCLUDE_FILE = Path(
     os.environ.get(
         "NFT_INCLUDE_FILE",
@@ -866,9 +869,104 @@ def firestore_ip_for_proxmox_node(node_id: str) -> str | None:
     return s
 
 
+def parse_base_hosts() -> dict[str, str]:
+    """{b0: ipv6, b1: ipv6, ...} from BASE_HOSTS env (positional, comma-separated).
+
+    Empty/missing -> {}. Order matters: first entry becomes b0, second b1,
+    etc. Keep the same order on every BASE so the bN aliases map to the
+    same hosts everywhere.
+    """
+    raw = (os.environ.get("BASE_HOSTS") or "").strip()
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    idx = 0
+    for ip in raw.split(","):
+        ip = ip.strip()
+        if not ip:
+            continue
+        try:
+            normalize_ipv6(ip)
+        except ValueError:
+            logger.warning("BASE_HOSTS: skip invalid IPv6 %r", ip)
+            continue
+        out[f"b{idx}"] = ip
+        idx += 1
+    return out
+
+
+_NODE_NUM_RE = re.compile(r"^0*(\d+)")
+
+
+def node_short_alias(node_id: str) -> str | None:
+    """`p<N>` from the leading digits of a node id, or None when absent.
+
+    "0000002-AX162-R" -> "p2", "0000047-EX44" -> "p47".
+    """
+    m = _NODE_NUM_RE.match(node_id)
+    return f"p{m.group(1)}" if m else None
+
+
+def _replace_marker_block(text: str, begin: str, end: str, replacement: str) -> str:
+    """Replace the begin..end block in text. Append at EOF when missing."""
+    lines = text.splitlines(keepends=True)
+    start = end_idx = None
+    for i, line in enumerate(lines):
+        s = line.rstrip("\n")
+        if start is None and s == begin:
+            start = i
+        elif start is not None and s == end:
+            end_idx = i
+            break
+    if start is None or end_idx is None:
+        prefix = text if (not text or text.endswith("\n")) else text + "\n"
+        return prefix + replacement
+    return "".join(lines[:start]) + replacement + "".join(lines[end_idx + 1:])
+
+
+def write_hosts_block(nodes: dict[str, str], bases: dict[str, str]):
+    """Replace the managed block in /etc/hosts with bases + node aliases.
+
+    Each line: `<ipv6>\t<canonical>\t<short>` so `ssh p2` / `ssh b1` work
+    on any BASE. The block is rewritten atomically; rest of /etc/hosts is
+    untouched.
+    """
+    if not HOSTS_FILE.is_file():
+        logger.warning("hosts: %s missing; skip", HOSTS_FILE)
+        return
+
+    out_lines: list[str] = [HOSTS_BLOCK_BEGIN]
+    for alias in sorted(bases.keys()):
+        ipv6 = bases[alias]
+        canonical = f"base-{alias[1:]}" if alias.startswith("b") else alias
+        out_lines.append(f"{ipv6}\t{canonical}\t{alias}")
+    for node_id in sorted(nodes.keys()):
+        ipv6 = nodes[node_id]
+        short = node_short_alias(node_id)
+        if short:
+            out_lines.append(f"{ipv6}\t{node_id}\t{short}")
+        else:
+            out_lines.append(f"{ipv6}\t{node_id}")
+    out_lines.append(HOSTS_BLOCK_END)
+    new_block = "\n".join(out_lines) + "\n"
+
+    text = HOSTS_FILE.read_text()
+    new_text = _replace_marker_block(text, HOSTS_BLOCK_BEGIN, HOSTS_BLOCK_END, new_block)
+    if new_text == text:
+        return
+    try:
+        tmp = HOSTS_FILE.with_suffix(HOSTS_FILE.suffix + ".sync-base-nat.tmp")
+        tmp.write_text(new_text)
+        os.replace(tmp, HOSTS_FILE)
+        logger.info("hosts: updated (%d nodes, %d bases)", len(nodes), len(bases))
+    except OSError as e:
+        logger.warning("hosts: write %s failed: %s", HOSTS_FILE, e)
+
+
 def sync_nodes_apply_state(nodes: dict[str, str], reload_nginx: bool = True):
     write_pve_nodes_state(nodes)
     write_pve_nginx_map(nodes)
+    write_hosts_block(nodes, parse_base_hosts())
     if reload_nginx:
         nginx_test_and_reload()
     logger.info("PVE nodes map: %d entries", len(nodes))

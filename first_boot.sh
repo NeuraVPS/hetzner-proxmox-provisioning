@@ -385,8 +385,6 @@ policy_forward: DROP
 
 [IPSET base]
 
-64:ff9b::/96 # TEMPORAL 1
-fd00:4000::/108 # TEMPORAL 2
 2a01:4f9:3090:2488::/64 # BASE 0 IPv6
 2a01:4f9:3070:3984::/64 # BASE 1 IPv6
 
@@ -397,14 +395,16 @@ fd00:4000::/108 # TEMPORAL 2
 [RULES]
 
 IN PMG(ACCEPT) -source +dc/base -log nolog
-IN SSH(ACCEPT) -log nolog
+IN PMG(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN SSH(ACCEPT) -source +dc/base -log nolog
+IN SSH(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 IN DHCPfwd(ACCEPT) -i vmbr0 -log nolog
-IN DHCPv6(ACCEPT) -i vmbr0 -log nolog
 
 [group vm-default]
 
 IN SSH(ACCEPT) -source +dc/base -log nolog
 IN RDP(ACCEPT) -source +dc/base -log nolog
+IN ACCEPT -source +dc/base -p udp -dport 3389 -log nolog
 IN SMB(ACCEPT) -source +dc/base -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 
@@ -412,23 +412,11 @@ IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 
 IN SSH(ACCEPT) -source +dc/base -log nolog
 IN RDP(ACCEPT) -source +dc/base -log nolog
+IN ACCEPT -source +dc/base -p udp -dport 3389 -log nolog
 IN SMB(ACCEPT) -source +dc/base -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 IN DROP -log nolog
 OUT DROP -log nolog
-
-[group vm-no-rdp]
-
-IN RDP(DROP) -log nolog
-
-[group vm-no-samba]
-
-IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
-IN SMB(DROP) -log nolog
-
-[group vm-no-ssh]
-
-IN SSH(DROP) -log nolog
 
 [group vm-public-ipv6]
 

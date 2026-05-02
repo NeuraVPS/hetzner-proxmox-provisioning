@@ -79,6 +79,12 @@ FIREWALL_STORAGE_USER=u560363
 FIREWALL_STORAGE_HOST=u560363.your-storagebox.de
 FIREWALL_REMOTE_PATH=/home/firewall/cluster.fw
 FIREWALL_SCP_PORT=23
+
+# Comma-separated main IPv6 of every BASE in stable order.
+# sync-base-nat.py rewrites /etc/hosts on every node sync, giving each
+# entry a positional alias (b0, b1, ...) so `ssh b1` works from any BASE.
+# Keep the order identical on every BASE.
+BASE_HOSTS=2a01:4f9:3090:2488::2,2a01:4f9:3070:3984::2
 EOF
 
 # 3) Install Firebase credentials before starting service.
