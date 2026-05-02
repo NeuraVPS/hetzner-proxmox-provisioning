@@ -10,8 +10,8 @@
 # Schedules migrations in parallel with three safety caps so we don't
 # saturate any single node's NIC / disk / RAM:
 #   - PER_NODE     max in-flight migrations touching any single node (src OR dst).
-#                  Live migration is mostly NIC-bound; 2 is safe on a 1 Gbps
-#                  link, ~4 on 10 Gbps. Default 2.
+#                  Live migration is mostly NIC-bound; 1 is safe on a 1 Gbps
+#                  link, ~2 on 10 Gbps. Default 1.
 #   - MAX_TOTAL    hard cap on overall in-flight migrations (default 8).
 #   - per-VMID    same VMID is never in two slots at once (chained migrations
 #                  like A→B then B→C are auto-serialised in input order).
@@ -31,7 +31,7 @@ set -eo pipefail
 
 # ----- Defaults & args ---------------------------------------------------------
 INPUT=""
-PER_NODE=2
+PER_NODE=1
 MAX_TOTAL=8
 LOG_DIR="${LOG_DIR:-/var/log/migrate_vm}"
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
