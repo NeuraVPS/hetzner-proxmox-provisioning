@@ -32,6 +32,8 @@ Commands:
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import ipaddress
 import json
 import logging
@@ -63,6 +65,7 @@ MAX_LOG_SIZE = 1024 * 1024
 STATE_DIR = Path("/var/lib/base-nat")
 DEFAULT_STATE_FILE = STATE_DIR / "state.json"
 DEFAULT_ENV_FILE = Path("/etc/default/base-nat")
+LOCK_FILE = STATE_DIR / ".sync.lock"
 
 
 def clean_log_if_needed() -> bool:
@@ -243,19 +246,65 @@ def vm_ports(vmid: int) -> tuple[int, int]:
     return SAMBA_PORT_BASE + vmid, RDP_PORT_BASE + vmid
 
 
+@contextlib.contextmanager
+def state_lock():
+    """Serialize the read-modify-write of STATE_FILE + nft maps across
+    concurrent sync-base-nat invocations.
+
+    Without this, two processes (e.g. a Firestore-trigger SSH from the
+    Cloud Function plus a migrate_vm.sh sync, or two back-to-back
+    nat64_sync_trigger_handler del+create calls) can interleave their
+    read of state.json with the other's non-atomic truncate-and-write.
+    The reader then parses an empty/partial file, falls back to an empty
+    desired map, flushes every nft map, and rewrites state.json with
+    *only the VM it was processing* — wiping every unrelated client's
+    DNAT until the next full sync. The lock is held for the whole
+    reconcile (read + nft transaction + write_state + include file)
+    because all four operations share the same desired snapshot.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 def read_state() -> dict:
     if not STATE_FILE.is_file():
         return {}
     try:
         return json.loads(STATE_FILE.read_text())
     except Exception as e:
-        logger.warning("State read failed: %s", e)
-        return {}
+        # state.json exists but is unreadable/unparseable. Treating this
+        # as "empty" is dangerous: the caller would flush every nft map
+        # and write back a single-VM state, breaking every unrelated VM.
+        # Bail out so the operator (or systemd Restart=) sees the failure
+        # and the include file from §7 / a subsequent full sync recovers.
+        logger.error("State read failed (refusing to proceed): %s", e)
+        sys.exit(1)
 
 
 def write_state(state: dict):
+    """Atomic state file write.
+
+    Non-atomic write_text leaves a window where a concurrent reader sees
+    an empty file (open(..., 'w') truncates before the new contents land),
+    which read_state used to silently treat as `{}`. Even with the lock
+    above, atomicity protects any out-of-band reader that doesn't take
+    the lock (`cat`, monitoring scripts, jq queries during incident
+    response) from observing a torn file.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(payload)
+    os.replace(tmp, STATE_FILE)
 
 
 # Per-VM desired entry: ipv6 + which services BASE should redirect.
@@ -605,9 +654,13 @@ def _state_payload(desired: dict[int, dict]) -> dict:
 
 
 def sync_full():
+    # Firestore read happens outside the lock because it can take seconds
+    # and we don't want to block per-VM syncs that whole time. The lock
+    # only needs to cover the nft+state critical section.
     desired = firestore_list_configured_servers()
-    reconcile_dynamic_dnat_rules(desired)
-    write_state(_state_payload(desired))
+    with state_lock():
+        reconcile_dynamic_dnat_rules(desired)
+        write_state(_state_payload(desired))
     logger.info("Full sync done (%d servers)", len(desired))
 
 
@@ -637,36 +690,40 @@ def sync_single_vmid(
         logger.error("Explicit IPv6 required for sync <proxmoxId> <ipv6>")
         sys.exit(2)
 
-    desired = desired_from_state()
-    if delete_only:
-        desired.pop(vmid, None)
-        logger.info("proxmoxId=%s removed from desired map", vmid)
-    elif server is not None:
-        if ipv6_override:
-            # Override path: caller is authoritative when it supplied a
-            # flag, otherwise preserve the previous state so an IPv6
-            # change doesn't accidentally re-enable a service the user
-            # previously toggled off.
-            existing = desired.get(vmid)
-            rdp_default = bool(existing.get("rdp", True)) if existing else True
-            samba_default = bool(existing.get("samba", True)) if existing else True
-            override = flags_override or {}
-            rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
-            samba_flag = bool(override["samba"]) if "samba" in override else samba_default
+    # All read-modify-write of state.json + nft maps must run under the
+    # lock — see state_lock() docstring for why a torn read here used to
+    # nuke unrelated VMs' DNAT.
+    with state_lock():
+        desired = desired_from_state()
+        if delete_only:
+            desired.pop(vmid, None)
+            logger.info("proxmoxId=%s removed from desired map", vmid)
+        elif server is not None:
+            if ipv6_override:
+                # Override path: caller is authoritative when it supplied a
+                # flag, otherwise preserve the previous state so an IPv6
+                # change doesn't accidentally re-enable a service the user
+                # previously toggled off.
+                existing = desired.get(vmid)
+                rdp_default = bool(existing.get("rdp", True)) if existing else True
+                samba_default = bool(existing.get("samba", True)) if existing else True
+                override = flags_override or {}
+                rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
+                samba_flag = bool(override["samba"]) if "samba" in override else samba_default
+            else:
+                rdp_flag = bool(server.get("rdp", True))
+                samba_flag = bool(server.get("samba", True))
+            desired[vmid] = _server_entry(
+                normalize_ipv6(server["ipv6"]),
+                rdp=rdp_flag,
+                samba=samba_flag,
+            )
         else:
-            rdp_flag = bool(server.get("rdp", True))
-            samba_flag = bool(server.get("samba", True))
-        desired[vmid] = _server_entry(
-            normalize_ipv6(server["ipv6"]),
-            rdp=rdp_flag,
-            samba=samba_flag,
-        )
-    else:
-        desired.pop(vmid, None)
-        logger.info("proxmoxId=%s not in Firestore; removed from desired map", vmid)
+            desired.pop(vmid, None)
+            logger.info("proxmoxId=%s not in Firestore; removed from desired map", vmid)
 
-    reconcile_dynamic_dnat_rules(desired)
-    write_state(_state_payload(desired))
+        reconcile_dynamic_dnat_rules(desired)
+        write_state(_state_payload(desired))
     logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
 
