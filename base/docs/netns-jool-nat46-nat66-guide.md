@@ -307,40 +307,160 @@ systemctl start nftables
 
 ### 7.1 nftables.service drop-in (boot race + auto-resync)
 
-`nftables.service` is loaded very early in boot, before the WAN interface
-is registered. Because the flowtable in `table inet filter` references
-the WAN device by name, an early load fails with
-`Could not process rule: No such file or directory` and **the entire
-ruleset is rejected** — leaving the box with zero firewall/DNAT until a
-later retry succeeds. Even when that retry succeeds, the maps come up
-empty.
+`nftables.service` is loaded very early in boot — much earlier than
+`jool-nat46.service`, which runs after `network-online.target`. Because
+the flowtable in `table inet filter` references **both** the WAN
+interface and the `veth-host` netns peer by name (`devices = { enp*,
+veth-host }`), an early load when `veth-host` is still missing fails
+with `Could not process rule: No such file or directory` and **the
+entire ruleset is rejected** — leaving the box with zero firewall/DNAT.
 
-The drop-in below fixes both problems:
+### Why we can't just reorder nftables.service after jool-nat46.service
 
-- `After=/Wants=network-online.target` — wait until interfaces are up
-  before loading `/etc/nftables.conf`, so the flowtable resolves on the
-  first try.
-- `ExecStartPost=` — re-run sync whenever nftables starts. Combined with
-  the include file (§7), this guarantees the maps are populated after
-  every (re)load, regardless of the trigger (boot, manual restart,
-  package upgrade hook).
+It would seem natural to add a drop-in like
+`After=network-online.target jool-nat46.service` so nftables loads only
+once both are up. **This does not work.** Debian's upstream
+`/usr/lib/systemd/system/nftables.service` ships with
+
+```
+Wants=network-pre.target
+Before=network-pre.target
+```
+
+i.e. the firewall is required to run **before** networking comes up.
+Adding any `After=` that points (directly or transitively) at
+`network-online.target` produces an ordering cycle:
+
+```
+nftables.service → network-online.target → networking.service
+                 → network-pre.target → nftables.service
+```
+
+systemd resolves this by silently deleting one ordering edge on every
+boot — sometimes the very wait we just added. And dependency lists are
+effectively append-only across drop-ins on the systemd version shipped
+in Debian today: an empty `Before=` does NOT clear the inherited
+`Before=network-pre.target`, so we cannot remove the offending edge from
+a drop-in either.
+
+### The fix: a tiny sibling unit, `veth-host.service`
+
+Instead of trying to reorder nftables relative to jool, we split the
+*one thing nftables actually needs* — the `veth-host` netdev pair —
+into its own oneshot that runs in the **same early-boot slot** as
+nftables. `veth-host.service` mirrors nftables's
+`DefaultDependencies=no` + `Before=network-pre.target`, has no upstream
+`After=` edges of its own, and therefore can be ordered before nftables
+without closing any loop. The full installation of `veth-host.service`
+(and `veth-host-setup.sh`) is documented in §8.0; both files live in
+`base/snippets/`.
+
+Address/route/Jool configuration on this veth pair still happens in
+`jool-nat46.service` (§8), which runs much later. nftables doesn't care
+about any of that — it only needs the netdev to exist.
+
+### The nftables drop-in
+
+With `veth-host.service` in place, the drop-in is small and the `[Unit]`
+edge is now safe:
+
+- `Wants=/After=veth-host.service` — wait for the veth pair before
+  loading `/etc/nftables.conf`. Without this, nftables loads in the
+  sysinit slot before veth-host exists and the flowtable rejects the
+  whole ruleset.
+- No `ExecStartPost=sync-base-nat.py sync` here, deliberately. nftables
+  now runs in the sysinit slot — well before networking is up and DNS
+  resolves — so the Firestore client inside `sync-base-nat.py` would
+  burn its full 300 s retry budget before failing, holding up every
+  unit ordered after `sysinit.target`. Boot-time sync responsibility
+  lives in `base-nat-boot.service` (`After=network-online.target`),
+  which already runs the same command. For a manual refresh after a
+  Firestore change post-boot, run `/usr/local/sbin/sync-base-nat.py
+  sync` directly or `systemctl restart base-nat-boot.service`.
 
 ```bash
 mkdir -p /etc/systemd/system/nftables.service.d
 cat >/etc/systemd/system/nftables.service.d/10-base-nat.conf <<'EOF'
 [Unit]
-After=network-online.target
-Wants=network-online.target
+Wants=veth-host.service
+After=veth-host.service
 
 [Service]
-# Best-effort resync on every (re)start. The leading "-" means a sync
-# failure (e.g. Firestore unreachable) does not fail nftables itself —
-# the include file from §7 already provides the last-known-good state.
-ExecStartPost=-/usr/bin/python3 /usr/local/sbin/sync-base-nat.py sync
+ReadWritePaths=/etc/nftables.d /var/lib/base-nat /var/log
 EOF
 
 systemctl daemon-reload
 ```
+
+**Healthy-boot journal pattern:** `veth-host.service` finishes in the
+sysinit slot, `nftables.service` loads cleanly on first try with the
+full ruleset live (sub-second), `jool-nat46.service` configures
+addresses/routes after `network-online.target`, and
+`base-nat-boot.service` then pulls fresh Firestore state and rewrites
+`/etc/nftables.d/base-nat-elements.nft`. No failed units, no journal
+red, no manual restarts.
+
+---
+
+## 8.0 Early-boot veth pair: `veth-host.service`
+
+This service exists for one reason: to make `veth-host` available before
+`nftables.service` loads `/etc/nftables.conf` (see §7.1 for the full
+analysis of why we cannot solve this with ordering against
+`jool-nat46.service`). It is intentionally tiny.
+
+`/usr/local/sbin/veth-host-setup.sh` (see `base/snippets/veth-host-setup.sh`):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# All commands are idempotent — safe to re-run.
+ip netns add jool 2>/dev/null || true
+ip link add veth-host type veth peer name veth-ns 2>/dev/null || true
+ip link set veth-ns netns jool 2>/dev/null || true
+ip link set veth-host up
+```
+
+`/etc/systemd/system/veth-host.service` (see `base/snippets/veth-host.service`):
+
+```ini
+[Unit]
+Description=Create veth-host pair for Jool NAT46 (nftables flowtable dependency)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/veth-host-setup.sh
+RemainAfterExit=yes
+StandardInput=null
+
+[Install]
+WantedBy=sysinit.target
+```
+
+`DefaultDependencies=no` + `Before=network-pre.target` puts this unit in
+the same early-boot slot as Debian's `nftables.service`. With no upstream
+`After=` edges, it is a leaf in the ordering DAG — `nftables.service`
+can order itself `After=veth-host.service` (from the §7.1 drop-in)
+without introducing any cycle.
+
+Enable:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/veth-host-setup.sh \
+  -o /usr/local/sbin/veth-host-setup.sh
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/veth-host.service \
+  -o /etc/systemd/system/veth-host.service
+chmod +x /usr/local/sbin/veth-host-setup.sh
+systemctl daemon-reload
+systemctl enable --now veth-host.service
+```
+
+`base_setup.sh` already does the above as part of step §4b — this
+section exists so the manual install path stays self-contained.
 
 ---
 
@@ -348,6 +468,7 @@ systemctl daemon-reload
 
 The following makes everything persistent except **Dynamic NAT66 Rules**:
 
+- veth pair host↔netns (delegated to `veth-host.service`, see §8.0)
 - netns + veth addresses/routes
 - host static routes for Jool
 - Jool SIIT instance (`--netfilter`) + EAMT mapping (hooks attach in the netns automatically)
@@ -355,7 +476,11 @@ The following makes everything persistent except **Dynamic NAT66 Rules**:
 
 Install **`jool-dkms`** and **`jool-tools`** (see §5) before enabling this service.
 
-Create a boot script:
+Create a boot script. Note that the veth pair itself (`ip netns add
+jool` / `ip link add veth-host ...`) is no longer this script's job —
+`veth-host.service` (§8.0) creates the pair in the sysinit slot so
+`nftables.service` can resolve its flowtable on the first try. This
+script only configures it.
 
 ```bash
 cat >/usr/local/sbin/jool-nat46-setup.sh <<'EOF'
@@ -365,14 +490,10 @@ set -euo pipefail
 ROUTER_IPV6="<ROUTER_IPV6>"
 WAN_IF="enp6s0"
 
-# 1) netns + veth
-ip netns add jool 2>/dev/null || true
-ip link add veth-host type veth peer name veth-ns 2>/dev/null || true
-ip link set veth-ns netns jool 2>/dev/null || true
-
+# 1) Addresses on the already-existing veth pair (created by
+#    veth-host.service in the sysinit slot — see §8.0).
 ip addr replace 10.0.0.1/24 dev veth-host
 ip -6 addr replace fd00::1/64 dev veth-host
-ip link set veth-host up
 
 ip netns exec jool ip addr replace 10.0.0.2/24 dev veth-ns
 ip netns exec jool ip addr replace 10.0.0.3/32 dev veth-ns
@@ -444,8 +565,13 @@ Create systemd unit:
 cat >/etc/systemd/system/jool-nat46.service <<'EOF'
 [Unit]
 Description=Setup Jool NAT46 netns topology
-Wants=network-online.target
-After=network-online.target nftables.service
+Wants=network-online.target veth-host.service
+# `veth-host.service` (§8.0) owns creation of the veth pair this script
+# configures, so order after it. Do NOT add `After=nftables.service` —
+# Debian's nftables.service ships with `Before=network-pre.target` which
+# combined with our `After=network-online.target` would form a systemd
+# ordering cycle (see §7.1).
+After=network-online.target veth-host.service
 
 [Service]
 Type=oneshot

@@ -1,0 +1,22 @@
+[Unit]
+Description=Create veth-host pair for Jool NAT46 (nftables flowtable dependency)
+Documentation=https://github.com/NeuraVPS/hetzner-proxmox-provisioning/blob/master/base/docs/netns-jool-nat46-nat66-guide.md
+
+# Run in the same early-boot slot as nftables.service so the veth pair
+# exists by the time `/etc/nftables.conf` is loaded. nftables.service
+# ships with `DefaultDependencies=no` + `Before=network-pre.target`;
+# mirror that so this unit can sit before nftables without creating any
+# ordering cycle.
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/veth-host-setup.sh
+RemainAfterExit=yes
+StandardInput=null
+
+[Install]
+WantedBy=sysinit.target

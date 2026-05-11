@@ -108,10 +108,20 @@ chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
 mkdir -p /etc/nftables.d
 [ -f /etc/nftables.d/base-nat-elements.nft ] || : > /etc/nftables.d/base-nat-elements.nft
 
-# 4b) nftables.service drop-in: wait for WAN before loading the ruleset
-# (avoids "Could not process rule" failure when the flowtable references
-# an interface that doesn't exist yet) and re-run sync after every
-# (re)start so map elements are always populated. See guide §7.1.
+# 4b) veth-host.service: tiny early-boot oneshot that creates the
+# `veth-host` netdev pair before nftables.service loads. The flowtable
+# in /etc/nftables.conf references this device; loading the ruleset
+# before it exists fails the entire load. See guide §7.1 + §8.0.
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/veth-host-setup.sh \
+  -o /usr/local/sbin/veth-host-setup.sh
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/veth-host.service \
+  -o /etc/systemd/system/veth-host.service
+chmod +x /usr/local/sbin/veth-host-setup.sh
+
+# 4c) nftables.service drop-in: order after veth-host.service so the
+# flowtable can resolve `devices = { enp*, veth-host }` on first try,
+# and re-run sync after every (re)start so map elements are always
+# populated. See guide §7.1.
 mkdir -p /etc/systemd/system/nftables.service.d
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/nftables-base-nat.conf \
   -o /etc/systemd/system/nftables.service.d/10-base-nat.conf
@@ -119,6 +129,7 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
 # 5) Enable boot-time dynamic sync.
 mkdir -p /var/lib/base-nat
 systemctl daemon-reload
+systemctl enable --now veth-host.service
 systemctl restart nftables.service
 systemctl enable --now base-nat-boot.service
 
