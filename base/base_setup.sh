@@ -39,7 +39,7 @@
 
 # 1) Install runtime dependencies.
 apt update && apt upgrade -y
-apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool
+apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool sshpass smbclient netcat-openbsd
 pip3 install --break-system-packages firebase-admin
 
 # 2) Runtime configuration for sync-base-nat.py.
