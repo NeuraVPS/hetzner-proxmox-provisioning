@@ -658,7 +658,28 @@ if (( _vm_on_src == 1 )); then
             ${ONLINE_FLAG} \
             --delete" \
     || _die "pvesh remote_migrate failed."
-  _ok "remote_migrate completed."
+  _ok "remote_migrate command returned."
+
+  # 6) Verify the migration ACTUALLY landed. `pvesh remote_migrate` exits 0 even
+  # when the task ends in "migration finished with problems" (the CLI returns
+  # the worker UPID, not the task result), so exit code is not trustworthy.
+  # Check ground truth instead: with --delete a successful migration leaves the
+  # VM present on dest and gone from source. If that does not hold, the VM was
+  # kept on source — _die here (BEFORE MIGRATION_DONE=1) so the existing
+  # _rollback re-attaches the hookscript on source and leaves Firestore routing
+  # (nodeId/ipv6) untouched; only the advisory maintenance flag is reverted.
+  _post_on_dst=0; _post_on_src=0
+  dst_ssh "qm config '${VMID}' >/dev/null 2>&1" && _post_on_dst=1 || _post_on_dst=0
+  src_ssh "qm config '${VMID}' >/dev/null 2>&1" && _post_on_src=1 || _post_on_src=0
+  if (( _post_on_dst == 0 || _post_on_src == 1 )); then
+    _die "remote_migrate did not complete (on_dst=${_post_on_dst} on_src=${_post_on_src}) — VM ${VMID} was kept on source ${SRC_NODE}. See the migration log above for the underlying error. Rolling back transient changes; Firestore routing left unchanged."
+  fi
+  if [[ -n "$ONLINE_FLAG" ]]; then
+    _post_run=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
+    [[ "$_post_run" == "running" ]] \
+      || _die "VM ${VMID} reached dest ${DST_NODE} but is not running (status=${_post_run:-unknown}) after an online migration — treating as failed. Rolling back; Firestore routing left unchanged."
+  fi
+  _ok "Verified VM ${VMID} is on dest ${DST_NODE}${ONLINE_FLAG:+ and running}."
 
   _vm_on_dst=1; _vm_on_src=0
 else
