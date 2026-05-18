@@ -22,6 +22,12 @@
 #   errors-<ts>.log             aggregated content of every FAILED job
 #                               + every WARN/ERROR line from successful jobs
 #
+# Before scheduling, every unique node referenced (source or dest) is
+# `apt dist-upgrade`d exactly once so dest pve-qemu-kvm >= source's (live
+# migration is forward-compatible only). Jobs whose src/dst node fails the
+# upgrade are dropped and counted as failures; unrelated nodes still run.
+# Bypass with SKIP_NODE_APT_UPGRADE=1 (QEMU parity then NOT guaranteed).
+#
 # Exit code: 0 if every job succeeded, 1 if any failed, 2 on usage error.
 
 # NOTE: `set -u` is intentionally OFF — bash 5.x trips on `${#assoc[@]}` in
@@ -201,10 +207,117 @@ if (( ${#JOBS[@]} == 0 )); then
   exit 0
 fi
 
+TOTAL_JOBS=${#JOBS[@]}
 log "Parsed ${#JOBS[@]} job(s), skipped=$skipped, per_node=$PER_NODE max_total=$MAX_TOTAL"
 log "Master log:  $MASTER_LOG"
 log "Errors log:  $ERRORS_LOG"
 log "Job logs in: $LOG_DIR/jobs/"
+
+# ----- Pre-migration node package convergence (once per unique node) -----------
+# Live migration needs dest pve-qemu-kvm >= source's; we dist-upgrade every node
+# involved exactly once here so the per-VM migrate_vm.sh check just sees "0
+# pending" and skips fast. A node whose upgrade fails has ALL its jobs (src or
+# dst) dropped and recorded as failures; unrelated nodes still proceed.
+#
+# IMPORTANT: payload identical to _APT_REMOTE_PAYLOAD in migrate_vm.sh — keep in
+# sync. Set SKIP_NODE_APT_UPGRADE=1 to bypass (emergency / offline-repo).
+node_fail_count=0
+if [[ "${SKIP_NODE_APT_UPGRADE:-0}" == "1" ]]; then
+  log "SKIP_NODE_APT_UPGRADE=1 — skipping pre-migration node upgrades; QEMU parity NOT guaranteed."
+else
+  declare -A NODE_IP
+  while IFS=$'\t' read -r _n _ip; do NODE_IP["$_n"]="$_ip"; done < <(
+    python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+[print(f"{k}\t{v}") for k,v in d.items()]' "$PVE_NODES_FILE"
+  )
+
+  APT_REMOTE_PAYLOAD='
+set -o pipefail
+export DEBIAN_FRONTEND=noninteractive
+LOCK="-o DPkg::Lock::Timeout=300"
+CONF="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+if ! apt-get $LOCK update -qq; then echo "APT_UPGRADE_FAIL apt-get update failed" >&2; exit 1; fi
+n=$(LC_ALL=C apt-get -s dist-upgrade 2>/dev/null | awk "/^[0-9]+ upgraded,/{print \$1; exit}")
+n=${n:-0}
+if [ "$n" -eq 0 ]; then echo "APT_UPGRADE_SKIP already current"; exit 0; fi
+echo "APT_UPGRADE_RUN $n package(s) pending"
+if ! apt-get $LOCK $CONF -y dist-upgrade; then echo "APT_UPGRADE_FAIL dist-upgrade failed" >&2; exit 1; fi
+echo "APT_UPGRADE_DONE"
+'
+  SSH_OPTS=(-o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+            -o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o BatchMode=yes)
+
+  # Unique set of nodes referenced as src or dst across all jobs.
+  declare -A _seen_node
+  declare -A NODE_BAD
+  for job in "${JOBS[@]}"; do
+    IFS='|' read -r _jv jsrc jdst _jn <<< "$job"
+    for nd in "$jsrc" "$jdst"; do
+      [[ -n "${_seen_node[$nd]:-}" ]] && continue
+      _seen_node[$nd]=1
+      nip="${NODE_IP[$nd]:-}"
+      if [[ -z "$nip" ]]; then
+        log "NODE-UPGRADE FAIL node=$nd: no IPv6 in $PVE_NODES_FILE"
+        NODE_BAD[$nd]=1; continue
+      fi
+      log "NODE-UPGRADE start node=$nd ($nip)"
+      if out=$(ssh "${SSH_OPTS[@]}" "root@${nip}" "$APT_REMOTE_PAYLOAD" 2>&1); then
+        if grep -q 'APT_UPGRADE_SKIP' <<< "$out"; then
+          log "NODE-UPGRADE ok    node=$nd (already current)"
+        elif grep -q 'APT_UPGRADE_DONE' <<< "$out"; then
+          log "NODE-UPGRADE ok    node=$nd (dist-upgrade applied)"
+        else
+          log "NODE-UPGRADE FAIL  node=$nd: no success marker"
+          NODE_BAD[$nd]=1
+        fi
+      else
+        log "NODE-UPGRADE FAIL  node=$nd: $(printf '%s' "$out" | tail -1)"
+        NODE_BAD[$nd]=1
+      fi
+      if [[ -n "${NODE_BAD[$nd]:-}" ]]; then
+        {
+          echo
+          echo "========================================================================"
+          echo "NODE-UPGRADE FAIL  node=$nd  $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "------------------------------------ output ------------------------------------"
+          printf '%s\n' "$out"
+          echo "----------------------------------- end output ---------------------------------"
+        } >> "$ERRORS_LOG"
+      fi
+    done
+  done
+
+  # Drop every job whose src or dst node failed to upgrade; count as failures.
+  if (( ${#NODE_BAD[@]} > 0 )); then
+    declare -a _kept=()
+    for job in "${JOBS[@]}"; do
+      IFS='|' read -r jvmid jsrc jdst jdstnum <<< "$job"
+      if [[ -n "${NODE_BAD[$jsrc]:-}" || -n "${NODE_BAD[$jdst]:-}" ]]; then
+        node_fail_count=$((node_fail_count + 1))
+        log "FAIL     vmid=$jvmid src=$jsrc dst=$jdst rc=- node-upgrade failed (migration not attempted)"
+        {
+          echo
+          echo "========================================================================"
+          echo "FAIL  vmid=$jvmid  src=$jsrc → dst=$jdst  rc=-  $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "      reason: pre-migration node dist-upgrade failed; migration not attempted"
+          echo "========================================================================"
+        } >> "$ERRORS_LOG"
+      else
+        _kept+=("$job")
+      fi
+    done
+    JOBS=("${_kept[@]}")
+  fi
+fi
+
+if (( ${#JOBS[@]} == 0 )); then
+  log "no runnable jobs after node-upgrade gate (node_fail=$node_fail_count); exiting"
+  log "========================================================================"
+  log "SUMMARY  ok=0 fail=$node_fail_count skipped=$skipped total=$TOTAL_JOBS"
+  (( node_fail_count > 0 )) && exit 1
+  exit 0
+fi
 
 # ----- Scheduler ---------------------------------------------------------------
 declare -A in_flight    # node -> count
@@ -212,7 +325,7 @@ declare -A pid_meta     # pid  -> "vmid|src|dst|jlog"
 declare -A vmid_busy    # vmid -> 1
 pending=("${JOBS[@]}")
 
-ok_count=0; fail_count=0
+ok_count=0; fail_count=${node_fail_count:-0}
 
 # Trap: on Ctrl-C or fatal, kill all in-flight children, wait for their
 # rollbacks to finish, and exit. The trap *must* terminate the script — if it
@@ -309,7 +422,7 @@ trap - INT TERM
 
 # ----- Summary -----------------------------------------------------------------
 log "========================================================================"
-log "SUMMARY  ok=$ok_count fail=$fail_count skipped=$skipped total=${#JOBS[@]}"
+log "SUMMARY  ok=$ok_count fail=$fail_count skipped=$skipped total=$TOTAL_JOBS"
 log "Master log:  $MASTER_LOG"
 log "Errors log:  $ERRORS_LOG"
 

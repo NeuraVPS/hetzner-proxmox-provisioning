@@ -18,6 +18,14 @@
 # to apply the in-guest IPv6 reconfig, then gracefully shut back down so the
 # original power state is preserved.
 #
+# Before the migration phase, BOTH source and dest are `apt dist-upgrade`d (in
+# that order) so dest pve-qemu-kvm is >= source's — live migration is only
+# forward-compatible and independently-patched nodes drift. Any upgrade failure
+# aborts the migration before the VM is touched. This never reboots the node or
+# the guest. Bypass with SKIP_NODE_APT_UPGRADE=1 (QEMU parity then NOT
+# guaranteed). In batch runs migrate_vms_batch.sh does this once per node up
+# front, so the per-VM check here just sees "0 pending" and skips in seconds.
+#
 # wget https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/migrate_vm.sh
 #
 # ----- Error handling & logging -----------------------------------------------
@@ -276,6 +284,61 @@ _ssh_close() {
   rm -rf "$SSH_CTL_DIR"
 }
 
+# ----- Pre-migration node package convergence ---------------------------------
+# Live (online) migration requires the destination's pve-qemu-kvm to be at least
+# as new as the source's; independently-patched nodes drift, and a newer source
+# than dest fails the migration. We converge BOTH nodes before touching the VM.
+#
+# On Proxmox the blessed upgrade is `apt dist-upgrade` (plain `apt upgrade` holds
+# back kernel/qemu and is explicitly discouraged in the Proxmox docs), so that is
+# what actually moves pve-qemu-kvm forward.
+#
+# Safe w.r.t. running guests: a new qemu binary only applies to processes started
+# AFTER the upgrade — already-running VMs keep their existing qemu until they are
+# migrated/restarted, and dist-upgrade never reboots the node or any guest.
+#
+# IMPORTANT: this is identical to the per-node payload in migrate_vms_batch.sh —
+# keep the two in sync. Markers (APT_UPGRADE_*) are parsed by both callers.
+# Set SKIP_NODE_APT_UPGRADE=1 to bypass (emergency / offline-repo situations).
+_APT_REMOTE_PAYLOAD='
+set -o pipefail
+export DEBIAN_FRONTEND=noninteractive
+LOCK="-o DPkg::Lock::Timeout=300"
+CONF="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+if ! apt-get $LOCK update -qq; then echo "APT_UPGRADE_FAIL apt-get update failed" >&2; exit 1; fi
+n=$(LC_ALL=C apt-get -s dist-upgrade 2>/dev/null | awk "/^[0-9]+ upgraded,/{print \$1; exit}")
+n=${n:-0}
+if [ "$n" -eq 0 ]; then echo "APT_UPGRADE_SKIP already current"; exit 0; fi
+echo "APT_UPGRADE_RUN $n package(s) pending"
+if ! apt-get $LOCK $CONF -y dist-upgrade; then echo "APT_UPGRADE_FAIL dist-upgrade failed" >&2; exit 1; fi
+echo "APT_UPGRADE_DONE"
+'
+
+# _apt_dist_upgrade <ssh_fn> <label> — runs the payload on one node via the
+# given multiplexed SSH function. _die (abort this migration) on any failure.
+_apt_dist_upgrade() {
+  local ssh_fn="$1" label="$2" line
+  if [[ "${SKIP_NODE_APT_UPGRADE:-0}" == "1" ]]; then
+    _warn "SKIP_NODE_APT_UPGRADE=1 — not upgrading ${label}; QEMU parity NOT guaranteed."
+    return 0
+  fi
+  _info "Pre-migration apt dist-upgrade on ${label}…"
+  # Stream remote output to our log; capture it too so we can assert on markers.
+  local out
+  out=$("$ssh_fn" "$_APT_REMOTE_PAYLOAD" 2>&1) || {
+    while IFS= read -r line; do [[ -n "$line" ]] && _warn "[${label}] $line"; done <<< "$out"
+    _die "apt dist-upgrade failed on ${label} — aborting migration (QEMU parity not guaranteed)."
+  }
+  while IFS= read -r line; do [[ -n "$line" ]] && _info "[${label}] $line"; done <<< "$out"
+  if grep -q 'APT_UPGRADE_SKIP' <<< "$out"; then
+    _ok "${label} already current — nothing to upgrade."
+  elif grep -q 'APT_UPGRADE_DONE' <<< "$out"; then
+    _ok "${label} dist-upgrade complete."
+  else
+    _die "apt dist-upgrade on ${label} produced no success marker — aborting (QEMU parity not guaranteed)."
+  fi
+}
+
 # ----- Embedded Firestore helper (writes servers/{proxmoxId == VMID}) ----------
 # Requires firebase_admin + /etc/firebase-credentials.json on BASE.
 _firestore_update_servers() {
@@ -528,6 +591,13 @@ fi
 # ----- Migration phase (skipped if VM already on dest from a prior run) --------
 if (( _vm_on_src == 1 )); then
   _info "VM is on source — performing migration."
+
+  # 0a) Converge packages on BOTH nodes before migrating so dest pve-qemu-kvm is
+  # >= source's (live-migration is forward-compatible only). Source first, dest
+  # last, so dest's apt snapshot is the newest and can't end up behind source.
+  # Aborts the migration on any failure.
+  _apt_dist_upgrade src_ssh "source ${SRC_NODE}"
+  _apt_dist_upgrade dst_ssh "dest ${DST_NODE}"
 
   # 0) Detect source run state to decide online vs offline migration. Stopped
   # VMs are migrated offline (no --online); we'll start them on dest after
