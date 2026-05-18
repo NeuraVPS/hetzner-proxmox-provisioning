@@ -717,9 +717,19 @@ if (( _vm_on_src == 1 )); then
     _die "remote_migrate did not complete (on_dst=${_post_on_dst} on_src=${_post_on_src}) — VM ${VMID} was kept on source ${SRC_NODE}. See the migration log above for the underlying error. Rolling back transient changes; Firestore routing left unchanged."
   fi
   if [[ -n "$ONLINE_FLAG" ]]; then
-    _post_run=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
-    [[ "$_post_run" == "running" ]] \
-      || _die "VM ${VMID} reached dest ${DST_NODE} but is not running (status=${_post_run:-unknown}) after an online migration — treating as failed. Rolling back; Firestore routing left unchanged."
+    # After "migration finished successfully" the dest VM briefly stays in the
+    # `inmigrate` lock/status for a few seconds before QEMU resumes it and
+    # `qm status` reports `running`. A single immediate check races that settling
+    # window and would false-fail (and roll back) a migration that actually
+    # succeeded — observed on large guests with a long (~100 s) cutover downtime.
+    # Poll instead: returns as soon as it reaches `running`, only _die if it
+    # never gets there. The on_dst/on_src ground-truth check above already
+    # caught the genuine "kept on source" failure, so a timeout here means the
+    # VM landed on dest but truly won't resume.
+    if ! _wait_status_dst running 120; then
+      _post_run=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
+      _die "VM ${VMID} reached dest ${DST_NODE} but did not reach 'running' within 120s (last status=${_post_run:-unknown}) after an online migration — treating as failed. Rolling back; Firestore routing left unchanged."
+    fi
   fi
   _ok "Verified VM ${VMID} is on dest ${DST_NODE}${ONLINE_FLAG:+ and running}."
 
