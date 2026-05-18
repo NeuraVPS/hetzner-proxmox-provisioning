@@ -27,6 +27,10 @@ set -euo pipefail
 #   # In-place restore (overwrite the same VM, keep VMID/MAC/UUIDs); VM must be stopped:
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_vm_from_backup.sh?t=$(date +%s)" | bash -s -- 20260518_103000_node1_100_windows-es
 #
+#   # Restore a backup's disk DATA onto an EXISTING (stopped) different VM, keeping
+#   # that VM's own config/MAC/UUIDs/firewall (e.g. backup of 611 onto VM 1312):
+#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_vm_from_backup.sh?t=$(date +%s)" | bash -s -- 20260518_072521_node_611_E-dev 1312
+#
 #   # Restore the backup as a NEW VM (new datasets, regenerated vmgenid/smbios uuid):
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_vm_from_backup.sh?t=$(date +%s)" | bash -s -- 20260518_103000_node1_100_windows-es 250
 #
@@ -90,7 +94,9 @@ install_pve_cfg_file() {
 # Same as proxmox_client._parse_vm_config_disk_tokens: one volume leaf per disk key,
 # sorted by config key. NOTE: backup_vm_to_storagebox streams one disk{i}.stream.zst
 # per token in this exact order WITHOUT deduping, so we must NOT dedupe here either.
-pve_sorted_disk_tokens() {
+# Emit "diskkey<TAB>volumeleaf" lines, sorted by config key (the order
+# backup_vm_to_storagebox numbers disk{i}.stream.zst in).
+_pve_sorted_disk_kv() {
   local f="$1"
   LC_ALL=C awk '
     function is_disk_key(k) {
@@ -116,7 +122,29 @@ pve_sorted_disk_tokens() {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
       if (val != "") print key "\t" val
     }
-  ' "$f" | LC_ALL=C sort -t $'\t' -k1,1 | cut -f2
+  ' "$f" | LC_ALL=C sort -t $'\t' -k1,1
+}
+
+pve_sorted_disk_tokens() { _pve_sorted_disk_kv "$1" | cut -f2; }
+pve_sorted_disk_keys() { _pve_sorted_disk_kv "$1" | cut -f1; }
+
+# Map a sorted-order volume leaf (e.g. vm-1312-disk-1) to its ZFS dataset, like
+# proxmox_client._map_tokens_to_datasets: full path used as-is, else match leaf.
+map_token_to_dataset() {
+  local token="$1" zfs_list="$2"
+  if [[ "$token" == */* ]]; then
+    printf '%s\n' "$token"
+    return 0
+  fi
+  local ds
+  while IFS= read -r ds; do
+    [[ -z "$ds" ]] && continue
+    if [[ "${ds##*/}" == "$token" ]]; then
+      printf '%s\n' "$ds"
+      return 0
+    fi
+  done <<<"$zfs_list"
+  return 1
 }
 
 # Rewrite the backed-up VM config for the target VMID.
@@ -213,15 +241,19 @@ Usage:
   <backup_folder>  Folder name under $STORAGE_BOX_BACKUP_PATH (default /home/backups),
                    e.g. 20260518_103000_node1_100_windows-es. An absolute path on the
                    storage box is also accepted.
-  [target_vmid]    Optional.
-                     omitted / equal to the backed-up VMID -> IN-PLACE restore:
-                       overwrite that VM's datasets (zfs receive -F), keep VMID, MAC
-                       and UUIDs, rewrite the backed-up config. VM must be STOPPED.
-                     different VMID -> restore as a NEW VM:
+  [target_vmid]    Optional. Picks the mode:
+                     omitted / equal to backed-up VMID -> IN-PLACE:
+                       overwrite that VM's datasets, restore the backed-up config
+                       (keeps VMID/MAC/UUIDs). VM must be STOPPED.
+                     different VMID, and it ALREADY EXISTS -> DATA-RESTORE:
+                       overwrite only that VM's disk DATA with the backup, keep its
+                       existing config & identity (MAC/UUIDs/hookscript/firewall).
+                       Disk layout must match the backup. VM must be STOPPED.
+                     different VMID, and it is FREE -> NEW VM:
                        receive into fresh rpool/data/vm-<target>-disk-* datasets,
-                       regenerate vmgenid + smbios1 uuid. Fails if that VMID exists.
-                       With KEEP_UUIDS=1 -> RELOCATE instead: same as above but keep
-                       the original MAC + vmgenid + smbios1 uuid (no reactivation).
+                       regenerate vmgenid + smbios1 uuid.
+                       With KEEP_UUIDS=1 -> RELOCATE: same but keep the original
+                       MAC + vmgenid + smbios1 uuid (no reactivation).
   [node]           Must match a name under /etc/pve/nodes/ (often `hostname -s`).
                    If omitted, picks the first of hostname -s / hostname with qemu-server/.
 
@@ -337,7 +369,7 @@ fi
 ORIG_VMID="$(sed -nE 's/.*vm-([0-9]+)-disk-[0-9]+.*/\1/p' <<<"${REMOTE_TOKENS[0]}" | head -n1)"
 [[ -n "$ORIG_VMID" ]] || die "Could not determine original VMID from token '${REMOTE_TOKENS[0]}'"
 
-# Decide target VMID + mode.
+# Decide target VMID.
 if [[ -n "$ARG_TARGET_VMID" ]]; then
   [[ "$ARG_TARGET_VMID" =~ ^[0-9]+$ ]] || die "<target_vmid> must be digits, got: ${ARG_TARGET_VMID}"
   TARGET_VMID=$((10#$ARG_TARGET_VMID))
@@ -349,13 +381,26 @@ if [[ "$TARGET_VMID" -lt 100 || "$TARGET_VMID" -gt 999999999 ]]; then
 fi
 
 # KEEP_UUIDS=1 keeps the VM's identity (MAC, vmgenid, smbios1 uuid) even when
-# restoring to a different VMID — a "relocate", not a clone. Use this when the
-# original VMID is being retired and the guest must stay the same (no Windows
-# reactivation). KEEP_UUIDS only has an effect in new-vm mode.
+# restoring to a different VMID — a "relocate", not a clone. Only affects the
+# new-vm path (no effect for in-place or data-restore).
 KEEP_UUIDS="${KEEP_UUIDS:-0}"
+VM_NAME="${VM_NAME:-}"
 
+shopt -s nullglob
+EXISTING_CONFS=(/etc/pve/nodes/*/qemu-server/${TARGET_VMID}.conf)
+shopt -u nullglob
+
+# Mode:
+#   in-place     target == backup VMID            -> overwrite that VM, restore backup config
+#   data-restore target != backup VMID, EXISTS    -> overwrite that VM's disk DATA only,
+#                                                    keep its existing config & identity
+#   relocate     target != backup VMID, free, KEEP_UUIDS=1 -> new VM, keep backup identity
+#   new-vm       target != backup VMID, free      -> new VM, regenerated vmgenid/smbios uuid
 if [[ "$TARGET_VMID" -eq "$ORIG_VMID" ]]; then
   MODE="in-place"
+  REGEN_UUIDS=0
+elif [[ "${#EXISTING_CONFS[@]}" -gt 0 ]]; then
+  MODE="data-restore"
   REGEN_UUIDS=0
 elif [[ "$KEEP_UUIDS" == "1" ]]; then
   MODE="relocate"
@@ -365,18 +410,21 @@ else
   REGEN_UUIDS=1
 fi
 
-VM_NAME="${VM_NAME:-}"
+# Resolve the node + config path. data-restore uses the target VM's existing
+# node/config; the other modes write into the resolved local node.
+if [[ "$MODE" == "data-restore" ]]; then
+  CONF_PATH="${EXISTING_CONFS[0]}"
+  TARGET_NODE="$(sed -nE 's#^/etc/pve/nodes/([^/]+)/qemu-server/[0-9]+\.conf$#\1#p' <<<"$CONF_PATH")"
+  [[ -n "$TARGET_NODE" ]] || die "Could not parse node from existing config path: ${CONF_PATH}"
+else
+  TARGET_NODE="$NODE"
+  CONF_PATH="/etc/pve/nodes/${TARGET_NODE}/qemu-server/${TARGET_VMID}.conf"
+fi
 
-CONF_DIR="/etc/pve/nodes/${NODE}/qemu-server"
-CONF_PATH="${CONF_DIR}/${TARGET_VMID}.conf"
-
-shopt -s nullglob
-EXISTING_CONFS=(/etc/pve/nodes/*/qemu-server/${TARGET_VMID}.conf)
-shopt -u nullglob
-
+# Per-mode existence guard.
 if [[ "$MODE" == "new-vm" || "$MODE" == "relocate" ]]; then
   [[ "${#EXISTING_CONFS[@]}" -eq 0 ]] \
-    || die "Refusing ${MODE^^} restore: VMID ${TARGET_VMID} already exists: ${EXISTING_CONFS[0]} (use a free VMID, or restore in-place with no target_vmid)"
+    || die "Refusing ${MODE^^} restore: VMID ${TARGET_VMID} already exists: ${EXISTING_CONFS[0]}"
   if [[ "$MODE" == "relocate" ]]; then
     shopt -s nullglob
     ORIG_CONFS=(/etc/pve/nodes/*/qemu-server/${ORIG_VMID}.conf)
@@ -387,12 +435,14 @@ if [[ "$MODE" == "new-vm" || "$MODE" == "relocate" ]]; then
       echo "         cause MAC/identity conflicts — only run one. Retire VMID ${ORIG_VMID} first." >&2
     fi
   fi
-else
-  # In-place: the VM must be stopped before we overwrite its zvols (zfs receive -F).
+fi
+
+# Modes that overwrite an existing VM's zvols require it to be STOPPED.
+if [[ "$MODE" == "in-place" || "$MODE" == "data-restore" ]]; then
   if command -v qm >/dev/null 2>&1; then
     QM_STATUS="$(qm status "$TARGET_VMID" 2>/dev/null || true)"
     if grep -qi 'status: running' <<<"$QM_STATUS"; then
-      die "VM ${TARGET_VMID} is RUNNING. Stop it first (qm stop ${TARGET_VMID}) — in-place restore overwrites its disks."
+      die "VM ${TARGET_VMID} is RUNNING. Stop it first (qm stop ${TARGET_VMID}) — restore overwrites its disks."
     fi
   fi
   if [[ -f "/run/qemu-server/${TARGET_VMID}.pid" ]]; then
@@ -401,14 +451,54 @@ else
 fi
 
 n="${#REMOTE_TOKENS[@]}"
-echo "Mode: ${MODE} | backup VMID=${ORIG_VMID} -> target VMID=${TARGET_VMID} | node=${NODE} | ${n} disk stream(s)"
-if [[ "$MODE" == "in-place" ]]; then
-  echo "IN-PLACE restore will OVERWRITE datasets ${ZFS_PARENT}/vm-${TARGET_VMID}-disk-0..$((n - 1)) and replace ${CONF_PATH}"
+
+# Resolve the n local datasets that stream i (disk{i}.stream.zst) is received into.
+LOCAL_DATASETS=()
+if [[ "$MODE" == "data-restore" ]]; then
+  # Keep the target VM's config; only overwrite its disk DATA. Map streams to the
+  # target's *current* datasets by the same sorted-disk-key order the backup used,
+  # and require the disk-key layout to line up so each stream lands in its role.
+  mapfile -t LOCAL_KEYS < <(pve_sorted_disk_keys "$CONF_PATH")
+  mapfile -t LOCAL_TOKENS < <(pve_sorted_disk_tokens "$CONF_PATH")
+  mapfile -t BACKUP_KEYS < <(pve_sorted_disk_keys "$CONFIG_TMP")
+  if [[ "${#LOCAL_TOKENS[@]}" -ne "$n" ]]; then
+    die "data-restore: target VM ${TARGET_VMID} has ${#LOCAL_TOKENS[@]} disk(s) but backup has ${n}. Disk layout differs — refusing (use new-vm/relocate to restore as a separate VM)."
+  fi
+  for ((i = 0; i < n; i++)); do
+    if [[ "${LOCAL_KEYS[i]}" != "${BACKUP_KEYS[i]}" ]]; then
+      die "data-restore: disk-key mismatch at position ${i} (target '${LOCAL_KEYS[i]}' vs backup '${BACKUP_KEYS[i]}'). Layouts differ — refusing."
+    fi
+  done
+  ZFS_LIST="$(zfs list -H -o name 2>/dev/null || true)"
+  [[ -n "$ZFS_LIST" ]] || die "data-restore: 'zfs list' returned nothing"
+  for ((i = 0; i < n; i++)); do
+    ds="$(map_token_to_dataset "${LOCAL_TOKENS[i]}" "$ZFS_LIST")" \
+      || die "data-restore: cannot map disk '${LOCAL_KEYS[i]}' volume '${LOCAL_TOKENS[i]}' to a ZFS dataset"
+    LOCAL_DATASETS+=("$ds")
+  done
+else
+  for ((i = 0; i < n; i++)); do
+    LOCAL_DATASETS+=("${ZFS_PARENT}/vm-${TARGET_VMID}-disk-${i}")
+  done
 fi
+
+echo "Mode: ${MODE} | backup VMID=${ORIG_VMID} -> target VMID=${TARGET_VMID} | node=${TARGET_NODE} | ${n} disk stream(s)"
+case "$MODE" in
+  in-place)
+    echo "IN-PLACE restore will OVERWRITE ${ZFS_PARENT}/vm-${TARGET_VMID}-disk-0..$((n - 1)) and replace ${CONF_PATH}"
+    ;;
+  data-restore)
+    echo "DATA-RESTORE will OVERWRITE the disk DATA of VM ${TARGET_VMID} (keeping its config/MAC/UUIDs):"
+    for ((i = 0; i < n; i++)); do
+      echo "  ${BACKUP_KEYS[i]} <- backup disk${i}  ->  ${LOCAL_DATASETS[i]}"
+    done
+    echo "  (config ${CONF_PATH} is NOT modified; backup's firewall is ignored)"
+    ;;
+esac
 
 # Stream each disk: ssh storagebox "dd if=... bs=4M" | zstd -d | zfs receive -F <local_ds>
 for ((i = 0; i < n; i++)); do
-  local_ds="${ZFS_PARENT}/vm-${TARGET_VMID}-disk-${i}"
+  local_ds="${LOCAL_DATASETS[i]}"
   remote_file="${REMOTE_BASE}/disk${i}.stream.zst"
   echo "[${i}/$((n - 1))] ${remote_file} -> ${local_ds}"
 
@@ -428,13 +518,22 @@ done
 
 # Destroy the @backup snapshot carried in the received stream, if present.
 for ((i = 0; i < n; i++)); do
-  local_ds="${ZFS_PARENT}/vm-${TARGET_VMID}-disk-${i}"
+  local_ds="${LOCAL_DATASETS[i]}"
   while IFS= read -r snap; do
     snap="${snap//[$'\r']}"
     [[ -z "$snap" || "$snap" != *"@"* ]] && continue
     zfs destroy "$snap" || true
   done < <(zfs list -H -o name -t snapshot -S creation -r "$local_ds" 2>/dev/null || true)
 done
+
+if [[ "$MODE" == "data-restore" ]]; then
+  echo "Disk data restored into VM ${TARGET_VMID}. Config left untouched: ${CONF_PATH}"
+  echo "NOTE: zvol sizes now match the backup (VMID ${ORIG_VMID}); the target's config"
+  echo "      disk 'size=' is only metadata. Resize later with 'qm disk resize' if needed."
+  echo "Restore finished (${MODE}). VMID=${TARGET_VMID}"
+  echo "VM left STOPPED. Start it when ready: qm start ${TARGET_VMID}"
+  exit 0
+fi
 
 # Rewrite + install VM config from the backup.
 TOKENS_TMP="$(mktemp)"
