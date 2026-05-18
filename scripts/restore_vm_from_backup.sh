@@ -30,6 +30,9 @@ set -euo pipefail
 #   # Restore the backup as a NEW VM (new datasets, regenerated vmgenid/smbios uuid):
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_vm_from_backup.sh?t=$(date +%s)" | bash -s -- 20260518_103000_node1_100_windows-es 250
 #
+#   # Relocate to a different VMID but keep the SAME identity (MAC/vmgenid/smbios uuid):
+#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_vm_from_backup.sh?t=$(date +%s)" | KEEP_UUIDS=1 bash -s -- 20260518_103000_node1_100_windows-es 250
+#
 # Backup folders are written by NeuraVPS functions/proxmox_client.py::backup_vm_to_storagebox:
 #   <STORAGE_BOX_BACKUP_PATH>/<YYYYmmdd_HHMMSS>_<node>_<vmid>_<name>/
 #     config.conf
@@ -217,6 +220,8 @@ Usage:
                      different VMID -> restore as a NEW VM:
                        receive into fresh rpool/data/vm-<target>-disk-* datasets,
                        regenerate vmgenid + smbios1 uuid. Fails if that VMID exists.
+                       With KEEP_UUIDS=1 -> RELOCATE instead: same as above but keep
+                       the original MAC + vmgenid + smbios1 uuid (no reactivation).
   [node]           Must match a name under /etc/pve/nodes/ (often `hostname -s`).
                    If omitted, picks the first of hostname -s / hostname with qemu-server/.
 
@@ -225,6 +230,10 @@ Environment:
   STORAGE_BOX_BACKUP_PATH  (default /home/backups)
   ZFS_PARENT               (default rpool/data)
   VM_NAME                  override guest name (default: keep backed-up name)
+  KEEP_UUIDS=1             when restoring to a DIFFERENT VMID, keep the VM's
+                           identity (MAC, vmgenid, smbios1 uuid) instead of
+                           regenerating. Only run one of the original / restored
+                           VM at a time or they will conflict.
 EOF
 }
 
@@ -339,8 +348,17 @@ if [[ "$TARGET_VMID" -lt 100 || "$TARGET_VMID" -gt 999999999 ]]; then
   die "target VMID must be between 100 and 999999999, got: ${TARGET_VMID}"
 fi
 
+# KEEP_UUIDS=1 keeps the VM's identity (MAC, vmgenid, smbios1 uuid) even when
+# restoring to a different VMID — a "relocate", not a clone. Use this when the
+# original VMID is being retired and the guest must stay the same (no Windows
+# reactivation). KEEP_UUIDS only has an effect in new-vm mode.
+KEEP_UUIDS="${KEEP_UUIDS:-0}"
+
 if [[ "$TARGET_VMID" -eq "$ORIG_VMID" ]]; then
   MODE="in-place"
+  REGEN_UUIDS=0
+elif [[ "$KEEP_UUIDS" == "1" ]]; then
+  MODE="relocate"
   REGEN_UUIDS=0
 else
   MODE="new-vm"
@@ -356,9 +374,19 @@ shopt -s nullglob
 EXISTING_CONFS=(/etc/pve/nodes/*/qemu-server/${TARGET_VMID}.conf)
 shopt -u nullglob
 
-if [[ "$MODE" == "new-vm" ]]; then
+if [[ "$MODE" == "new-vm" || "$MODE" == "relocate" ]]; then
   [[ "${#EXISTING_CONFS[@]}" -eq 0 ]] \
-    || die "Refusing NEW-VM restore: VMID ${TARGET_VMID} already exists: ${EXISTING_CONFS[0]} (use a free VMID, or restore in-place with no target_vmid)"
+    || die "Refusing ${MODE^^} restore: VMID ${TARGET_VMID} already exists: ${EXISTING_CONFS[0]} (use a free VMID, or restore in-place with no target_vmid)"
+  if [[ "$MODE" == "relocate" ]]; then
+    shopt -s nullglob
+    ORIG_CONFS=(/etc/pve/nodes/*/qemu-server/${ORIG_VMID}.conf)
+    shopt -u nullglob
+    if [[ "${#ORIG_CONFS[@]}" -gt 0 ]]; then
+      echo "WARNING: KEEP_UUIDS relocate keeps the original MAC + vmgenid + smbios uuid," >&2
+      echo "         but VMID ${ORIG_VMID} still exists (${ORIG_CONFS[0]}). Running BOTH will" >&2
+      echo "         cause MAC/identity conflicts — only run one. Retire VMID ${ORIG_VMID} first." >&2
+    fi
+  fi
 else
   # In-place: the VM must be stopped before we overwrite its zvols (zfs receive -F).
   if command -v qm >/dev/null 2>&1; then
