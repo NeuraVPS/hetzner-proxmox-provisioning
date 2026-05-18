@@ -18,6 +18,13 @@
 # to apply the in-guest IPv6 reconfig, then gracefully shut back down so the
 # original power state is preserved.
 #
+# For ONLINE migrations the source VM's max cutover downtime is raised to
+# MIGRATE_DOWNTIME seconds (default 10) so busy/large-RAM guests converge over a
+# slow 1 GbE link instead of running for ~7 min — a long migration leaves the
+# tiny efidisk0 drive-mirror idle until the remote_migrate tunnel reaps it,
+# causing "mirror-efidisk0: Input/output error" at finalize. One-time ~10 s
+# freeze at switchover (not a reboot/offline). MIGRATE_DOWNTIME=0 to disable.
+#
 # Before the migration phase, BOTH source and dest are `apt dist-upgrade`d (in
 # that order) so dest pve-qemu-kvm is >= source's — live migration is only
 # forward-compatible and independently-patched nodes drift. Any upgrade failure
@@ -93,6 +100,7 @@ STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
+MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-10}"  # max cutover freeze (s) for ONLINE migrations; 0 = leave VM default
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
@@ -610,6 +618,24 @@ if (( _vm_on_src == 1 )); then
     ONLINE_FLAG=""
     WAS_STOPPED=1
     _info "Source VM is not running — using offline migration."
+  fi
+
+  # 0b) Online migrations of busy / large-RAM VMs over a slow (1 GbE) link never
+  # converge at the default 100 ms downtime: the migration runs for many minutes
+  # and the tiny efidisk0 drive-mirror sits idle long enough that the
+  # remote_migrate websocket tunnel reaps its forwarded NBD socket, yielding
+  # "mirror-efidisk0: Input/output error (io-status: ok)" at finalize. Raising
+  # the max cutover downtime lets RAM converge in one stop-and-copy pass so the
+  # whole migration finishes in ~1-2 min, closing that race. It's a one-time
+  # freeze of up to MIGRATE_DOWNTIME seconds at switchover (not a reboot, not
+  # offline) and travels with the VM config to the destination. Irrelevant for
+  # offline migrations (no live RAM copy). Non-fatal; MIGRATE_DOWNTIME=0 skips.
+  if [[ -n "$ONLINE_FLAG" && "${MIGRATE_DOWNTIME:-0}" != "0" ]]; then
+    if src_ssh "qm set '${VMID}' --migrate_downtime '${MIGRATE_DOWNTIME}'" >/dev/null 2>&1; then
+      _ok "Set migrate_downtime=${MIGRATE_DOWNTIME}s on source (online convergence)."
+    else
+      _warn "Could not set migrate_downtime on source; continuing (busy VMs may fail to converge over a slow link)."
+    fi
   fi
 
   # 1) Firestore: set maintenance=true (advisory; non-fatal)
