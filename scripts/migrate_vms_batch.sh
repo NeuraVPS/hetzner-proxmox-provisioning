@@ -42,15 +42,15 @@ MAX_TOTAL=8
 LOG_DIR="${LOG_DIR:-/var/log/migrate_vm}"
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 MIGRATE_SCRIPT="${MIGRATE_SCRIPT:-$SCRIPT_DIR/migrate_vm.sh}"
-# Online-migration cutover-downtime CEILING (s) handed to every child
-# migrate_vm.sh. Defined and exported here so a batch run always applies the
-# current default (300 — large ceiling so RAM converges in ~one pass and the
-# efidisk0 finalize race can't open; Proxmox still auto-minimizes the actual
-# freeze). Same default as migrate_vm.sh; exporting just guarantees the value
-# is explicit at the batch entry point and identical across all parallel
-# children regardless of inherited env. Override by setting MIGRATE_DOWNTIME
-# before launching (env wins; MIGRATE_DOWNTIME=0 leaves the VM default).
-export MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-300}"
+# Online-migration cutover downtime (s) handed to every child migrate_vm.sh.
+# Default 90: empirically below the dest-QEMU-exit blackout threshold (~108 s
+# survived, ~175 s killed the dest) while still forcing real pre-copy so large
+# VMs don't go straight to one giant blackout. See migrate_vm.sh header for the
+# full two-failure-mode rationale. Defined and exported here so a batch run
+# always applies it identically across all parallel children regardless of
+# inherited env. Override by setting MIGRATE_DOWNTIME before launching (env
+# wins; MIGRATE_DOWNTIME=0 leaves the VM default).
+export MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"
 PVE_NODES_FILE="${PVE_NODES_FILE:-/var/lib/base-nat/pve_nodes.json}"
 STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 

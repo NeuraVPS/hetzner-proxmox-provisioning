@@ -18,23 +18,30 @@
 # to apply the in-guest IPv6 reconfig, then gracefully shut back down so the
 # original power state is preserved.
 #
-# For ONLINE migrations the source VM's max cutover downtime is raised to
-# MIGRATE_DOWNTIME seconds (default 300). This is a CEILING, not a fixed freeze:
-# Proxmox pre-copies RAM and only stops the guest for the final delta, always
-# using the minimum downtime it can — a generous ceiling just lets it decide to
-# cut over in (effectively) a single stop-and-copy pass instead of looping for
-# minutes. That matters because efidisk0 is drive-mirrored AFTER the big data
-# disk and then sits idle in "actively synced mode" for the entire RAM-migration
-# phase until finalize; on a busy/large-RAM/fast-dirtying guest that phase ran
-# for minutes, long enough for the remote_migrate websocket tunnel to reap the
-# forwarded efidisk0 NBD socket → "mirror-efidisk0: Input/output error
-# (io-status: ok)" at finalize even though the mirror logged "Completed
-# successfully". Collapsing the RAM phase closes that idle window. The old
-# default of 10 s was far too small for these guests (Proxmox auto-raised it to
-# ~20 s on its own and the RAM phase still took ~2 min). Worst-case observed
-# cutover freeze is ~tens of seconds to ~2 min for the largest guests — a
-# one-time HOT freeze at switchover, never a reboot/offline, and never longer
-# than the guest actually needs. MIGRATE_DOWNTIME=0 leaves the VM default.
+# For ONLINE migrations the source VM's max cutover downtime is set to
+# MIGRATE_DOWNTIME seconds (default 90). There are TWO independent failure modes
+# this value is squeezed between, both proven empirically over this ~180 MiB/s
+# cross-DC WAN:
+#   (a) TOO LOW → RAM never converges → many pre-copy rounds → the tiny efidisk0
+#       drive-mirror (mirrored AFTER the big data disk) sits idle through the
+#       whole RAM phase until the remote_migrate websocket tunnel reaps its
+#       forwarded NBD socket → "mirror-efidisk0: Input/output error (io-status:
+#       ok)" at finalize (the default of 10 was far too low — Proxmox even
+#       auto-raised it to ~20 and it still looped).
+#   (b) TOO HIGH → Proxmox decides it can finish within the budget, SKIPS
+#       pre-copy, and does one giant stop-and-copy blackout ≈ RAM_state / WAN
+#       rate. A ~108 s blackout (19 GiB-state VM) survived; a ~175 s blackout
+#       (31 GiB-state VM) made the DESTINATION QEMU exit on resume
+#       ("VM not running", migration "finished with problems"). There is a hard
+#       dest-exit / tunnel-timeout threshold somewhere in (108 s, 175 s].
+# NOTE: this is NOT a kernel-skew issue (dest nodes 57 and 13 ran the identical
+# kernel with opposite outcomes) and NOT a removable bwlimit (there is none) —
+# it is purely blackout duration vs. that dest-exit threshold. 90 keeps the
+# worst-case blackout safely under the threshold while still forcing real
+# pre-copy. It is a one-time HOT freeze at switchover, never a reboot/offline.
+# Very large / fast-dirtying guests that can't converge under 90 s of budget
+# will fail (a) — but the verification gate (step 6) makes that a SAFE rollback,
+# not a corrupted/half-migrated VM. MIGRATE_DOWNTIME=0 leaves the VM default.
 #
 # Before the migration phase, BOTH source and dest are `apt dist-upgrade`d (in
 # that order) so dest pve-qemu-kvm is >= source's — live migration is only
@@ -111,7 +118,7 @@ STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
-MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-300}"  # max cutover freeze CEILING (s) for ONLINE migrations; Proxmox auto-minimizes the actual freeze, this just lets RAM converge in ~one pass to close the efidisk0 reap race; 0 = leave VM default
+MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # max cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
@@ -631,21 +638,16 @@ if (( _vm_on_src == 1 )); then
     _info "Source VM is not running — using offline migration."
   fi
 
-  # 0b) Online migrations of busy / large-RAM / fast-dirtying VMs never converge
-  # at the default 100 ms downtime: the RAM phase loops for minutes, and because
-  # efidisk0 is mirrored AFTER the big data disk it then idles in "actively
-  # synced mode" for that entire RAM phase until finalize — long enough for the
-  # remote_migrate websocket tunnel to reap its forwarded NBD socket, yielding
-  # "mirror-efidisk0: Input/output error (io-status: ok)" at finalize even
-  # though the mirror logged "Completed successfully". migrate_downtime is a
-  # CEILING, not a fixed freeze: Proxmox pre-copies and only stops the guest for
-  # the final delta, always using the minimum it can. A generous ceiling just
-  # lets it choose to cut over in ~one stop-and-copy pass, collapsing the RAM
-  # phase and closing the efidisk0 idle window. One-time HOT freeze at
-  # switchover (never a reboot/offline), bounded by what the guest actually
-  # needs (~tens of s, up to ~2 min worst case), and it travels with the VM
-  # config to the destination. Irrelevant for offline migrations (no live RAM
-  # copy). Non-fatal; MIGRATE_DOWNTIME=0 skips.
+  # 0b) Set the cutover downtime to MIGRATE_DOWNTIME (default 90 s) — see the
+  # header for the full rationale. Short version: too low → RAM never converges
+  # → efidisk0 mirror idles → tunnel reaps it → "mirror-efidisk0: I/O error";
+  # too high → Proxmox skips pre-copy → one multi-minute blackout → dest QEMU
+  # exits on resume (proven: ~108 s blackout OK, ~175 s killed the dest). 90 s
+  # sits under that dest-exit threshold and still forces real pre-copy. NOT a
+  # kernel-skew or bwlimit issue (both ruled out by the data). One-time HOT
+  # freeze at switchover (never a reboot/offline); travels with the VM config
+  # to dest. Irrelevant for offline migrations. Non-fatal; MIGRATE_DOWNTIME=0
+  # skips.
   if [[ -n "$ONLINE_FLAG" && "${MIGRATE_DOWNTIME:-0}" != "0" ]]; then
     if src_ssh "qm set '${VMID}' --migrate_downtime '${MIGRATE_DOWNTIME}'" >/dev/null 2>&1; then
       _ok "Set migrate_downtime=${MIGRATE_DOWNTIME}s on source (online convergence)."
