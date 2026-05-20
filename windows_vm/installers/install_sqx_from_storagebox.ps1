@@ -19,10 +19,10 @@
   Password for the Storage Box SMB user (required).
 
 .PARAMETER Version
-  SQX build number: 142 or 143 only. Used for the zip name (SQX_<Version>.zip), install folder (C:\SQX_<Version>), and shortcut labels. Defaults to 143.
+  SQX build number: 142, 143, or 144. Used for the zip name (SQX_<Version>.zip), install folder (C:\SQX_<Version>), and shortcut labels. Defaults to 143 — 143 remains the default while 144 is being validated; customers can opt into 144 from the panel's custom-install settings.
 
 .PARAMETER MaxRamGb
-  When set, writes a line "option -Xmx<MaxRamGb>g" into C:\SQX_<Version>\StrategyQuantX_nocheck.config (replacing any existing option -Xmx...g line). When omitted, that file is not modified.
+  When set, writes a line "option -Xmx<MaxRamGb>g" into the SQX heap-config file (replacing any existing option -Xmx...g line). The target file depends on the SQX version: for v142 / v143 it's C:\SQX_<Version>\StrategyQuantX_nocheck.config; for v144 it's C:\SQX_<Version>\StrategyQuantX.config (v144 moved the heap setting out of the _nocheck file). When omitted, no file is modified.
 
 .PARAMETER PatchHobbiecodeLoadingScreen
   When specified, downloads and runs customize_sqx_loading_screen.ps1 to add the Hobbiecode logo above the StrategyQuant logo on the SQX loading screen. Defaults to false.
@@ -48,7 +48,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$SmbPassword,
 
-    [ValidateSet('142', '143')]
+    [ValidateSet('142', '143', '144')]
     [string]$Version = '143',
 
     [Parameter(Mandatory = $false)]
@@ -320,16 +320,19 @@ try {
     }
 
     if ($PSBoundParameters.ContainsKey('MaxRamGb')) {
-        $nocheckConfig = Join-Path -Path $ExtractRoot -ChildPath 'StrategyQuantX_nocheck.config'
+        # v144 moved the heap setting from StrategyQuantX_nocheck.config to StrategyQuantX.config.
+        # v142 / v143 still read it from the _nocheck.config file.
+        $xmxConfigName = if ($Version -eq '144') { 'StrategyQuantX.config' } else { 'StrategyQuantX_nocheck.config' }
+        $xmxConfig = Join-Path -Path $ExtractRoot -ChildPath $xmxConfigName
         $xmxLine = "option -Xmx${MaxRamGb}g"
         $lines = @()
-        if (Test-Path -LiteralPath $nocheckConfig) {
-            $lines = @(Get-Content -LiteralPath $nocheckConfig -Encoding UTF8)
+        if (Test-Path -LiteralPath $xmxConfig) {
+            $lines = @(Get-Content -LiteralPath $xmxConfig -Encoding UTF8)
         }
         $filtered = $lines | Where-Object { $_ -notmatch '^\s*option\s+-Xmx\d+g\s*$' }
         $outLines = @($filtered) + $xmxLine
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllLines($nocheckConfig, $outLines, $utf8NoBom)
+        [System.IO.File]::WriteAllLines($xmxConfig, $outLines, $utf8NoBom)
     }
 
     New-ShellShortcutLnk -ShortcutPath $DesktopLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
