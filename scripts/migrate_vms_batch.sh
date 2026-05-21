@@ -3,9 +3,20 @@
 #
 # Usage:
 #   ./migrate_vms_batch.sh [-f FILE] [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
+#   ./migrate_vms_batch.sh -n SRC_NUM:DST_NUM [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
 #
 # Reads "VMID NEW_NODE_ID" pairs (one per line) from FILE (or stdin if -f is
 # omitted or "-"). Lines starting with # and blank lines are ignored.
+#
+# -n SRC_NUM:DST_NUM    full-node drain mode: enumerate every VM currently in
+#                       source node SRC_NUM's /64 (from state.json) and migrate
+#                       them all to DST_NUM. Mutually exclusive with -f/stdin.
+#                       Both nodes are FROZEN (proxmox_nodes.frozen=true) for
+#                       the duration of the batch so new orders can't land on
+#                       either of them mid-drain, then restored to their
+#                       pre-run frozen state on exit (success, failure, or
+#                       Ctrl-C). Requires firebase_admin + Firestore creds on
+#                       BASE — same creds migrate_vm.sh already needs.
 #
 # Schedules migrations in parallel with three safety caps so we don't
 # saturate any single node's NIC / disk / RAM:
@@ -37,6 +48,7 @@ set -eo pipefail
 
 # ----- Defaults & args ---------------------------------------------------------
 INPUT=""
+NODE_MIGRATION=""
 PER_NODE=1
 MAX_TOTAL=8
 LOG_DIR="${LOG_DIR:-/var/log/migrate_vm}"
@@ -57,29 +69,37 @@ STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 usage() {
   cat >&2 <<EOF
 Usage: $(basename "$0") [-f FILE] [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
-  -f FILE        list of "VMID NEW_NODE_ID" pairs ("-" or omit for stdin)
-  -c PER_NODE    max in-flight per node (default $PER_NODE)
-  -m MAX_TOTAL   max total in-flight (default $MAX_TOTAL)
-  -l LOG_DIR     log directory          (default $LOG_DIR)
-  -h             show this help
+       $(basename "$0") -n SRC_NUM:DST_NUM [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
+  -f FILE          list of "VMID NEW_NODE_ID" pairs ("-" or omit for stdin)
+  -n SRC:DST       full-node drain: migrate ALL VMs on SRC to DST, freezing
+                   both proxmox_nodes for the duration (restored on exit).
+                   Mutually exclusive with -f/stdin.
+  -c PER_NODE      max in-flight per node (default $PER_NODE)
+  -m MAX_TOTAL     max total in-flight (default $MAX_TOTAL)
+  -l LOG_DIR       log directory          (default $LOG_DIR)
+  -h               show this help
 
 Reads:
   $PVE_NODES_FILE  (nodeId -> vmbr0 IPv6, written by sync-base-nat.py sync nodes)
   $STATE_FILE      (vmid   -> current VM IPv6, written by sync-base-nat.py sync)
 
-Example:
+Examples:
   cat > migrations.txt <<'TXT'
   # one VMID NEW_NODE_ID pair per line
   123 99
   111 44
   TXT
   ./$(basename "$0") -f migrations.txt
+
+  # Drain every VM off node 7 onto node 99 (both nodes auto-frozen until done):
+  ./$(basename "$0") -n 7:99
 EOF
 }
 
-while getopts ":f:c:m:l:h" opt; do
+while getopts ":f:n:c:m:l:h" opt; do
   case "$opt" in
     f) INPUT="$OPTARG" ;;
+    n) NODE_MIGRATION="$OPTARG" ;;
     c) PER_NODE="$OPTARG" ;;
     m) MAX_TOTAL="$OPTARG" ;;
     l) LOG_DIR="$OPTARG" ;;
@@ -87,6 +107,20 @@ while getopts ":f:c:m:l:h" opt; do
     *) usage; exit 2 ;;
   esac
 done
+
+if [[ -n "$NODE_MIGRATION" ]]; then
+  if [[ -n "$INPUT" ]]; then
+    echo "❌ -n and -f are mutually exclusive" >&2; exit 2
+  fi
+  if ! [[ "$NODE_MIGRATION" =~ ^([0-9]+):([0-9]+)$ ]]; then
+    echo "❌ -n must be SRC_NUM:DST_NUM (e.g. -n 7:99); got: $NODE_MIGRATION" >&2; exit 2
+  fi
+  NODE_SRC_NUM="${BASH_REMATCH[1]}"
+  NODE_DST_NUM="${BASH_REMATCH[2]}"
+  if (( NODE_SRC_NUM == NODE_DST_NUM )); then
+    echo "❌ -n: source and destination are the same node ($NODE_SRC_NUM)" >&2; exit 2
+  fi
+fi
 
 # Need bash 5.1+ for `wait -n -p VAR` (Debian 12 ships 5.2).
 if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
@@ -111,6 +145,47 @@ ERRORS_LOG="$LOG_DIR/errors-$TS.log"
 log() {
   printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$MASTER_LOG"
 }
+
+# Freeze-restore vars: only populated by -n mode. The EXIT trap guards on
+# them so file/stdin mode never touches Firestore.
+NODE_SRC_NAME=""
+NODE_DST_NAME=""
+SRC_WAS_FROZEN=""
+DST_WAS_FROZEN=""
+
+# Single EXIT trap doing two jobs: (1) restore each node's pre-run frozen
+# state when -n drained them, and (2) ALWAYS dump the aggregated errors log
+# so the operator never has to chase down a separate file — clean run prints
+# "(no errors recorded)", failed run prints every WARN/ERROR + every failed
+# job's output. Registered here (right after the log paths are set) so it
+# covers every exit path, including the early upgrade-gate exit, Ctrl-C
+# through _kill_children, and `set -e` aborts. _node_set_frozen is defined
+# below; bash resolves the name at call time, and the trap only fires after
+# definitions are in place.
+_on_exit() {
+  local rc=$?
+  set +e
+  if [[ -n "$NODE_SRC_NAME" && "$SRC_WAS_FROZEN" == "false" ]]; then
+    log "Restoring $NODE_SRC_NAME → frozen=false (was unfrozen before run)"
+    _node_set_frozen "$NODE_SRC_NAME" "false" >/dev/null 2>&1 \
+      || log "WARN: failed to restore $NODE_SRC_NAME frozen=false — set manually"
+  fi
+  if [[ -n "$NODE_DST_NAME" && "$DST_WAS_FROZEN" == "false" ]]; then
+    log "Restoring $NODE_DST_NAME → frozen=false (was unfrozen before run)"
+    _node_set_frozen "$NODE_DST_NAME" "false" >/dev/null 2>&1 \
+      || log "WARN: failed to restore $NODE_DST_NAME frozen=false — set manually"
+  fi
+  echo
+  echo "==================== ERRORS LOG ($(basename "$ERRORS_LOG")) ===================="
+  if [[ -s "$ERRORS_LOG" ]]; then
+    cat "$ERRORS_LOG"
+  else
+    echo "(no errors or warnings recorded)"
+  fi
+  echo "==================== END ERRORS LOG ===================="
+  return "$rc"
+}
+trap _on_exit EXIT
 
 # ----- Resolver ----------------------------------------------------------------
 # Given (vmid, dst_num), prints "src_node dst_node" using the same logic as
@@ -172,44 +247,208 @@ print(src_node, dst_node)
 PY
 }
 
+# ----- Node-drain helpers (only used by -n) ------------------------------------
+# _enumerate_node SRC_NUM DST_NUM
+#   On success (stdout):
+#     NODES<TAB>src_node<TAB>dst_node
+#     VM<TAB>vmid          (one line per VMID currently in src's /64)
+#   Exit 1 on resolve failure, 2 if SRC == DST.
+_enumerate_node() {
+  SRC_NUM="$1" DST_NUM="$2" \
+  PVE_NODES_FILE="$PVE_NODES_FILE" STATE_FILE="$STATE_FILE" \
+  python3 - <<'PY'
+import ipaddress, json, os, sys
+
+src_num = int(os.environ["SRC_NUM"])
+dst_num = int(os.environ["DST_NUM"])
+nodes   = json.load(open(os.environ["PVE_NODES_FILE"]))
+state   = json.load(open(os.environ["STATE_FILE"]))
+
+def find_node(num):
+    for h, ip in nodes.items():
+        head = h.split("-", 1)[0]
+        if head.isdigit() and int(head) == num:
+            return h, ip
+    return None, None
+
+src_node, src_ipv6 = find_node(src_num)
+dst_node, dst_ipv6 = find_node(dst_num)
+if not src_node:
+    sys.stderr.write(f"src_num={src_num} not in pve_nodes.json\n"); sys.exit(1)
+if not dst_node:
+    sys.stderr.write(f"dst_num={dst_num} not in pve_nodes.json\n"); sys.exit(1)
+if src_node == dst_node:
+    sys.stderr.write("src and dst resolve to the same node\n"); sys.exit(2)
+
+try:
+    a = int(ipaddress.IPv6Address(src_ipv6))
+    src_net = ipaddress.IPv6Network((a & ~((1 << 64) - 1), 64))
+except ValueError:
+    sys.stderr.write(f"bad src ipv6: {src_ipv6!r}\n"); sys.exit(1)
+
+vmids = []
+for vmid_s, vm in state.items():
+    ipv6 = (vm.get("ipv6") or "").strip()
+    if not ipv6:
+        continue
+    try:
+        a = int(ipaddress.IPv6Address(ipv6))
+        if ipaddress.IPv6Network((a & ~((1 << 64) - 1), 64)) == src_net:
+            vmids.append(int(vmid_s))
+    except ValueError:
+        continue
+
+vmids.sort()
+print(f"NODES\t{src_node}\t{dst_node}")
+for v in vmids:
+    print(f"VM\t{v}")
+PY
+}
+
+# _node_get_frozen <node_id>  → prints "true"/"false" on stdout.
+# Used to remember a node's pre-run frozen state so we can restore it on exit.
+_node_get_frozen() {
+  python3 - "$1" <<'PY'
+import os, sys
+from pathlib import Path
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except ImportError:
+    sys.stderr.write("firebase_admin not installed\n"); sys.exit(3)
+CREDS = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+if not firebase_admin._apps:
+    if not Path(CREDS).is_file():
+        sys.stderr.write(f"missing creds: {CREDS}\n"); sys.exit(1)
+    firebase_admin.initialize_app(credentials.Certificate(CREDS))
+db = firestore.client()
+doc = db.collection("proxmox_nodes").document(sys.argv[1]).get()
+if not doc.exists:
+    sys.stderr.write(f"no proxmox_nodes/{sys.argv[1]}\n"); sys.exit(2)
+print("true" if (doc.to_dict() or {}).get("frozen") else "false")
+PY
+}
+
+# _node_set_frozen <node_id> <true|false>
+_node_set_frozen() {
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+from pathlib import Path
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except ImportError:
+    sys.stderr.write("firebase_admin not installed\n"); sys.exit(3)
+CREDS = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+if not firebase_admin._apps:
+    if not Path(CREDS).is_file():
+        sys.stderr.write(f"missing creds: {CREDS}\n"); sys.exit(1)
+    firebase_admin.initialize_app(credentials.Certificate(CREDS))
+db = firestore.client()
+db.collection("proxmox_nodes").document(sys.argv[1]).update({"frozen": sys.argv[2] == "true"})
+PY
+}
+
 # ----- Parse input + resolve all jobs upfront ----------------------------------
 declare -a JOBS=()
-if [[ -z "$INPUT" || "$INPUT" == "-" ]]; then
-  input_src=/dev/stdin
-else
-  [[ -r "$INPUT" ]] || { echo "❌ cannot read $INPUT" >&2; exit 1; }
-  input_src="$INPUT"
-fi
-
 skipped=0
-while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-  line="${raw_line%%#*}"
-  line="${line#"${line%%[![:space:]]*}"}"
-  line="${line%"${line##*[![:space:]]}"}"
-  [[ -z "$line" ]] && continue
 
-  read -r vmid dst_num extra <<< "$line" || true
-  if [[ -n "${extra:-}" ]]; then
-    log "SKIP malformed (extra fields): $raw_line"
-    skipped=$((skipped + 1)); continue
-  fi
-  if ! [[ "$vmid" =~ ^[0-9]+$ && "$dst_num" =~ ^[0-9]+$ ]]; then
-    log "SKIP malformed: $raw_line"
-    skipped=$((skipped + 1)); continue
+if [[ -n "$NODE_MIGRATION" ]]; then
+  # --- Full-node drain mode: enumerate, freeze, then synthesize JOBS ---
+  enum_out=$(_enumerate_node "$NODE_SRC_NUM" "$NODE_DST_NUM" 2>&1) || {
+    echo "❌ -n enumeration failed: $enum_out" >&2; exit 1
+  }
+
+  declare -a NODE_VMIDS=()
+  while IFS=$'\t' read -r tag a b; do
+    case "$tag" in
+      NODES) NODE_SRC_NAME="$a"; NODE_DST_NAME="$b" ;;
+      VM)    NODE_VMIDS+=("$a") ;;
+    esac
+  done <<< "$enum_out"
+
+  if [[ -z "$NODE_SRC_NAME" || -z "$NODE_DST_NAME" ]]; then
+    echo "❌ -n enumeration returned no node ids" >&2; exit 1
   fi
 
-  res=$(_resolve_pair "$vmid" "$dst_num" 2>&1) && rc=0 || rc=$?
-  if (( rc == 99 )); then
-    log "SKIP vmid=$vmid: source == dest=$dst_num (already there)"
-    skipped=$((skipped + 1)); continue
+  log "FULL-NODE drain: $NODE_SRC_NAME ($NODE_SRC_NUM) → $NODE_DST_NAME ($NODE_DST_NUM)"
+  log "Discovered ${#NODE_VMIDS[@]} VM(s) on $NODE_SRC_NAME"
+
+  if (( ${#NODE_VMIDS[@]} == 0 )); then
+    log "No VMs on $NODE_SRC_NAME — nothing to migrate."
+    exit 0
   fi
-  if (( rc != 0 )); then
-    log "SKIP vmid=$vmid dst=$dst_num: resolve failed: $res"
-    skipped=$((skipped + 1)); continue
+
+  # Capture pre-run frozen state so we can restore on exit. Hard-fail if we
+  # can't read it — we'd be unable to safely restore, and migrate_vm.sh needs
+  # the same Firestore creds anyway, so failing here surfaces the real issue
+  # before we start touching anything.
+  SRC_WAS_FROZEN=$(_node_get_frozen "$NODE_SRC_NAME") \
+    || { echo "❌ Could not read frozen state of $NODE_SRC_NAME from Firestore" >&2; exit 1; }
+  DST_WAS_FROZEN=$(_node_get_frozen "$NODE_DST_NAME") \
+    || { echo "❌ Could not read frozen state of $NODE_DST_NAME from Firestore" >&2; exit 1; }
+  log "Pre-run freeze: $NODE_SRC_NAME=$SRC_WAS_FROZEN $NODE_DST_NAME=$DST_WAS_FROZEN"
+
+  # EXIT trap (registered up top) restores both nodes' pre-run frozen state.
+  # No-op for any node whose WAS_FROZEN was already "true" — we don't undo an
+  # admin's manual freeze.
+  log "Freezing both nodes for the duration of the drain…"
+  _node_set_frozen "$NODE_SRC_NAME" "true" >/dev/null 2>&1 \
+    || log "WARN: failed to freeze $NODE_SRC_NAME — continuing (new orders may still land on it)"
+  _node_set_frozen "$NODE_DST_NAME" "true" >/dev/null 2>&1 \
+    || log "WARN: failed to freeze $NODE_DST_NAME — continuing (new orders may still land on it)"
+
+  for vmid in "${NODE_VMIDS[@]}"; do
+    res=$(_resolve_pair "$vmid" "$NODE_DST_NUM" 2>&1) && rc=0 || rc=$?
+    if (( rc == 99 )); then
+      log "SKIP vmid=$vmid: source == dest=$NODE_DST_NUM (already there)"
+      skipped=$((skipped + 1)); continue
+    fi
+    if (( rc != 0 )); then
+      log "SKIP vmid=$vmid dst=$NODE_DST_NUM: resolve failed: $res"
+      skipped=$((skipped + 1)); continue
+    fi
+    read -r src_node dst_node <<< "$res"
+    JOBS+=("$vmid|$src_node|$dst_node|$NODE_DST_NUM")
+  done
+else
+  # --- File/stdin mode (original behaviour) ---
+  if [[ -z "$INPUT" || "$INPUT" == "-" ]]; then
+    input_src=/dev/stdin
+  else
+    [[ -r "$INPUT" ]] || { echo "❌ cannot read $INPUT" >&2; exit 1; }
+    input_src="$INPUT"
   fi
-  read -r src_node dst_node <<< "$res"
-  JOBS+=("$vmid|$src_node|$dst_node|$dst_num")
-done < "$input_src"
+
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    line="${raw_line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    read -r vmid dst_num extra <<< "$line" || true
+    if [[ -n "${extra:-}" ]]; then
+      log "SKIP malformed (extra fields): $raw_line"
+      skipped=$((skipped + 1)); continue
+    fi
+    if ! [[ "$vmid" =~ ^[0-9]+$ && "$dst_num" =~ ^[0-9]+$ ]]; then
+      log "SKIP malformed: $raw_line"
+      skipped=$((skipped + 1)); continue
+    fi
+
+    res=$(_resolve_pair "$vmid" "$dst_num" 2>&1) && rc=0 || rc=$?
+    if (( rc == 99 )); then
+      log "SKIP vmid=$vmid: source == dest=$dst_num (already there)"
+      skipped=$((skipped + 1)); continue
+    fi
+    if (( rc != 0 )); then
+      log "SKIP vmid=$vmid dst=$dst_num: resolve failed: $res"
+      skipped=$((skipped + 1)); continue
+    fi
+    read -r src_node dst_node <<< "$res"
+    JOBS+=("$vmid|$src_node|$dst_node|$dst_num")
+  done < "$input_src"
+fi
 
 if (( ${#JOBS[@]} == 0 )); then
   log "no runnable jobs (skipped=$skipped); exiting"
@@ -435,8 +674,10 @@ log "SUMMARY  ok=$ok_count fail=$fail_count skipped=$skipped total=$TOTAL_JOBS"
 log "Master log:  $MASTER_LOG"
 log "Errors log:  $ERRORS_LOG"
 
+# EXIT trap (registered above) dumps the aggregated errors log unconditionally.
+
 if (( fail_count > 0 )); then
-  log "Some migrations failed. Review $ERRORS_LOG for details."
+  log "Some migrations failed. Review $ERRORS_LOG above for details."
   exit 1
 fi
 exit 0
