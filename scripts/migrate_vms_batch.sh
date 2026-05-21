@@ -3,20 +3,40 @@
 #
 # Usage:
 #   ./migrate_vms_batch.sh [-f FILE] [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
-#   ./migrate_vms_batch.sh -n SRC_NUM:DST_NUM [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
+#   ./migrate_vms_batch.sh -n SRC:DST[,SRC:DST...] [-n …] [-c …] [-m …] [-l …]
 #
 # Reads "VMID NEW_NODE_ID" pairs (one per line) from FILE (or stdin if -f is
 # omitted or "-"). Lines starting with # and blank lines are ignored.
 #
-# -n SRC_NUM:DST_NUM    full-node drain mode: enumerate every VM currently in
-#                       source node SRC_NUM's /64 (from state.json) and migrate
-#                       them all to DST_NUM. Mutually exclusive with -f/stdin.
-#                       Both nodes are FROZEN (proxmox_nodes.frozen=true) for
-#                       the duration of the batch so new orders can't land on
-#                       either of them mid-drain, then restored to their
-#                       pre-run frozen state on exit (success, failure, or
-#                       Ctrl-C). Requires firebase_admin + Firestore creds on
-#                       BASE — same creds migrate_vm.sh already needs.
+# -n SRC:DST[,SRC:DST…]
+#                       full-node drain mode: enumerate every VM currently in
+#                       each source node's /64 (from state.json) and migrate
+#                       them to its paired destination. Multiple pairs may be
+#                       given either comma-separated within one -n or by
+#                       repeating -n (or both). Mutually exclusive with
+#                       -f/stdin.
+#                       For each pair, BOTH nodes are FROZEN
+#                       (proxmox_nodes.frozen=true) on entry so new orders
+#                       can't land on either of them mid-drain. All resulting
+#                       VM migrations share the same scheduler: PER_NODE /
+#                       MAX_TOTAL / per-VMID caps apply across pairs so e.g.
+#                       two drains converging on the same DST run serially
+#                       on that DST while their independent SRCs proceed
+#                       in parallel.
+#                       On exit (success, failure, or Ctrl-C):
+#                         - Every SRC stays frozen — drained nodes are kept
+#                           out of auto_provision until an admin manually
+#                           unfreezes them (re-frozen defensively even if
+#                           the initial freeze write failed).
+#                         - Every DST is restored to its pre-run frozen
+#                           state (admin-frozen DST stays frozen; auto-
+#                           frozen DST is unfrozen).
+#                       A node may appear at most once as a SRC, and may not
+#                       appear as both a SRC and a DST across pairs (chained
+#                       drains aren't supported — run them as two separate
+#                       invocations). A DST may repeat (N→1 fan-in).
+#                       Requires firebase_admin + Firestore creds on BASE —
+#                       same creds migrate_vm.sh already needs.
 #
 # Schedules migrations in parallel with three safety caps so we don't
 # saturate any single node's NIC / disk / RAM:
@@ -48,7 +68,7 @@ set -eo pipefail
 
 # ----- Defaults & args ---------------------------------------------------------
 INPUT=""
-NODE_MIGRATION=""
+declare -a NODE_MIGRATIONS=()  # accumulated "SRC:DST" specs from -n
 PER_NODE=1
 MAX_TOTAL=8
 LOG_DIR="${LOG_DIR:-/var/log/migrate_vm}"
@@ -69,10 +89,12 @@ STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 usage() {
   cat >&2 <<EOF
 Usage: $(basename "$0") [-f FILE] [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
-       $(basename "$0") -n SRC_NUM:DST_NUM [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
+       $(basename "$0") -n SRC:DST[,SRC:DST…] [-n …] [-c …] [-m …] [-l …]
   -f FILE          list of "VMID NEW_NODE_ID" pairs ("-" or omit for stdin)
-  -n SRC:DST       full-node drain: migrate ALL VMs on SRC to DST, freezing
-                   both proxmox_nodes for the duration (restored on exit).
+  -n SRC:DST       full-node drain: migrate ALL VMs on SRC to DST. SRC stays
+                   frozen at the end; DST is restored to its pre-run state.
+                   May be repeated and/or comma-separated to drain multiple
+                   sources in one batch (all share the scheduler caps).
                    Mutually exclusive with -f/stdin.
   -c PER_NODE      max in-flight per node (default $PER_NODE)
   -m MAX_TOTAL     max total in-flight (default $MAX_TOTAL)
@@ -91,15 +113,27 @@ Examples:
   TXT
   ./$(basename "$0") -f migrations.txt
 
-  # Drain every VM off node 7 onto node 99 (both nodes auto-frozen until done):
+  # Drain every VM off node 7 onto node 99:
   ./$(basename "$0") -n 7:99
+
+  # Drain three sources in one batch (7→99, 11→55, 15→99); 99 is shared so
+  # those two drains will serialise on the 99 side while 11→55 runs in
+  # parallel (subject to PER_NODE/MAX_TOTAL):
+  ./$(basename "$0") -n 7:99,11:55,15:99
 EOF
 }
 
 while getopts ":f:n:c:m:l:h" opt; do
   case "$opt" in
     f) INPUT="$OPTARG" ;;
-    n) NODE_MIGRATION="$OPTARG" ;;
+    n)
+      # Accept either repeated -n or comma-separated pairs within one -n
+      # (or both). Skip empty fragments from stray commas.
+      IFS=',' read -ra _ns <<< "$OPTARG"
+      for _one in "${_ns[@]}"; do
+        [[ -n "$_one" ]] && NODE_MIGRATIONS+=("$_one")
+      done
+      ;;
     c) PER_NODE="$OPTARG" ;;
     m) MAX_TOTAL="$OPTARG" ;;
     l) LOG_DIR="$OPTARG" ;;
@@ -108,18 +142,36 @@ while getopts ":f:n:c:m:l:h" opt; do
   esac
 done
 
-if [[ -n "$NODE_MIGRATION" ]]; then
+if (( ${#NODE_MIGRATIONS[@]} > 0 )); then
   if [[ -n "$INPUT" ]]; then
     echo "❌ -n and -f are mutually exclusive" >&2; exit 2
   fi
-  if ! [[ "$NODE_MIGRATION" =~ ^([0-9]+):([0-9]+)$ ]]; then
-    echo "❌ -n must be SRC_NUM:DST_NUM (e.g. -n 7:99); got: $NODE_MIGRATION" >&2; exit 2
-  fi
-  NODE_SRC_NUM="${BASH_REMATCH[1]}"
-  NODE_DST_NUM="${BASH_REMATCH[2]}"
-  if (( NODE_SRC_NUM == NODE_DST_NUM )); then
-    echo "❌ -n: source and destination are the same node ($NODE_SRC_NUM)" >&2; exit 2
-  fi
+  # Validate each pair's format, forbid SRC==DST within a pair, forbid a SRC
+  # appearing twice (one drain per source), and forbid a node being both a
+  # SRC and a DST across pairs (chained drains aren't supported — they'd
+  # require draining a node that's simultaneously receiving new VMs).
+  declare -A _seen_src
+  declare -A _seen_dst
+  for spec in "${NODE_MIGRATIONS[@]}"; do
+    if ! [[ "$spec" =~ ^([0-9]+):([0-9]+)$ ]]; then
+      echo "❌ invalid -n spec '$spec': expected SRC:DST (e.g. 7:99)" >&2; exit 2
+    fi
+    _sn="${BASH_REMATCH[1]}"
+    _dn="${BASH_REMATCH[2]}"
+    if (( _sn == _dn )); then
+      echo "❌ -n '$spec': source and destination are the same node" >&2; exit 2
+    fi
+    if [[ -n "${_seen_src[$_sn]:-}" ]]; then
+      echo "❌ -n: source $_sn appears in multiple pairs (one drain per source)" >&2; exit 2
+    fi
+    _seen_src[$_sn]=1
+    _seen_dst[$_dn]=1
+  done
+  for _sn in "${!_seen_src[@]}"; do
+    if [[ -n "${_seen_dst[$_sn]:-}" ]]; then
+      echo "❌ -n: node $_sn appears as both source and destination — chained drains not supported (run as separate invocations)" >&2; exit 2
+    fi
+  done
 fi
 
 # Need bash 5.1+ for `wait -n -p VAR` (Debian 12 ships 5.2).
@@ -146,35 +198,41 @@ log() {
   printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$MASTER_LOG"
 }
 
-# Freeze-restore vars: only populated by -n mode. The EXIT trap guards on
-# them so file/stdin mode never touches Firestore.
-NODE_SRC_NAME=""
-NODE_DST_NAME=""
-SRC_WAS_FROZEN=""
-DST_WAS_FROZEN=""
+# Freeze tracking maps. Populated by -n mode; file/stdin mode leaves them
+# empty so the EXIT trap is a no-op.
+#   FREEZE_KEEP    [node_name] -> 1            # write frozen=true at exit
+#                                              # (drained sources stay frozen)
+#   FREEZE_RESTORE [node_name] -> "true|false" # target state at exit
+#                                              # (destinations restore to pre-run)
+# A node will only ever be in one of these — cross-pair validation forbids a
+# node being both a SRC and a DST.
+declare -A FREEZE_KEEP=()
+declare -A FREEZE_RESTORE=()
 
-# Single EXIT trap doing two jobs: (1) restore each node's pre-run frozen
-# state when -n drained them, and (2) ALWAYS dump the aggregated errors log
-# so the operator never has to chase down a separate file — clean run prints
-# "(no errors recorded)", failed run prints every WARN/ERROR + every failed
-# job's output. Registered here (right after the log paths are set) so it
-# covers every exit path, including the early upgrade-gate exit, Ctrl-C
-# through _kill_children, and `set -e` aborts. _node_set_frozen is defined
-# below; bash resolves the name at call time, and the trap only fires after
-# definitions are in place.
+# Single EXIT trap doing two jobs: (1) reconcile each touched node's frozen
+# state — sources stay frozen, destinations restore to their pre-run state —
+# and (2) ALWAYS dump the aggregated errors log so the operator never has to
+# chase down a separate file (clean run prints "(no errors recorded)", failed
+# run prints every WARN/ERROR + every failed job's output). Registered here
+# (right after the log paths are set) so it covers every exit path: early
+# upgrade-gate exit, Ctrl-C through _kill_children, and `set -e` aborts.
+# _node_set_frozen is defined below; bash resolves the name at call time and
+# the trap only fires after definitions are in place.
 _on_exit() {
   local rc=$?
   set +e
-  if [[ -n "$NODE_SRC_NAME" && "$SRC_WAS_FROZEN" == "false" ]]; then
-    log "Restoring $NODE_SRC_NAME → frozen=false (was unfrozen before run)"
-    _node_set_frozen "$NODE_SRC_NAME" "false" >/dev/null 2>&1 \
-      || log "WARN: failed to restore $NODE_SRC_NAME frozen=false — set manually"
-  fi
-  if [[ -n "$NODE_DST_NAME" && "$DST_WAS_FROZEN" == "false" ]]; then
-    log "Restoring $NODE_DST_NAME → frozen=false (was unfrozen before run)"
-    _node_set_frozen "$NODE_DST_NAME" "false" >/dev/null 2>&1 \
-      || log "WARN: failed to restore $NODE_DST_NAME frozen=false — set manually"
-  fi
+  for nd in "${!FREEZE_KEEP[@]}"; do
+    log "Leaving $nd frozen=true (drained source stays frozen)"
+    _node_set_frozen "$nd" "true" >/dev/null 2>&1 \
+      || log "WARN: failed to ensure $nd frozen=true — verify in admin UI"
+  done
+  for nd in "${!FREEZE_RESTORE[@]}"; do
+    if [[ "${FREEZE_RESTORE[$nd]}" == "false" ]]; then
+      log "Restoring $nd → frozen=false (was unfrozen before run)"
+      _node_set_frozen "$nd" "false" >/dev/null 2>&1 \
+        || log "WARN: failed to restore $nd frozen=false — set manually"
+    fi
+  done
   echo
   echo "==================== ERRORS LOG ($(basename "$ERRORS_LOG")) ===================="
   if [[ -s "$ERRORS_LOG" ]]; then
@@ -353,63 +411,79 @@ PY
 declare -a JOBS=()
 skipped=0
 
-if [[ -n "$NODE_MIGRATION" ]]; then
-  # --- Full-node drain mode: enumerate, freeze, then synthesize JOBS ---
-  enum_out=$(_enumerate_node "$NODE_SRC_NUM" "$NODE_DST_NUM" 2>&1) || {
-    echo "❌ -n enumeration failed: $enum_out" >&2; exit 1
-  }
-
-  declare -a NODE_VMIDS=()
-  while IFS=$'\t' read -r tag a b; do
-    case "$tag" in
-      NODES) NODE_SRC_NAME="$a"; NODE_DST_NAME="$b" ;;
-      VM)    NODE_VMIDS+=("$a") ;;
-    esac
-  done <<< "$enum_out"
-
-  if [[ -z "$NODE_SRC_NAME" || -z "$NODE_DST_NAME" ]]; then
-    echo "❌ -n enumeration returned no node ids" >&2; exit 1
-  fi
-
-  log "FULL-NODE drain: $NODE_SRC_NAME ($NODE_SRC_NUM) → $NODE_DST_NAME ($NODE_DST_NUM)"
-  log "Discovered ${#NODE_VMIDS[@]} VM(s) on $NODE_SRC_NAME"
-
-  if (( ${#NODE_VMIDS[@]} == 0 )); then
-    log "No VMs on $NODE_SRC_NAME — nothing to migrate."
-    exit 0
-  fi
-
-  # Capture pre-run frozen state so we can restore on exit. Hard-fail if we
-  # can't read it — we'd be unable to safely restore, and migrate_vm.sh needs
-  # the same Firestore creds anyway, so failing here surfaces the real issue
-  # before we start touching anything.
-  SRC_WAS_FROZEN=$(_node_get_frozen "$NODE_SRC_NAME") \
-    || { echo "❌ Could not read frozen state of $NODE_SRC_NAME from Firestore" >&2; exit 1; }
-  DST_WAS_FROZEN=$(_node_get_frozen "$NODE_DST_NAME") \
-    || { echo "❌ Could not read frozen state of $NODE_DST_NAME from Firestore" >&2; exit 1; }
-  log "Pre-run freeze: $NODE_SRC_NAME=$SRC_WAS_FROZEN $NODE_DST_NAME=$DST_WAS_FROZEN"
-
-  # EXIT trap (registered up top) restores both nodes' pre-run frozen state.
-  # No-op for any node whose WAS_FROZEN was already "true" — we don't undo an
-  # admin's manual freeze.
-  log "Freezing both nodes for the duration of the drain…"
-  _node_set_frozen "$NODE_SRC_NAME" "true" >/dev/null 2>&1 \
-    || log "WARN: failed to freeze $NODE_SRC_NAME — continuing (new orders may still land on it)"
-  _node_set_frozen "$NODE_DST_NAME" "true" >/dev/null 2>&1 \
-    || log "WARN: failed to freeze $NODE_DST_NAME — continuing (new orders may still land on it)"
-
-  for vmid in "${NODE_VMIDS[@]}"; do
-    res=$(_resolve_pair "$vmid" "$NODE_DST_NUM" 2>&1) && rc=0 || rc=$?
-    if (( rc == 99 )); then
-      log "SKIP vmid=$vmid: source == dest=$NODE_DST_NUM (already there)"
-      skipped=$((skipped + 1)); continue
+if (( ${#NODE_MIGRATIONS[@]} > 0 )); then
+  # --- Full-node drain mode: process every SRC:DST pair, build one shared
+  # --- JOBS array; the existing scheduler then parallelises across pairs.
+  log "FULL-NODE drain: ${#NODE_MIGRATIONS[@]} pair(s) requested"
+  for spec in "${NODE_MIGRATIONS[@]}"; do
+    # Format already validated; re-extract via `if` so a regex mismatch can't
+    # cooperate-with-`set -e` to abort silently.
+    if ! [[ "$spec" =~ ^([0-9]+):([0-9]+)$ ]]; then
+      echo "❌ internal: -n spec '$spec' bypassed validation" >&2; exit 1
     fi
-    if (( rc != 0 )); then
-      log "SKIP vmid=$vmid dst=$NODE_DST_NUM: resolve failed: $res"
-      skipped=$((skipped + 1)); continue
+    src_num="${BASH_REMATCH[1]}"
+    dst_num="${BASH_REMATCH[2]}"
+
+    enum_out=$(_enumerate_node "$src_num" "$dst_num" 2>&1) || {
+      echo "❌ -n enumeration failed for $spec: $enum_out" >&2; exit 1
+    }
+
+    src_name=""; dst_name=""
+    declare -a pair_vmids=()
+    while IFS=$'\t' read -r tag a b; do
+      case "$tag" in
+        NODES) src_name="$a"; dst_name="$b" ;;
+        VM)    pair_vmids+=("$a") ;;
+      esac
+    done <<< "$enum_out"
+    if [[ -z "$src_name" || -z "$dst_name" ]]; then
+      echo "❌ -n enumeration returned no node ids for $spec" >&2; exit 1
     fi
-    read -r src_node dst_node <<< "$res"
-    JOBS+=("$vmid|$src_node|$dst_node|$NODE_DST_NUM")
+
+    log "  pair $spec → $src_name → $dst_name — discovered ${#pair_vmids[@]} VM(s)"
+
+    # Capture & freeze EVEN IF 0 VMs found: the operator's intent in passing
+    # this pair was for src to end frozen, so we honour that even when the
+    # drain itself is a no-op. _node_get_frozen hard-fails if it can't read
+    # the doc (Firestore creds missing / node missing) — surfacing that here
+    # is better than discovering it during the run.
+    if [[ -z "${FREEZE_KEEP[$src_name]:-}" ]]; then
+      src_was=$(_node_get_frozen "$src_name") \
+        || { echo "❌ Could not read frozen state of $src_name from Firestore" >&2; exit 1; }
+      FREEZE_KEEP[$src_name]=1
+      log "    pre-run: $src_name=$src_was (will stay frozen)"
+    fi
+    # Same DST may appear in multiple pairs (N→1 fan-in); only record the
+    # first reading. Subsequent _node_set_frozen calls below are idempotent.
+    if [[ -z "${FREEZE_RESTORE[$dst_name]:-}" ]]; then
+      dst_was=$(_node_get_frozen "$dst_name") \
+        || { echo "❌ Could not read frozen state of $dst_name from Firestore" >&2; exit 1; }
+      FREEZE_RESTORE[$dst_name]="$dst_was"
+      log "    pre-run: $dst_name=$dst_was (will restore to that at end)"
+    fi
+
+    _node_set_frozen "$src_name" "true" >/dev/null 2>&1 \
+      || log "    WARN: failed to freeze $src_name — continuing (new orders may still land on it)"
+    _node_set_frozen "$dst_name" "true" >/dev/null 2>&1 \
+      || log "    WARN: failed to freeze $dst_name — continuing (new orders may still land on it)"
+
+    for vmid in "${pair_vmids[@]}"; do
+      res=$(_resolve_pair "$vmid" "$dst_num" 2>&1) && rc=0 || rc=$?
+      if (( rc == 99 )); then
+        log "    SKIP vmid=$vmid: source == dest=$dst_num (already there)"
+        skipped=$((skipped + 1)); continue
+      fi
+      if (( rc != 0 )); then
+        log "    SKIP vmid=$vmid dst=$dst_num: resolve failed: $res"
+        skipped=$((skipped + 1)); continue
+      fi
+      read -r r_src r_dst <<< "$res"
+      JOBS+=("$vmid|$r_src|$r_dst|$dst_num")
+    done
+
+    # `declare -a pair_vmids` from previous iteration would persist as the
+    # same name; reset for next loop iter so we don't carry over VMs.
+    unset pair_vmids
   done
 else
   # --- File/stdin mode (original behaviour) ---
