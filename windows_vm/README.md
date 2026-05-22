@@ -83,7 +83,7 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 #Set-ItemProperty -Path $RegPath -Name "DefaultPassword" -Value "<new password>" -Type String
 ```
 
-- Disk cleanup
+- Disk cleanup — see [prepare.md](prepare.md) for the full pre-sysprep cleanup checklist (DISM `/ResetBase`, SoftwareDistribution, Delivery Optimization, defrag/TRIM, SDelete zero-fill)
 - From Linux, remove recovery partition
 - Sysprep with unattend_cleanup.xml
 
@@ -105,9 +105,15 @@ cd C:\Windows\System32\Sysprep
 .\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend.xml
 ```
 
-Disable Windows Update
+Disable *automatic* Windows Update (manual updates from Settings still work)
+
+```powershell
+# Policy: "Never check for updates (not recommended)" — blocks auto scan/download/install
+$auPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+if (!(Test-Path $auPath)) { New-Item -Path $auPath -Force | Out-Null }
+Set-ItemProperty -Path $auPath -Name 'NoAutoUpdate' -Value 1 -Type DWord
+Set-ItemProperty -Path $auPath -Name 'AUOptions'    -Value 1 -Type DWord
+
+# Keep wuauserv on-demand so the user can still click "Check for updates" in Settings
+Set-Service -Name wuauserv -StartupType Manual
 ```
-Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoUpdate' -Value 1 -Type DWord;
-Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'AUOptions' -Value 1 -Type DWord;
-Set-Service -Name wuauserv -StartupType Disabled;
-Stop-Service -Name wuauserv```

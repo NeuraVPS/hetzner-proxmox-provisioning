@@ -31,9 +31,12 @@ set -euo pipefail
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=$(date +%s)" | bash -s -- windows-en 101
 #
 # With storage-box overrides (optional; script has defaults):
-#   STORAGE_BOX_HOST=... STORAGE_BOX_USER=... \
-#     curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=$(date +%s)" \
-#     | bash -s -- windows-es 100
+#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=$(date +%s)" \
+#     | STORAGE_BOX_HOST=... STORAGE_BOX_USER=... bash -s -- windows-es 100
+#
+# IMPORTANT: env vars must go AFTER the pipe, prefixing `bash`. Putting them before
+# `curl` (e.g. `STORAGE_BOX_HOST=... curl ... | bash`) attaches them to curl only —
+# bash never sees them. Use `curl ... | VAR=x bash` instead.
 #
 # Optional third argument [node] defaults to $(hostname); set ZFS_PARENT / VM_NAME in the environment if needed.
 
@@ -218,6 +221,20 @@ Usage:
 
   [node] must match a name under /etc/pve/nodes/ (often `hostname -s`, not the FQDN).
   If omitted, the script picks the first of hostname -s / hostname that has qemu-server/.
+
+Run from GitHub via curl|bash (no checkout needed; the ?t=... cache-busts so you
+always pull the latest master revision):
+
+  curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=$(date +%s)" \
+    | bash -s -- <template_key> <vmid> [node]
+
+  Concrete examples:
+    curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=$(date +%s)" | bash -s -- windows-es 100
+    curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=$(date +%s)" | bash -s -- windows-en 101
+
+  IMPORTANT: you MUST pipe curl into bash with `| bash -s -- args`. If you omit
+  the "|", curl treats "bash", "--", "windows-en", "101" as extra URLs to fetch
+  and fails with: curl: (6) Could not resolve host: bash
 
 Environment:
   STORAGE_BOX_HOST, STORAGE_BOX_USER, STORAGE_BOX_PORT, STORAGE_BOX_BASE_PATH (default /home/templates)
