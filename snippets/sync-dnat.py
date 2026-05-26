@@ -226,6 +226,78 @@ def update_proxmox_node_last_boot_at():
     except Exception as e:
         logger.warning(f"Failed to update lastNodeBootAt for proxmox_nodes/{NODE_NAME}: {e}")
 
+
+def handle_pending_post_boot_action():
+    """
+    VPS E dedicated nodes (max_vm == 1): if the user requested an
+    upgrade-and-restart or restart from the panel, the cloud function set
+    proxmox_nodes/{NODE_NAME}.pendingPostBootAction = "start-vm". After the
+    node has finished booting and statuses are synced, start the single VM
+    here and clear the flag + the maintenance lock.
+
+    Intentionally NOT a permanent onboot=1: only user-requested cycles
+    auto-start. Unexpected reboots (kernel panic, hardware) leave the VM
+    stopped so a crash-loop can't take down the node.
+    """
+    if not ensure_firebase_initialized():
+        return
+    try:
+        db = firestore.client()
+        node_ref = db.collection("proxmox_nodes").document(NODE_NAME)
+        node_snap = node_ref.get()
+        if not node_snap.exists:
+            return
+        node_data = node_snap.to_dict() or {}
+        if node_data.get("pendingPostBootAction") != "start-vm":
+            return
+        try:
+            max_vm = int(node_data.get("max_vm") or 0)
+        except (TypeError, ValueError):
+            max_vm = 0
+        if max_vm != 1:
+            logger.warning(
+                f"pendingPostBootAction=start-vm on {NODE_NAME} but max_vm={max_vm}; "
+                f"refusing auto-start and clearing flag"
+            )
+            node_ref.update({
+                "pendingPostBootAction": firestore.DELETE_FIELD,
+                "maintenance": firestore.DELETE_FIELD,
+            })
+            return
+
+        all_vms = get_all_vms()
+        if not all_vms:
+            logger.warning(f"pendingPostBootAction=start-vm on {NODE_NAME} but `qm list` returned no VMs")
+            return
+        if len(all_vms) > 1:
+            logger.warning(
+                f"pendingPostBootAction=start-vm on {NODE_NAME} but {len(all_vms)} VMs present; "
+                f"refusing auto-start"
+            )
+            return
+
+        vmid = next(iter(all_vms.keys()))
+        actual = all_vms[vmid]
+        if actual == "running":
+            logger.info(f"VM {vmid} already running on {NODE_NAME}; clearing post-boot flag")
+        else:
+            logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
+            try:
+                run(["qm", "start", str(vmid)])
+            except subprocess.CalledProcessError as e:
+                # Leave the flag in place so a manual operator can investigate;
+                # don't loop forever — sync-dnat only runs once at boot.
+                logger.error(f"qm start {vmid} failed: {e.stderr or e}")
+                return
+
+        node_ref.update({
+            "pendingPostBootAction": firestore.DELETE_FIELD,
+            "maintenance": firestore.DELETE_FIELD,
+            "lastUserRebootAt": firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as e:
+        logger.warning(f"handle_pending_post_boot_action failed on {NODE_NAME}: {e}")
+
 def sync_all_statuses():
     """Reconcile every local VM's running/stopped state with Firestore."""
     all_vm_status = get_all_vms()
@@ -257,11 +329,13 @@ def main():
         ok = set_server_ipv6(target_vmid, sys.argv[3])
         sys.exit(0 if ok else 1)
 
-    # node-boot: stamp lastNodeBootAt, sync all statuses
+    # node-boot: stamp lastNodeBootAt, sync all statuses, then honor any
+    # user-requested post-boot action (VPS E dedicated nodes only).
     if len(sys.argv) >= 2 and sys.argv[1] == "node-boot":
         logger.info("node-boot: updating lastNodeBootAt and syncing VM statuses")
         update_proxmox_node_last_boot_at()
         sync_all_statuses()
+        handle_pending_post_boot_action()
         logger.info("Sync complete.")
         return
 
