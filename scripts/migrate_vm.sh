@@ -692,6 +692,39 @@ if (( _vm_on_src == 1 )); then
     exit 1' | tr -d '\r ' || true)
   [[ -n "$FINGERPRINT" ]] || _die "Could not read dest pveproxy SSL fingerprint."
 
+  # 4b) Strip stale `snaptime` annotation from the TOP of the source VM config.
+  # When a VM has been rolled back to a snapshot, Proxmox leaves a breadcrumb at
+  # the top of the config (`snaptime: <unix_ts>` — when the snapshot the current
+  # state came from was taken). This field is flagged `property_protected => 1`
+  # in QemuServer's schema, which accepts ONLY a strict `root@pam` ticket — NEVER
+  # an API token, regardless of `--privsep`. `pvesh remote_migrate` pushes the
+  # source config to dest through the token we created in step 3
+  # (`root@pam!<TOKEN_NAME>`), so dest aborts AFTER disks have already streamed
+  # with:  failed to handle 'config' command - only root can set 'snaptime' config
+  # The annotation is informational — removing it doesn't affect VM operation,
+  # snapshot integrity, or rollback ability. We rewrite the TOP section only
+  # (lines before the first `[snapshot_name]` header) so legitimate per-snapshot
+  # snaptime inside those blocks is untouched. Idempotent.
+  # NOTE: `parent: <snapname>` is NOT protected and migrates fine — leave it.
+  _info "Checking source VM config for stale 'snaptime' (would abort remote_migrate via token auth)…"
+  strip_out=$(src_ssh "
+    CFG=/etc/pve/qemu-server/${VMID}.conf
+    [ -f \"\$CFG\" ] || { echo NOFILE; exit 0; }
+    TMP=\$(mktemp) || { echo NOTMP; exit 0; }
+    if awk 'BEGIN{top=1; f=0} /^\\[/{top=0} top && /^snaptime:/{f=1; next} {print} END{exit f==0}' \"\$CFG\" > \"\$TMP\"; then
+      if cat \"\$TMP\" > \"\$CFG\"; then echo STRIPPED; else echo WRITEFAIL; fi
+    else
+      echo CLEAN
+    fi
+    rm -f \"\$TMP\"
+  " 2>&1)
+  case "$strip_out" in
+    STRIPPED) _ok   "Stripped stale 'snaptime' from source VM config (was a leftover from a prior snapshot rollback)." ;;
+    CLEAN)    _info "No stale 'snaptime' in source VM config — nothing to strip." ;;
+    NOFILE)   _warn "Source VM config not found at /etc/pve/qemu-server/${VMID}.conf; skipping strip." ;;
+    *)        _warn "Could not strip 'snaptime' on source (result=${strip_out:-empty}); remote_migrate may fail with 'only root can set snaptime'." ;;
+  esac
+
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   TARGET_HOST="[${DST_IPV6}]"
   _info "Starting pvesh remote_migrate (${SRC_NODE} → ${DST_NODE}, mode=${ONLINE_FLAG:-offline})…"

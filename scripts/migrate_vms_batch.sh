@@ -15,22 +15,28 @@
 #                       given either comma-separated within one -n or by
 #                       repeating -n (or both). Mutually exclusive with
 #                       -f/stdin.
-#                       For each pair, BOTH nodes are FROZEN
-#                       (proxmox_nodes.frozen=true) on entry so new orders
-#                       can't land on either of them mid-drain. All resulting
-#                       VM migrations share the same scheduler: PER_NODE /
-#                       MAX_TOTAL / per-VMID caps apply across pairs so e.g.
-#                       two drains converging on the same DST run serially
-#                       on that DST while their independent SRCs proceed
-#                       in parallel.
-#                       On exit (success, failure, or Ctrl-C):
-#                         - Every SRC stays frozen — drained nodes are kept
-#                           out of auto_provision until an admin manually
-#                           unfreezes them (re-frozen defensively even if
-#                           the initial freeze write failed).
-#                         - Every DST is restored to its pre-run frozen
-#                           state (admin-frozen DST stays frozen; auto-
-#                           frozen DST is unfrozen).
+#                       All resulting VM migrations share the same scheduler:
+#                       PER_NODE / MAX_TOTAL / per-VMID caps apply across pairs
+#                       so e.g. two drains converging on the same DST run
+#                       serially on that DST while their independent SRCs
+#                       proceed in parallel.
+#                       Frozen-state handling: by DEFAULT no node's
+#                       `proxmox_nodes.frozen` is changed (neither on entry
+#                       nor on exit) — opt in via the freeze flags. Pre-run
+#                       frozen state is still recorded for every touched node
+#                       so `--unfreeze-X=restore` (the default exit policy)
+#                       can put each node back exactly as it was.
+#                       Flags (`-n` mode only — ignored in -f/stdin mode):
+#                         --freeze-src=yes|no              (default no)
+#                         --freeze-dst=yes|no              (default no)
+#                         --unfreeze-src=yes|no|restore    (default restore)
+#                         --unfreeze-dst=yes|no|restore    (default restore)
+#                       `--unfreeze-X=no` means "leave whatever state the node
+#                       ended up at run end" (so combined with `--freeze-X=yes`
+#                       the node stays frozen post-run). The OLD always-freeze
+#                       drain (freeze both, keep src frozen, restore dst to
+#                       pre-run) is now:
+#                         --freeze-src=yes --freeze-dst=yes --unfreeze-src=no
 #                       A node may appear at most once as a SRC, and may not
 #                       appear as both a SRC and a DST across pairs (chained
 #                       drains aren't supported — run them as two separate
@@ -86,20 +92,39 @@ export MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"
 PVE_NODES_FILE="${PVE_NODES_FILE:-/var/lib/base-nat/pve_nodes.json}"
 STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 
+# Freeze/unfreeze policy for -n drain mode (no effect in -f/stdin mode). Defaults
+# are conservative — no node's frozen state is touched on start, and on exit
+# every touched node is restored to its pre-run state. Override via long flags
+# `--freeze-* / --unfreeze-*` (parsed manually below before getopts; only the
+# `--key=value` form is supported).
+FREEZE_SRC_ON_START="no"        # yes | no
+FREEZE_DST_ON_START="no"        # yes | no
+UNFREEZE_SRC_AT_END="restore"   # yes | no | restore
+UNFREEZE_DST_AT_END="restore"   # yes | no | restore
+
 usage() {
   cat >&2 <<EOF
 Usage: $(basename "$0") [-f FILE] [-c PER_NODE] [-m MAX_TOTAL] [-l LOG_DIR]
-       $(basename "$0") -n SRC:DST[,SRC:DST…] [-n …] [-c …] [-m …] [-l …]
+       $(basename "$0") -n SRC:DST[,SRC:DST…] [-n …] [freeze flags] [-c …] [-m …] [-l …]
   -f FILE          list of "VMID NEW_NODE_ID" pairs ("-" or omit for stdin)
-  -n SRC:DST       full-node drain: migrate ALL VMs on SRC to DST. SRC stays
-                   frozen at the end; DST is restored to its pre-run state.
-                   May be repeated and/or comma-separated to drain multiple
-                   sources in one batch (all share the scheduler caps).
-                   Mutually exclusive with -f/stdin.
+  -n SRC:DST       full-node drain: migrate ALL VMs on SRC to DST. By default
+                   no node's frozen state is touched; opt in via the freeze
+                   flags below. May be repeated and/or comma-separated to
+                   drain multiple sources in one batch (all share scheduler
+                   caps). Mutually exclusive with -f/stdin.
   -c PER_NODE      max in-flight per node (default $PER_NODE)
   -m MAX_TOTAL     max total in-flight (default $MAX_TOTAL)
   -l LOG_DIR       log directory          (default $LOG_DIR)
   -h               show this help
+
+Freeze flags (-n mode only; ignored in -f/stdin mode):
+  --freeze-src=yes|no              freeze every SRC on start (default $FREEZE_SRC_ON_START)
+  --freeze-dst=yes|no              freeze every DST on start (default $FREEZE_DST_ON_START)
+  --unfreeze-src=yes|no|restore    SRC exit policy (default $UNFREEZE_SRC_AT_END):
+                                     yes      → force unfreeze
+                                     no       → leave run-end state as-is
+                                     restore  → revert to pre-run state
+  --unfreeze-dst=yes|no|restore    DST exit policy (default $UNFREEZE_DST_AT_END), same semantics
 
 Reads:
   $PVE_NODES_FILE  (nodeId -> vmbr0 IPv6, written by sync-base-nat.py sync nodes)
@@ -113,15 +138,36 @@ Examples:
   TXT
   ./$(basename "$0") -f migrations.txt
 
-  # Drain every VM off node 7 onto node 99:
+  # Drain every VM off node 7 onto node 99 (no freezing — frozen state unchanged):
   ./$(basename "$0") -n 7:99
 
   # Drain three sources in one batch (7→99, 11→55, 15→99); 99 is shared so
   # those two drains will serialise on the 99 side while 11→55 runs in
   # parallel (subject to PER_NODE/MAX_TOTAL):
   ./$(basename "$0") -n 7:99,11:55,15:99
+
+  # Old always-freeze drain (freeze both, keep src frozen at exit, restore dst):
+  ./$(basename "$0") -n 7:99 --freeze-src=yes --freeze-dst=yes --unfreeze-src=no
 EOF
 }
+
+# Extract long options (--freeze-*=, --unfreeze-*=) before getopts so getopts
+# only sees short flags + positional args. Only the `--key=value` form is
+# supported — keeps the parser obvious and avoids ambiguous arg consumption
+# next to `-n`/etc.
+declare -a _pass=()
+while (( $# > 0 )); do
+  case "$1" in
+    --freeze-src=*)   FREEZE_SRC_ON_START="${1#*=}" ;;
+    --freeze-dst=*)   FREEZE_DST_ON_START="${1#*=}" ;;
+    --unfreeze-src=*) UNFREEZE_SRC_AT_END="${1#*=}"  ;;
+    --unfreeze-dst=*) UNFREEZE_DST_AT_END="${1#*=}"  ;;
+    --) shift; _pass+=("$@"); break ;;
+    *)  _pass+=("$1") ;;
+  esac
+  shift
+done
+set -- "${_pass[@]}"
 
 while getopts ":f:n:c:m:l:h" opt; do
   case "$opt" in
@@ -141,6 +187,12 @@ while getopts ":f:n:c:m:l:h" opt; do
     *) usage; exit 2 ;;
   esac
 done
+
+# Validate freeze policy values (set by long-flag preprocessor above).
+case "$FREEZE_SRC_ON_START" in yes|no) ;; *) echo "❌ --freeze-src must be yes|no (got: $FREEZE_SRC_ON_START)" >&2; exit 2 ;; esac
+case "$FREEZE_DST_ON_START" in yes|no) ;; *) echo "❌ --freeze-dst must be yes|no (got: $FREEZE_DST_ON_START)" >&2; exit 2 ;; esac
+case "$UNFREEZE_SRC_AT_END" in yes|no|restore) ;; *) echo "❌ --unfreeze-src must be yes|no|restore (got: $UNFREEZE_SRC_AT_END)" >&2; exit 2 ;; esac
+case "$UNFREEZE_DST_AT_END" in yes|no|restore) ;; *) echo "❌ --unfreeze-dst must be yes|no|restore (got: $UNFREEZE_DST_AT_END)" >&2; exit 2 ;; esac
 
 if (( ${#NODE_MIGRATIONS[@]} > 0 )); then
   if [[ -n "$INPUT" ]]; then
@@ -200,38 +252,47 @@ log() {
 
 # Freeze tracking maps. Populated by -n mode; file/stdin mode leaves them
 # empty so the EXIT trap is a no-op.
-#   FREEZE_KEEP    [node_name] -> 1            # write frozen=true at exit
-#                                              # (drained sources stay frozen)
-#   FREEZE_RESTORE [node_name] -> "true|false" # target state at exit
-#                                              # (destinations restore to pre-run)
-# A node will only ever be in one of these — cross-pair validation forbids a
-# node being both a SRC and a DST.
-declare -A FREEZE_KEEP=()
-declare -A FREEZE_RESTORE=()
+#   FROZEN_PRE_RUN [node] -> "true"|"false"  # node's frozen state at run start
+#                                            # (used by `--unfreeze-X=restore`)
+#   FROZEN_ROLE    [node] -> "src"|"dst"     # role this node plays this run
+#                                            # (drives which exit policy applies:
+#                                            #   src → $UNFREEZE_SRC_AT_END
+#                                            #   dst → $UNFREEZE_DST_AT_END)
+# A node will only ever have one role — cross-pair validation forbids a node
+# being both a SRC and a DST.
+declare -A FROZEN_PRE_RUN=()
+declare -A FROZEN_ROLE=()
 
 # Single EXIT trap doing two jobs: (1) reconcile each touched node's frozen
-# state — sources stay frozen, destinations restore to their pre-run state —
-# and (2) ALWAYS dump the aggregated errors log so the operator never has to
-# chase down a separate file (clean run prints "(no errors recorded)", failed
-# run prints every WARN/ERROR + every failed job's output). Registered here
-# (right after the log paths are set) so it covers every exit path: early
-# upgrade-gate exit, Ctrl-C through _kill_children, and `set -e` aborts.
-# _node_set_frozen is defined below; bash resolves the name at call time and
-# the trap only fires after definitions are in place.
+# state per the --unfreeze-src/--unfreeze-dst policy, and (2) ALWAYS dump the
+# aggregated errors log so the operator never has to chase down a separate file
+# (clean run prints "(no errors recorded)", failed run prints every WARN/ERROR
+# + every failed job's output). Registered here (right after the log paths are
+# set) so it covers every exit path: early upgrade-gate exit, Ctrl-C through
+# _kill_children, and `set -e` aborts. _node_set_frozen is defined below; bash
+# resolves the name at call time and the trap only fires after definitions are
+# in place.
 _on_exit() {
   local rc=$?
   set +e
-  for nd in "${!FREEZE_KEEP[@]}"; do
-    log "Leaving $nd frozen=true (drained source stays frozen)"
-    _node_set_frozen "$nd" "true" >/dev/null 2>&1 \
-      || log "WARN: failed to ensure $nd frozen=true — verify in admin UI"
-  done
-  for nd in "${!FREEZE_RESTORE[@]}"; do
-    if [[ "${FREEZE_RESTORE[$nd]}" == "false" ]]; then
-      log "Restoring $nd → frozen=false (was unfrozen before run)"
-      _node_set_frozen "$nd" "false" >/dev/null 2>&1 \
-        || log "WARN: failed to restore $nd frozen=false — set manually"
-    fi
+  local nd role action target
+  for nd in "${!FROZEN_PRE_RUN[@]}"; do
+    role="${FROZEN_ROLE[$nd]:-}"
+    case "$role" in
+      src) action="$UNFREEZE_SRC_AT_END" ;;
+      dst) action="$UNFREEZE_DST_AT_END" ;;
+      *)   log "BUG: $nd has no FROZEN_ROLE; skipping freeze-state restoration"; continue ;;
+    esac
+    case "$action" in
+      restore) target="${FROZEN_PRE_RUN[$nd]}"
+               log "$nd ($role) → frozen=$target (--unfreeze-$role=restore; pre-run=${FROZEN_PRE_RUN[$nd]})" ;;
+      yes)     target="false"
+               log "$nd ($role) → frozen=false (--unfreeze-$role=yes)" ;;
+      no)      log "$nd ($role): leaving run-end frozen state untouched (--unfreeze-$role=no)"
+               continue ;;
+    esac
+    _node_set_frozen "$nd" "$target" >/dev/null 2>&1 \
+      || log "WARN: failed to set $nd frozen=$target — set manually in admin UI"
   done
   echo
   echo "==================== ERRORS LOG ($(basename "$ERRORS_LOG")) ===================="
@@ -442,30 +503,45 @@ if (( ${#NODE_MIGRATIONS[@]} > 0 )); then
 
     log "  pair $spec → $src_name → $dst_name — discovered ${#pair_vmids[@]} VM(s)"
 
-    # Capture & freeze EVEN IF 0 VMs found: the operator's intent in passing
-    # this pair was for src to end frozen, so we honour that even when the
-    # drain itself is a no-op. _node_get_frozen hard-fails if it can't read
-    # the doc (Firestore creds missing / node missing) — surfacing that here
-    # is better than discovering it during the run.
-    if [[ -z "${FREEZE_KEEP[$src_name]:-}" ]]; then
+    # Record pre-run frozen state for src + dst EVEN IF 0 VMs found, so the
+    # EXIT trap's `--unfreeze-X=restore` policy (the default) can put them back
+    # exactly as they were even when the drain itself is a no-op.
+    # _node_get_frozen hard-fails if it can't read the doc (Firestore creds
+    # missing / node missing) — surfacing that here is better than discovering
+    # it during the run.
+    if [[ -z "${FROZEN_PRE_RUN[$src_name]:-}" ]]; then
       src_was=$(_node_get_frozen "$src_name") \
         || { echo "❌ Could not read frozen state of $src_name from Firestore" >&2; exit 1; }
-      FREEZE_KEEP[$src_name]=1
-      log "    pre-run: $src_name=$src_was (will stay frozen)"
+      FROZEN_PRE_RUN[$src_name]="$src_was"
+      FROZEN_ROLE[$src_name]="src"
+      log "    pre-run: $src_name=$src_was (role=src, exit policy=$UNFREEZE_SRC_AT_END)"
     fi
     # Same DST may appear in multiple pairs (N→1 fan-in); only record the
     # first reading. Subsequent _node_set_frozen calls below are idempotent.
-    if [[ -z "${FREEZE_RESTORE[$dst_name]:-}" ]]; then
+    if [[ -z "${FROZEN_PRE_RUN[$dst_name]:-}" ]]; then
       dst_was=$(_node_get_frozen "$dst_name") \
         || { echo "❌ Could not read frozen state of $dst_name from Firestore" >&2; exit 1; }
-      FREEZE_RESTORE[$dst_name]="$dst_was"
-      log "    pre-run: $dst_name=$dst_was (will restore to that at end)"
+      FROZEN_PRE_RUN[$dst_name]="$dst_was"
+      FROZEN_ROLE[$dst_name]="dst"
+      log "    pre-run: $dst_name=$dst_was (role=dst, exit policy=$UNFREEZE_DST_AT_END)"
     fi
 
-    _node_set_frozen "$src_name" "true" >/dev/null 2>&1 \
-      || log "    WARN: failed to freeze $src_name — continuing (new orders may still land on it)"
-    _node_set_frozen "$dst_name" "true" >/dev/null 2>&1 \
-      || log "    WARN: failed to freeze $dst_name — continuing (new orders may still land on it)"
+    # Conditionally freeze on start (default: no — leave alone). Repeated DSTs
+    # across pairs are idempotent (writing frozen=true a second time is a no-op).
+    if [[ "$FREEZE_SRC_ON_START" == "yes" ]]; then
+      if _node_set_frozen "$src_name" "true" >/dev/null 2>&1; then
+        log "    $src_name → frozen=true (--freeze-src=yes)"
+      else
+        log "    WARN: failed to freeze $src_name — continuing (new orders may still land on it)"
+      fi
+    fi
+    if [[ "$FREEZE_DST_ON_START" == "yes" ]]; then
+      if _node_set_frozen "$dst_name" "true" >/dev/null 2>&1; then
+        log "    $dst_name → frozen=true (--freeze-dst=yes)"
+      else
+        log "    WARN: failed to freeze $dst_name — continuing (new orders may still land on it)"
+      fi
+    fi
 
     for vmid in "${pair_vmids[@]}"; do
       res=$(_resolve_pair "$vmid" "$dst_num" 2>&1) && rc=0 || rc=$?
