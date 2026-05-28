@@ -23,7 +23,7 @@ echo "Hostname: $NAME"
 
 ### --- CONFIG -------------------------------------------------------
 
-PVE_VERSION="9.1-1"
+PVE_VERSION="9.2-1"
 PVE_ISO_URL="https://enterprise.proxmox.com/iso/proxmox-ve_${PVE_VERSION}.iso"
 ISO_PATH="/root/proxmox-ve_${PVE_VERSION}.iso"
 AUTO_ISO_PATH="/root/proxmox-ve_${PVE_VERSION}-auto-from-iso.iso"
