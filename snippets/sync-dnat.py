@@ -229,15 +229,22 @@ def update_proxmox_node_last_boot_at():
 
 def handle_pending_post_boot_action():
     """
-    VPS E dedicated nodes (max_vm == 1): if the user requested an
-    upgrade-and-restart or restart from the panel, the cloud function set
-    proxmox_nodes/{NODE_NAME}.pendingPostBootAction = "start-vm". After the
-    node has finished booting and statuses are synced, start the single VM
-    here and clear the flag + the maintenance lock.
+    Finalize a user-requested node maintenance cycle at boot.
 
-    Intentionally NOT a permanent onboot=1: only user-requested cycles
-    auto-start. Unexpected reboots (kernel panic, hardware) leave the VM
-    stopped so a crash-loop can't take down the node.
+    Reaching node-boot means the node has finished rebooting, so any maintenance
+    window opened by the panel (proxmox_nodes/{NODE_NAME}.maintenance, set by the
+    NeuraVPS cloud functions before the reboot) is OVER by definition. This
+    function therefore ALWAYS clears `maintenance` + `pendingPostBootAction` when
+    either is present — even if there is no VM to auto-start. Leaving `maintenance`
+    set is what made the panel hang on "upgrading"/"rebooting" forever and locked
+    the node out of all future maintenance (the claim transaction refuses any
+    non-idle state).
+
+    VM auto-start is the separate, opt-in part: only when
+    pendingPostBootAction == "start-vm" on a dedicated node (max_vm == 1) do we
+    `qm start` the single VM. This is intentionally NOT a permanent onboot=1, so
+    unexpected reboots (kernel panic, hardware) leave the VM stopped and a
+    crash-loop can't take down the node.
     """
     if not ensure_firebase_initialized():
         return
@@ -248,58 +255,54 @@ def handle_pending_post_boot_action():
         if not node_snap.exists:
             return
         node_data = node_snap.to_dict() or {}
-        if node_data.get("pendingPostBootAction") != "start-vm":
-            return
-        try:
-            max_vm = int(node_data.get("max_vm") or 0)
-        except (TypeError, ValueError):
-            max_vm = 0
-        if max_vm != 1:
-            logger.warning(
-                f"pendingPostBootAction=start-vm on {NODE_NAME} but max_vm={max_vm}; "
-                f"refusing auto-start and clearing flag"
-            )
-            node_ref.update({
-                "pendingPostBootAction": firestore.DELETE_FIELD,
-                "maintenance": firestore.DELETE_FIELD,
-            })
-            return
 
-        all_vms = get_all_vms()
+        pending = node_data.get("pendingPostBootAction")
+        has_maintenance = bool(node_data.get("maintenance"))
+        if pending is None and not has_maintenance:
+            return  # nothing to finalize
 
-        # Past this point the node has definitively rebooted, so the
-        # maintenance window is OVER regardless of what happens with the VM.
-        # We therefore ALWAYS clear pendingPostBootAction + maintenance in the
-        # finalize below. Previously each of these branches `return`ed early and
-        # left both fields set — that is exactly the "server restarted but
-        # Firestore not updated" failure: the panel stays stuck on
-        # "upgrading"/"rebooting" and the node is permanently locked, because
-        # the cloud-function claim transaction refuses any non-idle maintenance
-        # state. The VM-start outcome is recorded so an operator can see it; a
-        # stopped VM is already reflected in servers/{id}.status by the
-        # sync_all_statuses() call that ran just before this.
-        vm_started = None  # None = auto-start not attempted; True/False = result
-        if not all_vms:
-            logger.warning(f"pendingPostBootAction=start-vm on {NODE_NAME} but `qm list` returned no VMs")
-        elif len(all_vms) > 1:
-            logger.warning(
-                f"pendingPostBootAction=start-vm on {NODE_NAME} but {len(all_vms)} VMs present; "
-                f"refusing auto-start"
-            )
-        else:
-            vmid = next(iter(all_vms.keys()))
-            if all_vms[vmid] == "running":
-                logger.info(f"VM {vmid} already running on {NODE_NAME}")
-                vm_started = True
+        # Auto-start the VM only when explicitly requested for a dedicated node.
+        vm_started = None  # None = not attempted; True/False = result
+        if pending == "start-vm":
+            try:
+                max_vm = int(node_data.get("max_vm") or 0)
+            except (TypeError, ValueError):
+                max_vm = 0
+            if max_vm != 1:
+                logger.warning(
+                    f"pendingPostBootAction=start-vm on {NODE_NAME} but max_vm={max_vm}; "
+                    f"refusing auto-start"
+                )
             else:
-                logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
-                try:
-                    run(["qm", "start", str(vmid)])
-                    vm_started = True
-                except subprocess.CalledProcessError as e:
-                    logger.error(f"qm start {vmid} failed: {e.stderr or e}")
-                    vm_started = False
+                all_vms = get_all_vms()
+                if not all_vms:
+                    logger.warning(f"pendingPostBootAction=start-vm on {NODE_NAME} but `qm list` returned no VMs")
+                elif len(all_vms) > 1:
+                    logger.warning(
+                        f"pendingPostBootAction=start-vm on {NODE_NAME} but {len(all_vms)} VMs present; "
+                        f"refusing auto-start"
+                    )
+                else:
+                    vmid = next(iter(all_vms.keys()))
+                    if all_vms[vmid] == "running":
+                        logger.info(f"VM {vmid} already running on {NODE_NAME}")
+                        vm_started = True
+                    else:
+                        logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
+                        try:
+                            run(["qm", "start", str(vmid)])
+                            vm_started = True
+                        except subprocess.CalledProcessError as e:
+                            logger.error(f"qm start {vmid} failed: {e.stderr or e}")
+                            vm_started = False
+        elif pending is not None:
+            logger.warning(f"Unknown pendingPostBootAction={pending!r} on {NODE_NAME}; clearing it")
 
+        # Single finalize: ALWAYS clear both fields so the panel unsticks and the
+        # node accepts future maintenance. Runs whether or not a VM was started.
+        # A stopped VM is already reflected in servers/{id}.status by the
+        # sync_all_statuses() call that ran just before this; the start outcome
+        # is also recorded here for operator visibility.
         finalize = {
             "pendingPostBootAction": firestore.DELETE_FIELD,
             "maintenance": firestore.DELETE_FIELD,
@@ -308,6 +311,7 @@ def handle_pending_post_boot_action():
         if vm_started is not None:
             finalize["lastUserRebootVmStarted"] = vm_started
         node_ref.update(finalize)
+        logger.info(f"node-boot: finalized maintenance on {NODE_NAME} (vm_started={vm_started})")
     except Exception as e:
         logger.warning(f"handle_pending_post_boot_action failed on {NODE_NAME}: {e}")
 
@@ -347,7 +351,14 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "node-boot":
         logger.info("node-boot: updating lastNodeBootAt and syncing VM statuses")
         update_proxmox_node_last_boot_at()
-        sync_all_statuses()
+        try:
+            sync_all_statuses()
+        except Exception as e:
+            # Never let a transient `qm list` / status-sync failure skip the
+            # maintenance finalize below. If it did, the panel would stay stuck
+            # on "upgrading"/"rebooting" and the node would be locked out of all
+            # future maintenance — exactly the failure this whole path guards.
+            logger.warning(f"node-boot: status sync failed, continuing to finalize: {e}")
         handle_pending_post_boot_action()
         logger.info("Sync complete.")
         return
