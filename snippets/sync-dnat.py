@@ -266,35 +266,48 @@ def handle_pending_post_boot_action():
             return
 
         all_vms = get_all_vms()
+
+        # Past this point the node has definitively rebooted, so the
+        # maintenance window is OVER regardless of what happens with the VM.
+        # We therefore ALWAYS clear pendingPostBootAction + maintenance in the
+        # finalize below. Previously each of these branches `return`ed early and
+        # left both fields set — that is exactly the "server restarted but
+        # Firestore not updated" failure: the panel stays stuck on
+        # "upgrading"/"rebooting" and the node is permanently locked, because
+        # the cloud-function claim transaction refuses any non-idle maintenance
+        # state. The VM-start outcome is recorded so an operator can see it; a
+        # stopped VM is already reflected in servers/{id}.status by the
+        # sync_all_statuses() call that ran just before this.
+        vm_started = None  # None = auto-start not attempted; True/False = result
         if not all_vms:
             logger.warning(f"pendingPostBootAction=start-vm on {NODE_NAME} but `qm list` returned no VMs")
-            return
-        if len(all_vms) > 1:
+        elif len(all_vms) > 1:
             logger.warning(
                 f"pendingPostBootAction=start-vm on {NODE_NAME} but {len(all_vms)} VMs present; "
                 f"refusing auto-start"
             )
-            return
-
-        vmid = next(iter(all_vms.keys()))
-        actual = all_vms[vmid]
-        if actual == "running":
-            logger.info(f"VM {vmid} already running on {NODE_NAME}; clearing post-boot flag")
         else:
-            logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
-            try:
-                run(["qm", "start", str(vmid)])
-            except subprocess.CalledProcessError as e:
-                # Leave the flag in place so a manual operator can investigate;
-                # don't loop forever — sync-dnat only runs once at boot.
-                logger.error(f"qm start {vmid} failed: {e.stderr or e}")
-                return
+            vmid = next(iter(all_vms.keys()))
+            if all_vms[vmid] == "running":
+                logger.info(f"VM {vmid} already running on {NODE_NAME}")
+                vm_started = True
+            else:
+                logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
+                try:
+                    run(["qm", "start", str(vmid)])
+                    vm_started = True
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"qm start {vmid} failed: {e.stderr or e}")
+                    vm_started = False
 
-        node_ref.update({
+        finalize = {
             "pendingPostBootAction": firestore.DELETE_FIELD,
             "maintenance": firestore.DELETE_FIELD,
             "lastUserRebootAt": firestore.SERVER_TIMESTAMP,
-        })
+        }
+        if vm_started is not None:
+            finalize["lastUserRebootVmStarted"] = vm_started
+        node_ref.update(finalize)
     except Exception as e:
         logger.warning(f"handle_pending_post_boot_action failed on {NODE_NAME}: {e}")
 
