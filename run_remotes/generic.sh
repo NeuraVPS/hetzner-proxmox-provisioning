@@ -5,6 +5,10 @@
 ############################################################
 remote_task() {
   echo "== Running remote task =="
+  curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/snippets/sync-dnat.py \
+    -o /var/lib/svz/snippets/sync-dnat.py
+
+  chmod +x /var/lib/svz/snippets/sync-dnat.py
   echo "== Finished =="
 }
 ############################################################
@@ -19,7 +23,7 @@ if [[ ! -f "$NODES_FILE" ]]; then
 fi
 
 # Run only on these host numbers (e.g. 2 5 7). Leave empty to run on all (still subject to SKIP/GTE/LTE below).
-ONLY_HOST_NUMS=(3)
+ONLY_HOST_NUMS=()
 # Skip these host numbers (e.g. 2 5 7). Leave empty to run on all.
 SKIP_HOST_NUMS=()
 # Only run when host_num >= N, or host_num <= N. Leave empty to ignore.
