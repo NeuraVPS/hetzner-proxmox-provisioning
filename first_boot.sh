@@ -54,7 +54,10 @@ fi
 apt-get update && apt-get full-upgrade -y
 #apt-get purge -y proxmox-first-boot
 apt-get install -y python3-pip
-pip3 install firebase_admin --break-system-packages --root-user-action=ignore
+# Install firebase_admin into system site-packages. --ignore-installed prevents pip from
+# trying to uninstall the apt-provided requests (no RECORD file -> "uninstall-no-record-file"
+# error that previously failed proxmox-first-boot); pip installs its own copies instead.
+pip3 install firebase_admin --break-system-packages --root-user-action=ignore --ignore-installed
 
 # Configure chrony with Hetzner NTP servers
 log "Configuring chrony with Hetzner NTP servers"
