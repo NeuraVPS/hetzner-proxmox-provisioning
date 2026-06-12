@@ -10,7 +10,7 @@
 # paying disk latency on every touched page (slow SQX Monte Carlo / retests).
 #
 # WHAT (per-class profiles):
-#   profile e   (*-EX44, 1 dedicated VM):  zfs_arc_max=2G,  swappiness=1
+#   profile e   (*-EX44, 1 dedicated VM):  zfs_arc_max=1G (arc_min=0.5G), swappiness=1
 #   profile mt  (*-AX102, ~48 MT VMs):     zfs_arc_max=8G,  swappiness=5, ksmtuned ON
 #   profile vps (*-AX162*, *-AX102-U):     zfs_arc_max=16G, swappiness=5
 # plus optional swap drain (swapoff/swapon) so already-swapped customer RAM
@@ -60,9 +60,14 @@ remote_task() {
     esac
   fi
 
-  local arc_bytes swappiness ksm_on=0
+  # Profile e also lowers zfs_arc_min: the default is RAM/32 (= 2 GiB on a
+  # 64 GB EX44) and ZFS silently CLAMPS c_max to arc_min — writing a 1 GiB
+  # cap alone leaves the ARC at 2 GiB with no error. Always write min first.
+  # (2026-06-12 retune: 1 GiB ARC + memory=61440 VM frees the EX44 budget;
+  # measured cold-swap floor drops 2-4.5 GB -> 0.54 GB, Windows pagefile 0.)
+  local arc_bytes arc_min_bytes=0 swappiness ksm_on=0
   case "$profile" in
-    e)   arc_bytes=$((2 * 1024 * 1024 * 1024));  swappiness=1 ;;
+    e)   arc_bytes=$((1024 * 1024 * 1024)); arc_min_bytes=$((512 * 1024 * 1024)); swappiness=1 ;;
     mt)  arc_bytes=$((8 * 1024 * 1024 * 1024));  swappiness=5; ksm_on=1 ;;
     vps) arc_bytes=$((16 * 1024 * 1024 * 1024)); swappiness=5 ;;
     *)   echo "ERROR: unknown profile '$profile'"; return 1 ;;
@@ -102,9 +107,19 @@ remote_task() {
   fi
 
   # ---- apply: ARC cap (live + persisted) ---------------------------------
-  echo "Applying zfs_arc_max=$arc_bytes"
+  # arc_min BEFORE arc_max, or the max write is clamped (see profile table).
+  local min_note=""
+  (( arc_min_bytes > 0 )) && min_note=" (arc_min=$arc_min_bytes)"
+  echo "Applying zfs_arc_max=$arc_bytes$min_note"
+  if (( arc_min_bytes > 0 )); then
+    echo "$arc_min_bytes" > /sys/module/zfs/parameters/zfs_arc_min
+  fi
   echo "$arc_bytes" > /sys/module/zfs/parameters/zfs_arc_max
-  echo "options zfs zfs_arc_max=$arc_bytes" > /etc/modprobe.d/zfs.conf
+  if (( arc_min_bytes > 0 )); then
+    echo "options zfs zfs_arc_max=$arc_bytes zfs_arc_min=$arc_min_bytes" > /etc/modprobe.d/zfs.conf
+  else
+    echo "options zfs zfs_arc_max=$arc_bytes" > /etc/modprobe.d/zfs.conf
+  fi
   update-initramfs -u >/dev/null 2>&1 || echo "WARNING: update-initramfs failed (live value still applied)"
 
   # Wait (bounded) for the ARC to shrink toward the new cap so a subsequent
