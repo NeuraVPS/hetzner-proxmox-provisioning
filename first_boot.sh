@@ -333,16 +333,32 @@ else
   log "rpool not found, skipping third-disk swap check"
 fi
 
-# Prefer RAM over swap (use swap mainly when needed; good for Proxmox + balloon)
-log "Setting vm.swappiness=10 (prefer RAM, use swap when necessary)"
-mkdir -p /etc/sysctl.d
-echo "vm.swappiness=10" > /etc/sysctl.d/99-proxmox-swap.conf
-sysctl -p /etc/sysctl.d/99-proxmox-swap.conf 2>/dev/null || true
+# Memory profile per node class (see NeuraVPS/NeuraVPS docs/NEURAVPS_FLEET_TUNING_PLAN.md).
+# A fixed 32G ARC used to be set on every class; on 64G EX44 nodes (one dedicated
+# 61G VPS-E VM) that evicted customer VM RAM into host swap fleet-wide. Same
+# table as run_remotes/tune_memory_profile.sh — keep both in sync.
+HOSTCLASS="$(hostname)"
+case "$HOSTCLASS" in
+  *-EX44*)    MEM_PROFILE="e";   ARC_BYTES=$((2  * 1024 * 1024 * 1024)); SWAPPINESS=1; KSM_ON=0 ;;
+  *-AX102-U*) MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); SWAPPINESS=5; KSM_ON=0 ;;
+  *-AX102*)   MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); SWAPPINESS=5; KSM_ON=1 ;;
+  *)          MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); SWAPPINESS=5; KSM_ON=0 ;;
+esac
+log "Memory profile: $MEM_PROFILE (host=$HOSTCLASS) — zfs_arc_max=$ARC_BYTES, swappiness=$SWAPPINESS, ksm=$KSM_ON"
 
-# Server optimizations
-echo 34359738368 > /sys/module/zfs/parameters/zfs_arc_max
-echo "options zfs zfs_arc_max=34359738368" > /etc/modprobe.d/zfs.conf
+mkdir -p /etc/sysctl.d
+echo "vm.swappiness=$SWAPPINESS" > /etc/sysctl.d/99-neuravps-memprofile.conf
+rm -f /etc/sysctl.d/99-proxmox-swap.conf
+sysctl -p /etc/sysctl.d/99-neuravps-memprofile.conf 2>/dev/null || true
+
+echo "$ARC_BYTES" > /sys/module/zfs/parameters/zfs_arc_max
+echo "options zfs zfs_arc_max=$ARC_BYTES" > /etc/modprobe.d/zfs.conf
 update-initramfs -u
+
+if [ "$KSM_ON" = "1" ]; then
+  log "MT profile: enabling ksmtuned (KSM dedup across identical Windows VMs)"
+  systemctl enable --now ksmtuned || log "WARNING: ksmtuned enable failed"
+fi
 
 # Disable integrated GPUs (Intel + AMD) on headless Proxmox to avoid kernel issues
 # Intel: i915 (older), xe (Alder Lake+). AMD: amdgpu
