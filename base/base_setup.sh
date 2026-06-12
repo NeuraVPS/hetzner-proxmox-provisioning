@@ -42,6 +42,13 @@ apt update && apt upgrade -y
 apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool sshpass smbclient netcat-openbsd freerdp3-x11 xvfb imagemagick
 pip3 install --break-system-packages firebase-admin
 
+# 1b) sshd rate limits for fleet sweeps. node_health_check and run_remotes/*
+# hop through this BASE with bursts of short SSH connections; the default
+# MaxStartups 10:30:100 resets part of each burst (kex_exchange_identification).
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/50-neuravps-maxstartups.conf \
+  -o /etc/ssh/sshd_config.d/50-neuravps-maxstartups.conf
+sshd -t && systemctl reload ssh
+
 # 2) Runtime configuration for sync-base-nat.py.
 cat >/etc/default/base-nat <<'EOF'
 # Host addresses (used by boot checks only).
