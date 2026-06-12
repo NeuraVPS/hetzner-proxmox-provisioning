@@ -520,7 +520,10 @@ chmod 755 /usr/local/sbin/smartd-filter.sh
 cp -a /etc/smartd.conf /etc/smartd.conf.bak.$(date +%Y%m%d-%H%M%S) 2>/dev/null || true
 
 {
-  for dev in /dev/nvme*; do
+  # Namespaces only (nvme0n1, nvme1n1): the old /dev/nvme* glob also matched
+  # partitions (nvme0n1p1..p4) and char devices, generating redundant smartd
+  # entries per disk.
+  for dev in /dev/nvme[0-9]n[0-9]; do
     [[ -b "$dev" ]] || continue
     echo "${dev} -d nvme -a -n standby -m root -M exec /usr/local/sbin/smartd-filter.sh"
   done
