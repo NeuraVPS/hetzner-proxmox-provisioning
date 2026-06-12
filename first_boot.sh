@@ -338,21 +338,31 @@ fi
 # 61G VPS-E VM) that evicted customer VM RAM into host swap fleet-wide. Same
 # table as run_remotes/tune_memory_profile.sh — keep both in sync.
 HOSTCLASS="$(hostname)"
+# Profile e also lowers zfs_arc_min: the default is RAM/32 (= 2 GiB on a 64 GB
+# EX44) and ZFS silently CLAMPS c_max to arc_min — a 1 GiB cap written alone
+# stays at 2 GiB with no error. Write min before max, persist both.
+# (2026-06-12 retune: 1G ARC + memory=61440 VPS-E VM → cold-swap floor 0.5 GB.)
 case "$HOSTCLASS" in
-  *-EX44*)    MEM_PROFILE="e";   ARC_BYTES=$((2  * 1024 * 1024 * 1024)); SWAPPINESS=1; KSM_ON=0 ;;
-  *-AX102-U*) MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); SWAPPINESS=5; KSM_ON=0 ;;
-  *-AX102*)   MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); SWAPPINESS=5; KSM_ON=1 ;;
-  *)          MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); SWAPPINESS=5; KSM_ON=0 ;;
+  *-EX44*)    MEM_PROFILE="e";   ARC_BYTES=$((1024 * 1024 * 1024)); ARC_MIN_BYTES=$((512 * 1024 * 1024)); SWAPPINESS=1; KSM_ON=0 ;;
+  *-AX102-U*) MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=0 ;;
+  *-AX102*)   MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=1 ;;
+  *)          MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=0 ;;
 esac
-log "Memory profile: $MEM_PROFILE (host=$HOSTCLASS) — zfs_arc_max=$ARC_BYTES, swappiness=$SWAPPINESS, ksm=$KSM_ON"
+log "Memory profile: $MEM_PROFILE (host=$HOSTCLASS) — zfs_arc_max=$ARC_BYTES, arc_min=$ARC_MIN_BYTES, swappiness=$SWAPPINESS, ksm=$KSM_ON"
 
 mkdir -p /etc/sysctl.d
 echo "vm.swappiness=$SWAPPINESS" > /etc/sysctl.d/99-neuravps-memprofile.conf
 rm -f /etc/sysctl.d/99-proxmox-swap.conf
 sysctl -p /etc/sysctl.d/99-neuravps-memprofile.conf 2>/dev/null || true
 
-echo "$ARC_BYTES" > /sys/module/zfs/parameters/zfs_arc_max
-echo "options zfs zfs_arc_max=$ARC_BYTES" > /etc/modprobe.d/zfs.conf
+if [ "$ARC_MIN_BYTES" -gt 0 ]; then
+  echo "$ARC_MIN_BYTES" > /sys/module/zfs/parameters/zfs_arc_min
+  echo "$ARC_BYTES" > /sys/module/zfs/parameters/zfs_arc_max
+  echo "options zfs zfs_arc_max=$ARC_BYTES zfs_arc_min=$ARC_MIN_BYTES" > /etc/modprobe.d/zfs.conf
+else
+  echo "$ARC_BYTES" > /sys/module/zfs/parameters/zfs_arc_max
+  echo "options zfs zfs_arc_max=$ARC_BYTES" > /etc/modprobe.d/zfs.conf
+fi
 update-initramfs -u
 
 if [ "$KSM_ON" = "1" ]; then
