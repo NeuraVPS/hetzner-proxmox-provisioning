@@ -144,7 +144,12 @@ remote_task() {
   # ---- apply: KSM (MT profile only) --------------------------------------
   if [[ "$ksm_on" == "1" ]]; then
     echo "Ensuring ksmtuned is enabled (KSM dedup across ~48 identical Windows VMs)"
+    # THRES_COEF=85: the default 20 never triggers when VM RAM sits in swap
+    # (low qemu RSS -> run=0 deadlock, found live 2026-06-12). Set + restart.
+    sed -i "/^#* *KSM_THRES_COEF=/d; /^#* *KSM_NPAGES_MAX=/d" /etc/ksmtuned.conf
+    printf "KSM_THRES_COEF=85\nKSM_NPAGES_MAX=2500\n" >> /etc/ksmtuned.conf
     systemctl enable --now ksmtuned >/dev/null 2>&1 || echo "WARNING: ksmtuned enable failed"
+    systemctl restart ksmtuned >/dev/null 2>&1 || true
   fi
 
   # ---- optional: drain swap ----------------------------------------------
