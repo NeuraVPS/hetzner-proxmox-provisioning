@@ -344,7 +344,7 @@ HOSTCLASS="$(hostname)"
 # (2026-06-12 retune: 1G ARC + memory=61440 VPS-E VM → cold-swap floor 0.5 GB.)
 case "$HOSTCLASS" in
   *-EX44*)    MEM_PROFILE="e";   ARC_BYTES=$((1024 * 1024 * 1024)); ARC_MIN_BYTES=$((512 * 1024 * 1024)); SWAPPINESS=1; KSM_ON=0 ;;
-  *-AX102-U*) MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=0 ;;
+  *-AX102-U*) MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=1 ;;
   *-AX102*)   MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=1 ;;
   *)          MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=0 ;;
 esac
@@ -367,7 +367,14 @@ update-initramfs -u
 
 if [ "$KSM_ON" = "1" ]; then
   log "MT profile: enabling ksmtuned (KSM dedup across identical Windows VMs)"
+  # Default KSM_THRES_COEF=20 deadlocks on swapped MT nodes: VM RAM exiled to
+  # swap lowers qemu RSS, ksmtuned concludes "ksm not needed" (run=0), nothing
+  # dedups, swap never recovers (found live on all 9 AX102-U, 2026-06-12).
+  # 85 = effectively always-on at MT density; NPAGES_MAX 2500 = 2x scan rate.
+  sed -i "/^#* *KSM_THRES_COEF=/d; /^#* *KSM_NPAGES_MAX=/d" /etc/ksmtuned.conf
+  printf "KSM_THRES_COEF=85\nKSM_NPAGES_MAX=2500\n" >> /etc/ksmtuned.conf
   systemctl enable --now ksmtuned || log "WARNING: ksmtuned enable failed"
+  systemctl restart ksmtuned 2>/dev/null || true
 fi
 
 # Disable integrated GPUs (Intel + AMD) on headless Proxmox to avoid kernel issues

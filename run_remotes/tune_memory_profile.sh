@@ -11,8 +11,10 @@
 #
 # WHAT (per-class profiles):
 #   profile e   (*-EX44, 1 dedicated VM):  zfs_arc_max=1G (arc_min=0.5G), swappiness=1
-#   profile mt  (*-AX102, ~48 MT VMs):     zfs_arc_max=8G,  swappiness=5, ksmtuned ON
-#   profile vps (*-AX162*, *-AX102-U):     zfs_arc_max=16G, swappiness=5
+#   profile mt  (*-AX102 y *-AX102-U, 38-48 MT VMs): zfs_arc_max=8G, swappiness=5, ksmtuned ON
+#   profile vps (*-AX162*):                zfs_arc_max=16G, swappiness=5
+# (2026-06-12: AX102-U reclassified vps->mt — live audit found all 9 nodes
+#  host exclusively 38-48 x 4096 MiB MT VMs; mt profile applied fleet-wide.)
 # plus optional swap drain (swapoff/swapon) so already-swapped customer RAM
 # returns to memory NOW instead of on next page-touch.
 #
@@ -53,7 +55,7 @@ remote_task() {
   if [[ -z "$profile" ]]; then
     case "$host" in
       *-EX44*)    profile="e"   ;;
-      *-AX102-U*) profile="vps" ;;
+      *-AX102-U*) profile="mt"  ;;
       *-AX102*)   profile="mt"  ;;
       *-AX162*)   profile="vps" ;;
       *)          profile="vps" ;;
@@ -142,7 +144,12 @@ remote_task() {
   # ---- apply: KSM (MT profile only) --------------------------------------
   if [[ "$ksm_on" == "1" ]]; then
     echo "Ensuring ksmtuned is enabled (KSM dedup across ~48 identical Windows VMs)"
+    # THRES_COEF=85: the default 20 never triggers when VM RAM sits in swap
+    # (low qemu RSS -> run=0 deadlock, found live 2026-06-12). Set + restart.
+    sed -i "/^#* *KSM_THRES_COEF=/d; /^#* *KSM_NPAGES_MAX=/d" /etc/ksmtuned.conf
+    printf "KSM_THRES_COEF=85\nKSM_NPAGES_MAX=2500\n" >> /etc/ksmtuned.conf
     systemctl enable --now ksmtuned >/dev/null 2>&1 || echo "WARNING: ksmtuned enable failed"
+    systemctl restart ksmtuned >/dev/null 2>&1 || true
   fi
 
   # ---- optional: drain swap ----------------------------------------------
