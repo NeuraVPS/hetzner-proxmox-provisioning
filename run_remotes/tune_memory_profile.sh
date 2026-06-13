@@ -145,15 +145,23 @@ remote_task() {
   # Retire the old first_boot file so there's a single source of truth.
   rm -f /etc/sysctl.d/99-proxmox-swap.conf
 
-  # ---- apply: KSM (MT profile only) --------------------------------------
+  # ---- apply: KSM (mt/ad profiles enable; e/vps disable) -----------------
   if [[ "$ksm_on" == "1" ]]; then
-    echo "Ensuring ksmtuned is enabled (KSM dedup across ~48 identical Windows VMs)"
+    echo "Ensuring ksmtuned is enabled (KSM dedup across identical Windows VMs)"
     # THRES_COEF=85: the default 20 never triggers when VM RAM sits in swap
     # (low qemu RSS -> run=0 deadlock, found live 2026-06-12). Set + restart.
     sed -i "/^#* *KSM_THRES_COEF=/d; /^#* *KSM_NPAGES_MAX=/d" /etc/ksmtuned.conf
     printf "KSM_THRES_COEF=85\nKSM_NPAGES_MAX=2500\n" >> /etc/ksmtuned.conf
     systemctl enable --now ksmtuned >/dev/null 2>&1 || echo "WARNING: ksmtuned enable failed"
     systemctl restart ksmtuned >/dev/null 2>&1 || true
+  else
+    # e (dedicated VPS-E) / vps (catch-all): actively disable ksmtuned so it
+    # can't auto-toggle KSM under pressure and burn dedicated cores on pointless
+    # single-VM dedup (found 49/124 EX44 running KSM 2026-06-13). run=0 stops
+    # scanning without unmerging (no spike); residual merges COW-split naturally.
+    echo "Disabling ksmtuned (KSM off for $profile profile)"
+    systemctl disable --now ksmtuned >/dev/null 2>&1 || true
+    echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null || true
   fi
 
   # ---- optional: drain swap ----------------------------------------------
