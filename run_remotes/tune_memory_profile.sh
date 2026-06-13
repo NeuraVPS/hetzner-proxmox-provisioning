@@ -12,9 +12,12 @@
 # WHAT (per-class profiles):
 #   profile e   (*-EX44, 1 dedicated VM):  zfs_arc_max=1G (arc_min=0.5G), swappiness=1
 #   profile mt  (*-AX102 y *-AX102-U, 38-48 MT VMs): zfs_arc_max=8G, swappiness=5, ksmtuned ON
-#   profile vps (*-AX162*):                zfs_arc_max=16G, swappiness=5
+#   profile ad  (*-AX162*, A-D shared, identical Win+SQX): zfs_arc_max=16G, swappiness=5, ksmtuned ON
+#   profile vps (catch-all / unknown class):       zfs_arc_max=16G, swappiness=5
 # (2026-06-12: AX102-U reclassified vps->mt — live audit found all 9 nodes
 #  host exclusively 38-48 x 4096 MiB MT VMs; mt profile applied fleet-wide.)
+# (2026-06-13: AX162 split vps->ad — KSM pilot proved A-D dedups like MT
+#  (96/174 self-drained 60-72G); ksmtuned rolled out to all 39, run=1.)
 # plus optional swap drain (swapoff/swapon) so already-swapped customer RAM
 # returns to memory NOW instead of on next page-touch.
 #
@@ -57,7 +60,7 @@ remote_task() {
       *-EX44*)    profile="e"   ;;
       *-AX102-U*) profile="mt"  ;;
       *-AX102*)   profile="mt"  ;;
-      *-AX162*)   profile="vps" ;;
+      *-AX162*)   profile="ad"  ;;
       *)          profile="vps" ;;
     esac
   fi
@@ -71,6 +74,7 @@ remote_task() {
   case "$profile" in
     e)   arc_bytes=$((1024 * 1024 * 1024)); arc_min_bytes=$((512 * 1024 * 1024)); swappiness=1 ;;
     mt)  arc_bytes=$((8 * 1024 * 1024 * 1024));  swappiness=5; ksm_on=1 ;;
+    ad)  arc_bytes=$((16 * 1024 * 1024 * 1024)); swappiness=5; ksm_on=1 ;;
     vps) arc_bytes=$((16 * 1024 * 1024 * 1024)); swappiness=5 ;;
     *)   echo "ERROR: unknown profile '$profile'"; return 1 ;;
   esac
@@ -101,7 +105,7 @@ remote_task() {
   echo "  swappiness: $cur_swappiness  ->  $swappiness"
   echo "  host swap used: ${swap_used_mb}M | MemAvailable: ${mem_avail_mb}M"
   echo "  VM RAM in host swap: total=$((vm_swap_total_kb / 1024))M worst=vm${vm_swap_max_vmid}:$((vm_swap_max_kb / 1024))M"
-  [[ "$ksm_on" == "1" ]] && echo "  KSM: will ensure ksmtuned enabled (MT profile)"
+  [[ "$ksm_on" == "1" ]] && echo "  KSM: will ensure ksmtuned enabled (mt/ad profile)"
 
   if [[ "${APPLY:-0}" != "1" ]]; then
     echo "[DRY-RUN] no changes made. Re-run with APPLY=1 to apply."
