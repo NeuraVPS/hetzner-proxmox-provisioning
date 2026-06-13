@@ -377,6 +377,15 @@ if [ "$KSM_ON" = "1" ]; then
   printf "KSM_THRES_COEF=85\nKSM_NPAGES_MAX=2500\n" >> /etc/ksmtuned.conf
   systemctl enable --now ksmtuned || log "WARNING: ksmtuned enable failed"
   systemctl restart ksmtuned 2>/dev/null || true
+else
+  # KSM off for this class (e = dedicated VPS-E, vps = unknown/catch-all).
+  # Actively DISABLE ksmtuned: it ships enabled and would auto-toggle KSM under
+  # memory pressure, burning the customer's dedicated cores on pointless single-
+  # VM dedup (found 49/124 EX44 running KSM 2026-06-13). run=0 stops scanning
+  # without unmerging (no memory spike); residual merges COW-split naturally.
+  log "$MEM_PROFILE profile: disabling ksmtuned (KSM off — dedicated/unknown class)"
+  systemctl disable --now ksmtuned 2>/dev/null || true
+  echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null || true
 fi
 
 # Disable integrated GPUs (Intel + AMD) on headless Proxmox to avoid kernel issues
