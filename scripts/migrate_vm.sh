@@ -310,6 +310,22 @@ _ssh_close() {
   rm -rf "$SSH_CTL_DIR"
 }
 
+# Reads "vendor|family|model" (from /proc/cpuinfo) of one node via the given
+# multiplexed ssh fn. Used by the cpu=host live-migration pre-check below.
+# /proc/cpuinfo is NOT localized (unlike lscpu) so this is locale-safe. Prints
+# empty / not-"a|b|c" on error, which the caller treats as "couldn't verify".
+# `model name` is deliberately NOT used (it's the marketing string, e.g. "EPYC
+# 9454" vs "9224", which differs between migration-compatible same-gen CPUs).
+_node_cpu_sig() {
+  local ssh_fn="$1"
+  "$ssh_fn" '
+    v=$(grep -m1 "^vendor_id"  /proc/cpuinfo | cut -d: -f2 | tr -d " \t\r\n")
+    f=$(grep -m1 "^cpu family" /proc/cpuinfo | cut -d: -f2 | tr -d " \t\r\n")
+    m=$(grep -m1 -E "^model[[:space:]]*:" /proc/cpuinfo | cut -d: -f2 | tr -d " \t\r\n")
+    printf "%s|%s|%s" "$v" "$f" "$m"
+  ' 2>/dev/null
+}
+
 # ----- Pre-migration node package convergence ---------------------------------
 # Live (online) migration requires the destination's pve-qemu-kvm to be at least
 # as new as the source's; independently-patched nodes drift, and a newer source
@@ -618,16 +634,12 @@ fi
 if (( _vm_on_src == 1 )); then
   _info "VM is on source — performing migration."
 
-  # 0a) Converge packages on BOTH nodes before migrating so dest pve-qemu-kvm is
-  # >= source's (live-migration is forward-compatible only). Source first, dest
-  # last, so dest's apt snapshot is the newest and can't end up behind source.
-  # Aborts the migration on any failure.
-  _apt_dist_upgrade src_ssh "source ${SRC_NODE}"
-  _apt_dist_upgrade dst_ssh "dest ${DST_NODE}"
-
   # 0) Detect source run state to decide online vs offline migration. Stopped
   # VMs are migrated offline (no --online); we'll start them on dest after
   # migration to apply the in-guest IPv6 reconfig, then shut them back down.
+  # Read-only, so it runs FIRST: the cpu=host pre-check (0a) needs it to skip
+  # offline migrations (a stopped guest cold-boots on dest and picks up dest's
+  # CPU features — only a LIVE migration restores vCPU state and can mismatch).
   SRC_STATUS=$(src_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
   _info "Source VM status: ${SRC_STATUS:-unknown}"
 
@@ -638,7 +650,57 @@ if (( _vm_on_src == 1 )); then
     _info "Source VM is not running — using offline migration."
   fi
 
-  # 0b) Set the cutover downtime to MIGRATE_DOWNTIME (default 90 s) — see the
+  # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
+  # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
+  # migration restores that vCPU state verbatim on the destination, so if dest is
+  # a different microarchitecture QEMU aborts at the resume handshake ON THE DEST
+  # ("kvm: Restoring registers after init: Failed to set special registers:
+  # Invalid argument") and the VM lands STOPPED on dest (exactly what hit VMs 708
+  # and 1670 migrating an EPYC 9454 Genoa guest onto an EPYC 7401P Naples node).
+  # `pvesh remote_migrate` does NO cross-node CPU compatibility check, so we do it
+  # here — BEFORE the dist-upgrade and any disk copy, so a mismatch is a clean
+  # no-op abort with nothing to roll back.
+  #
+  # Signal = vendor+family+model from /proc/cpuinfo, NOT the marketing name: same
+  # family+model == same microarch == same baseline feature set == safe (EPYC
+  # 9454 and 9224 are BOTH AMD family 25 model 17 "Genoa" and migrate fine despite
+  # different core counts / part numbers); a different family or model == different
+  # generation == blocked (Genoa 25/17 vs Naples 23/1). Offline (stopped) source
+  # skips this entirely. Named/baseline cpu models (kvm64, x86-64-v2/-v3/-v4,
+  # qemu64, EPYC-*, etc.) also skip — QEMU pins their feature set regardless of the
+  # host, so they're migration-safe across CPUs by design; only `host`/`max` (full
+  # host passthrough) carry the live guest's real CPU features and need the check.
+  if [[ -n "$ONLINE_FLAG" ]]; then
+    CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+    CPU_MODEL=""
+    if [[ -n "$CPU_RAW" ]]; then
+      _cpu_first="${CPU_RAW%%,*}"                       # strip ",flags=..." etc.
+      if [[ "$_cpu_first" == cputype=* ]]; then CPU_MODEL="${_cpu_first#cputype=}"; else CPU_MODEL="$_cpu_first"; fi
+    fi
+    _cpu_lc=$(printf '%s' "$CPU_MODEL" | tr '[:upper:]' '[:lower:]')
+    if [[ "$_cpu_lc" == "host" || "$_cpu_lc" == "max" ]]; then
+      _info "VM uses cpu=${CPU_MODEL} (host passthrough) on a LIVE migration — verifying source/dest CPU compatibility…"
+      SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
+      DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
+      [[ "$SRC_CPU_SIG" == *"|"*"|"* ]] || _die "Could not read source ${SRC_NODE} CPU signature for the cpu=host compatibility check (got: '${SRC_CPU_SIG}'). Aborting before any VM state is touched."
+      [[ "$DST_CPU_SIG" == *"|"*"|"* ]] || _die "Could not read dest ${DST_NODE} CPU signature for the cpu=host compatibility check (got: '${DST_CPU_SIG}'). Aborting before any VM state is touched."
+      if [[ "$SRC_CPU_SIG" != "$DST_CPU_SIG" ]]; then
+        _die "CPU mismatch — refusing a live cpu=host migration that would die on resume. VM ${VMID} runs cpu=host; source ${SRC_NODE} CPU is [${SRC_CPU_SIG//|/ }] but dest ${DST_NODE} is [${DST_CPU_SIG//|/ }] (vendor family model). Different microarchitectures: the guest's live vCPU feature state cannot be restored on dest, so QEMU would exit at the resume handshake and leave VM ${VMID} STOPPED on dest. Options: (1) pick a dest with the SAME family+model; (2) stop the VM and re-run — offline migration is safe across CPU generations; or (3) set a baseline cpu model both hosts support, e.g. 'qm set ${VMID} --cpu x86-64-v2-AES'. Aborting before any VM state is touched."
+      fi
+      _ok "CPU compatible — source and dest are both [${SRC_CPU_SIG//|/ }] (vendor family model); live cpu=host migration is safe."
+    else
+      _info "VM cpu model=${CPU_MODEL:-<proxmox default>} (not host passthrough) — CPU compatibility pre-check not required."
+    fi
+  fi
+
+  # 0b) Converge packages on BOTH nodes before migrating so dest pve-qemu-kvm is
+  # >= source's (live-migration is forward-compatible only). Source first, dest
+  # last, so dest's apt snapshot is the newest and can't end up behind source.
+  # Aborts the migration on any failure.
+  _apt_dist_upgrade src_ssh "source ${SRC_NODE}"
+  _apt_dist_upgrade dst_ssh "dest ${DST_NODE}"
+
+  # 0c) Set the cutover downtime to MIGRATE_DOWNTIME (default 90 s) — see the
   # header for the full rationale. Short version: too low → RAM never converges
   # → efidisk0 mirror idles → tunnel reaps it → "mirror-efidisk0: I/O error";
   # too high → Proxmox skips pre-copy → one multi-minute blackout → dest QEMU
