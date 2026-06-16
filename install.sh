@@ -443,27 +443,37 @@ if [ ! -s "/mnt/etc/network/interfaces" ]; then
 fi
 
 if ! grep -q "auto vmbr0" /mnt/etc/network/interfaces; then
-sed -i -e "/^iface ${PREDICTED} inet6 static$/,/^$/{
+# Determine the ACTUAL uplink NIC from the interfaces Hetzner just generated,
+# instead of trusting ${PREDICTED} (= physical_network_interfaces | head -1).
+# On multi-NIC hosts the active uplink isn't always first, and a mismatch
+# silently breaks guest networking — the netmask fix, the IPv6-gateway
+# derivation and the IPv4 MASQUERADE all key off the NIC name, so a wrong guess
+# yields a node with no guest IPv6 + NAT on the wrong NIC (every VM then fails
+# to provision: no egress for the in-guest installer). Pick the iface that
+# actually carries the routed global IPv6.
+UPLINK_IF="$(awk '
+    $1=="iface" && $3=="inet6" && $4=="static" {ifc=$2; next}
+    ifc && $1=="address" && $2 ~ /::/ && $2 !~ /^fe80/ {print ifc; exit}
+    $1=="iface" {ifc=""}
+  ' /mnt/etc/network/interfaces)"
+[[ -z "$UPLINK_IF" ]] && UPLINK_IF="$PREDICTED"
+log "Uplink NIC for vmbr0 NAT/routing: ${UPLINK_IF} (predicted was ${PREDICTED})"
+
+# Routed-/64 model: the host main IPv6 must be /128 on the uplink so the whole
+# /64 can live on vmbr0 for the guests.
+sed -i -e "/^iface ${UPLINK_IF} inet6 static$/,/^$/{
     s/^\([[:space:]]*netmask[[:space:]]\)64$/\1128/
 }" /mnt/etc/network/interfaces
 
-# VM_V6_GATEWAY / VM_V6_PREFIXLEN were never set → heredoc wrote "address /". Derive vmbr0 IPv6
-# from the primary iface block Hetzner just wrote: same routed /64 as the host (…::/64 on vmbr0).
+# Derive vmbr0 IPv6 gateway (…::1/64) from the first GLOBAL inet6 address in the
+# generated file — NIC-name agnostic, so a prediction mismatch can't skip it.
 VM_V6_GATEWAY=""
 VM_V6_PREFIXLEN="64"
-PRIMARY_V6_ADDR="$(
-  awk -v d="$PREDICTED" '
-    $0 ~ "^iface " d " inet6 static" {inblk=1; next}
-    inblk && /^iface / {exit}
-    inblk && /^[[:space:]]*address[[:space:]]+/ {
-      sub(/^[[:space:]]*address[[:space:]]+/, "")
-      gsub(/#.*/, "")
-      gsub(/[[:space:]]+$/, "")
-      print
-      exit
-    }
-  ' /mnt/etc/network/interfaces
-)"
+PRIMARY_V6_ADDR="$(awk '
+    $1=="iface" && $3=="inet6" && $4=="static" {inblk=1; next}
+    inblk && $1=="address" && $2 ~ /::/ && $2 !~ /^fe80/ {print $2; exit}
+    inblk && $1=="iface" {inblk=0}
+  ' /mnt/etc/network/interfaces)"
 if [[ -n "$PRIMARY_V6_ADDR" ]]; then
   ADDR_ONLY="${PRIMARY_V6_ADDR%%/*}"
   ADDR_ONLY="${ADDR_ONLY//[[:space:]]/}"
@@ -473,16 +483,13 @@ if [[ -n "$PRIMARY_V6_ADDR" ]]; then
     COLONS="${PREFIX64//[^:]/}"
     if [[ "${#COLONS}" -eq 3 ]]; then
       VM_V6_GATEWAY="${PREFIX64}::1"
-      log "vmbr0 inet6: ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN} (from primary ${PREDICTED} address ${PRIMARY_V6_ADDR})"
-    else
-      log "WARNING: primary IPv6 shape not n:n:n:n::h; skipping vmbr0 inet6 (fix manually if needed)"
+      log "vmbr0 inet6: ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN} (from ${PRIMARY_V6_ADDR} on ${UPLINK_IF})"
     fi
-  else
-    log "WARNING: primary IPv6 has no ::; skipping vmbr0 inet6"
   fi
-else
-  log "WARNING: no IPv6 address in generated iface ${PREDICTED}; vmbr0 will be IPv4-only"
 fi
+# A node without guest IPv6 has no working egress and fails to provision every
+# VM. Fail loudly here rather than silently shipping a broken node into the pool.
+[[ -z "$VM_V6_GATEWAY" ]] && die "Could not derive vmbr0 IPv6 gateway from /etc/network/interfaces (uplink=${UPLINK_IF}); refusing to ship a node without guest IPv6."
 
 {
   echo ""
@@ -493,18 +500,24 @@ fi
   echo "    bridge-stp off"
   echo "    bridge-fd 0"
   echo "    post-up   echo 1 > /proc/sys/net/ipv4/ip_forward"
-  echo "    post-up   iptables -t nat -A POSTROUTING -s '10.0.0.0/16' -o ${PREDICTED} -j MASQUERADE"
+  echo "    post-up   iptables -t nat -A POSTROUTING -s '10.0.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo "    post-up   iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1"
-  echo "    post-down iptables -t nat -D POSTROUTING -s '10.0.0.0/16' -o ${PREDICTED} -j MASQUERADE"
+  echo "    post-down iptables -t nat -D POSTROUTING -s '10.0.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo "    post-down iptables -t raw -D PREROUTING -i fwbr+ -j CT --zone 1"
-  if [[ -n "$VM_V6_GATEWAY" ]]; then
-    echo ""
-    echo "iface vmbr0 inet6 static"
-    echo "    address ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
-    echo "    post-up   echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"
-  fi
+  echo ""
+  echo "iface vmbr0 inet6 static"
+  echo "    address ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
+  echo "    post-up   echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"
 } >> /mnt/etc/network/interfaces
 fi
+
+# Persist forwarding independently of the vmbr0 post-up hooks, so the node keeps
+# forwarding even if the interfaces stanza is ever regenerated or reloaded.
+mkdir -p /mnt/etc/sysctl.d
+cat > /mnt/etc/sysctl.d/99-neuravps-forwarding.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
 
 log "Successfully generated /etc/network/interfaces ($(wc -l < /mnt/etc/network/interfaces) lines)"
 
