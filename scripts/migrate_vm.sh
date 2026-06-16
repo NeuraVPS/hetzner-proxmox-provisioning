@@ -326,6 +326,16 @@ _node_cpu_sig() {
   ' 2>/dev/null
 }
 
+# Reads the raw CPU feature `flags` line (space-separated) of one node via the
+# given multiplexed ssh fn. Used by the upgrade/downgrade direction decision:
+# the destination is migration-safe iff its flags are a SUPERSET of the source's
+# (the source guest can only be using flags the source host has). Prints empty
+# on error.
+_node_cpu_flags() {
+  local ssh_fn="$1"
+  "$ssh_fn" 'grep -m1 "^flags" /proc/cpuinfo | cut -d: -f2' 2>/dev/null
+}
+
 # ----- Pre-migration node package convergence ---------------------------------
 # Live (online) migration requires the destination's pve-qemu-kvm to be at least
 # as new as the source's; independently-patched nodes drift, and a newer source
@@ -652,24 +662,31 @@ if (( _vm_on_src == 1 )); then
 
   # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
   # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
-  # migration restores that vCPU state verbatim on the destination, so if dest is
-  # a different microarchitecture QEMU aborts at the resume handshake ON THE DEST
-  # ("kvm: Restoring registers after init: Failed to set special registers:
-  # Invalid argument") and the VM lands STOPPED on dest (exactly what hit VMs 708
-  # and 1670 migrating an EPYC 9454 Genoa guest onto an EPYC 7401P Naples node).
-  # `pvesh remote_migrate` does NO cross-node CPU compatibility check, so we do it
-  # here — BEFORE the dist-upgrade and any disk copy, so a mismatch is a clean
-  # no-op abort with nothing to roll back.
+  # migration restores that vCPU state verbatim on the destination. The rule that
+  # decides success is DIRECTIONAL: the migration restores iff the DEST CPU is a
+  # feature SUPERSET of the source's.
+  #   - SAME cpu / UPGRADE (dest has >= the source's features) → restores fine.
+  #   - DOWNGRADE (dest is MISSING a feature the running guest has) → QEMU aborts
+  #     at the resume handshake ON THE DEST ("kvm: Restoring registers after init:
+  #     Failed to set special registers: Invalid argument") and the VM lands
+  #     STOPPED on dest. This is exactly what hit VMs 708/1670: an EPYC 9454 Genoa
+  #     guest pushed onto an EPYC 7401P Naples node (Naples lacks AVX-512 etc.).
+  # `pvesh remote_migrate` does NO cross-node CPU check, so we do it here — BEFORE
+  # the dist-upgrade and any disk copy, so a block is a clean no-op abort.
   #
-  # Signal = vendor+family+model from /proc/cpuinfo, NOT the marketing name: same
-  # family+model == same microarch == same baseline feature set == safe (EPYC
-  # 9454 and 9224 are BOTH AMD family 25 model 17 "Genoa" and migrate fine despite
-  # different core counts / part numbers); a different family or model == different
-  # generation == blocked (Genoa 25/17 vs Naples 23/1). Offline (stopped) source
-  # skips this entirely. Named/baseline cpu models (kvm64, x86-64-v2/-v3/-v4,
-  # qemu64, EPYC-*, etc.) also skip — QEMU pins their feature set regardless of the
-  # host, so they're migration-safe across CPUs by design; only `host`/`max` (full
-  # host passthrough) carry the live guest's real CPU features and need the check.
+  # How we decide: first compare vendor+family+model (from /proc/cpuinfo, NOT the
+  # marketing name — EPYC 9454 and 9224 are both AMD family 25 model 17 "Genoa"
+  # and identical here). If they match → identical CPU → allow. If they differ we
+  # don't block blindly (older→newer is the SAFE direction): we compare the actual
+  # CPU feature FLAGS — if dest is missing any non-trivial flag the source has it's
+  # a DOWNGRADE → block; otherwise it's an upgrade/lateral → allow (with a warning;
+  # the guest keeps presenting the source CPU until it's rebooted on dest). Cross-
+  # vendor (AMD<->Intel) and unreadable flags → block. Offline (stopped) source
+  # skips all of this — a cold boot on dest picks up dest's features in any
+  # direction. Named/baseline cpu models (kvm64, x86-64-v2/-v3/-v4, qemu64,
+  # EPYC-*, etc.) also skip — QEMU pins their feature set regardless of host, so
+  # they're migration-safe by design; only `host`/`max` carry the live guest's
+  # real CPU features and need the check.
   if [[ -n "$ONLINE_FLAG" ]]; then
     CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
     CPU_MODEL=""
@@ -684,10 +701,51 @@ if (( _vm_on_src == 1 )); then
       DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
       [[ "$SRC_CPU_SIG" == *"|"*"|"* ]] || _die "Could not read source ${SRC_NODE} CPU signature for the cpu=host compatibility check (got: '${SRC_CPU_SIG}'). Aborting before any VM state is touched."
       [[ "$DST_CPU_SIG" == *"|"*"|"* ]] || _die "Could not read dest ${DST_NODE} CPU signature for the cpu=host compatibility check (got: '${DST_CPU_SIG}'). Aborting before any VM state is touched."
-      if [[ "$SRC_CPU_SIG" != "$DST_CPU_SIG" ]]; then
-        _die "CPU mismatch — refusing a live cpu=host migration that would die on resume. VM ${VMID} runs cpu=host; source ${SRC_NODE} CPU is [${SRC_CPU_SIG//|/ }] but dest ${DST_NODE} is [${DST_CPU_SIG//|/ }] (vendor family model). Different microarchitectures: the guest's live vCPU feature state cannot be restored on dest, so QEMU would exit at the resume handshake and leave VM ${VMID} STOPPED on dest. Options: (1) pick a dest with the SAME family+model; (2) stop the VM and re-run — offline migration is safe across CPU generations; or (3) set a baseline cpu model both hosts support, e.g. 'qm set ${VMID} --cpu x86-64-v2-AES'. Aborting before any VM state is touched."
+      if [[ "$SRC_CPU_SIG" == "$DST_CPU_SIG" ]]; then
+        _ok "CPU identical — source and dest are both [${SRC_CPU_SIG//|/ }] (vendor family model); live cpu=host migration is safe."
+      else
+        # CPUs differ. Cross-vendor is never compatible; otherwise decide
+        # upgrade-vs-downgrade by comparing actual feature flags.
+        SRC_VENDOR="${SRC_CPU_SIG%%|*}"; DST_VENDOR="${DST_CPU_SIG%%|*}"
+        if [[ "$SRC_VENDOR" != "$DST_VENDOR" ]]; then
+          _die "CPU mismatch (cross-vendor) — refusing live cpu=host migration. Source ${SRC_NODE} is ${SRC_VENDOR}, dest ${DST_NODE} is ${DST_VENDOR}; a guest started on one vendor cannot resume on the other. Stop the VM and migrate offline, or use a baseline cpu model. Aborting before any VM state is touched."
+        fi
+        _info "CPUs differ (src [${SRC_CPU_SIG//|/ }] → dst [${DST_CPU_SIG//|/ }]); comparing feature flags to tell an upgrade from a downgrade…"
+        SRC_FLAGS=$(_node_cpu_flags src_ssh || true)
+        DST_FLAGS=$(_node_cpu_flags dst_ssh || true)
+        [[ -n "${SRC_FLAGS// /}" && -n "${DST_FLAGS// /}" ]] || _die "Could not read CPU feature flags from source and/or dest for the upgrade/downgrade decision. Refusing to guess. Stop the VM and migrate OFFLINE (safe in any direction), or pick a same/newer-generation dest. Aborting before any VM state is touched."
+        # Set-diff with a noise ignore-list: security mitigations, p-state/power,
+        # and Linux-synthetic flags vary host-to-host for reasons unrelated to
+        # migratable guest state. MISSING = real features the source has that the
+        # dest lacks → non-empty means DOWNGRADE. Only flags we're certain are
+        # non-ISA are ignored, so a real ISA gap (e.g. avx512*) is never masked.
+        _flagcmp=$(SRC_FLAGS="$SRC_FLAGS" DST_FLAGS="$DST_FLAGS" python3 - <<'PY' 2>/dev/null || true
+import os
+IGNORE = set('''
+ibpb ibrs ibrs_enhanced ibrs_fw stibp spec_ctrl intel_stibp amd_ibpb amd_ibrs
+ssbd amd_ssbd amd_stibp virt_ssbd ssb_no pti kaiser md_clear flush_l1d
+arch_capabilities tsx_async_abort srbds mmio_stale_data spec_store_bypass
+gather_data_sampling bhi rfds reg_file_data_sampling rsb_ctxsw retpoline
+cpb hw_pstate amd_pstate hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req
+hwp_hint aperfmperf dtherm ida arat pln pts tm tm2 acpi est eist epb ibs irperf
+cpuid cpuid_fault rep_good nopl eagerfpu xtopology amd_dcm extd_apicid
+amd_lbr_v2 amd_lbr_pmc_freeze
+sme sev sev_es sev_snp sme_coherent
+'''.split())
+src = set(os.environ.get("SRC_FLAGS", "").split())
+dst = set(os.environ.get("DST_FLAGS", "").split())
+print("MISSING:" + "".join(" " + f for f in sorted((src - dst) - IGNORE)))
+print("GAINED:"  + "".join(" " + f for f in sorted((dst - src) - IGNORE)))
+PY
+)
+        [[ "$_flagcmp" == *MISSING:* ]] || _die "Feature-flag comparison failed (could not run the flag diff). Refusing to guess direction. Stop the VM and migrate OFFLINE. Aborting before any VM state is touched."
+        _missing=$(printf '%s\n' "$_flagcmp" | sed -n 's/^MISSING://p')
+        _gained=$(printf '%s\n' "$_flagcmp" | sed -n 's/^GAINED://p')
+        if [[ -n "$_missing" ]]; then
+          _die "CPU DOWNGRADE blocked — dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is MISSING feature(s) the running guest has:${_missing}. Live-migrating a cpu=host guest onto a CPU that lacks these makes QEMU die at the resume handshake and leaves VM ${VMID} STOPPED on dest (the VMs 708/1670 failure). Options: (1) migrate to a same-or-newer generation dest (a superset of the source); (2) stop the VM and re-run — OFFLINE migration is safe in any direction; or (3) set a baseline cpu model both hosts support, e.g. 'qm set ${VMID} --cpu x86-64-v2-AES'. Aborting before any VM state is touched."
+        fi
+        _warn "Cross-generation UPGRADE: dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is a feature superset of source ${SRC_NODE} [${SRC_CPU_SIG//|/ }]${_gained:+ (dest adds:${_gained})} — live cpu=host migration permitted. NOTE: VM ${VMID} keeps presenting the SOURCE CPU until it is rebooted on dest, so it won't use the new features until then."
       fi
-      _ok "CPU compatible — source and dest are both [${SRC_CPU_SIG//|/ }] (vendor family model); live cpu=host migration is safe."
     else
       _info "VM cpu model=${CPU_MODEL:-<proxmox default>} (not host passthrough) — CPU compatibility pre-check not required."
     fi
