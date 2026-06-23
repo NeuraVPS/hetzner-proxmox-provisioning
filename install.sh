@@ -118,6 +118,21 @@ detect_firmware() {
 log "Checking required tools"
 require_cmd wget lsblk awk ip zpool zfs dmidecode udevadm
 
+# --- Require UEFI boot (NeuraVPS fleet standard) -------------------
+# The whole fleet boots UEFI. The QEMU/SeaBIOS (Legacy BIOS) path leaves
+# the node with an empty/non-functional bootloader (empty ESPs, no
+# zfs.mod): it installs fine but never boots and stays unreachable. Abort
+# before touching any disk instead of silently shipping a dead node
+# (root cause of 0000192, 2026-06-23). die() does not exit here, so we
+# exit explicitly.
+FIRMWARE="$(detect_firmware)"
+log "Detected firmware (rescue): $FIRMWARE"
+if [ "$FIRMWARE" != "UEFI" ]; then
+  die "Rescue booted in Legacy BIOS, but NeuraVPS installs in UEFI only — installing now would produce a node that never boots."
+  log "FIX: Hetzner KVM/LARA console -> BIOS setup -> enable UEFI, disable CSM/Legacy boot; re-activate the rescue (must boot UEFI: '[ -d /sys/firmware/efi ]'), then retry."
+  exit 1
+fi
+
 log "Installing qemu, OVMF, and proxmox-auto-install-assistant (this may take a bit)..."
 
 # Add Proxmox repositories and keys
@@ -673,6 +688,42 @@ fi
 
 log "Cleaning up /mnt/hdd symlink"
 rm -f /mnt/hdd
+
+# --- Verify the bootloader actually installed before rebooting -----
+# A completed OS install with EMPTY ESPs reboots into nothing and the
+# node is unreachable (root cause of 0000192, 2026-06-23). Confirm at
+# least one EFI System Partition holds a UEFI bootloader; otherwise fail
+# loudly here instead of rebooting into a dead system. die() does not
+# exit in this script, so we exit explicitly.
+log "Verifying bootloader on ESP(s) before reboot"
+udevadm settle 2>/dev/null || true
+ESP_MNT="/tmp/esp-verify"
+mkdir -p "$ESP_MNT"
+mapfile -t ESP_PARTS < <(lsblk -rno NAME,PARTTYPE 2>/dev/null | awk 'tolower($2)=="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"{print "/dev/"$1}')
+if [ "${#ESP_PARTS[@]}" -eq 0 ]; then
+  die "No EFI System Partition found on the installed disks — the installer produced no UEFI bootloader. NOT rebooting (node would be unreachable)."
+  exit 1
+fi
+ESP_OK=0
+for _dev in "${ESP_PARTS[@]}"; do
+  if mount -o ro "$_dev" "$ESP_MNT" 2>/dev/null; then
+    if find "$ESP_MNT" -iname '*.efi' -print -quit 2>/dev/null | grep -q .; then
+      log "  ESP $_dev: bootloader present"
+      ESP_OK=1
+    else
+      log "  ESP $_dev: EMPTY (no .efi found)"
+    fi
+    umount "$ESP_MNT" 2>/dev/null || true
+  else
+    log "  ESP $_dev: mount failed"
+  fi
+done
+rmdir "$ESP_MNT" 2>/dev/null || true
+if [ "$ESP_OK" -ne 1 ]; then
+  die "All ESPs are empty (no UEFI bootloader) — the install did not produce a bootable system. NOT rebooting. Re-run the install; if it recurs, inspect proxmox-boot-tool / the QEMU installer step."
+  exit 1
+fi
+log "Bootloader verified on at least one ESP."
 
 log "Unmounting root dataset and restoring mountpoint=/"
 zfs umount "$ROOT_DS"
