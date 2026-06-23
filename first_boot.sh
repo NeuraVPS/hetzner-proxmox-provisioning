@@ -54,6 +54,13 @@ fi
 apt-get update && apt-get full-upgrade -y
 #apt-get purge -y proxmox-first-boot
 apt-get install -y python3-pip
+
+# ntfs-3g (userspace NTFS via FUSE). The preserveNeuraData reinstall merge writes
+# C:\NeuraData host-side and MUST use ntfs-3g, never the in-kernel ntfs3 driver,
+# which kernel-BUGs on buffered writes (fs/iomap/buffered-io.c) on current kernels
+# and crashes the merge mid-copy. Required on every node.
+apt-get install -y ntfs-3g
+
 # Install firebase_admin into system site-packages. --ignore-installed prevents pip from
 # trying to uninstall the apt-provided requests (no RECORD file -> "uninstall-no-record-file"
 # error that previously failed proxmox-first-boot); pip installs its own copies instead.
