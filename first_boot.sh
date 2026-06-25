@@ -113,10 +113,12 @@ rm -f /etc/dnsmasq-vm-pins.hosts /etc/dnsmasq.d/vm-pins.conf
 systemctl restart dnsmasq
 
 ############################################
-# Raw swap: 23 GB per disk (reserved by install via zfs.hdsize)
+# Raw swap: one partition per rpool disk, filling the free space install.sh
+# reserved via zfs.hdsize (SWAP_GB_PER_DISK). Whatever was reserved becomes swap
+# (legacy ~23 GB, big-RAM boxes 256 GB), so the two scripts stay in sync with no
+# value to pass between them and old nodes are unaffected.
 ############################################
-SWAP_RESERVE_GB=23
-log "Setting up raw swap partitions (${SWAP_RESERVE_GB} GB per disk) on rpool disks"
+log "Setting up raw swap partitions (filling reserved free space) on rpool disks"
 if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>&1; then
   apt-get install -y gdisk parted
   # Get rpool vdev block devices. Pool may show /dev/ paths, by-id paths, or short names (sda1, vda1).
@@ -199,8 +201,8 @@ if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>
     fi
     # Create next partition for swap (installer left free space via zfs.hdsize)
     next_num=$((next_num + 0))
-    log "Creating ${SWAP_RESERVE_GB} GB swap partition ${next_num} on $disk"
-    sgdisk -n "${next_num}:0:+${SWAP_RESERVE_GB}G" -t "${next_num}:8200" "$disk" || { log "WARNING: sgdisk failed on $disk"; continue; }
+    log "Creating swap partition ${next_num} (filling reserved free space) on $disk"
+    sgdisk -n "${next_num}:0:0" -t "${next_num}:8200" "$disk" || { log "WARNING: sgdisk failed on $disk"; continue; }
     partprobe "$disk" 2>/dev/null || true
     udevadm settle -t 5 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do

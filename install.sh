@@ -34,6 +34,12 @@ ANSWER_FILE="/root/answer.toml"
 : "${PVE_EMAIL:=soporte@neuravps.com}"
 : "${PVE_TIMEZONE:=Europe/Madrid}"
 
+# Per-disk raw swap reserved OUTSIDE the ZFS pool (GB). install reserves this much
+# free space per ZFS disk via zfs.hdsize; first_boot.sh turns it into a swap
+# partition. Default 23 keeps legacy 2-disk nodes unchanged; set higher for
+# big-RAM boxes, e.g. SWAP_GB_PER_DISK=256 on the 4x1.92TB NVMe R470s.
+: "${SWAP_GB_PER_DISK:=23}"
+
 NETWORK_FUNCS="/root/.oldroot/nfs/install/network_config.functions.sh"
 
 ### --- UTILS --------------------------------------------------------
@@ -92,17 +98,23 @@ select_zfs_mirror_disks() {
 
   [ -n "$best_size" ] || return 1
 
+  # Use 4 same-size disks when available (ZFS raid10), otherwise 2 (raid1). A
+  # 3-disk node still resolves to 2 here; its 3rd disk becomes a dedicated swap
+  # disk in first_boot.
+  local want=2
+  [ "${size_count[$best_size]}" -ge 4 ] && want=4
+
   local picked=0
   for d in "${candidates[@]}"; do
     bytes="$(disk_size_bytes "$d")"
     if [ "$bytes" = "$best_size" ]; then
       echo "$d"
       picked=$((picked + 1))
-      [ "$picked" -eq 2 ] && break
+      [ "$picked" -eq "$want" ] && break
     fi
   done
 
-  [ "$picked" -eq 2 ] || return 1
+  [ "$picked" -eq "$want" ] || return 1
 }
 
 detect_firmware() {
@@ -162,7 +174,7 @@ done
 
 # Disks used for ZFS mirror: pick a same-size pair (required by installer).
 mapfile -t ZFS_DISKS < <(select_zfs_mirror_disks "${DISKS[@]}" || true)
-if [ "${#ZFS_DISKS[@]}" -ne 2 ]; then
+if [ "${#ZFS_DISKS[@]}" != 2 ] && [ "${#ZFS_DISKS[@]}" != 4 ]; then
   log "Detected disk sizes:"
   for d in "${DISKS[@]}"; do
     bytes="$(disk_size_bytes "$d")"
@@ -173,10 +185,23 @@ if [ "${#ZFS_DISKS[@]}" -ne 2 ]; then
       log "  $d -> unknown size"
     fi
   done
-  die "Could not find two same-size disks for ZFS mirror (installer requires equal-sized mirror disks)"
+  die "Could not find 2 or 4 equal-sized disks for the ZFS pool (raid1 needs 2, raid10 needs 4)"
   exit 1
 fi
-log "Selected ZFS mirror disks: ${ZFS_DISKS[*]}"
+log "Selected ZFS disks: ${ZFS_DISKS[*]}"
+
+# RAID level + answer.toml disk-list derive from the ZFS disk count: 2 -> raid1
+# (2-way mirror), 4 -> raid10 (stripe of two mirrors: ~half the raw capacity,
+# still mirror-redundant). Override with ZFS_RAID=... only if you need otherwise.
+NUM_ZFS_DISKS="${#ZFS_DISKS[@]}"
+if [ "$NUM_ZFS_DISKS" -eq 4 ]; then
+  : "${ZFS_RAID:=raid10}"
+  DISK_LIST='["vda", "vdb", "vdc", "vdd"]'
+else
+  : "${ZFS_RAID:=raid1}"
+  DISK_LIST='["vda", "vdb"]'
+fi
+log "ZFS layout: ${NUM_ZFS_DISKS} disk(s) -> ${ZFS_RAID}; disk-list=${DISK_LIST}; swap reserve=${SWAP_GB_PER_DISK} GB/disk"
 
 # Ensure the selected ZFS disks are first in QEMU, so they map to vda/vdb (disk-list in answer.toml).
 REMAINING_DISKS=()
@@ -193,7 +218,7 @@ done
 QEMU_DISKS=( "${ZFS_DISKS[@]}" "${REMAINING_DISKS[@]}" )
 log "QEMU disk order (vda,vdb first): ${QEMU_DISKS[*]}"
 
-# Reserve 23 GB per disk for raw swap on ZFS disks (only when 2 disks; with 3 disks we use first two fully)
+# Reserve SWAP_GB_PER_DISK per disk for raw swap on ZFS disks (carved from free space by zfs.hdsize; with 3 disks we use the first two fully and the 3rd as a swap disk)
 log "Computing ZFS hdsize for disks: ${ZFS_DISKS[*]}"
 MIN_GB=""
 for d in "${ZFS_DISKS[@]}"; do
@@ -211,20 +236,19 @@ elif [ -z "$MIN_GB" ] || [ "$MIN_GB" -lt 1 ]; then
   log "WARNING: Could not get disk sizes, not setting zfs.hdsize (installer will use full disks)"
   ZFS_HDSIZE_LINE=""
 else
-  ZFS_HDSIZE=$((MIN_GB - 23))
+  ZFS_HDSIZE=$((MIN_GB - SWAP_GB_PER_DISK))
   if [ "$ZFS_HDSIZE" -lt 32 ]; then
     log "WARNING: Disks too small (min ${MIN_GB} GB); not setting zfs.hdsize (no swap reservation)"
     ZFS_HDSIZE_LINE=""
   else
-    log "Using zfs.hdsize = ${ZFS_HDSIZE} GB (23 GB free per disk for raw swap)"
+    log "Using zfs.hdsize = ${ZFS_HDSIZE} GB (${SWAP_GB_PER_DISK} GB free per disk for raw swap)"
     ZFS_HDSIZE_LINE="zfs.hdsize = ${ZFS_HDSIZE}"
   fi
 fi
 
-# disk-list for answer file: use vda,vdb because the installer runs inside QEMU (Step 5) where
-# the first two -drive arguments appear as /dev/vda and /dev/vdb in the guest.
-DISK_LIST='["vda", "vdb"]'
-log "Using disk-list = ${DISK_LIST} (guest devices inside QEMU)"
+# disk-list (DISK_LIST) was set above from the ZFS disk count. The installer runs
+# inside QEMU (Step 5) where the -drive arguments appear as /dev/vda, vdb, vdc,
+# vdd in the guest, in QEMU_DISKS order (ZFS disks first).
 
 ### --- STEP 3: download Proxmox ISO --------------------------------
 
@@ -259,7 +283,7 @@ source = "from-dhcp"
 
 [disk-setup]
 filesystem = "zfs"
-zfs.raid = "raid1"
+zfs.raid = "${ZFS_RAID}"
 ${ZFS_HDSIZE_LINE}
 disk-list = ${DISK_LIST}
 
