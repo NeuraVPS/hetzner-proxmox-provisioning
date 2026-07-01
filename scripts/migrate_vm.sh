@@ -125,6 +125,7 @@ DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
 DNS6_SECONDARY="${DNS6_SECONDARY:-2a01:4ff:ff00::add:2}"
 RDP_GUEST_PORT="${RDP_GUEST_PORT:-3389}"
 CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — RDP listener can take a moment after the in-guest IPv6 rebind
+POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
 # ----- Logging helpers ---------------------------------------------------------
@@ -549,6 +550,38 @@ _wait_status_dst() {
   return 1
 }
 
+# After a COMMITTED online migration the dest VM can sit in `inmigrate` well
+# beyond a few seconds on a slow/degraded cutover (multi-minute downtime, laggy
+# dest). Wait up to `timeout` for `running`; if the cutover left the VM
+# `stopped` (dest QEMU exited on a too-long blackout), nudge it cold ONCE — the
+# disks are already on dest, so a cold start is safe. Best-effort: returns
+# non-zero WITHOUT dying, so the caller fix-forwards (commit routing to dest)
+# instead of rolling back to a source that remote_migrate --delete already removed.
+_ensure_running_dst() {
+  # NB: do NOT reference `timeout` in arithmetic on the declaration line
+  # (`deadline=$(( SECONDS + timeout ))`) — under `set -u` bash expands the
+  # arithmetic before the sibling local is assigned → "timeout: unbound
+  # variable" abort. Use the same elapsed-counter shape as _wait_status_dst.
+  local timeout="${1:-300}" elapsed=0 nudged=0 cur=""
+  while (( elapsed < timeout )); do
+    cur=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
+    if [[ "$cur" == "running" ]]; then return 0; fi
+    if [[ "$cur" == "stopped" && $nudged -eq 0 ]]; then
+      _warn "VM ${VMID} is 'stopped' on dest after cutover — nudging with 'qm start' (disks are on dest; cold start is safe)."
+      dst_ssh "qm start '${VMID}'" >/dev/null 2>&1 || true
+      nudged=1
+    fi
+    sleep 3; (( elapsed += 3 ))
+  done
+  # Never reached 'running'. If we never saw 'stopped' to nudge (e.g. stuck in
+  # 'inmigrate'/locked), try one cold start before handing off to manual triage.
+  if (( nudged == 0 )); then
+    dst_ssh "qm start '${VMID}'" >/dev/null 2>&1 || true
+    if _wait_status_dst running 60; then return 0; fi
+  fi
+  return 1
+}
+
 _verify_dest_ipv6() {
   local timeout="${1:-60}" elapsed=0 ifaces
   while (( elapsed < timeout )); do
@@ -871,30 +904,41 @@ PY
   if (( _post_on_dst == 0 || _post_on_src == 1 )); then
     _die "remote_migrate did not complete (on_dst=${_post_on_dst} on_src=${_post_on_src}) — VM ${VMID} was kept on source ${SRC_NODE}. See the migration log above for the underlying error. Rolling back transient changes; Firestore routing left unchanged."
   fi
+  # GROUND TRUTH above proved the VM is on dest and GONE from source: the
+  # migration is committed and IRREVERSIBLE (remote_migrate --delete removed the
+  # source copy). Disarm the source rollback NOW — before the resume wait — so a
+  # slow or failed *resume* is fixed forward on dest, never reverted to a source
+  # that no longer holds the VM. Reverting routing to the deleted source is the
+  # stale-routing bug that stranded VMs 1785/1790/1791 (2026-07-01): each had
+  # actually migrated, but a long cutover kept them in `inmigrate` past the old
+  # hard 120s gate, so the wrapper "rolled back" and left routing on the source.
+  MIGRATION_DONE=1
+
   if [[ -n "$ONLINE_FLAG" ]]; then
-    # After "migration finished successfully" the dest VM briefly stays in the
-    # `inmigrate` lock/status for a few seconds before QEMU resumes it and
-    # `qm status` reports `running`. A single immediate check races that settling
-    # window and would false-fail (and roll back) a migration that actually
-    # succeeded — observed on large guests with a long (~100 s) cutover downtime.
-    # Poll instead: returns as soon as it reaches `running`, only _die if it
-    # never gets there. The on_dst/on_src ground-truth check above already
-    # caught the genuine "kept on source" failure, so a timeout here means the
-    # VM landed on dest but truly won't resume.
-    if ! _wait_status_dst running 120; then
+    # After "migration finished successfully" the dest VM stays in `inmigrate`
+    # until QEMU resumes it; on a slow/degraded cutover that can take minutes.
+    # Wait generously and nudge a `stopped` VM with `qm start` (see helper). A
+    # timeout is now a WARNING + fix-forward, not a rollback — the VM is on dest
+    # regardless, and routing is committed to dest below (gated on NAT, not on
+    # the guest being up).
+    if _ensure_running_dst "$POST_MIGRATE_RUN_TIMEOUT"; then
+      _ok "VM ${VMID} is running on dest ${DST_NODE}."
+    else
       _post_run=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
-      _die "VM ${VMID} reached dest ${DST_NODE} but did not reach 'running' within 120s (last status=${_post_run:-unknown}) after an online migration — treating as failed. Rolling back; Firestore routing left unchanged."
+      _warn "VM ${VMID} landed on dest ${DST_NODE} but is '${_post_run:-unknown}', not 'running', after ${POST_MIGRATE_RUN_TIMEOUT}s (+ cold-start nudge). Migration is COMMITTED (the VM lives on dest); routing will still be pointed at dest below, but the in-guest IPv6 reconfig is skipped while the guest is down. MANUAL: bring VM ${VMID} up on ${DST_NODE}, then re-run 'migrate_vm.sh ${VMID} ${NEW_NODE_NUM}' to finish the in-guest reconfig."
     fi
   fi
-  _ok "Verified VM ${VMID} is on dest ${DST_NODE}${ONLINE_FLAG:+ and running}."
+  _ok "Verified VM ${VMID} is on dest ${DST_NODE}."
 
   _vm_on_dst=1; _vm_on_src=0
 else
   _info "VM is already on dest — skipping migration; running post-migration sync."
 fi
 
-# Past this point the VM is on the destination — any subsequent failure is a
-# warning, not a reason to roll back the source-side state. Disarm the rollback.
+# Belt-and-suspenders: also disarm the rollback for the "already on dest" branch
+# (the migrated branch already set MIGRATION_DONE=1 right after the ground-truth
+# check, before the resume wait). Past this point any failure is a warning, never
+# a source-side rollback.
 MIGRATION_DONE=1
 
 # ----- Post-migration sync (always idempotent) ---------------------------------
