@@ -351,19 +351,63 @@ HOSTCLASS="$(hostname)"
 # EX44) and ZFS silently CLAMPS c_max to arc_min — a 1 GiB cap written alone
 # stays at 2 GiB with no error. Write min before max, persist both.
 # (2026-06-12 retune: 1G ARC + memory=61440 VPS-E VM → cold-swap floor 0.5 GB.)
+# v2 (2026-07-02): RAM-pressure retune for the overcommit era. swappiness=100
+# on multi-VM classes is paired with zswap (below): cold guest pages compress
+# into the in-RAM pool early instead of burst-swapping at allocation spikes.
+# page-cluster=0 kills swap readahead (pointless for zswap/NVMe). New r470
+# class (172t/503G deep-overcommit): KSM ON — same identical-Windows dedup as
+# ad, measured ~80 GB/node on AX162.
 case "$HOSTCLASS" in
-  *-EX44*)    MEM_PROFILE="e";   ARC_BYTES=$((1024 * 1024 * 1024)); ARC_MIN_BYTES=$((512 * 1024 * 1024)); SWAPPINESS=1; KSM_ON=0 ;;
-  *-AX102-U*) MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=1 ;;
-  *-AX102*)   MEM_PROFILE="mt";  ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=1 ;;
-  *-AX162*)   MEM_PROFILE="ad";  ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=1 ;;
-  *)          MEM_PROFILE="vps"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5; KSM_ON=0 ;;
+  *-EX44*)    MEM_PROFILE="e";    ARC_BYTES=$((1024 * 1024 * 1024)); ARC_MIN_BYTES=$((512 * 1024 * 1024)); SWAPPINESS=1; KSM_ON=0 ;;
+  *-AX102-U*) MEM_PROFILE="mt";   ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=100; KSM_ON=1 ;;
+  *-AX102*)   MEM_PROFILE="mt";   ARC_BYTES=$((8  * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=100; KSM_ON=1 ;;
+  *-AX162*)   MEM_PROFILE="ad";   ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=100; KSM_ON=1 ;;
+  *-R470*)    MEM_PROFILE="r470"; ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=100; KSM_ON=1 ;;
+  *)          MEM_PROFILE="vps";  ARC_BYTES=$((16 * 1024 * 1024 * 1024)); ARC_MIN_BYTES=0; SWAPPINESS=5;   KSM_ON=0 ;;
 esac
-log "Memory profile: $MEM_PROFILE (host=$HOSTCLASS) — zfs_arc_max=$ARC_BYTES, arc_min=$ARC_MIN_BYTES, swappiness=$SWAPPINESS, ksm=$KSM_ON"
+log "Memory profile: $MEM_PROFILE (host=$HOSTCLASS) — zfs_arc_max=$ARC_BYTES, arc_min=$ARC_MIN_BYTES, swappiness=$SWAPPINESS, ksm=$KSM_ON, zswap=on"
 
 mkdir -p /etc/sysctl.d
-echo "vm.swappiness=$SWAPPINESS" > /etc/sysctl.d/99-neuravps-memprofile.conf
+printf 'vm.swappiness=%s\nvm.page-cluster=0\n' "$SWAPPINESS" > /etc/sysctl.d/99-neuravps-memprofile.conf
 rm -f /etc/sysctl.d/99-proxmox-swap.conf
 sysctl -p /etc/sysctl.d/99-neuravps-memprofile.conf 2>/dev/null || true
+
+# zswap (ALL classes): compressed in-RAM swap cache in front of the swap
+# partitions. Built into the kernel (no modprobe.d), so a oneshot unit
+# re-applies the params each boot. Keep in sync with
+# run_remotes/tune_memory_profile.sh.
+log "Enabling zswap (zstd->lz4->lzo, zsmalloc, max_pool_percent=20)"
+cat > /usr/local/sbin/neuravps-zswap.sh <<'ZSWAPEOF'
+#!/bin/bash
+# NeuraVPS: enable zswap (compressed in-RAM swap cache). Run at boot by
+# neuravps-zswap.service; safe to re-run any time. See
+# run_remotes/tune_memory_profile.sh (v2) for the why.
+P=/sys/module/zswap/parameters
+[ -d "$P" ] || exit 0
+modprobe zsmalloc 2>/dev/null || true
+for c in zstd lz4 lzo; do
+  modprobe "$c" 2>/dev/null || true
+  echo "$c" > "$P/compressor" 2>/dev/null && break
+done
+echo zsmalloc > "$P/zpool" 2>/dev/null || echo zbud > "$P/zpool" 2>/dev/null || true
+echo 20 > "$P/max_pool_percent" 2>/dev/null
+echo Y > "$P/enabled"
+ZSWAPEOF
+chmod +x /usr/local/sbin/neuravps-zswap.sh
+cat > /etc/systemd/system/neuravps-zswap.service <<'UNITEOF'
+[Unit]
+Description=NeuraVPS: enable zswap (compressed swap cache)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuravps-zswap.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+systemctl daemon-reload
+systemctl enable --now neuravps-zswap.service || log "WARNING: neuravps-zswap enable failed"
 
 if [ "$ARC_MIN_BYTES" -gt 0 ]; then
   echo "$ARC_MIN_BYTES" > /sys/module/zfs/parameters/zfs_arc_min
@@ -382,6 +426,7 @@ if [ "$KSM_ON" = "1" ]; then
   # needed" (run=0), nothing dedups, swap never recovers (found live on all 9
   # AX102-U 2026-06-12; AX162 pilot confirmed the same 2026-06-13).
   # 85 = effectively always-on at MT density; NPAGES_MAX 2500 = 2x scan rate.
+  [ -x /usr/sbin/ksmtuned ] || DEBIAN_FRONTEND=noninteractive apt-get install -y ksm-control-daemon || log "WARNING: ksm-control-daemon install failed"
   sed -i "/^#* *KSM_THRES_COEF=/d; /^#* *KSM_NPAGES_MAX=/d" /etc/ksmtuned.conf
   printf "KSM_THRES_COEF=85\nKSM_NPAGES_MAX=2500\n" >> /etc/ksmtuned.conf
   systemctl enable --now ksmtuned || log "WARNING: ksmtuned enable failed"
