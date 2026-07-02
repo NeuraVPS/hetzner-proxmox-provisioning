@@ -36,9 +36,9 @@ ANSWER_FILE="/root/answer.toml"
 
 # Per-disk raw swap reserved OUTSIDE the ZFS pool (GB). install reserves this much
 # free space per ZFS disk via zfs.hdsize; first_boot.sh turns it into a swap
-# partition. Default 23 keeps legacy 2-disk nodes unchanged; set higher for
-# big-RAM boxes, e.g. SWAP_GB_PER_DISK=256 on the 4x1.92TB NVMe R470s.
-: "${SWAP_GB_PER_DISK:=23}"
+# partition (one per pool disk, swapon'd at equal priority = striped).
+# AUTO-DETECTED from the hardware below (after the log helpers) when not passed
+# explicitly — an explicit SWAP_GB_PER_DISK env always wins.
 
 NETWORK_FUNCS="/root/.oldroot/nfs/install/network_config.functions.sh"
 
@@ -47,6 +47,39 @@ NETWORK_FUNCS="/root/.oldroot/nfs/install/network_config.functions.sh"
 log() { echo "[$(date +'%F %T')] $*"; }
 #die() { echo "ERROR: $*" >&2; exit 1; }
 die() { echo "ERROR: $*" >&2; }
+
+# ---- SWAP_GB_PER_DISK auto-detection (fleet standard 2026-07-02) --------------
+# The fleet converges on exactly four hardware configs; swap sizing follows the
+# class's RAM-overcommit vs disk-thin-provisioning balance (measured fleet data):
+#   EPYC 9454P + >=320 GB RAM  (AX162/384, SQX <=135t) -> 75   150 GB swap; DISK is the scarce
+#                                                              resource (~3.8 TB thin-sold on a 1.7 TB pool)
+#   EPYC 9454P + <320 GB RAM   (AX162/256, SQX <=110t) -> 100  200 GB swap; most RAM-overcommitted SQX tier (~1.6x)
+#   Ryzen 9 7950X3D            (AX102/128, MT 48 VMs)  -> 100  200 GB swap; 1.5x chronic RAM overcommit
+#                                                              + reboot storms while KSM re-warms
+#   i5-13500                   (EX44/64, legacy VPS E) -> 23   46 GB; the pool is the tightest (512 GB sold
+#                                                              on ~450 GB usable); no new signups on this class
+#   Xeon 6787P                 (R470 — being retired)  -> 256  unchanged until the class is gone
+# Detection keys on SILICON + RAM, never the hostname — hostnames have lied
+# before (0000186/192/193 "AX162-R" are Naples/48-thread boxes). Unknown
+# hardware falls back to a conservative 23 with a loud warning: pass
+# SWAP_GB_PER_DISK explicitly when installing a brand-new hardware class.
+if [ -z "${SWAP_GB_PER_DISK:-}" ]; then
+  _SWAP_CPU_MODEL="$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+  _SWAP_RAM_GB="$(awk '/^MemTotal/{print int($2/1024/1024)}' /proc/meminfo 2>/dev/null)"
+  case "$_SWAP_CPU_MODEL" in
+    *"EPYC 9454P"*)
+      if [ "${_SWAP_RAM_GB:-0}" -ge 320 ]; then SWAP_GB_PER_DISK=75; else SWAP_GB_PER_DISK=100; fi ;;
+    *"Ryzen 9 7950X3D"*) SWAP_GB_PER_DISK=100 ;;
+    *"i5-13500"*)        SWAP_GB_PER_DISK=23 ;;
+    *"Xeon"*"6787P"*)    SWAP_GB_PER_DISK=256 ;;
+    *)
+      SWAP_GB_PER_DISK=23
+      log "WARNING: unknown hardware class for swap sizing (cpu='${_SWAP_CPU_MODEL:-?}', ram=${_SWAP_RAM_GB:-?}GB) — using conservative ${SWAP_GB_PER_DISK} GB/disk. Pass SWAP_GB_PER_DISK explicitly for new hardware classes." ;;
+  esac
+  log "SWAP_GB_PER_DISK auto-detected: ${SWAP_GB_PER_DISK} GB/disk (cpu='${_SWAP_CPU_MODEL:-?}', ram=${_SWAP_RAM_GB:-?}GB)"
+else
+  log "SWAP_GB_PER_DISK explicitly set: ${SWAP_GB_PER_DISK} GB/disk (auto-detection skipped)"
+fi
 
 require_cmd() {
   for c in "$@"; do
