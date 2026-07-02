@@ -51,9 +51,9 @@ die() { echo "ERROR: $*" >&2; }
 # ---- SWAP_GB_PER_DISK auto-detection (fleet standard 2026-07-02) --------------
 # The fleet converges on exactly four hardware configs; swap sizing follows the
 # class's RAM-overcommit vs disk-thin-provisioning balance (measured fleet data):
-#   EPYC 9454P + >=320 GB RAM  (AX162/384, SQX <=135t) -> 75   150 GB swap; DISK is the scarce
+#   EPYC 9454(P) + >=320 GB RAM (AX162/384, SQX <=135t) -> 75   150 GB swap; DISK is the scarce
 #                                                              resource (~3.8 TB thin-sold on a 1.7 TB pool)
-#   EPYC 9454P + <320 GB RAM   (AX162/256, SQX <=110t) -> 100  200 GB swap; most RAM-overcommitted SQX tier (~1.6x)
+#   EPYC 9454(P) + <320 GB RAM  (AX162/256, SQX <=110t) -> 100  200 GB swap; most RAM-overcommitted SQX tier (~1.6x)
 #   Ryzen 9 7950X3D            (AX102/128, MT 48 VMs)  -> 100  200 GB swap; 1.5x chronic RAM overcommit
 #                                                              + reboot storms while KSM re-warms
 #   i5-13500                   (EX44/64, legacy VPS E) -> 23   46 GB; the pool is the tightest (512 GB sold
@@ -67,7 +67,10 @@ if [ -z "${SWAP_GB_PER_DISK:-}" ]; then
   _SWAP_CPU_MODEL="$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null)"
   _SWAP_RAM_GB="$(awk '/^MemTotal/{print int($2/1024/1024)}' /proc/meminfo 2>/dev/null)"
   case "$_SWAP_CPU_MODEL" in
-    *"EPYC 9454P"*)
+    # Match WITHOUT the P suffix: the AX162-2-LTD line ships the non-P
+    # "AMD EPYC 9454" (same Genoa 25/17 silicon) — the literal "9454P" match
+    # sent 0000203/204/205 to the unknown-hardware 23 GB fallback (2026-07-02).
+    *"EPYC 9454"*)
       if [ "${_SWAP_RAM_GB:-0}" -ge 320 ]; then SWAP_GB_PER_DISK=75; else SWAP_GB_PER_DISK=100; fi ;;
     *"Ryzen 9 7950X3D"*) SWAP_GB_PER_DISK=100 ;;
     *"i5-13500"*)        SWAP_GB_PER_DISK=23 ;;
