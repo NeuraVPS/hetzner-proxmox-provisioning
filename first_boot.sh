@@ -233,6 +233,78 @@ else
 fi
 
 ############################################
+# Spare-pair data mirror (fleet refresh 2026-07: AX162/384 = 2x1.92TB rpool
+# + 2x960GB extension pair)
+############################################
+# When the box ships with TWO equal-size empty spare disks beyond the rpool
+# pair, they are a CAPACITY EXPANSION, not swap: add them to rpool as a second
+# mirror vdev (mixed vdev sizes are fine in ZFS — allocation spreads
+# proportionally across vdevs). Swap already lives on the rpool-disk carve
+# (SWAP_GB_PER_DISK, auto-detected in install.sh). This runs BEFORE the
+# third-disk-swap check below so a 960 pair is never half-grabbed as a
+# full-disk swap. Idempotent: after `zpool add` the disks carry ZFS labels and
+# no longer count as empty. A SINGLE spare disk still becomes the legacy
+# dedicated swap disk (next section). After extending a node, re-run the
+# max_disk backfill so its placement budget reflects the bigger pool.
+log "Checking for an equal-size empty spare disk PAIR to extend rpool"
+if command -v zpool >/dev/null 2>&1 && zpool list -H -o name rpool >/dev/null 2>&1; then
+  pair_rpool_parents=()
+  pair_vdevs=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && pair_vdevs+=("$line")
+  done < <(zpool status -P -L rpool 2>/dev/null | grep -oE '/dev/[^[:space:]]+' || true)
+  for dev in "${pair_vdevs[@]}"; do
+    [[ -b "$dev" ]] || continue
+    canon=$(readlink -f "$dev" 2>/dev/null)
+    [[ -n "$canon" ]] && [[ -b "$canon" ]] && dev="$canon"
+    if [[ "$dev" =~ /nvme[0-9]+n[0-9]+p[0-9]+ ]]; then
+      parent="${dev%p*}"
+    else
+      parent="${dev%%[0-9]*}"
+    fi
+    [[ -b "$parent" ]] && pair_rpool_parents+=("$parent")
+  done
+  pair_spares=()
+  while IFS= read -r d; do
+    [[ -b "$d" ]] || continue
+    skip=
+    for p in "${pair_rpool_parents[@]}"; do
+      [[ "$d" == "$p" ]] && skip=1 && break
+    done
+    [[ -n "$skip" ]] && continue
+    # Only COMPLETELY empty disks qualify for the pair (a disk with any
+    # partition — swap, zfs_member, anything — is not ours to take).
+    part_count=0
+    if [[ "$(basename "$d")" == nvme* ]]; then
+      for part in "${d}"p*; do [[ -b "$part" ]] && part_count=$((part_count + 1)); done
+    else
+      for part in "${d}"[0-9]*; do [[ -b "$part" ]] && part_count=$((part_count + 1)); done
+    fi
+    [[ "$part_count" -eq 0 ]] && pair_spares+=("$d")
+  done < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+  if [[ ${#pair_spares[@]} -eq 2 ]]; then
+    s0=$(blockdev --getsize64 "${pair_spares[0]}" 2>/dev/null || true)
+    s1=$(blockdev --getsize64 "${pair_spares[1]}" 2>/dev/null || true)
+    if [[ -n "$s0" && "$s0" == "$s1" ]]; then
+      log "Adding spare pair as second mirror vdev: ${pair_spares[*]} ($((s0 / 1024 / 1024 / 1024)) GiB each)"
+      if zpool add rpool mirror "${pair_spares[0]}" "${pair_spares[1]}"; then
+        log "rpool extended; new size: $(zpool list -H -o size rpool 2>/dev/null)"
+      else
+        log "WARNING: zpool add failed for ${pair_spares[*]} — disks left untouched"
+      fi
+    else
+      log "Two spare disks with different sizes (${s0:-?} vs ${s1:-?}) — leaving them to the third-disk-swap logic below"
+    fi
+  elif [[ ${#pair_spares[@]} -gt 2 ]]; then
+    log "WARNING: ${#pair_spares[@]} empty spare disks found — ambiguous layout, leaving them to the third-disk-swap logic below"
+  else
+    log "No empty spare disk pair (${#pair_spares[@]} spare disk[s]) — nothing to extend"
+  fi
+else
+  log "rpool not found, skipping spare-pair check"
+fi
+
+############################################
 # Third-disk swap (when 3 disks: third is dedicated NVMe for swap)
 ############################################
 log "Checking for third empty disk to use as full-disk swap"
