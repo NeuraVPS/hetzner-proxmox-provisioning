@@ -68,18 +68,20 @@
       resize.value = "off";
       resize.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    // b) Clip the viewport (enabled only once resize is off). Then nudge a
-    //    window resize so noVNC recomputes clippingViewport — the drag button
-    //    auto-cancels unless clippingViewport is already true at click time.
+    // b) Best-effort: also tick the clip checkbox if it's enabled (on mobile
+    //    noVNC already force-clips internally WITHOUT ticking it, so we must
+    //    NOT gate the drag on this). Nudge a resize so clippingViewport recomputes.
     if (clip && !clip.disabled && !clip.checked) {
       clip.checked = true;
       clip.dispatchEvent(new Event("change", { bubbles: true }));
       window.dispatchEvent(new Event("resize"));
     }
-    // c) Enable pan/drag once connected + clip on. Keep re-clicking until it
-    //    STAYS selected for a couple of ticks (it can auto-cancel on the first
-    //    try before clipping settles).
-    if (connected && drag && clip && clip.checked) {
+    // c) Enable pan/drag. The button is in the DOM from the start but hidden
+    //    for the first seconds (noVNC reveals it once it decides the session
+    //    is touch/clipped) — clicking it while hidden does nothing, which is
+    //    why auto-activation failed. Only click once it is actually VISIBLE
+    //    (offsetParent != null), and keep re-clicking until it stays selected.
+    if (connected && drag && drag.offsetParent !== null) {
       if (drag.classList.contains("noVNC_selected")) {
         stableSelected += 1;
       } else {
