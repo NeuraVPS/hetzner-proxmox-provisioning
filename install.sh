@@ -785,6 +785,29 @@ if [ "$ESP_OK" -ne 1 ]; then
 fi
 log "Bootloader verified on at least one ESP."
 
+# Put the PXE/network entries FIRST in the permanent BootOrder. Hetzner's
+# rescue engages via PXE: with disk-first order an armed rescue is silently
+# skipped and the box boots the local OS again (hit on 0000008, 2026-07-03 —
+# two reboots wasted). Hetzner PXE chainloads the local disk when no rescue
+# is armed, so normal boots are unaffected. Non-fatal on quirky firmware.
+if command -v efibootmgr >/dev/null 2>&1; then
+  PXE_IDS=$(efibootmgr | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\}[[:space:]].*PXE.*/\1/p' | paste -sd, -)
+  CUR_ORDER=$(efibootmgr | sed -n 's/^BootOrder:[[:space:]]*//p')
+  if [ -n "$PXE_IDS" ] && [ -n "$CUR_ORDER" ]; then
+    REST=$(echo "$CUR_ORDER" | tr ',' '\n' | grep -v -F -x -f <(echo "$PXE_IDS" | tr ',' '\n') | paste -sd, -)
+    NEW_ORDER="${PXE_IDS}${REST:+,$REST}"
+    if efibootmgr -o "$NEW_ORDER" >/dev/null 2>&1; then
+      log "BootOrder set network-first: $NEW_ORDER (was: $CUR_ORDER)"
+    else
+      log "WARN: efibootmgr -o $NEW_ORDER failed — BootOrder unchanged ($CUR_ORDER)"
+    fi
+  else
+    log "WARN: no PXE entries or no BootOrder visible; leaving boot order as-is"
+  fi
+else
+  log "WARN: efibootmgr not available; leaving boot order as-is"
+fi
+
 log "Unmounting root dataset and restoring mountpoint=/"
 zfs umount "$ROOT_DS"
 zfs set mountpoint=/ "$ROOT_DS"
