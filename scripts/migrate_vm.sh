@@ -750,6 +750,10 @@ for l in lines:
 open('/etc/pve/qemu-server/${VMID}.conf','w').write('\n'.join(out).rstrip()+'\n')
 PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memory=${_cfg_m} vs running ${_run_m} MiB."
         _ok "Config memory aligned to running value (${_run_m} MiB)."
+        # Remember the INTENDED value: after the migration commits we re-apply
+        # it on the dest as a pending change, so the customer's next reboot
+        # still lands on the standardized size (e.g. vps-e 61440).
+        MEMORY_INTENDED_MB="$_cfg_m"
       else
         _die "Memory mismatch: running -m ${_run_m} != config ${_cfg_m} MiB — a live migration WILL fail at the RAM phase (kvm: Size mismatch: pc.ram). Fix: align the config to the running value, or power-cycle the VM to apply the pending change. Aborting before any data is copied."
       fi
@@ -1034,6 +1038,19 @@ _info "Dest VM: status=${DST_STATUS:-unknown} ostype=${OSTYPE:-unknown}"
 # short-circuits the rewrite, but DHCPv4 is always renewed because the node
 # changed and the old lease comes from a different dnsmasq.
 DST_GATEWAY="${EXPECTED_VM_IPV6%::*}::1"
+
+# If the memory pre-check auto-aligned the config to the running value, re-apply
+# the ORIGINAL (intended) config value on the dest as a pending change — the VM
+# keeps running at its current size, and the customer's next own reboot applies
+# the standardized value (operator request 2026-07-03: "restaurar la RAM de 60
+# por si el cliente decide reiniciar").
+if [[ -n "${MEMORY_INTENDED_MB:-}" ]]; then
+  if dst_ssh "qm set '${VMID}' --memory '${MEMORY_INTENDED_MB}'" >/dev/null 2>&1; then
+    _ok "Intended memory (${MEMORY_INTENDED_MB} MiB) re-applied as PENDING on dest — applies at the guest's next power cycle."
+  else
+    _warn "Could not re-apply intended memory ${MEMORY_INTENDED_MB} MiB on dest — run: qm set ${VMID} --memory ${MEMORY_INTENDED_MB}"
+  fi
+fi
 
 # VPS-E balloon adaptation across the EX44<->AX162 boundary (operator,
 # 2026-07-03). Dedicated EX44s run the vps-e with balloon == memory (the whole
