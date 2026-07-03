@@ -693,6 +693,27 @@ smartd -q onecheck 2>/dev/null || true
 systemctl restart smartd || true
 log "smartd NVMe filter installed"
 
+# Put PXE entries FIRST in the permanent BootOrder. install.sh already does
+# this in rescue, but the first REAL boot makes the firmware register fresh
+# entries for the new ESPs and PREPEND them (seen on 0000008: BootOrder became
+# 0009,0008,… with PXE third) — so the authoritative reorder must happen HERE,
+# when the final entry set exists. An armed Hetzner rescue then always engages;
+# normal boots are unaffected (Hetzner PXE chainloads the local disk).
+if command -v efibootmgr >/dev/null 2>&1; then
+  PXE_IDS=$(efibootmgr | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\}[[:space:]].*PXE.*/\1/p' | paste -sd, -)
+  CUR_ORDER=$(efibootmgr | sed -n 's/^BootOrder:[[:space:]]*//p')
+  if [[ -n "$PXE_IDS" && -n "$CUR_ORDER" ]]; then
+    REST=$(echo "$CUR_ORDER" | tr ',' '\n' | grep -v -F -x -f <(echo "$PXE_IDS" | tr ',' '\n') | paste -sd, -)
+    if efibootmgr -o "${PXE_IDS}${REST:+,$REST}" >/dev/null 2>&1; then
+      log "BootOrder set network-first: ${PXE_IDS}${REST:+,$REST}"
+    else
+      log "WARNING: efibootmgr reorder failed; BootOrder unchanged ($CUR_ORDER)"
+    fi
+  else
+    log "WARNING: no PXE entries/BootOrder visible; boot order left as-is"
+  fi
+fi
+
 log "first_boot.sh finished"
 
 # manually add with: qm set 100 --hookscript shared:snippets/sync-dnat.py
