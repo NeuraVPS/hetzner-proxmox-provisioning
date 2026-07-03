@@ -83,8 +83,15 @@ class SetTicketHandler(BaseHTTPRequestHandler):
         ticket, node_id, vmid = result
         if vmid is not None:
             vmid_str = str(int(vmid)) if isinstance(vmid, (int, float)) else str(vmid)
+            # &_cb=<one-time token> is a cache-buster: the console URL is
+            # otherwise identical every open (only the /set-ticket token
+            # changes, and that 302-redirects here), so the browser serves the
+            # noVNC HTML — and its injected script — from a stale cross-origin
+            # cache that a parent-page hard-reload doesn't clear. A unique _cb
+            # forces a fresh fetch. noVNC ignores unknown query params.
             location = (
-                f"/?console=kvm&vmid={vmid_str}&node={node_id}&resize=scale&novnc=1"
+                f"/?console=kvm&vmid={vmid_str}&node={node_id}"
+                f"&resize=scale&novnc=1&_cb={token}"
             )
         else:
             location = "/"
