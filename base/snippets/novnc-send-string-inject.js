@@ -107,4 +107,72 @@
 
     if (tries > 90 || stableSelected >= 3) clearInterval(iv);
   }, 400);
+
+  // --- 3) mobile: floating in-iframe keyboard toggle button ---
+  // The parent page's "Mostrar/ocultar teclado" action posts
+  // noVNC_toggleKeyboard (handled above), but mobile browsers only raise the
+  // OS soft keyboard when input.focus() runs inside a genuine user gesture
+  // IN THIS document — and the parent's tap activation does NOT propagate
+  // into a cross-origin iframe (noVNC's toggle itself has no visibility
+  // gate; the focus just happens gesture-less and the keyboard stays down).
+  // So the reliable path is this small floating button rendered inside the
+  // iframe: a tap here IS a valid gesture, and clicking noVNC's own keyboard
+  // button within the handler lets its input.focus() open the keyboard.
+  // touchstart is preventDefault'd so the tap neither steals focus from
+  // noVNC's hidden input (which would break the hide half of the toggle)
+  // nor fires the synthetic click (double-toggle); touchend carries the
+  // user activation and does the toggle.
+  var fab = document.getElementById("nvKbFab");
+  if (!fab) {
+    fab = document.createElement("button");
+    fab.id = "nvKbFab";
+    fab.type = "button";
+    fab.textContent = "⌨️";
+    fab.setAttribute(
+      "style",
+      "position:fixed;right:12px;bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:2147483000;width:46px;height:46px;border-radius:50%;border:none;background:rgba(20,20,20,0.55);color:#fff;font-size:24px;padding:0;line-height:46px;text-align:center;-webkit-tap-highlight-color:transparent"
+    );
+    var tgl = function () {
+      var b = document.getElementById("noVNC_keyboard_button");
+      if (b) {
+        b.click();
+      }
+    };
+    fab.addEventListener(
+      "touchstart",
+      function (ev) {
+        ev.preventDefault();
+      },
+      { passive: false }
+    );
+    fab.addEventListener(
+      "touchend",
+      function (ev) {
+        ev.preventDefault();
+        tgl();
+      },
+      { passive: false }
+    );
+    fab.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      tgl();
+    });
+    document.body.appendChild(fab);
+    // Tint the button while the virtual keyboard is active (noVNC's hidden
+    // input focused) so the toggle state is visible.
+    document.addEventListener("focusin", function () {
+      var i = document.getElementById("noVNC_keyboardinput");
+      if (i && document.activeElement === i) {
+        fab.style.background = "rgba(0,122,255,0.75)";
+      }
+    });
+    document.addEventListener("focusout", function () {
+      setTimeout(function () {
+        var i = document.getElementById("noVNC_keyboardinput");
+        if (document.activeElement !== i) {
+          fab.style.background = "rgba(20,20,20,0.55)";
+        }
+      }, 80);
+    });
+  }
 })();
