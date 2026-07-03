@@ -41,7 +41,12 @@
     el.dispatchEvent(new KeyboardEvent(e.type, opts));
   });
 
-  // --- 2) mobile: resize=off + view-drag on ---
+  // --- 2) mobile: resize=off + clip + view-drag on ---
+  // Order matters (noVNC internals): resize=off makes the desktop native 1:1,
+  // which ENABLES the view_clip checkbox; view_clip=true clips the viewport,
+  // which is REQUIRED for drag to stick (noVNC's updateViewDrag auto-cancels
+  // dragViewport whenever clipViewport is false). So we drive them in sequence
+  // via polling and only click the drag button once clip is on.
   var isMobile =
     (("ontouchstart" in window) || navigator.maxTouchPoints > 0) &&
     Math.min(screen.width, screen.height) <= 820;
@@ -51,22 +56,37 @@
   var iv = setInterval(function () {
     tries += 1;
     var resize = document.getElementById("noVNC_setting_resize");
+    var clip = document.getElementById("noVNC_setting_view_clip");
     var drag = document.getElementById("noVNC_view_drag_button");
     var connected = !!document.getElementById("noVNC_canvas");
 
-    // Switch Local Scaling -> None (fires noVNC's change handler).
+    // a) Local Scaling -> None.
     if (resize && resize.value !== "off") {
       resize.value = "off";
       resize.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    // Enable pan/drag if it isn't already (button toggles a selected class).
-    if (drag && !drag.classList.contains("noVNC_selected")) {
+    // b) Clip the viewport (enabled only once resize is off).
+    if (clip && !clip.disabled && !clip.checked) {
+      clip.checked = true;
+      clip.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    // c) Enable pan/drag — only after clip is on, else it auto-cancels.
+    if (
+      connected &&
+      drag &&
+      clip &&
+      clip.checked &&
+      !drag.classList.contains("noVNC_selected")
+    ) {
       drag.click();
     }
 
-    // Stop once applied on a connected session, or after ~20s of trying.
-    if (tries > 40 || (connected && resize && resize.value === "off")) {
-      clearInterval(iv);
-    }
-  }, 500);
+    var done =
+      connected &&
+      resize &&
+      resize.value === "off" &&
+      drag &&
+      drag.classList.contains("noVNC_selected");
+    if (tries > 60 || done) clearInterval(iv);
+  }, 400);
 })();
