@@ -25,7 +25,10 @@
 #   gateway 37.27.135.129
 #   # route 37.27.135.128/25 via 37.27.135.129
 #   up route add -net 37.27.135.128 netmask 255.255.255.128 gw 37.27.135.129 dev enp6s0
-#   # failover
+#   # failover 0
+#   up ip addr add 94.130.3.118/32 dev enp6s0 preferred_lft 0
+#   down ip addr del 94.130.3.118/32 dev enp6s0
+#   # failover 1
 #   up ip addr add 77.42.49.79/32 dev enp6s0 preferred_lft 0
 #   down ip addr del 77.42.49.79/32 dev enp6s0
 
@@ -33,7 +36,10 @@
 #   address 2a01:4f9:3070:3984::2
 #   netmask 64
 #   gateway fe80::1
-#   # failover
+#   # failover 0
+#   up ip addr add 2a01:4f8:fff2:95::2/64 dev enp6s0 preferred_lft 0
+#   down ip addr del 2a01:4f8:fff2:95::5f::2/64 dev enp6s0
+#   # failover 1
 #   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp6s0 preferred_lft 0
 #   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp6s0
 
