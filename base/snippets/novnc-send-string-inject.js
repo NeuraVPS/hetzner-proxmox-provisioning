@@ -109,28 +109,34 @@
   }, 400);
 
   // --- 3) mobile: floating in-iframe keyboard toggle button ---
-  // The parent page's "Mostrar/ocultar teclado" action posts
-  // noVNC_toggleKeyboard (handled above), but mobile browsers only raise the
-  // OS soft keyboard when input.focus() runs inside a genuine user gesture
-  // IN THIS document — and the parent's tap activation does NOT propagate
-  // into a cross-origin iframe (noVNC's toggle itself has no visibility
-  // gate; the focus just happens gesture-less and the keyboard stays down).
-  // So the reliable path is this small floating button rendered inside the
-  // iframe: a tap here IS a valid gesture, and clicking noVNC's own keyboard
-  // button within the handler lets its input.focus() open the keyboard.
+  // This is THE keyboard toggle (the parent Actions-menu item was removed):
+  // mobile browsers only raise the OS soft keyboard when input.focus() runs
+  // inside a genuine user gesture IN THIS document — and a parent-page tap's
+  // activation does NOT propagate into a cross-origin iframe (noVNC's toggle
+  // itself has no visibility gate; the focus just happens gesture-less and
+  // the keyboard stays down). A tap on this in-iframe button IS a valid
+  // gesture, and clicking noVNC's own keyboard button within the handler
+  // lets its input.focus() open the keyboard. The noVNC_toggleKeyboard
+  // postMessage handler above is kept as plumbing (hide always works —
+  // blur needs no gesture).
   // touchstart is preventDefault'd so the tap neither steals focus from
   // noVNC's hidden input (which would break the hide half of the toggle)
   // nor fires the synthetic click (double-toggle); touchend carries the
   // user activation and does the toggle.
+  // A <span> (not <button>/<div>) on purpose: pve.css has
+  // `input:not(.toggle), button, div:not(#noVNC_container) { border-radius:
+  // unset !important; }` which beats inline styles and squared the button
+  // into a bare block; a span escapes that rule and all generic button
+  // styling, so the inline style below fully controls the look.
   var fab = document.getElementById("nvKbFab");
   if (!fab) {
-    fab = document.createElement("button");
+    fab = document.createElement("span");
     fab.id = "nvKbFab";
-    fab.type = "button";
+    fab.setAttribute("role", "button");
     fab.textContent = "⌨️";
     fab.setAttribute(
       "style",
-      "position:fixed;right:12px;bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:2147483000;width:46px;height:46px;border-radius:50%;border:none;background:rgba(20,20,20,0.55);color:#fff;font-size:24px;padding:0;line-height:46px;text-align:center;-webkit-tap-highlight-color:transparent"
+      "position:fixed;right:12px;bottom:calc(14px + env(safe-area-inset-bottom,0px));z-index:2147483000;box-sizing:border-box;width:46px;height:46px;border-radius:50%;border:1px solid rgba(255,255,255,0.5);background:rgba(28,28,30,0.8);color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;line-height:1;box-shadow:0 2px 10px rgba(0,0,0,0.45);cursor:pointer;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent"
     );
     var tgl = function () {
       var b = document.getElementById("noVNC_keyboard_button");
@@ -163,14 +169,14 @@
     document.addEventListener("focusin", function () {
       var i = document.getElementById("noVNC_keyboardinput");
       if (i && document.activeElement === i) {
-        fab.style.background = "rgba(0,122,255,0.75)";
+        fab.style.background = "rgba(0,122,255,0.85)";
       }
     });
     document.addEventListener("focusout", function () {
       setTimeout(function () {
         var i = document.getElementById("noVNC_keyboardinput");
         if (document.activeElement !== i) {
-          fab.style.background = "rgba(20,20,20,0.55)";
+          fab.style.background = "rgba(28,28,30,0.8)";
         }
       }, 80);
     });
