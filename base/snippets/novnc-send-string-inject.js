@@ -60,8 +60,7 @@
     var resize = document.getElementById("noVNC_setting_resize");
     var clip = document.getElementById("noVNC_setting_view_clip");
     var drag = document.getElementById("noVNC_view_drag_button");
-    var connected = !!document.getElementById("noVNC_canvas");
-
+    
     // a) Local Scaling -> None.
     if (resize && resize.value !== "off") {
       resize.value = "off";
@@ -80,7 +79,12 @@
     //    is touch/clipped) — clicking it while hidden does nothing, which is
     //    why auto-activation failed. Only click once it is actually VISIBLE
     //    (offsetParent != null), and keep re-clicking until it stays selected.
-    if (connected && drag && drag.offsetParent !== null) {
+    // The drag button's own VISIBILITY is the connection signal — noVNC only
+    // reveals it once the session is connected+clipped. (There is NO element
+    // with id noVNC_canvas in the DOM — the canvas is created without an id —
+    // so any "connected" check on it never passes; that bug kept the click
+    // from ever firing.)
+    if (drag && drag.offsetParent !== null) {
       if (drag.classList.contains("noVNC_selected")) {
         stableSelected += 1;
       } else {
