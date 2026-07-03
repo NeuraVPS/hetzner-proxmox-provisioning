@@ -518,11 +518,11 @@ _dst_run_ps() {
     if printf '%s' "$exec_out" | grep -qi 'guest agent is not running\|agent.*not running\|not connected'; then
       sleep 3; (( attempt++ )); continue
     fi
-    _warn "agent exec failed: ${exec_out:0:200}"
+    _info "agent exec failed (recoverable, caller retries): ${exec_out:0:200}"
     return 1
   done
   if [[ -z "$pid" || "$pid" -le 0 ]]; then
-    _warn "guest agent never came up after $((max_attempts * 3))s"
+    _info "guest agent never came up after $((max_attempts * 3))s (recoverable, caller retries)"
     return 1
   fi
 
@@ -536,7 +536,7 @@ _dst_run_ps() {
     fi
     sleep 3; (( elapsed += 3 ))
   done
-  _warn "PS exec timed out after ${timeout}s"
+  _info "PS exec timed out after ${timeout}s (recoverable, caller retries)"
   return 1
 }
 
@@ -1062,17 +1062,17 @@ PSEOF
   # ~12 min before giving up loudly.
   RECONFIG_OK=0
   _wait_agent_dst 180 \
-    || _warn "Guest agent not answering after 180s — attempting reconfig anyway…"
+    || _info "Guest agent not answering after 180s — attempting reconfig anyway…"
   for _try in 1 2 3 4; do
     if (( _try > 1 )); then
-      _warn "In-guest IPv6 not confirmed yet; waiting for agent and retrying (${_try}/4)…"
+      _info "In-guest IPv6 not confirmed yet; waiting for agent and retrying (${_try}/4)…"
       sleep 10
       _wait_agent_dst 120 || true
     fi
     _ps_rc=0
     _dst_run_ps "$PS_RECONFIG" 120 || _ps_rc=$?
     if (( _ps_rc != 0 )); then
-      _warn "Reconfig attempt ${_try}/4 failed (rc=${_ps_rc})."
+      _info "Reconfig attempt ${_try}/4 failed (rc=${_ps_rc})."
       continue
     fi
     if _verify_dest_ipv6 30; then
