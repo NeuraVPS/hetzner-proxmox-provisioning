@@ -116,6 +116,15 @@ set -euo pipefail
 PVE_NODES_FILE="${PVE_NODES_FILE:-/var/lib/base-nat/pve_nodes.json}"
 STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
+# The other BASE(s) serving the failover VIP. Rollback (and the success path)
+# re-sync the VM's NAT entry there too — a failed migration otherwise leaves
+# the peer's entry stale/missing with no VM start/stop event to fix it
+# (live migrations never stop the guest). Space-separated, env-overridable.
+case "$(hostname)" in
+  0000000-BASE) PEER_BASES="${PEER_BASES:-2a01:4f9:3070:3984::2}" ;;
+  0000001-BASE) PEER_BASES="${PEER_BASES:-2a01:4f9:3090:2488::2}" ;;
+  *)            PEER_BASES="${PEER_BASES:-}" ;;
+esac
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
 MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # max cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default
@@ -611,6 +620,23 @@ _rollback() {
     _info "Clearing Firestore maintenance flag…"
     _firestore_update_servers --vmid "$VMID" --maintenance false >/dev/null 2>&1 || true
   fi
+  # A failed/aborted migration can leave the BASEs' NAT entry for this VM
+  # missing or stale (e.g. the aborted dest stub's stop event clobbers it via
+  # the hookscript chain) even though the VM kept running on source — the
+  # customer's connectionUrl then dies silently while direct-IPv6 RDP still
+  # works (VM 1648, 2026-07-03). Firestore routing is untouched on rollback
+  # by design, so a plain per-VM sync restores truth. Local + peer BASEs.
+  if [[ -x "$SYNC_BASE_NAT" ]]; then
+    _info "Restoring NAT entry for ${VMID} from Firestore (local + peer)…"
+    "$SYNC_BASE_NAT" sync "$VMID" >/dev/null 2>&1 \
+      || _warn "Local NAT restore failed — run: $SYNC_BASE_NAT sync ${VMID}"
+    local _peer
+    for _peer in $PEER_BASES; do
+      ssh -n -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no \
+        "root@${_peer}" "$SYNC_BASE_NAT sync '${VMID}'" >/dev/null 2>&1 \
+        || _warn "Peer NAT restore failed on ${_peer} — run there: $SYNC_BASE_NAT sync ${VMID}"
+    done
+  fi
   _ssh_close
 }
 trap _rollback EXIT
@@ -984,17 +1010,36 @@ if (-not (Test-Configured)) {
 if (Test-Configured) { exit 0 } else { exit 2 }
 PSEOF
 )
-  _ps_rc=0
-  _dst_run_ps "$PS_RECONFIG" 120 || _ps_rc=$?
-  case "$_ps_rc" in
-    0) _ok  "In-guest IPv6 reconfigured + DHCPv4 renewed." ;;
-    *) _warn "In-guest reconfig had issues (rc=${_ps_rc}); continuing — verifying via guest agent next." ;;
-  esac
-
-  if _verify_dest_ipv6 60; then
-    _ok "Verified: ${EXPECTED_VM_IPV6} bound on dest VM."
+  # Slow cutovers leave the guest agent down for minutes; a single reconfig
+  # attempt then fails (qga exec timeout) and the guest keeps the SOURCE-prefix
+  # IP → customer unreachable while everything else reports success (VMs
+  # 1777/1841/1084/702/1257, 2026-07-03). Wait for the agent, then retry the
+  # idempotent reconfig until the expected IPv6 is actually bound. Worst case
+  # ~12 min before giving up loudly.
+  RECONFIG_OK=0
+  _wait_agent_dst 180 \
+    || _warn "Guest agent not answering after 180s — attempting reconfig anyway…"
+  for _try in 1 2 3 4; do
+    if (( _try > 1 )); then
+      _warn "In-guest IPv6 not confirmed yet; waiting for agent and retrying (${_try}/4)…"
+      sleep 10
+      _wait_agent_dst 120 || true
+    fi
+    _ps_rc=0
+    _dst_run_ps "$PS_RECONFIG" 120 || _ps_rc=$?
+    if (( _ps_rc != 0 )); then
+      _warn "Reconfig attempt ${_try}/4 failed (rc=${_ps_rc})."
+      continue
+    fi
+    if _verify_dest_ipv6 30; then
+      RECONFIG_OK=1
+      break
+    fi
+  done
+  if (( RECONFIG_OK == 1 )); then
+    _ok "In-guest IPv6 reconfigured + verified: ${EXPECTED_VM_IPV6} bound on dest VM (attempt ${_try})."
   else
-    _warn "Could not verify ${EXPECTED_VM_IPV6} on dest VM within 60s — continuing anyway."
+    _warn "In-guest IPv6 reconfig NOT verified after 4 attempts — the guest may still hold the source-prefix IP (customer unreachable via connectionUrl AND direct RDP). Fix: re-run this script (idempotent) or apply the PS_RECONFIG netsh block via 'qm guest exec ${VMID}'. Continuing — NAT/Firestore will still point at ${EXPECTED_VM_IPV6}."
   fi
 elif [[ "${OSTYPE:-}" != win* ]]; then
   _info "ostype=${OSTYPE:-unknown} (not Windows); skipping in-guest reconfig."
@@ -1038,6 +1083,16 @@ if [[ -x "$SYNC_BASE_NAT" ]]; then
   else
     _warn "$SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6} failed; run it manually."
   fi
+  # Peer BASE(s) too, best-effort: live migrations fire no VM start/stop event,
+  # so without this the peer's entry stays stale until its periodic sync.
+  for _peer in $PEER_BASES; do
+    if ssh -n -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no \
+         "root@${_peer}" "$SYNC_BASE_NAT sync '${VMID}' '${EXPECTED_VM_IPV6}'" >/dev/null 2>&1; then
+      _ok "Peer NAT reconciled (${_peer})."
+    else
+      _warn "Peer NAT sync failed on ${_peer} — run there: $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6}"
+    fi
+  done
 else
   _warn "$SYNC_BASE_NAT not executable; skipping local NAT reconcile."
 fi
