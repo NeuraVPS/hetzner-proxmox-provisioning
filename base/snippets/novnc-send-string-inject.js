@@ -48,11 +48,14 @@
   // dragViewport whenever clipViewport is false). So we drive them in sequence
   // via polling and only click the drag button once clip is on.
   var isMobile =
-    (("ontouchstart" in window) || navigator.maxTouchPoints > 0) &&
-    Math.min(screen.width, screen.height) <= 820;
+    (("ontouchstart" in window) ||
+      navigator.maxTouchPoints > 0 ||
+      (window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) &&
+    Math.min(screen.width, screen.height) <= 900;
   if (!isMobile) return;
 
   var tries = 0;
+  var stableSelected = 0;
   var iv = setInterval(function () {
     tries += 1;
     var resize = document.getElementById("noVNC_setting_resize");
@@ -65,28 +68,26 @@
       resize.value = "off";
       resize.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    // b) Clip the viewport (enabled only once resize is off).
+    // b) Clip the viewport (enabled only once resize is off). Then nudge a
+    //    window resize so noVNC recomputes clippingViewport — the drag button
+    //    auto-cancels unless clippingViewport is already true at click time.
     if (clip && !clip.disabled && !clip.checked) {
       clip.checked = true;
       clip.dispatchEvent(new Event("change", { bubbles: true }));
+      window.dispatchEvent(new Event("resize"));
     }
-    // c) Enable pan/drag — only after clip is on, else it auto-cancels.
-    if (
-      connected &&
-      drag &&
-      clip &&
-      clip.checked &&
-      !drag.classList.contains("noVNC_selected")
-    ) {
-      drag.click();
+    // c) Enable pan/drag once connected + clip on. Keep re-clicking until it
+    //    STAYS selected for a couple of ticks (it can auto-cancel on the first
+    //    try before clipping settles).
+    if (connected && drag && clip && clip.checked) {
+      if (drag.classList.contains("noVNC_selected")) {
+        stableSelected += 1;
+      } else {
+        stableSelected = 0;
+        drag.click();
+      }
     }
 
-    var done =
-      connected &&
-      resize &&
-      resize.value === "off" &&
-      drag &&
-      drag.classList.contains("noVNC_selected");
-    if (tries > 60 || done) clearInterval(iv);
+    if (tries > 90 || stableSelected >= 3) clearInterval(iv);
   }, 400);
 })();
