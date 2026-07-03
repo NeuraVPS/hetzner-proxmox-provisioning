@@ -719,6 +719,43 @@ if (( _vm_on_src == 1 )); then
     _info "Source VM is not running — using offline migration."
   fi
 
+  # 0b) Memory config-vs-running pre-check — ONLINE migrations only. A pending
+  # memory change (e.g. `qm set --memory` on a running VM, like the 2026-06
+  # vps-e RAM standardization) leaves the RUNNING qemu with a different -m than
+  # the config. remote_migrate builds the dest VM from the CONFIG, so the RAM
+  # stream dies at the very end with "kvm: Size mismatch: pc.ram" — after ~40
+  # wasted minutes of disk mirror (VM 1648: 4 identical failures at 38m50s).
+  # Default: auto-align the config to the RUNNING value (always safe — it just
+  # describes reality; re-apply the intended value as pending AFTER migrating).
+  # Set MEMORY_MISMATCH_AUTOFIX=0 to abort instead.
+  if [[ -n "$ONLINE_FLAG" ]]; then
+    _run_m=$(src_ssh "tr '\\0' ' ' < /proc/\$(cat /var/run/qemu-server/${VMID}.pid 2>/dev/null)/cmdline 2>/dev/null" \
+             | grep -oE '\-m +(size=)?[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+    _cfg_m=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+    if [[ -n "$_run_m" && -n "$_cfg_m" && "$_run_m" != "$_cfg_m" ]]; then
+      if [[ "${MEMORY_MISMATCH_AUTOFIX:-1}" == "1" ]]; then
+        _warn "Memory mismatch: running -m ${_run_m} != config ${_cfg_m} MiB (pending change without reboot). AUTO-FIXING: config -> ${_run_m} MiB (+ dropping a memory-only [PENDING] entry) so the dest VM is built to match the running guest."
+        src_ssh "python3 - <<'PYEOF'
+lines = open('/etc/pve/qemu-server/${VMID}.conf').read().splitlines()
+out, pend = [], False
+for l in lines:
+    if l.strip() == '[PENDING]': pend = True; continue
+    if pend and l.startswith('['): pend = False
+    if pend:
+        if l.startswith('memory:'): continue
+        out.append('[PENDING]') if '[PENDING]' not in out else None
+        out.append(l); continue
+    if l.startswith('memory:'): l = 'memory: ${_run_m}'
+    out.append(l)
+open('/etc/pve/qemu-server/${VMID}.conf','w').write('\n'.join(out).rstrip()+'\n')
+PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memory=${_cfg_m} vs running ${_run_m} MiB."
+        _ok "Config memory aligned to running value (${_run_m} MiB)."
+      else
+        _die "Memory mismatch: running -m ${_run_m} != config ${_cfg_m} MiB — a live migration WILL fail at the RAM phase (kvm: Size mismatch: pc.ram). Fix: align the config to the running value, or power-cycle the VM to apply the pending change. Aborting before any data is copied."
+      fi
+    fi
+  fi
+
   # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
   # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
   # migration restores that vCPU state verbatim on the destination. The rule that
@@ -997,6 +1034,29 @@ _info "Dest VM: status=${DST_STATUS:-unknown} ostype=${OSTYPE:-unknown}"
 # short-circuits the rewrite, but DHCPv4 is always renewed because the node
 # changed and the old lease comes from a different dnsmasq.
 DST_GATEWAY="${EXPECTED_VM_IPV6%::*}::1"
+
+# VPS-E balloon adaptation across the EX44<->AX162 boundary (operator,
+# 2026-07-03). Dedicated EX44s run the vps-e with balloon == memory (the whole
+# box is theirs; no deflation). Shared AX162s pack vps-e with ballooning down
+# to the plan's ram_min (18 GB) so KSM/zswap can breathe. Cross-family moves
+# are offline-only (Intel<->AMD blocks live), so the qm set lands cleanly on a
+# stopped VM. Same-family moves no-op. VM is a vps-e iff its name is "E-*".
+VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-18432}"
+_vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+if [[ "$_vm_name" == E-* ]]; then
+  _fam() { case "$1" in *EX44*) echo EX44 ;; *AX162*) echo AX162 ;; *) echo other ;; esac; }
+  _src_fam=$(_fam "$SRC_NODE"); _dst_fam=$(_fam "$DST_NODE")
+  if [[ "$_src_fam" != "$_dst_fam" && "$_dst_fam" != "other" ]]; then
+    _mem_mb=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+    if [[ "$_dst_fam" == "AX162" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"; else _target_balloon="${_mem_mb:-61440}"; fi
+    if dst_ssh "qm set '${VMID}' --balloon '${_target_balloon}'" >/dev/null 2>&1; then
+      _ok "vps-e balloon adapted for ${_dst_fam} dest: balloon=${_target_balloon} MiB (memory=${_mem_mb:-?})."
+    else
+      _warn "Could not set balloon=${_target_balloon} on dest — set it manually: qm set ${VMID} --balloon ${_target_balloon}"
+    fi
+  fi
+fi
+
 if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
   _info "Reconfiguring static IPv6 in guest: addr=${EXPECTED_VM_IPV6}/64 gw=${DST_GATEWAY}…"
 
