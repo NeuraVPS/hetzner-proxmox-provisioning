@@ -47,12 +47,11 @@
   // which is REQUIRED for drag to stick (noVNC's updateViewDrag auto-cancels
   // dragViewport whenever clipViewport is false). So we drive them in sequence
   // via polling and only click the drag button once clip is on.
-  var isMobile =
-    (("ontouchstart" in window) ||
-      navigator.maxTouchPoints > 0 ||
-      (window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) &&
-    Math.min(screen.width, screen.height) <= 900;
-  if (!isMobile) return;
+  var coarse =
+    !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+  var touch =
+    ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
+  if (!(coarse || touch)) return;
 
   var tries = 0;
   var stableSelected = 0;
