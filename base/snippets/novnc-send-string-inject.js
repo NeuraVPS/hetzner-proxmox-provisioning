@@ -8,6 +8,10 @@
  * 1) "dispatch event": the console page (www.neuravps.com) can
  *    postMessage({ type: "noVNC_dispatchEvent", event }) to dispatch one
  *    keyboard event on noVNC_keyboardinput (paste / send-key from the parent).
+ *    It can also postMessage({ type: "noVNC_toggleKeyboard" }) to click
+ *    noVNC's own virtual-keyboard button (noVNC_keyboard_button), which
+ *    focuses/blurs noVNC's hidden input so the OS soft keyboard shows/hides
+ *    (mobile "Mostrar/ocultar teclado" action).
  * 2) Mobile ergonomics: pve-set-ticket builds the console URL with
  *    resize=scale ("Local Scaling"), which looks great on desktop but on a
  *    phone shrinks the whole desktop to fit — tiny and unreadable. On mobile
@@ -21,8 +25,16 @@
   // --- 1) keyboard dispatch bridge ---
   window.addEventListener("message", function (event) {
     var data = event.data;
+    if (!data) return;
+    // Toggle noVNC's virtual keyboard (opens/closes the OS soft keyboard).
+    if (data.type === "noVNC_toggleKeyboard") {
+      var kb = document.getElementById("noVNC_keyboard_button");
+      if (kb) {
+        kb.click();
+      }
+      return;
+    }
     if (
-      !data ||
       data.type !== "noVNC_dispatchEvent" ||
       !data.event ||
       typeof data.event !== "object"
