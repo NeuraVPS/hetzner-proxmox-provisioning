@@ -122,7 +122,7 @@ SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
 # (live migrations never stop the guest). Space-separated, env-overridable.
 case "$(hostname)" in
   0000000-BASE) PEER_BASES="${PEER_BASES:-2a01:4f9:3070:3984::2}" ;;
-  0000001-BASE) PEER_BASES="${PEER_BASES:-2a01:4f9:3090:2488::2}" ;;
+  0000001-BASE) PEER_BASES="${PEER_BASES:-2a01:4f8:2b03:18a9::2}" ;;  # b0 (German); was b00 pre-retirement
   *)            PEER_BASES="${PEER_BASES:-}" ;;
 esac
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
