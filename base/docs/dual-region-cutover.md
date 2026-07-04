@@ -115,3 +115,14 @@ secrets/certs were cloned), no config changes. All new ops run from `b1`
   `[IPSET base]` — a brand-new base cannot reach nodes (nor push
   cluster.fw itself) until a peer base pushes the updated ipset:
   bootstrap order matters.
+
+## fsn-v6 failover kick (2026-07-04)
+
+A newly-**assigned** Hetzner v6 failover subnet may not route to its server
+until a real `active_server_ip` **switch** happens (the initial assignment
+doesn't trigger propagation). Symptom: 0 packets reach the base (tcpdump)
+despite the IP being bound and the Robot API showing it assigned;
+traceroute6 loops in the Hetzner backbone. Config is NOT the cause (it's
+byte-identical to a working failover). **Fix = kick it:** POST the failover
+to the *other* base, wait for it to apply, POST it back. Verified fix on
+fsn-v6 (2a01:4f8:fff2:95::).
