@@ -670,6 +670,7 @@ def sync_single_vmid(
     delete_only: bool,
     ipv6_override: bool = False,
     flags_override: dict | None = None,
+    server_loader=None,
 ):
     """Reconcile a single VM in the desired map.
 
@@ -677,6 +678,14 @@ def sync_single_vmid(
     `ipv6_override=True` skips Firestore (use `server` as-is). Otherwise
     `server` is the Firestore snapshot (already includes firewall flags)
     or None when the VM is not configured anymore.
+
+    `server_loader` (callable returning the Firestore snapshot) defers the
+    read until AFTER the state lock is held. Concurrent per-VM syncs for
+    the same vmid (e.g. a burst of panel firewall toggles firing several
+    cloud triggers) serialize on the lock, and each one then reads the
+    CURRENT doc — so the last to run converges to the latest truth even
+    when the trigger executions arrive out of order (VM 231's recurring
+    lost rdp element, 2026-07-04).
 
     `flags_override` (only meaningful with `ipv6_override`) lets the
     caller force specific service flags by key (`rdp` and/or `samba`).
@@ -694,6 +703,8 @@ def sync_single_vmid(
     # lock — see state_lock() docstring for why a torn read here used to
     # nuke unrelated VMs' DNAT.
     with state_lock():
+        if server_loader is not None:
+            server = server_loader()
         desired = desired_from_state()
         if delete_only:
             desired.pop(vmid, None)
@@ -927,28 +938,48 @@ def firestore_ip_for_proxmox_node(node_id: str) -> str | None:
 
 
 def parse_base_hosts() -> dict[str, str]:
-    """{b0: ipv6, b1: ipv6, ...} from BASE_HOSTS env (positional, comma-separated).
+    """{alias: ipv6, ...} from BASE_HOSTS env (comma-separated).
 
-    Empty/missing -> {}. Order matters: first entry becomes b0, second b1,
-    etc. Keep the same order on every BASE so the bN aliases map to the
-    same hosts everywhere.
+    Two entry forms, mixable:
+      - "name=ipv6"  -> explicit alias (e.g. "b00=2a01:...", matches the
+        b00/b0/b1 DNS naming introduced with the dual-region bases, where
+        positional numbering can no longer express the alias set).
+        '=' is the separator on purpose: aliases like b0/b00/b1 are valid
+        IPv6 hextets, so "b0:2a01:..." would parse as an ADDRESS and a
+        colon separator would be ambiguous.
+      - "ipv6"       -> positional alias bN by position (legacy behavior).
+
+    Empty/missing -> {}. Keep the same entries on every BASE so the
+    aliases map to the same hosts everywhere.
     """
     raw = (os.environ.get("BASE_HOSTS") or "").strip()
     if not raw:
         return {}
     out: dict[str, str] = {}
     idx = 0
-    for ip in raw.split(","):
-        ip = ip.strip()
-        if not ip:
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
             continue
+        name = None
+        ip = entry
+        if "=" in entry:
+            name, ip = entry.split("=", 1)
+            name = name.strip()
+            ip = ip.strip()
+            if not name:
+                logger.warning("BASE_HOSTS: skip entry with empty name %r", entry)
+                continue
         try:
             normalize_ipv6(ip)
         except ValueError:
             logger.warning("BASE_HOSTS: skip invalid IPv6 %r", ip)
             continue
-        out[f"b{idx}"] = ip
-        idx += 1
+        if name:
+            out[name] = ip
+        else:
+            out[f"b{idx}"] = ip
+            idx += 1
     return out
 
 
@@ -1306,8 +1337,15 @@ def main():
         )
         return
 
-    server = firestore_server_for_vmid(vmid)
-    sync_single_vmid(vmid, server, delete_only=False, ipv6_override=False)
+    # Read Firestore INSIDE the lock (server_loader) so concurrent syncs
+    # for the same vmid each converge to the freshest doc state.
+    sync_single_vmid(
+        vmid,
+        None,
+        delete_only=False,
+        ipv6_override=False,
+        server_loader=lambda: firestore_server_for_vmid(vmid),
+    )
 
 
 if __name__ == "__main__":
