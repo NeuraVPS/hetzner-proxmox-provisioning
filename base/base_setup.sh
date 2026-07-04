@@ -193,10 +193,23 @@ rm -f /etc/nginx/sites-enabled/default
 # Wildcard TLS (DNS-01): scripts/certbot-namecheap-dns-hooks.py
 # See docs/pve-proxy-base-server-setup.md section 7.
 
-# Clone certs from an existing BASE (read-only pull; covers the compat
-# names *.pve / sqx / trading). The dual-region names (*.pve-hel, *.pve-fsn,
-# sqx-hel, sqx-fsn, trading-hel, trading-fsn) need a DNS-01 cert issued on
-# this box (Hetzner DNS API token) — see base/docs/dual-region-cutover.md.
+# TLS: issue the 12-SAN dual-region cert via DNS-01 against the Hetzner
+# Cloud API (token in /opt/letsencrypt/hetzner.env, chmod 600; hook =
+# snippets/certbot-hetzner-dns-hooks.py; renewal is automatic via
+# certbot.timer once issued — hooks are recorded in the renewal conf):
+#   certbot certonly --manual --preferred-challenges dns \
+#     --manual-auth-hook "/opt/letsencrypt/certbot-hetzner-dns-hooks.py auth" \
+#     --manual-cleanup-hook "/opt/letsencrypt/certbot-hetzner-dns-hooks.py cleanup" \
+#     --cert-name neuravps-dual \
+#     -d "*.pve.neuravps.com" -d pve.neuravps.com \
+#     -d "*.pve-hel.neuravps.com" -d pve-hel.neuravps.com \
+#     -d "*.pve-fsn.neuravps.com" -d pve-fsn.neuravps.com \
+#     -d sqx.neuravps.com -d trading.neuravps.com \
+#     -d sqx-hel.neuravps.com -d trading-hel.neuravps.com \
+#     -d sqx-fsn.neuravps.com -d trading-fsn.neuravps.com \
+#     --non-interactive --agree-tos
+# (Bootstrap alternative while the cert doesn't exist yet: clone
+# /etc/letsencrypt from an existing BASE — compat names only.)
 rsync -avz -e ssh root@b1.neuravps.com:/etc/letsencrypt/ /etc/letsencrypt/
 
 # Dual-region names: extend BOTH the map regex in pve-proxy-map.conf

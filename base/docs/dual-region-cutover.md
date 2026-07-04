@@ -60,15 +60,24 @@ secrets/certs were cloned), no config changes. All new ops run from `b1`
 
 ## Remaining phases
 
-1. **Cert for the new names on b0** — issue ONE cert via certbot DNS-01
-   covering: `*.pve`, `pve`, `*.pve-hel`, `pve-hel`, `*.pve-fsn`, `pve-fsn`,
-   `sqx`, `trading`, `sqx-hel`, `trading-hel`, `sqx-fsn`, `trading-fsn`
-   (.neuravps.com). Needs a **Hetzner DNS API token** (zone is on Hetzner
-   DNS; the old Namecheap hook in `pve-proxy-base-server-setup.md` §7 is
-   obsolete). Use `certbot-dns-hetzner` (pip) or acme.sh hooks; wire
-   auto-renew (this also fixes the wildcard's manual-renewal situation
-   inherited from b1, whose renewal config is `authenticator = manual`
-   with no hooks).
+1. **[DONE 2026-07-04] Cert for the new names on b0** — issued as cert-name
+   `neuravps-dual` (12 SANs: `*.pve`, `pve`, `*.pve-hel/-fsn` + apexes,
+   `sqx`, `trading`, `sqx/trading-hel/-fsn`; expires rolling ~90d) via
+   certbot DNS-01 with `snippets/certbot-hetzner-dns-hooks.py` against the
+   **Hetzner Cloud API** (DNS moved into api.hetzner.cloud; the legacy
+   dns.hetzner.com 301s; the old Namecheap §7 flow is obsolete). Token at
+   `/opt/letsencrypt/hetzner.env` (600). Renewal is AUTOMATIC: the hooks
+   are recorded in `renewal/neuravps-dual.conf` and Debian's certbot.timer
+   drives it. Hook gotchas (learned): the Cloud DNS API cannot update an
+   rrset's records in place (PUT touches metadata only, no
+   actions/set-records) → the hook merges via DELETE+POST; wildcard+apex
+   pairs share one `_acme-challenge` rrset (two TXT values); wait for ALL
+   THREE authoritative NS (hydrogen/oxygen/helium) — the secondaries lag
+   under bursts and LE hits transient NXDOMAIN if you only poll one.
+   nginx on b0 points both server blocks at `live/neuravps-dual/`.
+   (Also fixed on the way: pip's newer `cryptography` in /usr/local broke
+   Debian's pyOpenSSL — `pip3 install --break-system-packages
+   --ignore-installed pyopenssl` re-aligns it; certbot works after.)
 2. **Swing the HEL failover pair to b0** (operator, Hetzner panel/API):
    both VIP pairs then route to b0, which already binds the IPs and
    accepts them in nftables. Customers notice nothing (same IPs).
