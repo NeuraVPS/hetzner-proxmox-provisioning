@@ -1,74 +1,108 @@
-# Dual-region BASE cutover (Finland + Germany)
+# Dual-region BASE cutover (Helsinki + Falkenstein)
 
-Runbook to stand up a **German BASE** and retire one of the two Finnish ones,
-so every customer reaches NeuraVPS through the BASE closest to *their* node
-(lower NAT-path latency). Prepared 2026-07-03 while the infra is being staged
-with Hetzner — **not yet executed**.
+Runbook for the move to **2 BASEs, one per region**, so every customer reaches
+NeuraVPS through the BASE closest to *their* node. Originally prepared
+2026-07-03; **updated 2026-07-04 as-built** — the new German BASE (`b0`) is
+built and verified, phases 1–2 are DONE, the failover swing and the `b1`
+refresh remain.
 
-## Target state
+## Naming (DNS applied 2026-07-04, serial 2026070400)
 
-- **2 BASEs total** (cost), one per region: keep one Finnish BASE, add a German
-  one. The German BASE **replaces `0000000-BASE`** (base-0) — chosen because it
-  is the one *without* the primary failover IP associated in the Hetzner panel.
-  ⚠️ Verify before cutover: base-0 currently *carries* `77.42.49.79` +
-  `2a01:4f9:fff1:5f::2` live on its interface, so the failover must be swung
-  off it first.
-- **German BASE hardware** = Hetzner **#2982184**, `94.130.143.26`, subnet
-  `2a01:4f8:13b:2d03::`, dc FSN1 — the former `0000148-EX44`, emptied
-  2026-07-03 (VM 1648 live-migrated to node 26) and renamed to a BASE. As of
-  2026-07-03 it is **powered off while Hetzner moves it to a 10G-Uplink rack**
-  (a BASE must have the 10G uplink like the current ones for the NAT traffic of
-  a whole region).
-- **Second failover IPv4 + IPv6** added. DNS today: `sqx.neuravps.com` +
-  `trading.neuravps.com` → the single failover. New:
-  `sqx-de.neuravps.com` + `trading-de.neuravps.com` → the new failover.
-  Normal ops: `-de` names → German failover → German BASE; current names →
-  Finnish BASE. Maintenance on one BASE: point BOTH failovers at the survivor
-  (swing is by DNS / failover-IP reassignment, never by touching customer
-  config). Keep low DNS TTLs on these records for a fast swing.
+| Name | What | A / AAAA |
+|---|---|---|
+| `b00.neuravps.com` | OLD Helsinki base-0 (hostname `0000000-BASE`) — **retiring** | 46.62.188.207 / 2a01:4f9:3090:2488::2 |
+| `b0.neuravps.com` | NEW German base (hostname `0000000-BASE`, FSN, 10G uplink) | 188.40.153.120 / 2a01:4f8:2b03:18a9::2 |
+| `b1.neuravps.com` | Helsinki base-1 (hostname `0000001-BASE`) | 37.27.135.250 / 2a01:4f9:3070:3984::2 |
+| `sqx-hel` / `trading-hel` | Helsinki failover VIP pair (customers) | 77.42.49.79 / 2a01:4f9:fff1:5f::2 |
+| `sqx-fsn` / `trading-fsn` | Falkenstein failover VIP pair (customers) | 94.130.3.118 / 2a01:4f8:fff2:95::2 |
+| `sqx` / `trading` / `*.pve` | compat CNAMEs → `sqx-hel` (unchanged resolution for every existing customer) | — |
+| `*.pve-hel` / `*.pve-fsn` | region-pinned PVE console hosts | CNAME → sqx-hel / sqx-fsn |
 
-## What makes a BASE (rebuild the German one from these)
+The German box was re-IP'd by the 10G-rack move (old note said 94.130.143.26 —
+obsolete; 188.40.153.120 is final). Failover routing today: HEL pair → `b1`,
+FSN pair → `b0`.
 
-Everything a BASE needs is in this `base/` folder — build the German box with
-the same steps, then apply the cutover-specific items below.
+## State as of 2026-07-04
 
-| Piece | Source |
-|---|---|
-| Bootstrap runbook (executable) | `base/base_setup.sh` |
-| NAT46/NAT66 (netns + Jool) | `base/docs/netns-jool-nat46-nat66-guide.md` + `snippets/nftables-base-nat.conf`, `base-nat-boot.*` |
-| nginx `*.pve.neuravps.com` proxy + SSO set-ticket + wildcard TLS | `base/docs/pve-proxy-base-server-setup.md` + `snippets/neuravps-redirects.conf`, `pve-set-ticket.*`, `pve-proxy-*` |
-| Dynamic NAT sync from Firestore | `snippets/sync-base-nat.py` (→ `/usr/local/sbin/`), `base-nat-boot.service` |
-| noVNC send-string inject | `snippets/novnc-send-string-inject.js` |
-| sshd burst limits for fleet sweeps | `snippets/50-neuravps-maxstartups.conf` |
+**DONE — `b0` is a fully functional BASE** (built per `base_setup.sh` +
+`netns-jool-nat46-nat66-guide.md`, Debian 13):
 
-Live-vs-repo audited 2026-07-03: **zero drift** — the snippets match the
-running BASE byte-for-byte, so a fresh build from this folder is faithful.
+- Network: all four failover IPs bound with `preferred_lft 0` (FSN pair
+  routed here today; HEL pair pre-bound so the future swing is purely a
+  Hetzner-side switch). Router sysctls (forwarding, conntrack, BBR).
+- NAT stack: `veth-host.service` → nftables (maps + flowtable; ip nat
+  accepts main + BOTH failover v4s) → `jool-nat46.service`
+  (EAMT `2a01:4f8:2b03:18a9::2/128 ↔ 10.0.0.3`) → `base-nat-boot.service`.
+- `sync-base-nat.py` (with the state-lock Firestore read + **named
+  `BASE_HOSTS`**: `b0=…,b00=…,b1=…`) synced 1679 VMs into the maps;
+  `sync nodes` wrote 210 nginx backends + `/etc/hosts` (`pN` + `b0/b00/b1`).
+- nginx PVE proxy with the **extended names** (`*.pve`, `*.pve-hel`,
+  `*.pve-fsn` in the map regex + server_name; `sqx/trading` + `-hel/-fsn`
+  redirect blocks), noVNC inject served, `pve-set-ticket.service` on :5000
+  (env copied from b1).
+- TLS: `/etc/letsencrypt` cloned from b1 → valid for the compat names
+  (`*.pve`, `sqx`, `trading`). **Pending: DNS-01 cert covering the new
+  `-hel`/`-fsn` names** (needs a Hetzner DNS API token; see remaining steps).
+- Fleet firewall: `[IPSET base]` in `cluster.fw` (Storage Box) now includes
+  `2a01:4f8:2b03:18a9::/64 # BASE 0 GERMANY (b0) IPv6`, pushed to all
+  reachable nodes via `sync nodes sync-firewall`.
+- `/root/migrate_vm.sh` + `migrate_vms_batch.sh` installed (md5 = repo =
+  b1). The `PEER_BASES` case maps hostname `0000000-BASE` → b1 — correct
+  for b0 as-is.
+- E2E verified: IPv4 NAT46 + IPv6 NAT66 customer path through the FSN VIP
+  reaches VMs on Helsinki nodes; PVE console via `{node}.pve-fsn` serves
+  from the internet (HTTP 200 ~130 ms).
 
-## Cutover-specific steps (NOT covered by base_setup.sh)
+**Operating rule during the transition (operator):** `b00` and `b1` are
+FROZEN — they serve production; read-only access allowed (that is how
+secrets/certs were cloned), no config changes. All new ops run from `b1`
+(or `b0` for its own build) — `ssh b0|b00|b1` by name.
 
-1. **`/root/migrate_vm.sh` is copied by hand, NOT auto-deployed** (canonical:
-   repo `scripts/migrate_vm.sh`). Copy it to the German BASE, and **update the
-   `PEER_BASES` hostname `case`** (near the top of the script) — it maps each
-   BASE hostname → the *other* BASE's IPv6 so rollback/success NAT reconcile
-   reaches the peer. With base-0 retired the two entries become
-   `<Finnish-BASE-hostname>` ↔ German IPv6 and `<German-hostname>` ↔ Finnish
-   IPv6. `migrate_vms_batch.sh` inherits it (shells out per-VM).
-2. **`/etc/hosts` `sync-base-nat` block** (managed; `# BEGIN/END sync-base-nat`)
-   + the per-BASE static lines — `sync-base-nat.py sync nodes` regenerates the
-   node lines; the BASE self-lines are static. Ensure the German BASE resolves
-   itself and the peer.
-3. **NAT state**: run `sync-base-nat.py sync` on the German BASE after DNS/
-   failover are live (rebuilds `/var/lib/base-nat/state.json` + nft maps from
-   Firestore). Both BASEs hold the *same* NAT state — the VIP is what moves.
-4. **SSH access / ops hop**: base-0 (`2a01:4f9:3090:2488::2`) is the default
-   jump host for Cloud Functions and all ops tooling (fleet sweeps, migrate
-   orchestrators, monitors, `/root/*.sh`). If base-0 is the one retired,
-   **repoint the ops entry point to the survivor** and re-home any orchestrator
-   scripts / logs living under base-0 `/root` first. Cloud Functions read the
-   jump host from `secrets_config.BASE_SSH_HOST_IPS` — update that list.
-5. **connectionUrl by node location** (NeuraVPS app, separate repo): today the
-   customer URL is a fixed `sqx.neuravps.com:2<vmid>`; it must choose `-de` vs
-   current by the node's `location` field (Helsinki/Falkenstein, already
-   backfilled on `proxmox_nodes`). `trading.*` is the MetaTrader equivalent.
-6. **Retire base-0** in Hetzner only after 1–5 verified and the failover is off
-   it.
+## Remaining phases
+
+1. **Cert for the new names on b0** — issue ONE cert via certbot DNS-01
+   covering: `*.pve`, `pve`, `*.pve-hel`, `pve-hel`, `*.pve-fsn`, `pve-fsn`,
+   `sqx`, `trading`, `sqx-hel`, `trading-hel`, `sqx-fsn`, `trading-fsn`
+   (.neuravps.com). Needs a **Hetzner DNS API token** (zone is on Hetzner
+   DNS; the old Namecheap hook in `pve-proxy-base-server-setup.md` §7 is
+   obsolete). Use `certbot-dns-hetzner` (pip) or acme.sh hooks; wire
+   auto-renew (this also fixes the wildcard's manual-renewal situation
+   inherited from b1, whose renewal config is `authenticator = manual`
+   with no hooks).
+2. **Swing the HEL failover pair to b0** (operator, Hetzner panel/API):
+   both VIP pairs then route to b0, which already binds the IPs and
+   accepts them in nftables. Customers notice nothing (same IPs).
+   Immediately verify: fleet sweep of rdp/smb ports against BOTH VIPs
+   from outside + a PVE console open via `*.pve`.
+3. **Refresh b1** (its own phase, operator will schedule): update
+   `sync-base-nat.py` (state-lock read + named BASE_HOSTS →
+   `/etc/default/base-nat`), extend nginx names + map regex like b0,
+   install the new-names cert, and **update `PEER_BASES` for hostname
+   `0000001-BASE` → b0's IPv6** (`2a01:4f8:2b03:18a9::2`) in
+   `/root/migrate_vm.sh` (repo case still points at b00 — change repo +
+   b1 together in this phase). Then swing the HEL pair back to b1.
+4. **Repoint ops + retire b00**: move any orchestrators/logs still under
+   b00 `/root`, update `secrets_config.BASE_SSH_HOST_IPS` (Cloud Functions
+   currently SSH b00+b1 for NAT sync — must become b0+b1), remove b00 from
+   `BASE_HOSTS` on both survivors, drop its line from `[IPSET base]` in
+   cluster.fw, then cancel the server in Hetzner.
+5. **connectionUrl by node location** (NeuraVPS repo): panel/provisioning
+   pick `sqx-hel`/`sqx-fsn` (`trading-*` for MT) from the node's
+   `location` field. Compat names keep working for existing customers.
+
+## Gotchas learned during the b0 build (2026-07-04)
+
+- `pip3 install firebase-admin` on Debian 13 fails against the dpkg-owned
+  `requests` — use `--break-system-packages --ignore-installed`.
+- The nftables drop-in has `ReadWritePaths=/var/lib/base-nat` — create the
+  directory BEFORE the first `systemctl restart nftables` or the unit dies
+  with `status=226/NAMESPACE`.
+- Install `pve-proxy-map.conf` before the first `sync nodes`, or its
+  `nginx -t` validation fails on the unknown `$pve_node_from_host`
+  variable (harmless but noisy).
+- `BASE_HOSTS` named entries use `=` (`b0=2a01:…`) because `b0`/`b00`/`b1`
+  are valid IPv6 hextets — a colon separator would parse as an address.
+- Node PVE firewalls drop traffic from a base whose /64 is not yet in
+  `[IPSET base]` — a brand-new base cannot reach nodes (nor push
+  cluster.fw itself) until a peer base pushes the updated ipset:
+  bootstrap order matters.

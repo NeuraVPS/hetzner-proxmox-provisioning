@@ -8,7 +8,10 @@
 #   - reconcile dynamic VM forwardings in `ip6 nat prerouting` from Firestore
 #   - keep nginx proxmox_nodes map + firewall sync commands
 
-# 0) Interfaces example
+# 0) Interfaces example — as built on the German b0 (2026-07-04).
+# Per-base values: main IPs change; bind ALL failover VIPs with
+# preferred_lft 0 (deprecated => never chosen as source) so a failover
+# swing needs no config change on the base.
 
 ### Hetzner Online GmbH installimage
 
@@ -20,33 +23,35 @@
 
 # auto enp6s0
 # iface enp6s0 inet static
-#   address 37.27.135.250
+#   address 188.40.153.120
 #   netmask 255.255.255.128
-#   gateway 37.27.135.129
-#   # route 37.27.135.128/25 via 37.27.135.129
-#   up route add -net 37.27.135.128 netmask 255.255.255.128 gw 37.27.135.129 dev enp6s0
-#   # failover 0
+#   gateway 188.40.153.1
+#   up route add -net 188.40.153.0 netmask 255.255.255.128 gw 188.40.153.1 dev enp6s0
+#   # failover FSN (sqx-fsn)
 #   up ip addr add 94.130.3.118/32 dev enp6s0 preferred_lft 0
 #   down ip addr del 94.130.3.118/32 dev enp6s0
-#   # failover 1
+#   # failover HEL (sqx-hel)
 #   up ip addr add 77.42.49.79/32 dev enp6s0 preferred_lft 0
 #   down ip addr del 77.42.49.79/32 dev enp6s0
 
 # iface enp6s0 inet6 static
-#   address 2a01:4f9:3070:3984::2
+#   address 2a01:4f8:2b03:18a9::2
 #   netmask 64
 #   gateway fe80::1
-#   # failover 0
+#   # failover FSN v6
 #   up ip addr add 2a01:4f8:fff2:95::2/64 dev enp6s0 preferred_lft 0
-#   down ip addr del 2a01:4f8:fff2:95::5f::2/64 dev enp6s0
-#   # failover 1
+#   down ip addr del 2a01:4f8:fff2:95::2/64 dev enp6s0
+#   # failover HEL v6
 #   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp6s0 preferred_lft 0
 #   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp6s0
 
 # 1) Install runtime dependencies.
 apt update && apt upgrade -y
 apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool sshpass smbclient netcat-openbsd freerdp3-x11 xvfb imagemagick
-pip3 install --break-system-packages firebase-admin
+# Debian 13: the dpkg-owned `requests` blocks the dependency upgrade
+# (uninstall-no-record-file) — --ignore-installed installs the tree into
+# /usr/local without touching dpkg files.
+pip3 install --break-system-packages --ignore-installed firebase-admin
 
 # 1b) sshd rate limits for fleet sweeps. node_health_check and run_remotes/*
 # hop through this BASE with bursts of short SSH connections; the default
@@ -58,10 +63,11 @@ sshd -t && systemctl reload ssh
 # 2) Runtime configuration for sync-base-nat.py.
 cat >/etc/default/base-nat <<'EOF'
 # Host addresses (used by boot checks only).
-MAIN_IPV4=37.27.135.250
-MAIN_IPV6=2a01:4f9:3070:3984::2
-FAILOVER_IPV4=77.42.49.79
-FAILOVER_IPV6=2a01:4f9:fff1:5f::2
+# Per-base values — this example is the German b0 (2026-07-04).
+MAIN_IPV4=188.40.153.120
+MAIN_IPV6=2a01:4f8:2b03:18a9::2
+FAILOVER_IPV4=94.130.3.118
+FAILOVER_IPV6=2a01:4f8:fff2:95::2
 
 # Port contract:
 # SMB external port = SAMBA_PORT_BASE + proxmoxId -> VM 445 (TCP)
@@ -93,11 +99,10 @@ FIREWALL_STORAGE_HOST=u560363.your-storagebox.de
 FIREWALL_REMOTE_PATH=/home/firewall/cluster.fw
 FIREWALL_SCP_PORT=23
 
-# Comma-separated main IPv6 of every BASE in stable order.
-# sync-base-nat.py rewrites /etc/hosts on every node sync, giving each
-# entry a positional alias (b0, b1, ...) so `ssh b1` works from any BASE.
-# Keep the order identical on every BASE.
-BASE_HOSTS=2a01:4f9:3090:2488::2,2a01:4f9:3070:3984::2
+# Named base aliases (name=ipv6; '=' because b0/b00/b1 are valid IPv6
+# hextets, so a colon would be ambiguous). Keep identical on every BASE.
+# b00 = old Helsinki base-0 (retiring), b0 = German base, b1 = Helsinki.
+BASE_HOSTS=b0=2a01:4f8:2b03:18a9::2,b00=2a01:4f9:3090:2488::2,b1=2a01:4f9:3070:3984::2
 EOF
 
 # 3) Install Firebase credentials before starting service.
@@ -140,6 +145,9 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
   -o /etc/systemd/system/nftables.service.d/10-base-nat.conf
 
 # 5) Enable boot-time dynamic sync.
+# NOTE: /var/lib/base-nat MUST exist before (re)starting nftables — the
+# drop-in's ReadWritePaths references it and the unit dies with
+# status=226/NAMESPACE otherwise.
 mkdir -p /var/lib/base-nat
 systemctl daemon-reload
 systemctl enable --now veth-host.service
@@ -185,7 +193,18 @@ rm -f /etc/nginx/sites-enabled/default
 # Wildcard TLS (DNS-01): scripts/certbot-namecheap-dns-hooks.py
 # See docs/pve-proxy-base-server-setup.md section 7.
 
-rsync -avz -e ssh root@[2a01:4f9:3070:3984::2]:/etc/letsencrypt/ /etc/letsencrypt/
+# Clone certs from an existing BASE (read-only pull; covers the compat
+# names *.pve / sqx / trading). The dual-region names (*.pve-hel, *.pve-fsn,
+# sqx-hel, sqx-fsn, trading-hel, trading-fsn) need a DNS-01 cert issued on
+# this box (Hetzner DNS API token) — see base/docs/dual-region-cutover.md.
+rsync -avz -e ssh root@b1.neuravps.com:/etc/letsencrypt/ /etc/letsencrypt/
+
+# Dual-region names: extend BOTH the map regex in pve-proxy-map.conf
+#   "~^([0-9]+-[^.]+)\\.pve(?:-hel|-fsn)?\\.neuravps\\.com$" $1;
+# and the server_name lines in neuravps-redirects.conf
+#   server_name *.pve.neuravps.com *.pve-hel.neuravps.com *.pve-fsn.neuravps.com;
+#   server_name trading.neuravps.com sqx.neuravps.com trading-hel.neuravps.com sqx-hel.neuravps.com trading-fsn.neuravps.com sqx-fsn.neuravps.com;
+# (as built on b0, 2026-07-04)
 
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-set-ticket.py \
   -o /opt/pve-set-ticket/pve-set-ticket.py

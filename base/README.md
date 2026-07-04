@@ -21,6 +21,25 @@ the BASE set changes (see the cutover runbook).
 
 ## Operational changes log
 
+- **2026-07-04 — German b0 built as-built + dual-region names + NAT-sync race
+  fix.** The new Falkenstein BASE (`b0.neuravps.com`, hostname `0000000-BASE`)
+  was stood up from this folder on Debian 13 and E2E-verified (NAT46/NAT66
+  customer path via the FSN VIP, PVE console via `*.pve-fsn`, fleet SSH hop);
+  see `docs/dual-region-cutover.md` for the full as-built state, remaining
+  phases (HEL failover swing, b1 refresh, b00 retirement) and the build
+  gotchas (pip `--ignore-installed` on Debian 13, `/var/lib/base-nat` before
+  the first nftables restart, `[IPSET base]` bootstrap ordering). Snippets
+  updated to the dual-region form: `pve-proxy-map.conf` +
+  `neuravps-redirects.conf` now accept/serve `*.pve-hel` / `*.pve-fsn` and
+  `sqx/trading-hel/-fsn` (b1 still runs the previous single-region copies
+  until its refresh phase — intentional divergence, tracked in the runbook).
+  `sync-base-nat.py` gained **named `BASE_HOSTS`** (`b0=…,b00=…,b1=…`) and,
+  crucially, the arg-less per-VM sync now reads Firestore **inside the state
+  lock**: paired with NeuraVPS PR #80 (cloud triggers stopped passing
+  event-derived flags), this closes the out-of-order-trigger race that kept
+  dropping VM 231's RDP forward while SMB survived (customer-visible on
+  Jul 1 + Jul 4).
+
 - **2026-07-03 — migrate_vm.sh hardening series** (canonical `scripts/migrate_vm.sh`,
   deployed to both BASEs by hand; audited zero-drift the same day). Four fixes
   from the fleet base-config conversion, all relevant to any BASE running
