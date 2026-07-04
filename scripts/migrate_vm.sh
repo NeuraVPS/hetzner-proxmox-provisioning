@@ -451,7 +451,17 @@ if not docs:
 
 patch = {}
 if args.maintenance is not None:    patch["maintenance"] = (args.maintenance == "true")
-if args.node_id is not None:        patch["nodeId"]      = args.node_id
+if args.node_id is not None:
+    patch["nodeId"] = args.node_id
+    # Denormalize the destination node's datacenter so the panel/emails show
+    # the region-aware connection URL (sqx-hel / sqx-fsn) after a migration
+    # that crosses regions.
+    try:
+        nsnap = db.collection("proxmox_nodes").document(args.node_id).get()
+        if nsnap.exists:
+            patch["location"] = (nsnap.to_dict() or {}).get("location") or ""
+    except Exception:
+        pass
 if args.ipv6 is not None:           patch["ipv6"]        = args.ipv6
 if args.connection_url is not None: patch["connectionUrl"] = args.connection_url
 if not patch:
@@ -1008,11 +1018,43 @@ fi
 # a source-side rollback.
 MIGRATION_DONE=1
 
+# ----- EFI 2023-cert enrollment (opportunistic, offline path only) -------------
+# When an OFFLINE-migrated VM is momentarily stopped on dest (before we start it
+# for the in-guest reconfig), enroll Microsoft's UEFI 2023 certificates into its
+# efidisk if missing. Rationale: the 2011 certs shipped with older VMs have
+# expired; an expired cert in `db` still BOOTS fine (UEFI ignores CA expiry at
+# verification), but a future bootloader signed only with the 2023 CA would not
+# validate. `qm enroll-efi-keys` is idempotent (skips when the ms-cert=2023k
+# marker is already present) and requires the VM stopped + no config lock — both
+# true here. Best-effort: any failure is a warning, never fatal (the VM boots
+# with the old certs regardless). SAFETY: the only hazard is BitLocker (a
+# Secure-Boot key change re-seals the TPM → recovery-key prompt), and the fleet
+# runs Windows Server WITHOUT the BitLocker feature installed (audited
+# 2026-07-04). If BitLocker is ever allowed, gate this on an in-guest check
+# performed BEFORE the source shutdown. Toggle with ENROLL_EFI_ON_MIGRATE=0.
+ENROLL_EFI_ON_MIGRATE="${ENROLL_EFI_ON_MIGRATE:-1}"
+_enroll_efi_dst() {
+  [[ "$ENROLL_EFI_ON_MIGRATE" == "1" ]] || return 0
+  local _cfg
+  _cfg=$(dst_ssh "qm config '${VMID}'" 2>/dev/null || true)
+  # Only OVMF VMs with pre-enrolled keys and WITHOUT the 2023 marker qualify.
+  grep -q "^efidisk0:.*pre-enrolled-keys=1" <<<"$_cfg" || return 0
+  if grep -q "^efidisk0:.*ms-cert=2023" <<<"$_cfg"; then
+    return 0  # already enrolled — nothing to do
+  fi
+  if dst_ssh "qm enroll-efi-keys '${VMID}'" >/dev/null 2>&1; then
+    _ok "EFI: enrolled UEFI 2023 certs on dest (was missing)."
+  else
+    _warn "EFI: enroll-efi-keys failed on dest — VM boots with existing certs; retried on a future controlled shutdown."
+  fi
+}
+
 # ----- Post-migration sync (always idempotent) ---------------------------------
 
 # If we migrated a stopped VM (offline), start it on dest so the guest agent
 # is reachable for the in-guest IPv6 reconfig. We restore "stopped" at the end.
 if (( WAS_STOPPED == 1 )); then
+  _enroll_efi_dst
   _info "Starting VM ${VMID} on dest to apply in-guest reconfig (was stopped pre-migration)…"
   if dst_ssh "qm start '${VMID}'" >/dev/null 2>&1; then
     _ok "qm start issued."
