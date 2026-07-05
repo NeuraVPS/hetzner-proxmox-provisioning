@@ -678,6 +678,27 @@ nft list set ip6 rdpguard bf
 nft delete table ip6 rdpguard
 ```
 
+Tuning notes (from the 2026-07-05 live verification):
+
+- It is a **soft rate-cap, not a hard block**: dropped SYNs get retransmitted
+  by the client's TCP stack, so a legit user who trips the limit connects
+  after a short delay instead of being locked out (verified: a 25-connection
+  burst had 35 SYNs dropped yet most connections eventually succeeded via
+  retransmit). Attackers get throttled to the limit rate, which is what
+  removes the termsrv socket-leak wedge trigger — the goal is starving the
+  flood, not banning IPs.
+- The initial threshold (12/min burst 6 per source+port) is deliberately
+  conservative: mstsc auto-reconnect peaks around 12/min, and legit clients
+  open 1–3 connections per session, so there is a lot of headroom to tighten.
+  It reliably catches a single aggressive source but may sit ABOVE a
+  distributed low-and-slow flood (observed campaigns: 5–15k failed logons /
+  48 h / VM spread across many bot IPs, each possibly under 12/min). Review
+  `bf_drops` and the `bf` set after a few days of data and tighten if floods
+  are slipping under.
+- Keyed by `(saddr . dport)` on purpose: a fleet-wide sweep (1 SYN per port)
+  or one customer reconnecting hard can never affect other ports; only a
+  source hammering ONE VM's port trips it.
+
 ### Full reconcile from Firestore
 
 ```bash
