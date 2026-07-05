@@ -4,6 +4,10 @@ set -euo pipefail
 log() { echo "[$(date +'%F %T')] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Non-fatal failures accumulate here; the script still finishes every step
+# and reboots, but exits non-zero so the unit shows failed (node_health warns).
+FIRST_BOOT_FAILED=0
+
 # Restrict SSH
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 systemctl restart sshd
@@ -631,11 +635,36 @@ NODEBOOTEOF
 systemctl daemon-reload
 systemctl enable node-boot-sync-dnat.service
 
-sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes -P 23 u560363@u560363.your-storagebox.de <<EOF
+# Pull node credentials + canonical firewall from the Storage Box.
+# Tolerant on purpose: under set -e a failure here used to abort the whole
+# script, silently skipping everything below (smartd wear filter, PXE-first
+# BootOrder, final reboot) and leaving the pending-first-boot marker armed —
+# 14 half-configured nodes on 2026-07-04 when the fleet key was never seeded
+# in rescue. Retry, then carry the failure to the exit code instead of dying.
+pull_from_storagebox() {
+  sftp -i /root/.ssh/neuravps_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes -P 23 u560363@u560363.your-storagebox.de <<EOF
 get /home/id/firebase-credentials.json /etc/firebase-credentials.json
 get /home/firewall/cluster.fw /etc/pve/firewall/cluster.fw
 bye
 EOF
+}
+if [ ! -s /root/.ssh/neuravps_id ]; then
+  log "WARNING: /root/.ssh/neuravps_id missing (install.sh copies it from rescue) — cannot pull firebase-credentials.json/cluster.fw"
+  FIRST_BOOT_FAILED=1
+else
+  STORAGEBOX_PULL_OK=0
+  for _sb_attempt in 1 2 3; do
+    if pull_from_storagebox; then STORAGEBOX_PULL_OK=1; break; fi
+    log "WARNING: storagebox pull attempt ${_sb_attempt}/3 failed; retrying in 10s"
+    sleep 10
+  done
+  if [ "$STORAGEBOX_PULL_OK" -eq 1 ] && [ -s /etc/firebase-credentials.json ]; then
+    chmod 600 /etc/firebase-credentials.json
+  else
+    log "WARNING: storagebox pull failed after 3 attempts — node is missing firebase-credentials.json (sync-dnat.py Firestore updates) and the canonical cluster.fw (BASE push also delivers it)"
+    FIRST_BOOT_FAILED=1
+  fi
+fi
 
 pve-firewall restart || true
 
@@ -712,6 +741,17 @@ if command -v efibootmgr >/dev/null 2>&1; then
   else
     log "WARNING: no PXE entries/BootOrder visible; boot order left as-is"
   fi
+fi
+
+if [ "$FIRST_BOOT_FAILED" -ne 0 ]; then
+  # Clear the marker ourselves: ExecStartPost (which normally removes it)
+  # only runs on success, and a full re-run on the next boot is worse than a
+  # visibly failed unit once VMs land on the node (it would replay the whole
+  # setup and schedule a surprise reboot). Failed unit -> node_health warns.
+  rm -f /var/lib/proxmox-first-boot/pending-first-boot-setup
+  log "first_boot.sh finished WITH ERRORS — marker cleared, unit left failed for node_health visibility"
+  shutdown -r +1
+  exit 1
 fi
 
 log "first_boot.sh finished"
