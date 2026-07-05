@@ -258,6 +258,33 @@ table ip6 nat {
 # first install and is rewritten atomically on every sync.
 include "/etc/nftables.d/base-nat-elements.nft"
 
+# RDP brute-force guard — per-(source,port) rate limit on NEW RDP
+# connections (TCP SYN to the 20000-29999 RDP range). Own table so its
+# lifecycle is independent from `ip6 nat` (sync-base-nat reconciles those
+# map elements) — safe to add/remove atomically without touching NAT.
+# filter prerouting at -150 runs BEFORE dstnat (-100) and, in family ip6,
+# sees each client exactly once: native v6 directly, v4 clients as their
+# jool/SIIT-translated source 64:ff9b:1::<v4> (unique per client). Keyed
+# (saddr . dport): a fleet sweep (1 SYN per port) never trips; a bot
+# hammering one VM's port does. Legit RDP clients open 1-3 connections per
+# session (mstsc auto-reconnect ≈ 12/min worst case stays at the limit);
+# excess is dropped and the source recovers as soon as its rate falls back
+# under the limit. RDP's UDP transport is untouched (starts after TCP auth).
+table ip6 rdpguard {
+    counter bf_drops {
+    }
+    set bf {
+        type ipv6_addr . inet_service
+        flags dynamic
+        timeout 10m
+        size 65536
+    }
+    chain pre {
+        type filter hook prerouting priority -150; policy accept;
+        tcp dport 20000-29999 tcp flags & (syn|ack) == syn add @bf { ip6 saddr . tcp dport limit rate over 12/minute burst 6 packets } counter name bf_drops drop comment "drop excess new RDP conns per source+port"
+    }
+}
+
 table inet filter {
     # Fast-path: kernel flowtable for offloading established flows.
     # Once a connection is added to @ft, subsequent packets bypass the full
@@ -638,6 +665,17 @@ nft delete element ip6 nat smb_tcp_map "{ 10201 }"
 nft list map ip6 nat rdp_tcp_map
 nft list map ip6 nat rdp_udp_map
 nft list map ip6 nat smb_tcp_map
+```
+
+### RDP brute-force guard: observe and roll back
+
+```bash
+# Drops so far (packets = excess SYNs dropped)
+nft list counter ip6 rdpguard bf_drops
+# Live (source, port) limiters — who is hammering which VM port
+nft list set ip6 rdpguard bf
+# Emergency rollback (then also remove the table block from /etc/nftables.conf)
+nft delete table ip6 rdpguard
 ```
 
 ### Full reconcile from Firestore
