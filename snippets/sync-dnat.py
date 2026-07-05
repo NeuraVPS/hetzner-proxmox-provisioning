@@ -25,8 +25,10 @@ Commands:
 """
 import logging
 import os
+import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Firebase Admin SDK imports (optional - will be initialized if credentials available)
@@ -196,22 +198,36 @@ def set_server_ipv6(vmid, ipv6):
 def update_status_in_firestore(vmid, status):
     if not ensure_firebase_initialized():
         return
-    try:
-        db = firestore.client()
-        docs = _query_local_server_doc(db, vmid)
-        if not docs:
-            logger.debug(f"No Firestore document found for VM {vmid} (nodeId={NODE_NAME}) to update status")
+    # Bounded retry with backoff + jitter. The write is idempotent (setting
+    # status=X repeatedly is safe), and a single attempt drops the update on any
+    # transient failure — which shows up under load: many post-stop hooks firing
+    # at once (e.g. a mass `qm shutdown` before draining a node) contend on
+    # Firestore and some writes fail, leaving docs stuck at a stale "running"
+    # while the VM is stopped. Retrying absorbs those blips at the source.
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            db = firestore.client()
+            docs = _query_local_server_doc(db, vmid)
+            if not docs:
+                logger.debug(f"No Firestore document found for VM {vmid} (nodeId={NODE_NAME}) to update status")
+                return
+            if len(docs) > 1:
+                logger.warning(f"Multiple Firestore documents for VM {vmid}; updating all")
+            for doc_snapshot in docs:
+                db.collection('servers').document(doc_snapshot.id).update({
+                    'status': status,
+                    'lastStatusUpdate': firestore.SERVER_TIMESTAMP,
+                })
+                logger.info(f"Updated Firestore server {doc_snapshot.id} (VM {vmid}): status={status}")
             return
-        if len(docs) > 1:
-            logger.warning(f"Multiple Firestore documents for VM {vmid}; updating all")
-        for doc_snapshot in docs:
-            db.collection('servers').document(doc_snapshot.id).update({
-                'status': status,
-                'lastStatusUpdate': firestore.SERVER_TIMESTAMP,
-            })
-            logger.info(f"Updated Firestore server {doc_snapshot.id} (VM {vmid}): status={status}")
-    except Exception as e:
-        logger.warning(f"Failed to update status for VM {vmid} in Firestore: {e}")
+        except Exception as e:
+            if attempt == attempts:
+                logger.warning(f"Failed to update status for VM {vmid} in Firestore after {attempts} attempts: {e}")
+                return
+            backoff = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            logger.info(f"update_status VM {vmid} attempt {attempt}/{attempts} failed ({e}); retrying in {backoff:.1f}s")
+            time.sleep(backoff)
 
 def update_proxmox_node_last_boot_at():
     if not ensure_firebase_initialized():
