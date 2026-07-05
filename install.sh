@@ -181,6 +181,21 @@ if [ "$FIRMWARE" != "UEFI" ]; then
   exit 1
 fi
 
+# --- Require the fleet SSH key in rescue ---------------------------
+# install.sh copies /root/.ssh/neuravps_id into the new system and
+# first_boot.sh needs it to pull firebase-credentials.json + cluster.fw
+# from the Storage Box. Without it the node comes up half-configured (no
+# Firestore creds for sync-dnat.py, no smartd wear filter, ESP-first
+# BootOrder) — root cause of the 14 half-configured nodes on 2026-07-04.
+# The admin "Instalar Proxmox" flow seeds it automatically; manual rescue
+# runs must scp it in first. die() does not exit here, so we exit
+# explicitly.
+if [ ! -s /root/.ssh/neuravps_id ]; then
+  die "Missing /root/.ssh/neuravps_id in rescue — the installed node could not pull its credentials/firewall from the Storage Box."
+  log "FIX: seed it from a BASE first: scp /root/.ssh/neuravps_id root@<rescue-ip>:/root/.ssh/ — then retry."
+  exit 1
+fi
+
 log "Installing qemu, OVMF, and proxmox-auto-install-assistant (this may take a bit)..."
 
 # Add Proxmox repositories and keys
