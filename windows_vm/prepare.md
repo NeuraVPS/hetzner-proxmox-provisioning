@@ -299,10 +299,13 @@ Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' |
 # Free space sanity check
 Get-Volume -DriveLetter C | Select-Object DriveLetter, FileSystemLabel, SizeRemaining, Size
 
-# No appx packages installed-for-a-user-but-not-provisioned (classic sysprep blocker;
-# winget/DesktopAppInstaller is the usual suspect — remove it per README)
+# No appx packages installed-for-a-user-but-not-provisioned (classic sysprep blocker).
+# EXEMPT Microsoft.DesktopAppInstaller: after the operator's user-level winget uninstall
+# the OS-serviced stub stays registered (NonRemovable) — that state syspreps fine and
+# must be left alone (see README, 2026-07-06 note).
 Get-AppxPackage -AllUsers |
-    Where-Object { $_.PackageUserInformation.InstallState -contains 'Installed' -and -not $_.IsFramework } |
+    Where-Object { $_.PackageUserInformation.InstallState -contains 'Installed' -and -not $_.IsFramework -and
+                   $_.Name -ne 'Microsoft.DesktopAppInstaller' } |
     Select-Object Name, PackageFullName
 ```
 

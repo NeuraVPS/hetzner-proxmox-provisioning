@@ -11,27 +11,15 @@ Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "Microsoft.W
 ```
 
 - Install .NET framework legacy for myfxbook installed to work
-- Remove winget for sysprep to work
+- Remove winget for sysprep to work — **user-level uninstall, done interactively by the operator**:
 
 ```powershell
 Get-AppxPackage *winget* | Remove-AppxPackage
 ```
 
-  > **Server 2025 (since the 1.29 OS-serviced winget, seen 2026-07):** the plain removal above now fails with `0x80073CFA` / DeStage `0x80070032` — the package is hard-marked `NonRemovable=True` and neither `Dism /Set-NonRemovableAppPolicy` nor `Set-NonRemovableAppsPolicy` clears it (not even after a reboot). Leaving it is NOT an option: the template's state is *deprovisioned + installed-for-user*, the classic sysprep appx failure. What works is marking the package **EndOfLife** for the owning SID, which makes the deployment engine accept a real (StateRepository-consistent) removal:
+  > **Server 2025 (OS-serviced winget, clarified 2026-07-06):** the command above (run interactively as the admin user) removes the *full* app but Windows keeps the **stub** (`…_neutral_~_…` bundle, `NonRemovable=True`) registered for the user. That stub state is the **desired final state**: it syspreps fine (stubs are exempt from the appx installed-but-not-provisioned validation) and it keeps the on-demand mechanism — on a clone, just typing `winget` in PowerShell re-downloads the full app.
   >
-  > ```powershell
-  > $p   = Get-AppxPackage -AllUsers *DesktopAppInstaller*
-  > $sid = $p.PackageUserInformation[0].UserSecurityId.Sid
-  > # both fullnames: the installed x64 package AND the user-registered bundle (…_neutral_~_…)
-  > $fulls = @($p.PackageFullName) + (Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\$sid" |
-  >           Where-Object PSChildName -like '*DesktopAppInstaller*').PSChildName | Select-Object -Unique
-  > foreach ($f in $fulls) { New-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife\$sid\$f" -Force | Out-Null }
-  > Remove-AppxPackage -Package $p.PackageFullName -AllUsers
-  > foreach ($f in $fulls) { Remove-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife\$sid\$f" -Force }
-  > Get-AppxPackage -AllUsers *DesktopAppInstaller*   # must return nothing
-  > ```
-  >
-  > If winget is needed again for a later app-update round: reinstall from `https://aka.ms/getwinget` (`Add-AppxPackage`) and re-remove with the block above before sysprep.
+  > **Do NOT try to remove the stub itself.** `Remove-AppxPackage` on it (any variant: `-AllUsers`, `-User <sid>`, from SYSTEM/QGA) fails `0x80073CFA` / DeStage `0x80070032`, and neither `Dism /Set-NonRemovableAppPolicy` nor `Set-NonRemovableAppsPolicy` nor a reboot changes that — it is not policy, it is the stub design. Forcing it (e.g. `EndOfLife` registry keys per SID make the engine accept the removal) *works* but destroys the winget-on-demand UX for every clone and the only clean way back is a snapshot restore — this was done by mistake on 2026-07-06 and both templates had to be rolled back to their `@precleanup` ZFS snapshots. Also note: a false positive in a naive appx sysprep-blocker check (installed-for-user + not-provisioned) — whitelist `Microsoft.DesktopAppInstaller` when the only registration left is the stub.
 
 - Disable Password lock Policy
 
