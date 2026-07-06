@@ -203,7 +203,10 @@ echo "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm pve-no-su
 wget https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg 
 
 apt-get update -y
-apt-get install -y qemu-system-x86 ovmf proxmox-auto-install-assistant
+# mdadm: to tear down Hetzner's default MD RAID before wiping (see STEP 2).
+# gdisk: sgdisk --zap-all to clear residual GPT. Both are usually present in
+# the Hetzner rescue, but install explicitly so the disk-prep never no-ops.
+apt-get install -y qemu-system-x86 ovmf proxmox-auto-install-assistant mdadm gdisk
 
 [ -f "$NETWORK_FUNCS" ] || die "network_config.functions.sh not found at $NETWORK_FUNCS"
 
@@ -215,10 +218,34 @@ mapfile -t DISKS < <(detect_disks)
 
 log "Using disks: ${DISKS[*]}"
 
+# Tear down any pre-existing Linux MD RAID before wiping. Hetzner's default
+# installimage ships mdadm RAID1 across the disks (md0=ESP, md1=swap,
+# md2=/boot, md3=root). Those arrays auto-assemble in the rescue and HOLD the
+# member disks, so wipefs/sgdisk and the Proxmox auto-installer cannot
+# repartition them — the ZFS rpool is never created and the install fails
+# later with "no pools available to import" / empty root dataset (root cause of
+# the 0000148-EX44 reinstall failure, 2026-07-05). Stop every array and zero
+# the member superblocks so they cannot re-assemble mid-install.
+if command -v mdadm >/dev/null 2>&1; then
+  for md in /dev/md?*; do
+    [ -b "$md" ] || continue
+    log "  mdadm --stop $md"
+    mdadm --stop "$md" 2>/dev/null || true
+  done
+  for d in "${DISKS[@]}"; do
+    for part in "$d"p[0-9]* "$d"[0-9]*; do
+      [ -b "$part" ] || continue
+      mdadm --zero-superblock "$part" 2>/dev/null || true
+    done
+  done
+fi
+
 log "Wiping old partition signatures to avoid confusion"
 for d in "${DISKS[@]}"; do
   log "  wipefs -a $d"
-  wipefs -a "$d"
+  wipefs -a "$d" || true
+  # Clear residual GPT/MBR so the auto-installer starts from a clean table.
+  if command -v sgdisk >/dev/null 2>&1; then sgdisk --zap-all "$d" 2>/dev/null || true; fi
 done
 
 [ "${#DISKS[@]}" -ge 2 ] || die "At least 2 disks required for ZFS mirror"
