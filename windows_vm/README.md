@@ -17,6 +17,22 @@ Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "Microsoft.W
 Get-AppxPackage *winget* | Remove-AppxPackage
 ```
 
+  > **Server 2025 (since the 1.29 OS-serviced winget, seen 2026-07):** the plain removal above now fails with `0x80073CFA` / DeStage `0x80070032` — the package is hard-marked `NonRemovable=True` and neither `Dism /Set-NonRemovableAppPolicy` nor `Set-NonRemovableAppsPolicy` clears it (not even after a reboot). Leaving it is NOT an option: the template's state is *deprovisioned + installed-for-user*, the classic sysprep appx failure. What works is marking the package **EndOfLife** for the owning SID, which makes the deployment engine accept a real (StateRepository-consistent) removal:
+  >
+  > ```powershell
+  > $p   = Get-AppxPackage -AllUsers *DesktopAppInstaller*
+  > $sid = $p.PackageUserInformation[0].UserSecurityId.Sid
+  > # both fullnames: the installed x64 package AND the user-registered bundle (…_neutral_~_…)
+  > $fulls = @($p.PackageFullName) + (Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\$sid" |
+  >           Where-Object PSChildName -like '*DesktopAppInstaller*').PSChildName | Select-Object -Unique
+  > foreach ($f in $fulls) { New-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife\$sid\$f" -Force | Out-Null }
+  > Remove-AppxPackage -Package $p.PackageFullName -AllUsers
+  > foreach ($f in $fulls) { Remove-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife\$sid\$f" -Force }
+  > Get-AppxPackage -AllUsers *DesktopAppInstaller*   # must return nothing
+  > ```
+  >
+  > If winget is needed again for a later app-update round: reinstall from `https://aka.ms/getwinget` (`Add-AppxPackage`) and re-remove with the block above before sysprep.
+
 - Disable Password lock Policy
 
 ```powershell
@@ -83,7 +99,7 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 #Set-ItemProperty -Path $RegPath -Name "DefaultPassword" -Value "<new password>" -Type String
 ```
 
-- Disk cleanup — see [prepare.md](prepare.md) for the full pre-sysprep cleanup checklist (DISM `/ResetBase`, SoftwareDistribution, Delivery Optimization, defrag/TRIM, SDelete zero-fill)
+- Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). [prepare.md](prepare.md) documents every step (DISM `/ResetBase`, NGEN, SoftwareDistribution, Delivery Optimization, winget caches, defrag/TRIM, SDelete zero-fill) and the remote-run procedure
 - From Linux, remove recovery partition
 - Sysprep with unattend_cleanup.xml
 
