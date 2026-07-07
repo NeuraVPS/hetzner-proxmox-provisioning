@@ -49,9 +49,22 @@ between the token-minting Cloud Function (phase 4, pending) and both bridges.
 - files-hel/-fsn serve the bridge with a valid cert (curl --resolve, then
   publicly after DNS) — full path DNS→nginx→bridge→Firestore→SMB.
 
-## Still pending (not on the bases)
+## Shipped after (not on the bases — NeuraVPS repo)
 
-- **Phase 4**: Cloud Function that mints the HMAC token (ownership-checked,
-  clones the VNC set-ticket flow) using FILE_BRIDGE_TOKEN_SECRET.
-- **Phase 5**: panel UI (single-pane + clipboard, Chonky) in the "Transferir
-  archivos" section, new "Navegador web" tab.
+- **Phase 4** (2026-07-07, NeuraVPS PR #103/#104): Cloud Function
+  `get_file_browser_url` mints the HMAC token (ownership-checked, linked
+  accounts expanded) using FILE_BRIDGE_TOKEN_SECRET.
+- **Phase 5** (2026-07-07, NeuraVPS PR #103): panel UI — "Navegador web" tab
+  in "Transferir archivos"; the bridge serves its own single-pane UI at `/`
+  (`static/index.html` here).
+
+## Update 2026-07-08 — UI i18n + dark/light theme
+
+- `static/index.html` v2: es/en translation + dark/light theme. Reads
+  `?lang=es|en` and `?theme=dark|light` (appended by the panel, which knows
+  the user's locale + next-themes theme — the bridge is cross-origin so it
+  can't read the panel's localStorage); falls back to `navigator.language`
+  (es→es, else en) and `prefers-color-scheme`. Copied to
+  `b0:/opt/file-bridge/static/index.html` + b1 same (no service restart —
+  FileResponse reads per request); md5-verified repo↔b0↔b1 through the
+  public path.

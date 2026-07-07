@@ -4,21 +4,38 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Navegador de archivos · NeuraVPS</title>
+<script>
+// Theme before first paint (no flash): ?theme=dark|light from the panel wins,
+// else the OS preference. The main script reads dataset.theme back.
+(function(){var q=new URLSearchParams(location.search),t=(q.get("theme")||"").toLowerCase();
+if(t!=="dark"&&t!=="light")t=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";
+document.documentElement.dataset.theme=t;})();
+</script>
 <style>
-  :root { --bg:#f3f4f6; --panel:#fff; --line:#e5e7eb; --ink:#1f2937; --muted:#6b7280;
-          --accent:#2563eb; --accent-bg:#eff6ff; --danger:#dc2626; }
+  :root { color-scheme:light;
+          --bg:#f3f4f6; --panel:#fff; --line:#e5e7eb; --ink:#1f2937; --muted:#6b7280;
+          --accent:#2563eb; --accent-bg:#eff6ff; --danger:#dc2626; --danger-bg:#fef2f2;
+          --th-bg:#fafafa; --row-hover:#f9fafb; --card:#fff; --input-bg:#fff;
+          --toast-bg:#111827; --toast-ink:#fff; --overlay:rgba(0,0,0,.35);
+          --shadow:0 10px 40px rgba(0,0,0,.2); }
+  :root[data-theme="dark"] { color-scheme:dark;
+          --bg:#0b0b0e; --panel:#18181b; --line:#27272a; --ink:#ececee; --muted:#a1a1aa;
+          --accent:#60a5fa; --accent-bg:rgba(59,130,246,.16); --danger:#f87171; --danger-bg:rgba(248,113,113,.14);
+          --th-bg:#1c1c20; --row-hover:#212127; --card:#1f1f24; --input-bg:#101013;
+          --toast-bg:#f4f4f5; --toast-ink:#111827; --overlay:rgba(0,0,0,.6);
+          --shadow:0 10px 40px rgba(0,0,0,.6); }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif; color:var(--ink); background:var(--bg); }
   #app { display:flex; flex-direction:column; height:100%; }
   header { background:var(--panel); border-bottom:1px solid var(--line); padding:10px 14px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
   header .brand { font-weight:700; color:var(--accent); }
   select, button, input[type=text] { font:inherit; }
-  select { padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  select { padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:var(--input-bg); color:var(--ink); }
   .toolbar { background:var(--panel); border-bottom:1px solid var(--line); padding:8px 14px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
-  .btn { border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 12px; cursor:pointer; display:inline-flex; gap:6px; align-items:center; }
+  .btn { border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:8px; padding:6px 12px; cursor:pointer; display:inline-flex; gap:6px; align-items:center; }
   .btn:hover:not(:disabled) { background:var(--accent-bg); border-color:var(--accent); }
   .btn:disabled { opacity:.45; cursor:default; }
-  .btn.danger:hover:not(:disabled) { background:#fef2f2; border-color:var(--danger); color:var(--danger); }
+  .btn.danger:hover:not(:disabled) { background:var(--danger-bg); border-color:var(--danger); color:var(--danger); }
   .sep { width:1px; height:22px; background:var(--line); margin:0 4px; }
   .crumbs { padding:8px 14px; color:var(--muted); display:flex; gap:4px; align-items:center; flex-wrap:wrap; }
   .crumbs a { color:var(--accent); cursor:pointer; text-decoration:none; }
@@ -26,9 +43,9 @@
   main { flex:1; overflow:auto; padding:0 8px 8px; }
   table { width:100%; border-collapse:collapse; background:var(--panel); }
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
-  th { position:sticky; top:0; background:#fafafa; color:var(--muted); font-weight:600; z-index:1; }
+  th { position:sticky; top:0; background:var(--th-bg); color:var(--muted); font-weight:600; z-index:1; }
   tr.row { cursor:default; user-select:none; }
-  tr.row:hover { background:#f9fafb; }
+  tr.row:hover { background:var(--row-hover); }
   tr.row.sel { background:var(--accent-bg); }
   td.name { width:100%; white-space:normal; }
   td.name .ic { margin-right:8px; }
@@ -36,13 +53,13 @@
   .cut { opacity:.5; }
   footer { background:var(--panel); border-top:1px solid var(--line); padding:6px 14px; color:var(--muted); font-size:12.5px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; }
   #clip { color:var(--accent); }
-  #toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#111827; color:#fff; padding:10px 16px; border-radius:10px; opacity:0; transition:opacity .2s; pointer-events:none; max-width:90%; }
+  #toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:var(--toast-bg); color:var(--toast-ink); padding:10px 16px; border-radius:10px; opacity:0; transition:opacity .2s; pointer-events:none; max-width:90%; }
   #toast.show { opacity:.95; }
-  #overlay { position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; align-items:center; justify-content:center; }
+  #overlay { position:fixed; inset:0; background:var(--overlay); display:none; align-items:center; justify-content:center; }
   #overlay.show { display:flex; }
-  .card { background:#fff; border-radius:12px; padding:18px; min-width:280px; max-width:90%; box-shadow:0 10px 40px rgba(0,0,0,.2); }
+  .card { background:var(--card); border-radius:12px; padding:18px; min-width:280px; max-width:90%; box-shadow:var(--shadow); }
   .card h3 { margin:0 0 12px; }
-  .card input { width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; }
+  .card input { width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--input-bg); color:var(--ink); }
   .card .actions { display:flex; gap:8px; justify-content:flex-end; margin-top:14px; }
   .spin { display:inline-block; width:14px; height:14px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:sp 1s linear infinite; vertical-align:-2px; }
   @keyframes sp { to { transform:rotate(360deg); } }
@@ -52,38 +69,38 @@
 <body>
 <div id="app">
   <header>
-    <span class="brand">NeuraVPS · Archivos</span>
-    <label>Servidor:
+    <span class="brand" id="brand"></span>
+    <label><span id="serverLbl"></span>
       <select id="server"></select>
     </label>
     <span id="status" style="color:var(--muted)"></span>
   </header>
   <div class="toolbar">
-    <button class="btn" id="up" title="Subir un nivel">⬆️ Arriba</button>
-    <button class="btn" id="refresh" title="Actualizar">🔄</button>
+    <button class="btn" id="up">⬆️</button>
+    <button class="btn" id="refresh">🔄</button>
     <span class="sep"></span>
-    <button class="btn" id="upload">⬆️ Subir</button>
-    <button class="btn" id="mkdir">📁 Nueva carpeta</button>
-    <button class="btn" id="download">⬇️ Descargar</button>
+    <button class="btn" id="upload">⬆️</button>
+    <button class="btn" id="mkdir">📁</button>
+    <button class="btn" id="download">⬇️</button>
     <span class="sep"></span>
-    <button class="btn" id="copy">📋 Copiar</button>
-    <button class="btn" id="cut">✂️ Cortar</button>
-    <button class="btn" id="paste">📥 Pegar</button>
+    <button class="btn" id="copy">📋</button>
+    <button class="btn" id="cut">✂️</button>
+    <button class="btn" id="paste">📥</button>
     <span class="sep"></span>
-    <button class="btn" id="rename">✏️ Renombrar</button>
-    <button class="btn danger" id="del">🗑️ Eliminar</button>
+    <button class="btn" id="rename">✏️</button>
+    <button class="btn danger" id="del">🗑️</button>
     <input type="file" id="fileinput" multiple hidden>
   </div>
   <div class="crumbs" id="crumbs"></div>
   <main>
     <table>
-      <thead><tr><th>Nombre</th><th class="size">Tamaño</th><th class="date">Modificado</th></tr></thead>
+      <thead><tr><th id="thName"></th><th class="size" id="thSize"></th><th class="date" id="thDate"></th></tr></thead>
       <tbody id="list"></tbody>
     </table>
     <div class="empty" id="empty" hidden></div>
   </main>
   <footer>
-    <span id="sel">0 seleccionados</span>
+    <span id="sel"></span>
     <span id="clip"></span>
   </footer>
 </div>
@@ -95,8 +112,78 @@ const qs = new URLSearchParams(location.search);
 const TOKEN = qs.get("t") || "";
 const H = { "Authorization": "Bearer " + TOKEN };
 const $ = s => document.querySelector(s);
+
+// ---- i18n: ?lang=es|en from the panel wins, else navigator.language
+// (es→es, anything else→en — same rule as the panel's first visit).
+const MSG = {
+  es: {
+    title:"Navegador de archivos · NeuraVPS", brand:"NeuraVPS · Archivos", server:"Servidor:",
+    up:"⬆️ Arriba", upTitle:"Subir un nivel", refreshTitle:"Actualizar", upload:"⬆️ Subir",
+    mkdir:"📁 Nueva carpeta", download:"⬇️ Descargar", copy:"📋 Copiar", cut:"✂️ Cortar",
+    paste:"📥 Pegar", rename:"✏️ Renombrar", del:"🗑️ Eliminar",
+    thName:"Nombre", thSize:"Tamaño", thDate:"Modificado",
+    loading:"Cargando…", noServers:"No hay servidores encendidos.",
+    items:n=>`${n} elemento(s)`, emptyFolder:"Carpeta vacía",
+    selected:n=>`${n} seleccionado${n===1?"":"s"}`,
+    clipBar:(n,op)=>`Portapapeles: ${n} elemento(s) para ${op==="move"?"mover":"copiar"}`,
+    clipSet:(n,op)=>`${n} elemento(s) ${op==="move"?"cortado(s)":"copiado(s)"}`,
+    moving:"Moviendo…", copying:"Copiando…",
+    pasted:(n,sz)=>`Pegado: ${n} elemento(s)`+(sz?` (${sz})`:""),
+    errList:m=>"Error al listar: "+m, errPaste:m=>"Error al pegar: "+m, errDelete:m=>"Error al eliminar: "+m,
+    zip:"Preparando ZIP…",
+    mkdirTitle:"Nueva carpeta", mkdirLabel:"Nombre:", renameTitle:"Renombrar", renameLabel:"Nuevo nombre:",
+    confirmTitle:"Confirmar", confirmDelete:n=>`¿Eliminar ${n} elemento(s)? Esta acción no se puede deshacer.`,
+    deleting:"Eliminando…", cancel:"Cancelar", ok:"Aceptar", delBtn:"Eliminar",
+    uploading:n=>`Subiendo ${n}…`, uploaded:n=>`Subido: ${n}`, errUpload:(n,m)=>`Error subiendo ${n}: ${m}`,
+    noToken:"Falta el token de acceso. Abre el navegador desde el panel.",
+    badSession:"Sesión no válida o caducada. Vuelve a abrir desde el panel.",
+    dateLocale:"es-ES",
+  },
+  en: {
+    title:"File browser · NeuraVPS", brand:"NeuraVPS · Files", server:"Server:",
+    up:"⬆️ Up", upTitle:"Up one level", refreshTitle:"Refresh", upload:"⬆️ Upload",
+    mkdir:"📁 New folder", download:"⬇️ Download", copy:"📋 Copy", cut:"✂️ Cut",
+    paste:"📥 Paste", rename:"✏️ Rename", del:"🗑️ Delete",
+    thName:"Name", thSize:"Size", thDate:"Modified",
+    loading:"Loading…", noServers:"No servers are powered on.",
+    items:n=>`${n} item(s)`, emptyFolder:"Empty folder",
+    selected:n=>`${n} selected`,
+    clipBar:(n,op)=>`Clipboard: ${n} item(s) to ${op==="move"?"move":"copy"}`,
+    clipSet:(n,op)=>`${n} item(s) ${op==="move"?"cut":"copied"}`,
+    moving:"Moving…", copying:"Copying…",
+    pasted:(n,sz)=>`Pasted: ${n} item(s)`+(sz?` (${sz})`:""),
+    errList:m=>"Couldn't list: "+m, errPaste:m=>"Couldn't paste: "+m, errDelete:m=>"Couldn't delete: "+m,
+    zip:"Preparing ZIP…",
+    mkdirTitle:"New folder", mkdirLabel:"Name:", renameTitle:"Rename", renameLabel:"New name:",
+    confirmTitle:"Confirm", confirmDelete:n=>`Delete ${n} item(s)? This action cannot be undone.`,
+    deleting:"Deleting…", cancel:"Cancel", ok:"OK", delBtn:"Delete",
+    uploading:n=>`Uploading ${n}…`, uploaded:n=>`Uploaded: ${n}`, errUpload:(n,m)=>`Error uploading ${n}: ${m}`,
+    noToken:"Missing access token. Open the file browser from the panel.",
+    badSession:"Session invalid or expired. Reopen it from the panel.",
+    dateLocale:"en-GB",
+  },
+};
+const langParam = (qs.get("lang")||"").toLowerCase();
+const LANG = (langParam==="es"||langParam==="en") ? langParam
+  : ((navigator.language||"es").toLowerCase().startsWith("es") ? "es" : "en");
+const T = MSG[LANG];
+
+function applyStatic(){
+  document.documentElement.lang = LANG;
+  document.title = T.title;
+  $("#brand").textContent = T.brand;
+  $("#serverLbl").textContent = T.server;
+  const set=(id,txt,title)=>{ const el=$(id); el.textContent=txt; if(title) el.title=title; };
+  set("#up",T.up,T.upTitle); set("#refresh","🔄",T.refreshTitle); set("#upload",T.upload);
+  set("#mkdir",T.mkdir); set("#download",T.download); set("#copy",T.copy); set("#cut",T.cut);
+  set("#paste",T.paste); set("#rename",T.rename); set("#del",T.del);
+  $("#thName").textContent=T.thName; $("#thSize").textContent=T.thSize; $("#thDate").textContent=T.thDate;
+  $("#sel").textContent=T.selected(0);
+}
+applyStatic();
+
 const fmtSize = n => { if(!n) return ""; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<4){n/=1024;i++;} return n.toFixed(i?1:0)+" "+u[i]; };
-const fmtDate = t => t? new Date(t*1000).toLocaleString("es-ES",{dateStyle:"short",timeStyle:"short"}) : "";
+const fmtDate = t => t? new Date(t*1000).toLocaleString(T.dateLocale,{dateStyle:"short",timeStyle:"short"}) : "";
 let STATE = { vmid:null, path:"", entries:[], sel:new Set(), clip:null }; // clip={op,items:[{vmid,path,name}]}
 
 function toast(msg, ms=2600){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),ms); }
@@ -114,7 +201,7 @@ async function loadServers(){
   const d = await apiJSON("servers");
   const sel = $("#server"); sel.innerHTML="";
   d.servers.forEach(s=>{ const o=document.createElement("option"); o.value=s.vmid; o.textContent=`${s.name} (VM ${s.vmid})`; sel.appendChild(o); });
-  if(!d.servers.length){ status("No hay servidores encendidos."); return; }
+  if(!d.servers.length){ status(T.noServers); return; }
   STATE.vmid = d.servers[0].vmid;
   sel.value = STATE.vmid;
 }
@@ -123,20 +210,20 @@ $("#server").onchange = e => { STATE.vmid = +e.target.value; STATE.path=""; STAT
 // ---- Listing ----
 function joinPath(p, name){ return p ? p+"\\"+name : name; }
 async function list(){
-  status('<span class="spin"></span> Cargando…');
+  status('<span class="spin"></span> '+T.loading);
   try {
     const d = await apiJSON(`list?vmid=${STATE.vmid}&path=${encodeURIComponent(STATE.path)}`);
     STATE.entries = d.entries; STATE.sel.clear();
     render();
-    status(`${d.total} elemento(s)`);
-  } catch(e){ status(""); toast("Error al listar: "+e.message); }
+    status(T.items(d.total));
+  } catch(e){ status(""); toast(T.errList(e.message)); }
 }
 function render(){
   const tb=$("#list"); tb.innerHTML="";
   const empty=$("#empty");
   // folders first, then files, both alpha
-  const es=[...STATE.entries].sort((a,b)=> (b.isDir-a.isDir) || a.name.localeCompare(b.name,"es"));
-  if(!es.length){ empty.hidden=false; empty.textContent="Carpeta vacía"; } else empty.hidden=true;
+  const es=[...STATE.entries].sort((a,b)=> (b.isDir-a.isDir) || a.name.localeCompare(b.name,LANG));
+  if(!es.length){ empty.hidden=false; empty.textContent=T.emptyFolder; } else empty.hidden=true;
   const cutSet = new Set((STATE.clip&&STATE.clip.op==="move"? STATE.clip.items:[]).filter(i=>i.vmid===STATE.vmid).map(i=>i.path));
   es.forEach(en=>{
     const tr=document.createElement("tr"); tr.className="row"+(cutSet.has(joinPath(STATE.path,en.name))?" cut":"");
@@ -166,8 +253,8 @@ function renderCrumbs(){
 }
 function updateBar(){
   const n=STATE.sel.size;
-  $("#sel").textContent = n+" seleccionado"+(n===1?"":"s");
-  $("#clip").textContent = STATE.clip ? `Portapapeles: ${STATE.clip.items.length} elemento(s) para ${STATE.clip.op==="move"?"mover":"copiar"}` : "";
+  $("#sel").textContent = T.selected(n);
+  $("#clip").textContent = STATE.clip ? T.clipBar(STATE.clip.items.length, STATE.clip.op) : "";
   const one=n===1, any=n>=1;
   $("#download").disabled=!one; $("#rename").disabled=!one;
   $("#copy").disabled=!any; $("#cut").disabled=!any; $("#del").disabled=!any;
@@ -182,44 +269,44 @@ function selEntries(){ return STATE.entries.filter(e=>STATE.sel.has(e.name)); }
 $("#copy").onclick=()=>setClip("copy"); $("#cut").onclick=()=>setClip("move");
 function setClip(op){
   const items=[...STATE.sel].map(name=>({vmid:STATE.vmid, path:joinPath(STATE.path,name), name}));
-  if(!items.length) return; STATE.clip={op,items}; toast(`${items.length} elemento(s) ${op==="move"?"cortado(s)":"copiado(s)"}`); render();
+  if(!items.length) return; STATE.clip={op,items}; toast(T.clipSet(items.length, op)); render();
 }
 $("#paste").onclick=async()=>{
   if(!STATE.clip) return;
   const {op,items}=STATE.clip;
-  status('<span class="spin"></span> '+(op==="move"?"Moviendo":"Copiando")+"…");
+  status('<span class="spin"></span> '+(op==="move"?T.moving:T.copying));
   try{
     const r=await apiJSON("paste",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({op, items:items.map(i=>({vmid:i.vmid,path:i.path})), destVmid:STATE.vmid, destPath:STATE.path})});
-    toast(`Pegado: ${r.items} elemento(s)`+(r.bytesCopied?` (${fmtSize(r.bytesCopied)})`:""));
+    toast(T.pasted(r.items, r.bytesCopied?fmtSize(r.bytesCopied):""));
     STATE.clip=null; list();
-  }catch(e){ status(""); toast("Error al pegar: "+e.message); }
+  }catch(e){ status(""); toast(T.errPaste(e.message)); }
 };
 $("#download").onclick=()=>{ const e=selEntries()[0]; if(e) e.isDir?downloadFolder(e.name):download1(e.name); };
 function dlUrl(p,folder){ return `/api/${folder?"download-folder":"download"}?vmid=${STATE.vmid}&path=${encodeURIComponent(p)}&t=${encodeURIComponent(TOKEN)}`; }
 function download1(name){ window.location = dlUrl(joinPath(STATE.path,name),false); }
-function downloadFolder(name){ toast("Preparando ZIP…"); window.location = dlUrl(joinPath(STATE.path,name),true); }
-$("#mkdir").onclick=()=>prompt2("Nueva carpeta","Nombre:","",async v=>{
+function downloadFolder(name){ toast(T.zip); window.location = dlUrl(joinPath(STATE.path,name),true); }
+$("#mkdir").onclick=()=>prompt2(T.mkdirTitle,T.mkdirLabel,"",async v=>{
   if(!v) return; await apiJSON("mkdir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vmid:STATE.vmid,path:joinPath(STATE.path,v)})}); list();
 });
-$("#rename").onclick=()=>{ const e=selEntries()[0]; if(!e) return; prompt2("Renombrar","Nuevo nombre:",e.name,async v=>{
+$("#rename").onclick=()=>{ const e=selEntries()[0]; if(!e) return; prompt2(T.renameTitle,T.renameLabel,e.name,async v=>{
   if(!v||v===e.name) return; await apiJSON("rename",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vmid:STATE.vmid,path:joinPath(STATE.path,e.name),newPath:joinPath(STATE.path,v)})}); list();
 }); };
-$("#del").onclick=()=>{ const names=[...STATE.sel]; if(!names.length) return; confirm2(`¿Eliminar ${names.length} elemento(s)? Esta acción no se puede deshacer.`, async()=>{
-  status('<span class="spin"></span> Eliminando…');
+$("#del").onclick=()=>{ const names=[...STATE.sel]; if(!names.length) return; confirm2(T.confirmDelete(names.length), async()=>{
+  status('<span class="spin"></span> '+T.deleting);
   try{ for(const n of names){ await apiJSON("delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vmid:STATE.vmid,path:joinPath(STATE.path,n)})}); } list(); }
-  catch(e){ status(""); toast("Error al eliminar: "+e.message); }
+  catch(e){ status(""); toast(T.errDelete(e.message)); }
 }); };
 $("#upload").onclick=()=>$("#fileinput").click();
 $("#fileinput").onchange=async e=>{
   const files=[...e.target.files]; e.target.value="";
   for(const f of files){
-    status(`<span class="spin"></span> Subiendo ${escapeHtml(f.name)}…`);
+    status(`<span class="spin"></span> `+escapeHtml(T.uploading(f.name)));
     try{
       const fd=new FormData(); fd.append("file",f,f.name);
       await api(`upload?vmid=${STATE.vmid}&path=${encodeURIComponent(joinPath(STATE.path,f.name))}`,{method:"POST",body:fd});
-      toast(`Subido: ${f.name}`);
-    }catch(err){ toast(`Error subiendo ${f.name}: ${err.message}`); }
+      toast(T.uploaded(f.name));
+    }catch(err){ toast(T.errUpload(f.name, err.message)); }
   }
   list();
 };
@@ -227,15 +314,15 @@ $("#fileinput").onchange=async e=>{
 // ---- Tiny modals ----
 function prompt2(title,label,val,cb){
   $("#card").innerHTML=`<h3>${escapeHtml(title)}</h3><label>${escapeHtml(label)}<input id="pv" value="${escapeHtml(val)}"></label>
-    <div class="actions"><button class="btn" id="pc">Cancelar</button><button class="btn" id="po" style="border-color:var(--accent);color:var(--accent)">Aceptar</button></div>`;
+    <div class="actions"><button class="btn" id="pc">${escapeHtml(T.cancel)}</button><button class="btn" id="po" style="border-color:var(--accent);color:var(--accent)">${escapeHtml(T.ok)}</button></div>`;
   showOverlay(); const inp=$("#pv"); inp.focus(); inp.select();
   const done=ok=>{ hideOverlay(); if(ok) cb(inp.value.trim()); };
   $("#pc").onclick=()=>done(false); $("#po").onclick=()=>done(true);
   inp.onkeydown=e=>{ if(e.key==="Enter")done(true); if(e.key==="Escape")done(false); };
 }
 function confirm2(msg,cb){
-  $("#card").innerHTML=`<h3>Confirmar</h3><p>${escapeHtml(msg)}</p>
-    <div class="actions"><button class="btn" id="cc">Cancelar</button><button class="btn danger" id="co" style="border-color:var(--danger);color:var(--danger)">Eliminar</button></div>`;
+  $("#card").innerHTML=`<h3>${escapeHtml(T.confirmTitle)}</h3><p>${escapeHtml(msg)}</p>
+    <div class="actions"><button class="btn" id="cc">${escapeHtml(T.cancel)}</button><button class="btn danger" id="co" style="border-color:var(--danger);color:var(--danger)">${escapeHtml(T.delBtn)}</button></div>`;
   showOverlay(); $("#cc").onclick=hideOverlay; $("#co").onclick=()=>{hideOverlay();cb();};
 }
 function showOverlay(){ $("#overlay").classList.add("show"); }
@@ -244,9 +331,9 @@ $("#overlay").onclick=e=>{ if(e.target.id==="overlay") hideOverlay(); };
 
 // ---- Boot ----
 (async()=>{
-  if(!TOKEN){ status("Falta el token de acceso. Abre el navegador desde el panel."); return; }
+  if(!TOKEN){ status(escapeHtml(T.noToken)); return; }
   try{ await loadServers(); await list(); }
-  catch(e){ status("Sesión no válida o caducada. Vuelve a abrir desde el panel."); }
+  catch(e){ status(escapeHtml(T.badSession)); }
 })();
 </script>
 </body>
