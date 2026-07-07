@@ -8,7 +8,11 @@ Type=simple
 # Config: shared HMAC secret (= GCP secret FILE_BRIDGE_TOKEN_SECRET) + Firestore creds.
 EnvironmentFile=/etc/neuravps/file-bridge.env
 WorkingDirectory=/opt/file-bridge
-ExecStart=/opt/file-bridge/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8088 --workers 2
+# MUST be a single worker: the single-use link-redemption set and the
+# per-uid throttle buckets live in process memory (v3, 2026-07-08).
+# Concurrency still comes from the threadpool (sync endpoints) — the
+# bridge is I/O-bound and per-session throttled anyway.
+ExecStart=/opt/file-bridge/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8088 --workers 1
 Restart=on-failure
 RestartSec=3
 # Hardening: the bridge only needs network + its own dir + the creds file.

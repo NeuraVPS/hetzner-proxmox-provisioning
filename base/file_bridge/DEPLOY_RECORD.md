@@ -58,6 +58,23 @@ between the token-minting Cloud Function (phase 4, pending) and both bridges.
   in "Transferir archivos"; the bridge serves its own single-pane UI at `/`
   (`static/index.html` here).
 
+## Update 2026-07-08 (v3) — single-use links + session cookie + renewal
+
+- `app.py`/`bridge.py`/`static/index.html` v3 on both bases + **unit file
+  changed to `--workers 1`** (`daemon-reload` + restart): the in-process
+  single-use set and throttle buckets require one worker (with 2 workers the
+  reuse-block failed live — caught in E2E).
+- Auth model: CF link token redeems ONCE at `POST /api/session` → HttpOnly
+  Secure SameSite=Strict cookie, sliding 1h / capped 12h from link mint;
+  normal endpoints are cookie-only now (link tokens rejected — hard cut, old
+  open tabs die within their hour). Panel sends the token as `#t=` fragment
+  (never in server logs); UI strips it from the address bar after redeeming.
+- Restart residual (accepted): the redeemed set is in-memory, so after a
+  service restart a not-yet-expired link (≤1h) could redeem once more.
+- Verified live on files-hel AND files-fsn: redeem 200+cookie / same-link
+  reuse 401 / link-on-endpoint 401 / cookie renewal `resumed:true` / real
+  SMB list via cookie. HTTP suite 21/21 (run on b1 venv).
+
 ## Update 2026-07-08 — UI i18n + dark/light theme
 
 - `static/index.html` v2: es/en translation + dark/light theme. Reads

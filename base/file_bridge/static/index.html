@@ -109,8 +109,10 @@ document.documentElement.dataset.theme=t;})();
 
 <script>
 const qs = new URLSearchParams(location.search);
-const TOKEN = qs.get("t") || "";
-const H = { "Authorization": "Bearer " + TOKEN };
+// The link token arrives as #t= (fragment: never sent to the server, so it
+// can't land in access logs) — legacy ?t= still accepted. It is redeemed
+// ONCE at /api/session for an HttpOnly cookie, then stripped from the URL.
+const TOKEN = new URLSearchParams(location.hash.replace(/^#/,"")).get("t") || qs.get("t") || "";
 const $ = s => document.querySelector(s);
 
 // ---- i18n: ?lang=es|en from the panel wins, else navigator.language
@@ -137,6 +139,8 @@ const MSG = {
     uploading:n=>`Subiendo ${n}…`, uploaded:n=>`Subido: ${n}`, errUpload:(n,m)=>`Error subiendo ${n}: ${m}`,
     noToken:"Falta el token de acceso. Abre el navegador desde el panel.",
     badSession:"Sesión no válida o caducada. Vuelve a abrir desde el panel.",
+    expiredTitle:"Sesión caducada",
+    expiredMsg:"La sesión ha caducado por seguridad. Cierra esta pestaña y vuelve a abrir el navegador de archivos desde el panel.",
     dateLocale:"es-ES",
   },
   en: {
@@ -160,6 +164,8 @@ const MSG = {
     uploading:n=>`Uploading ${n}…`, uploaded:n=>`Uploaded: ${n}`, errUpload:(n,m)=>`Error uploading ${n}: ${m}`,
     noToken:"Missing access token. Open the file browser from the panel.",
     badSession:"Session invalid or expired. Reopen it from the panel.",
+    expiredTitle:"Session expired",
+    expiredMsg:"Your session expired for security reasons. Close this tab and reopen the file browser from the panel.",
     dateLocale:"en-GB",
   },
 };
@@ -189,12 +195,40 @@ let STATE = { vmid:null, path:"", entries:[], sel:new Set(), clip:null }; // cli
 function toast(msg, ms=2600){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),ms); }
 function status(msg){ $("#status").innerHTML = msg||""; }
 
+let SESSION = false; // becomes true once /api/session succeeds
 async function api(path, opts={}){
-  const r = await fetch("/api/"+path, { headers:{...H, ...(opts.headers||{})}, ...opts });
-  if(!r.ok){ let m=r.status; try{ m=(await r.json()).detail||m; }catch{} throw new Error(m); }
+  const r = await fetch("/api/"+path, { headers:{...(opts.headers||{})}, ...opts });
+  if(!r.ok){
+    if(r.status===401 && SESSION){ fatalExpired(); }
+    let m=r.status; try{ m=(await r.json()).detail||m; }catch{} throw new Error(m);
+  }
   return r;
 }
 async function apiJSON(path, opts={}){ return (await api(path, opts)).json(); }
+
+// ---- Session (cookie-based; the link token is single-use) ----
+async function startSession(){
+  const opts = {method:"POST"};
+  if(TOKEN) opts.headers = {"Authorization":"Bearer "+TOKEN};
+  const r = await fetch("/api/session", opts);
+  if(!r.ok) throw new Error(r.status);
+  SESSION = true;
+  // Drop the token from the address bar/history; keep lang/theme for F5.
+  const keep = new URLSearchParams();
+  for(const k of ["lang","theme"]){ const v=qs.get(k); if(v) keep.set(k,v); }
+  const q = keep.toString();
+  history.replaceState(null,"",location.pathname+(q?"?"+q:""));
+}
+async function renew(){
+  try{ const r = await fetch("/api/session",{method:"POST"}); if(r.status===401) fatalExpired(); }
+  catch(e){}
+}
+setInterval(()=>{ if(SESSION && document.visibilityState==="visible") renew(); }, 20*60*1000);
+document.addEventListener("visibilitychange",()=>{ if(SESSION && document.visibilityState==="visible") renew(); });
+function fatalExpired(){
+  $("#card").innerHTML=`<h3>${escapeHtml(T.expiredTitle)}</h3><p>${escapeHtml(T.expiredMsg)}</p>`;
+  $("#overlay").classList.add("show"); $("#overlay").dataset.fatal="1";
+}
 
 // ---- Servers ----
 async function loadServers(){
@@ -283,7 +317,7 @@ $("#paste").onclick=async()=>{
   }catch(e){ status(""); toast(T.errPaste(e.message)); }
 };
 $("#download").onclick=()=>{ const e=selEntries()[0]; if(e) e.isDir?downloadFolder(e.name):download1(e.name); };
-function dlUrl(p,folder){ return `/api/${folder?"download-folder":"download"}?vmid=${STATE.vmid}&path=${encodeURIComponent(p)}&t=${encodeURIComponent(TOKEN)}`; }
+function dlUrl(p,folder){ return `/api/${folder?"download-folder":"download"}?vmid=${STATE.vmid}&path=${encodeURIComponent(p)}`; } // auth = session cookie
 function download1(name){ window.location = dlUrl(joinPath(STATE.path,name),false); }
 function downloadFolder(name){ toast(T.zip); window.location = dlUrl(joinPath(STATE.path,name),true); }
 $("#mkdir").onclick=()=>prompt2(T.mkdirTitle,T.mkdirLabel,"",async v=>{
@@ -327,11 +361,14 @@ function confirm2(msg,cb){
 }
 function showOverlay(){ $("#overlay").classList.add("show"); }
 function hideOverlay(){ $("#overlay").classList.remove("show"); }
-$("#overlay").onclick=e=>{ if(e.target.id==="overlay") hideOverlay(); };
+$("#overlay").onclick=e=>{ if(e.target.id==="overlay" && !e.target.dataset.fatal) hideOverlay(); };
 
 // ---- Boot ----
 (async()=>{
-  if(!TOKEN){ status(escapeHtml(T.noToken)); return; }
+  // Redeem the link token (or resume the cookie session on refresh). A
+  // fresh tab with no token AND no cookie can't start — back to the panel.
+  try{ await startSession(); }
+  catch(e){ status(escapeHtml(TOKEN ? T.badSession : T.noToken)); return; }
   try{ await loadServers(); await list(); }
   catch(e){ status(escapeHtml(T.badSession)); }
 })();
