@@ -9,16 +9,26 @@ Run: uvicorn app:app --host 127.0.0.1 --port 8088  (see systemd unit).
 """
 
 import io
+import os
 import time
 import zipfile
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 import bridge
 
 app = FastAPI(title="NeuraVPS file bridge", docs_url=None, redoc_url=None)
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+
+@app.get("/")
+def index():
+    """The single-page file browser UI (reads ?t= itself, calls /api/*)."""
+    return FileResponse(os.path.join(_STATIC_DIR, "index.html"),
+                        media_type="text/html")
 
 
 # --- Auth dependency --------------------------------------------------------
