@@ -459,7 +459,13 @@ if args.node_id is not None:
     try:
         nsnap = db.collection("proxmox_nodes").document(args.node_id).get()
         if nsnap.exists:
-            patch["location"] = (nsnap.to_dict() or {}).get("location") or ""
+            ndata = nsnap.to_dict() or {}
+            patch["location"] = ndata.get("location") or ""
+            # D2 (2026-07-07): the node's egress IPv4 is mirrored on the
+            # server doc (panel "Acceso a Internet" / broker allowlists) —
+            # refresh it IMMEDIATELY on migration, same rule as nodeId/ipv6.
+            if ndata.get("server_ipv4"):
+                patch["publicIpv4"] = ndata["server_ipv4"]
     except Exception:
         pass
 if args.ipv6 is not None:           patch["ipv6"]        = args.ipv6
