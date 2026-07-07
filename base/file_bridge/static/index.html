@@ -46,6 +46,8 @@ document.documentElement.dataset.theme=t;})();
   th.ck,td.ck { width:34px; padding:8px 2px 8px 12px; }
   .ck input { width:17px; height:17px; accent-color:var(--accent); cursor:pointer; }
   th { position:sticky; top:0; background:var(--th-bg); color:var(--muted); font-weight:600; z-index:1; }
+  #thName,#thSize,#thDate { cursor:pointer; user-select:none; }
+  #thName:hover,#thSize:hover,#thDate:hover { color:var(--accent); }
   tr.row { cursor:default; user-select:none; }
   tr.row:hover { background:var(--row-hover); }
   tr.row.sel { background:var(--accent-bg); }
@@ -178,6 +180,9 @@ const LANG = (langParam==="es"||langParam==="en") ? langParam
   : ((navigator.language||"es").toLowerCase().startsWith("es") ? "es" : "en");
 const T = MSG[LANG];
 
+let STATE = { vmid:null, path:"", goodPath:"", entries:[], view:[], sel:new Set(), clip:null,
+              sort:{key:"name",dir:1} }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path; view = rendered name order
+
 function applyStatic(){
   document.documentElement.lang = LANG;
   document.title = T.title;
@@ -187,7 +192,7 @@ function applyStatic(){
   set("#up",T.up,T.upTitle); set("#refresh","🔄",T.refreshTitle); set("#upload",T.upload);
   set("#mkdir",T.mkdir); set("#download",T.download); set("#copy",T.copy); set("#cut",T.cut);
   set("#paste",T.paste); set("#rename",T.rename); set("#del",T.del);
-  $("#thName").textContent=T.thName; $("#thSize").textContent=T.thSize; $("#thDate").textContent=T.thDate;
+  renderHeaders();
   $("#selAll").title=T.selectAll;
   $("#sel").textContent=T.selected(0);
 }
@@ -195,7 +200,6 @@ applyStatic();
 
 const fmtSize = n => { if(!n) return ""; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<4){n/=1024;i++;} return n.toFixed(i?1:0)+" "+u[i]; };
 const fmtDate = t => t? new Date(t*1000).toLocaleString(T.dateLocale,{dateStyle:"short",timeStyle:"short"}) : "";
-let STATE = { vmid:null, path:"", goodPath:"", entries:[], view:[], sel:new Set(), clip:null }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path; view = rendered name order
 
 function toast(msg, ms=2600){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),ms); }
 function status(msg){ $("#status").innerHTML = msg||""; }
@@ -267,11 +271,34 @@ async function list(){
   }
 }
 let lastAnchor=null; // last plainly-clicked name, the Shift-range anchor
+// ---- Column sorting (folders always grouped first, Explorer-style) ----
+function renderHeaders(){
+  const s=STATE.sort, arrow=d=>d===1?" ▲":" ▼";
+  $("#thName").textContent=T.thName+(s.key==="name"?arrow(s.dir):"");
+  $("#thSize").textContent=T.thSize+(s.key==="size"?arrow(s.dir):"");
+  $("#thDate").textContent=T.thDate+(s.key==="mtime"?arrow(s.dir):"");
+}
+function setSort(key){
+  const s=STATE.sort;
+  if(s.key===key) s.dir=-s.dir; else { s.key=key; s.dir=1; }
+  renderHeaders(); render();
+}
+$("#thName").onclick=()=>setSort("name");
+$("#thSize").onclick=()=>setSort("size");
+$("#thDate").onclick=()=>setSort("mtime");
+function entryCmp(a,b){
+  if(b.isDir!==a.isDir) return b.isDir-a.isDir; // folders first, always
+  const s=STATE.sort;
+  const byName=a.name.localeCompare(b.name,LANG,{numeric:true,sensitivity:"base"});
+  let v = s.key==="size" ? (a.size||0)-(b.size||0)
+        : s.key==="mtime" ? (a.mtime||0)-(b.mtime||0)
+        : byName;
+  return v!==0 ? v*s.dir : byName; // stable name tie-break, never flipped
+}
 function render(){
   const tb=$("#list"); tb.innerHTML="";
   const empty=$("#empty");
-  // folders first, then files, both alpha
-  const es=[...STATE.entries].sort((a,b)=> (b.isDir-a.isDir) || a.name.localeCompare(b.name,LANG));
+  const es=[...STATE.entries].sort(entryCmp);
   STATE.view = es.map(e=>e.name); // rendered order, for Shift ranges / select-all
   if(!es.length){ empty.hidden=false; empty.textContent=T.emptyFolder; } else empty.hidden=true;
   const cutSet = new Set((STATE.clip&&STATE.clip.op==="move"? STATE.clip.items:[]).filter(i=>i.vmid===STATE.vmid).map(i=>i.path));
