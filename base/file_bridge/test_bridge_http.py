@@ -1,4 +1,5 @@
-import base64, hashlib, hmac, json, time, sys
+import base64, hashlib, hmac, json, os, tempfile, time, sys
+os.environ["FILE_BRIDGE_REDEEMED_FILE"] = os.path.join(tempfile.mkdtemp(), "redeemed.json")
 import bridge
 bridge.TOKEN_SECRET = "test-secret-123"
 # mock the SMB layer (already validated live) so we test HTTP logic only
@@ -12,8 +13,9 @@ from fastapi.testclient import TestClient
 # https base_url so the Secure session cookie is stored/sent by the client
 def client(): return TestClient(app.app, base_url="https://testserver")
 
-def mint(uid, servers, ttl=3600):
+def mint(uid, servers, ttl=3600, host="testserver"):
     body={"uid":uid,"servers":servers,"exp":int(time.time())+ttl}
+    if host is not None: body["host"]=host
     bj=base64.urlsafe_b64encode(json.dumps(body).encode()).rstrip(b"=").decode()
     sig=hmac.new(b"test-secret-123",bj.encode(),hashlib.sha256).digest()
     return bj+"."+base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
@@ -66,6 +68,18 @@ r.append(("session token can't redeem", cC.post("/api/session",headers={"Authori
 # --- tampered cookie rejected
 cD=client(); cD.cookies.set(app.SESSION_COOKIE, COOKIE[:-2]+"xx", domain="testserver")
 r.append(("tampered cookie 401", cD.get("/api/servers").status_code==401))
+# --- host binding: link for another host / no host claim -> 401
+oth=mint("uidA",SRV,host="files-fsn.neuravps.com")
+r.append(("wrong-host link 401", client().post("/api/session",headers={"Authorization":f"Bearer {oth}"}).status_code==401))
+noh=mint("uidA",SRV,host=None)
+r.append(("hostless link 401", client().post("/api/session",headers={"Authorization":f"Bearer {noh}"}).status_code==401))
+# --- persistence: redeemed set survives a "restart" (reload from disk)
+tok2=mint("uidB",SRV)
+cE=client()
+r.append(("2nd link redeems", cE.post("/api/session",headers={"Authorization":f"Bearer {tok2}"}).status_code==200))
+app._redeemed.clear()          # simulate process restart
+app._load_redeemed()           # reload from REDEEMED_PATH
+r.append(("reuse blocked AFTER restart", client().post("/api/session",headers={"Authorization":f"Bearer {tok2}"}).status_code==401))
 
 ok=sum(1 for _,v in r if v)
 for name,v in r: print(("PASS" if v else "FAIL"), name)
