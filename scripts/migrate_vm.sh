@@ -440,7 +440,7 @@ p.add_argument("--vmid", type=int, required=True)
 p.add_argument("--maintenance", choices=("true", "false"))
 p.add_argument("--node-id", default=None)
 p.add_argument("--ipv6", default=None)
-p.add_argument("--connection-url", default=None)
+# --connection-url REMOVED 2026-07-07: legacy field, URL is generated everywhere.
 args = p.parse_args()
 
 if not init(): sys.exit(1)
@@ -469,7 +469,6 @@ if args.node_id is not None:
     except Exception:
         pass
 if args.ipv6 is not None:           patch["ipv6"]        = args.ipv6
-if args.connection_url is not None: patch["connectionUrl"] = args.connection_url
 if not patch:
     sys.exit(0)
 
@@ -1221,23 +1220,11 @@ _info "Attaching hookscript on dest…"
 dst_ssh "qm set '${VMID}' --hookscript '${HOOKSCRIPT}'" >/dev/null 2>&1 \
   || _warn "Failed to attach hookscript on dest (manual fix may be needed)."
 
-# Resolve dest's public IPv4 for connectionUrl (best-effort; non-fatal).
-_info "Resolving dest public IPv4 for connectionUrl…"
-DST_PUBLIC_IPV4=$(dst_ssh '
-  for svc in https://ifconfig.me https://api.ipify.org https://icanhazip.com; do
-    ip=$(curl -4 -s --connect-timeout 5 "$svc" 2>/dev/null | tr -d "\r\n ")
-    case "$ip" in
-      [0-9]*.[0-9]*.[0-9]*.[0-9]*) echo "$ip"; exit 0 ;;
-    esac
-  done
-  exit 1' | tr -d '\r\n ' || true)
-DST_CONNECTION_URL=""
-if [[ -n "$DST_PUBLIC_IPV4" ]]; then
-  DST_CONNECTION_URL="${DST_PUBLIC_IPV4}:${RDP_PORT}"
-  _info "Dest connectionUrl: ${DST_CONNECTION_URL}"
-else
-  _warn "Could not resolve dest public IPv4; connectionUrl will not be updated."
-fi
+# connectionUrl is NOT written anymore (legacy field, removed 2026-07-07):
+# it stored an ip:port here, and the support agent quoted that stale value to
+# a customer. Every consumer (panel/emails/agent) now GENERATES the URL from
+# serverType + proxmoxId + location — the python helper below already
+# refreshes `location` and `publicIpv4` from the dest node doc.
 
 # Reconcile this BASE's local NAT immediately. We use the explicit-IPv6 path
 # (sync <vmid> <ipv6>) so this works WITHOUT Firestore being updated yet —
@@ -1294,7 +1281,6 @@ fi
 if (( NAT_OK == 1 )); then
   _info "Updating Firestore servers/{${VMID}}: nodeId=${DST_NODE}, ipv6=${EXPECTED_VM_IPV6}…"
   fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6" --maintenance false)
-  [[ -n "$DST_CONNECTION_URL" ]] && fs_args+=(--connection-url "$DST_CONNECTION_URL")
   if _firestore_update_servers "${fs_args[@]}"; then
     _ok "Firestore updated."
     MAINTENANCE_SET=0  # cleared by the update itself, no rollback needed
