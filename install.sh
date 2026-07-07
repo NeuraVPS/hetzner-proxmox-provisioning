@@ -45,8 +45,11 @@ NETWORK_FUNCS="/root/.oldroot/nfs/install/network_config.functions.sh"
 ### --- UTILS --------------------------------------------------------
 
 log() { echo "[$(date +'%F %T')] $*"; }
-#die() { echo "ERROR: $*" >&2; exit 1; }
-die() { echo "ERROR: $*" >&2; }
+# die() must actually ABORT. It was a print-and-continue no-op until
+# 2026-07-07, when 0000148 sailed past "Auto ISO not created" into the
+# QEMU/zpool/network steps over already-wiped disks. Every call site is a
+# cannot-proceed condition; log any FIX hint BEFORE calling die.
+die() { echo "ERROR: $*" >&2; exit 1; }
 
 # ---- SWAP_GB_PER_DISK auto-detection (fleet standard 2026-07-02) --------------
 # The fleet converges on exactly four hardware configs; swap sizing follows the
@@ -171,14 +174,12 @@ require_cmd wget lsblk awk ip zpool zfs dmidecode udevadm
 # the node with an empty/non-functional bootloader (empty ESPs, no
 # zfs.mod): it installs fine but never boots and stays unreachable. Abort
 # before touching any disk instead of silently shipping a dead node
-# (root cause of 0000192, 2026-06-23). die() does not exit here, so we
-# exit explicitly.
+# (root cause of 0000192, 2026-06-23).
 FIRMWARE="$(detect_firmware)"
 log "Detected firmware (rescue): $FIRMWARE"
 if [ "$FIRMWARE" != "UEFI" ]; then
-  die "Rescue booted in Legacy BIOS, but NeuraVPS installs in UEFI only — installing now would produce a node that never boots."
   log "FIX: Hetzner KVM/LARA console -> BIOS setup -> enable UEFI, disable CSM/Legacy boot; re-activate the rescue (must boot UEFI: '[ -d /sys/firmware/efi ]'), then retry."
-  exit 1
+  die "Rescue booted in Legacy BIOS, but NeuraVPS installs in UEFI only — installing now would produce a node that never boots."
 fi
 
 # --- Require the fleet SSH key in rescue ---------------------------
@@ -188,12 +189,10 @@ fi
 # Firestore creds for sync-dnat.py, no smartd wear filter, ESP-first
 # BootOrder) — root cause of the 14 half-configured nodes on 2026-07-04.
 # The admin "Instalar Proxmox" flow seeds it automatically; manual rescue
-# runs must scp it in first. die() does not exit here, so we exit
-# explicitly.
+# runs must scp it in first.
 if [ ! -s /root/.ssh/neuravps_id ]; then
-  die "Missing /root/.ssh/neuravps_id in rescue — the installed node could not pull its credentials/firewall from the Storage Box."
   log "FIX: seed it from a BASE first: scp /root/.ssh/neuravps_id root@<rescue-ip>:/root/.ssh/ — then retry."
-  exit 1
+  die "Missing /root/.ssh/neuravps_id in rescue — the installed node could not pull its credentials/firewall from the Storage Box."
 fi
 
 log "Installing qemu, OVMF, and proxmox-auto-install-assistant (this may take a bit)..."
@@ -206,7 +205,8 @@ apt-get update -y
 # mdadm: to tear down Hetzner's default MD RAID before wiping (see STEP 2).
 # gdisk: sgdisk --zap-all to clear residual GPT. Both are usually present in
 # the Hetzner rescue, but install explicitly so the disk-prep never no-ops.
-apt-get install -y qemu-system-x86 ovmf proxmox-auto-install-assistant mdadm gdisk
+apt-get install -y qemu-system-x86 ovmf proxmox-auto-install-assistant mdadm gdisk \
+  || die "apt-get install failed (qemu/OVMF/proxmox-auto-install-assistant/mdadm/gdisk) — cannot build or run the auto-installer. Check rescue apt sources/network and retry."
 
 [ -f "$NETWORK_FUNCS" ] || die "network_config.functions.sh not found at $NETWORK_FUNCS"
 
@@ -795,8 +795,7 @@ rm -f /mnt/hdd
 # A completed OS install with EMPTY ESPs reboots into nothing and the
 # node is unreachable (root cause of 0000192, 2026-06-23). Confirm at
 # least one EFI System Partition holds a UEFI bootloader; otherwise fail
-# loudly here instead of rebooting into a dead system. die() does not
-# exit in this script, so we exit explicitly.
+# loudly here instead of rebooting into a dead system.
 log "Verifying bootloader on ESP(s) before reboot"
 udevadm settle 2>/dev/null || true
 ESP_MNT="/tmp/esp-verify"
