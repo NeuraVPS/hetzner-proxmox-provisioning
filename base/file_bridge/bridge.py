@@ -89,6 +89,20 @@ def verify_token(token: str) -> Dict[str, Any]:
     return payload
 
 
+def sign_token(payload: Dict[str, Any]) -> str:
+    """Sign a payload with the shared secret (mirror of the CF's minter).
+    Used for the session-cookie tokens the bridge itself issues — verified
+    by the same verify_token() above."""
+    if not TOKEN_SECRET:
+        raise TokenError("bridge misconfigured: no TOKEN_SECRET")
+    body_b64 = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).rstrip(b"=").decode()
+    sig = hmac.new(TOKEN_SECRET.encode(), body_b64.encode(),
+                   hashlib.sha256).digest()
+    return body_b64 + "." + base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+
+
 # --- Firestore credential lookup (passwords stay on the base) ---------------
 
 _fb_app = None

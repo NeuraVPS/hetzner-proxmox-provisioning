@@ -1,20 +1,24 @@
 """FastAPI HTTP layer for the NeuraVPS web file browser bridge.
 
-nginx (files-hel/-fsn.neuravps.com) terminates TLS and proxies here. Every
-request carries the HMAC token (Authorization: Bearer, or ?t= for the
-download/EventSource cases where a header can't be set). Ownership is the
-token's server list; passwords are resolved base-side in bridge.py.
+nginx (files-hel/-fsn.neuravps.com) terminates TLS and proxies here. The
+CF-minted link token is redeemed ONCE at POST /api/session for an HttpOnly
+session cookie (sliding 1h, capped 12h); every other endpoint authenticates
+by that cookie. Ownership is the session's server list; passwords are
+resolved base-side in bridge.py.
 
 Run: uvicorn app:app --host 127.0.0.1 --port 8088  (see systemd unit).
 """
 
+import hashlib
 import io
 import os
+import secrets
 import time
 import zipfile
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, \
+    UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 import bridge
@@ -31,24 +35,106 @@ def index():
                         media_type="text/html")
 
 
-# --- Auth dependency --------------------------------------------------------
+# --- Auth: single-use link redemption -> sliding session cookie -------------
+#
+# v3 (2026-07-08). The CF-minted URL token is ONLY accepted at POST
+# /api/session, exactly once: it's exchanged for a signed session token in an
+# HttpOnly cookie. A copied/leaked URL is dead after first open (and the UI
+# strips it from the address bar anyway). The session slides +1h on renewal
+# while the tab is active, hard-capped at SESSION_CAP from the LINK's mint
+# time. Stateless (the cookie IS the signed state) — survives restarts; only
+# the redeemed-links set is in memory (worst case after a restart: a
+# not-yet-expired link could redeem again, ≤1h window).
 
-def _token_from(request: Request, t: Optional[str]) -> Dict[str, Any]:
-    raw = None
+CF_TOKEN_TTL = 3600          # the CF mints links with exp = mint + 1h
+SESSION_TTL = 3600           # sliding step
+SESSION_CAP = 12 * 3600      # absolute max session age, from link mint time
+SESSION_COOKIE = "fb_session"
+
+# NOTE: in-process store -> the service MUST run with --workers 1 (see
+# file-bridge.service); with N workers each has its own set and a link
+# could redeem N times. Same constraint already applied to _buckets.
+_redeemed: Dict[str, int] = {}  # sha256(link-token) -> link exp (pruned)
+
+
+def _prune_redeemed() -> None:
+    now = int(time.time())
+    for k in [k for k, exp in _redeemed.items() if exp < now]:
+        _redeemed.pop(k, None)
+
+
+def _bearer(request: Request) -> Optional[str]:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
-        raw = auth[7:].strip()
-    raw = raw or t
+        return auth[7:].strip()
+    return None
+
+
+def _session_from_cookie(request: Request) -> Optional[Dict[str, Any]]:
+    raw = request.cookies.get(SESSION_COOKIE)
+    if not raw:
+        return None
+    try:
+        payload = bridge.verify_token(raw)
+    except bridge.TokenError:
+        return None
+    # session tokens carry sid+cap; a raw LINK token pasted as a cookie
+    # must not pass here (links only redeem at /api/session)
+    if not payload.get("sid") or not payload.get("cap"):
+        return None
+    return payload
+
+
+def _set_session_cookie(response: Response, sess: Dict[str, Any]) -> None:
+    max_age = max(1, int(sess["cap"]) - int(time.time()))
+    response.set_cookie(SESSION_COOKIE, bridge.sign_token(sess),
+                        max_age=max_age, httponly=True, secure=True,
+                        samesite="strict", path="/")
+
+
+def require_session(request: Request) -> Dict[str, Any]:
+    sess = _session_from_cookie(request)
+    if not sess:
+        raise HTTPException(401, "session expired")
+    return sess
+
+
+@app.post("/api/session")
+def api_session(request: Request, response: Response,
+                t: Optional[str] = Query(None)):
+    """Resume-or-redeem. With a valid session cookie: slide it (renewal).
+    Else: redeem the CF link token (Bearer or ?t=) — single use — and set
+    the session cookie. The UI calls this at boot and every ~20 min."""
+    now = int(time.time())
+    sess = _session_from_cookie(request)
+    if sess:
+        sess["exp"] = min(now + SESSION_TTL, int(sess["cap"]))
+        _set_session_cookie(response, sess)
+        return {"ok": True, "exp": sess["exp"], "cap": sess["cap"],
+                "resumed": True}
+    raw = _bearer(request) or t
     if not raw:
         raise HTTPException(401, "missing token")
     try:
-        return bridge.verify_token(raw)
+        payload = bridge.verify_token(raw)
     except bridge.TokenError as e:
         raise HTTPException(401, f"invalid token: {e}")
-
-
-def require_token(request: Request, t: Optional[str] = Query(None)) -> Dict[str, Any]:
-    return _token_from(request, t)
+    if payload.get("sid"):
+        raise HTTPException(401, "not a link token")
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    _prune_redeemed()
+    if digest in _redeemed:
+        raise HTTPException(401, "link already used")
+    _redeemed[digest] = int(payload["exp"])
+    minted_at = int(payload["exp"]) - CF_TOKEN_TTL
+    cap = minted_at + SESSION_CAP
+    if now >= cap:  # can't happen while links live 1h, but keep the invariant
+        raise HTTPException(401, "link too old")
+    sess = {"uid": payload["uid"], "servers": payload["servers"],
+            "sid": secrets.token_hex(8), "cap": cap,
+            "exp": min(now + SESSION_TTL, cap)}
+    _set_session_cookie(response, sess)
+    return {"ok": True, "exp": sess["exp"], "cap": cap}
 
 
 def _authz_vmid(payload: Dict[str, Any], vmid: int) -> bridge.ServerRef:
@@ -85,7 +171,7 @@ def health():
 
 
 @app.get("/api/servers")
-def servers(payload: Dict[str, Any] = Depends(require_token)):
+def servers(payload: Dict[str, Any] = Depends(require_session)):
     """The dropdown: the user's servers embedded in the token."""
     return {"servers": [
         {"vmid": s["vmid"], "name": s.get("name"), "type": s.get("type")}
@@ -95,7 +181,7 @@ def servers(payload: Dict[str, Any] = Depends(require_token)):
 
 @app.get("/api/list")
 def api_list(vmid: int, path: str = "", offset: int = 0,
-             payload: Dict[str, Any] = Depends(require_token)):
+             payload: Dict[str, Any] = Depends(require_session)):
     _authz_vmid(payload, vmid)
     try:
         return bridge.list_dir(vmid, path, offset=offset)
@@ -106,9 +192,8 @@ def api_list(vmid: int, path: str = "", offset: int = 0,
 
 
 @app.get("/api/download")
-def api_download(request: Request, vmid: int, path: str,
-                 t: Optional[str] = Query(None)):
-    payload = _token_from(request, t)
+def api_download(vmid: int, path: str,
+                 payload: Dict[str, Any] = Depends(require_session)):
     _authz_vmid(payload, vmid)
     uid = payload["uid"]
     name = bridge._safe_rel(path).split("\\")[-1] or "download"
@@ -128,11 +213,10 @@ def api_download(request: Request, vmid: int, path: str,
 
 
 @app.get("/api/download-folder")
-def api_download_folder(request: Request, vmid: int, path: str,
-                        t: Optional[str] = Query(None)):
+def api_download_folder(vmid: int, path: str,
+                        payload: Dict[str, Any] = Depends(require_session)):
     """Zip-on-the-fly of a folder (capped). Streamed; not seekable, so the
     zip is stored (no compression) to keep memory flat."""
-    payload = _token_from(request, t)
     _authz_vmid(payload, vmid)
     uid = payload["uid"]
     import smbclient
@@ -178,7 +262,7 @@ def api_download_folder(request: Request, vmid: int, path: str,
 @app.post("/api/upload")
 async def api_upload(request: Request, vmid: int, path: str,
                      file: UploadFile,
-                     payload: Dict[str, Any] = Depends(require_token)):
+                     payload: Dict[str, Any] = Depends(require_session)):
     _authz_vmid(payload, vmid)
     uid = payload["uid"]
     dest = bridge._safe_rel(path)
@@ -201,7 +285,7 @@ class _Op:  # simple request bodies (avoid pydantic import churn)
 
 
 @app.post("/api/mkdir")
-async def api_mkdir(request: Request, payload: Dict[str, Any] = Depends(require_token)):
+async def api_mkdir(request: Request, payload: Dict[str, Any] = Depends(require_session)):
     body = await request.json()
     vmid = int(body["vmid"]); _authz_vmid(payload, vmid)
     bridge.mkdir(vmid, body["path"])
@@ -209,7 +293,7 @@ async def api_mkdir(request: Request, payload: Dict[str, Any] = Depends(require_
 
 
 @app.post("/api/rename")
-async def api_rename(request: Request, payload: Dict[str, Any] = Depends(require_token)):
+async def api_rename(request: Request, payload: Dict[str, Any] = Depends(require_session)):
     body = await request.json()
     vmid = int(body["vmid"]); _authz_vmid(payload, vmid)
     bridge.rename(vmid, body["path"], body["newPath"])
@@ -217,7 +301,7 @@ async def api_rename(request: Request, payload: Dict[str, Any] = Depends(require
 
 
 @app.post("/api/delete")
-async def api_delete(request: Request, payload: Dict[str, Any] = Depends(require_token)):
+async def api_delete(request: Request, payload: Dict[str, Any] = Depends(require_session)):
     body = await request.json()
     vmid = int(body["vmid"]); _authz_vmid(payload, vmid)
     bridge.remove(vmid, body["path"])
@@ -225,7 +309,7 @@ async def api_delete(request: Request, payload: Dict[str, Any] = Depends(require
 
 
 @app.post("/api/paste")
-async def api_paste(request: Request, payload: Dict[str, Any] = Depends(require_token)):
+async def api_paste(request: Request, payload: Dict[str, Any] = Depends(require_session)):
     """Clipboard paste: {items:[{vmid,path}], destVmid, destPath, op}.
     Every source vmid AND the destination must be in the session."""
     body = await request.json()
