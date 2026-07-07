@@ -1,0 +1,7 @@
+[Unit]
+Description=BASE peer failover watchdog check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/failover-watchdog.sh
