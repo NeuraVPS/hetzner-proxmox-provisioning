@@ -1,0 +1,22 @@
+[Unit]
+Description=NeuraVPS web file browser SMB bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Config: shared HMAC secret (= GCP secret FILE_BRIDGE_TOKEN_SECRET) + Firestore creds.
+EnvironmentFile=/etc/neuravps/file-bridge.env
+WorkingDirectory=/opt/file-bridge
+ExecStart=/opt/file-bridge/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8088 --workers 2
+Restart=on-failure
+RestartSec=3
+# Hardening: the bridge only needs network + its own dir + the creds file.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/file-bridge
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
