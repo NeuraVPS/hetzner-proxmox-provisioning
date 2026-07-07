@@ -58,6 +58,22 @@ between the token-minting Cloud Function (phase 4, pending) and both bridges.
   in "Transferir archivos"; the bridge serves its own single-pane UI at `/`
   (`static/index.html` here).
 
+## Update 2026-07-08 (v3.1) — redeemed-set persistence + host binding
+
+- The two v3 residuals are closed (operator OK'd invalidating old links):
+  - **Persistence**: the redeemed-links set is written to
+    `/opt/file-bridge/redeemed.json` (atomic tmp+rename, pruned, loaded at
+    boot) → a service restart can no longer re-open a used link.
+  - **Host binding**: the CF stamps `host` (files-hel/-fsn.neuravps.com)
+    into the link token and the bridge only redeems on that hostname —
+    before, a link could redeem once per REGION (each base has its own
+    set and both serve both hostnames).
+- Deploy order: CF first (old bridge ignores the claim), then bridges
+  (hostless links rejected — pre-deploy links ≤1h die, user re-clicks).
+- Verified live: wrong-region 401 / right-region 200 / reuse 401 /
+  **reuse after restart 401** / old session cookie after restart 200.
+  Suite 25/25.
+
 ## Update 2026-07-08 (v3) — single-use links + session cookie + renewal
 
 - `app.py`/`bridge.py`/`static/index.html` v3 on both bases + **unit file

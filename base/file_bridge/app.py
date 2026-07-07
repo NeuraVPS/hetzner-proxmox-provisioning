@@ -11,8 +11,10 @@ Run: uvicorn app:app --host 127.0.0.1 --port 8088  (see systemd unit).
 
 import hashlib
 import io
+import json
 import os
 import secrets
+import threading
 import time
 import zipfile
 from typing import Any, Dict, List, Optional
@@ -54,13 +56,41 @@ SESSION_COOKIE = "fb_session"
 # NOTE: in-process store -> the service MUST run with --workers 1 (see
 # file-bridge.service); with N workers each has its own set and a link
 # could redeem N times. Same constraint already applied to _buckets.
+# Persisted to disk (v3.1) so a service restart can't re-open a link.
 _redeemed: Dict[str, int] = {}  # sha256(link-token) -> link exp (pruned)
+_redeem_lock = threading.Lock()
+REDEEMED_PATH = os.environ.get(
+    "FILE_BRIDGE_REDEEMED_FILE",
+    os.path.join(os.path.dirname(__file__), "redeemed.json"))
 
 
 def _prune_redeemed() -> None:
     now = int(time.time())
     for k in [k for k, exp in _redeemed.items() if exp < now]:
         _redeemed.pop(k, None)
+
+
+def _load_redeemed() -> None:
+    try:
+        with open(REDEEMED_PATH) as f:
+            data = json.load(f)
+        now = int(time.time())
+        _redeemed.update({str(k): int(v) for k, v in data.items()
+                          if int(v) >= now})
+    except FileNotFoundError:
+        pass
+    except Exception:  # corrupt file -> start empty (worst: one re-redeem)
+        pass
+
+
+def _save_redeemed() -> None:
+    tmp = REDEEMED_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_redeemed, f)
+    os.replace(tmp, REDEEMED_PATH)
+
+
+_load_redeemed()
 
 
 def _bearer(request: Request) -> Optional[str]:
@@ -121,15 +151,23 @@ def api_session(request: Request, response: Response,
         raise HTTPException(401, f"invalid token: {e}")
     if payload.get("sid"):
         raise HTTPException(401, "not a link token")
+    # Host binding (v3.1): the CF stamps the hostname the link was minted
+    # for; without this a link could redeem once per REGION (each base has
+    # its own redeemed set, and both serve both files-* hostnames).
+    req_host = (request.headers.get("host") or "").split(":")[0].lower()
+    if str(payload.get("host") or "").lower() != req_host:
+        raise HTTPException(401, "wrong host")
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    _prune_redeemed()
-    if digest in _redeemed:
-        raise HTTPException(401, "link already used")
-    _redeemed[digest] = int(payload["exp"])
     minted_at = int(payload["exp"]) - CF_TOKEN_TTL
     cap = minted_at + SESSION_CAP
     if now >= cap:  # can't happen while links live 1h, but keep the invariant
         raise HTTPException(401, "link too old")
+    with _redeem_lock:
+        _prune_redeemed()
+        if digest in _redeemed:
+            raise HTTPException(401, "link already used")
+        _redeemed[digest] = int(payload["exp"])
+        _save_redeemed()
     sess = {"uid": payload["uid"], "servers": payload["servers"],
             "sid": secrets.token_hex(8), "cap": cap,
             "exp": min(now + SESSION_TTL, cap)}

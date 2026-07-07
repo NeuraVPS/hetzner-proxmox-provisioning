@@ -25,9 +25,12 @@ panel "Abrir navegador de archivos" (on server X)
 
 Session renewal: the UI re-POSTs /api/session every ~20 min while visible
 (sliding). On 401 it shows a "session expired" modal. The redeemed-links
-set is in-process → **`--workers 1` is mandatory** (see the unit file);
-worst case after a service restart a not-yet-expired link could redeem
-again (≤1h window, accepted).
+set is in-process → **`--workers 1` is mandatory** (see the unit file) —
+and persisted to `redeemed.json` (v3.1), so a restart can't re-open a
+used link. Links are **host-bound** (v3.1): the CF stamps the files-*
+hostname into the token and redemption is refused anywhere else (each
+base has its own redeemed set, so without the claim a link could redeem
+once per region).
 
 ## Pieces
 
