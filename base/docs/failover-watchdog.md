@@ -57,6 +57,30 @@ journalctl -u failover-watchdog.service -n 20   # ping results / reports
 # CF log: gcloud functions logs read failover_watchdog --gen2 --region europe-west1 --limit 20
 ```
 
+## Zero-impact detection drill
+
+`base/snippets/failover-watchdog-drill.sh` (installed on both bases) fakes a
+base's death by dropping ONLY the watchdog's probe traffic — peer pings +
+GCP TCP probes to the MAIN IPs. Customer traffic (VIPs) is untouched; the
+caller's SSH IP is excluded; a dead-man's switch removes the rules after
+15 min. With `dryRun:true` the whole chain fires (reporter → arbiter →
+`[SIMULACRO]` email) without moving anything.
+
+Validated live 2026-07-07 (victim b0, reporter b1, 0 user impact): fails
+1/6→6/6 in exactly 3 min → arbiter answered
+`{"action":"dry_run","wouldMove":["94.130.3.118","2a01:4f8:fff2:95::"]}` —
+correctly selecting ONLY the two VIPs pointing at the victim — and the
+simulacro email landed at soporte@. Clean recovery on disarm.
+
+```bash
+ssh b0 '/usr/local/sbin/failover-watchdog-drill.sh arm'    # start
+ssh b1 'journalctl -u failover-watchdog.service -f'        # watch
+ssh b0 '/usr/local/sbin/failover-watchdog-drill.sh disarm' # end
+```
+
+⚠️ With `dryRun:false` the same drill performs a REAL swap (established RDP
+sessions on the moved VIPs reconnect) — use only as a deliberate rehearsal.
+
 ## Known limits
 
 - ICMP is the base-side signal; the CF verdict uses TCP 443+22 (GCP can't ping).
