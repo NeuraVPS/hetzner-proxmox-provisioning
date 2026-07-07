@@ -86,8 +86,10 @@ r.append(("reuse blocked AFTER restart", client().post("/api/session",headers={"
 # C:\My Servers cross-server links / Users\All Users blew up the listing)
 import types
 from smbprotocol.exceptions import SMBLinkRedirectionError
+_tree = {r"\\srv\C$": ["VM100 - link", "ok.txt", "SubDir"],
+         r"\\srv\C$\SubDir": ["b.txt"]}
 fake_smb = types.ModuleType("smbclient")
-fake_smb.listdir = lambda unc: ["VM100 - link", "ok.txt", "SubDir"]
+fake_smb.listdir = lambda unc: _tree[unc]
 def _fake_stat(unc):
     name = unc.split("\\")[-1]
     if "link" in name: raise SMBLinkRedirectionError("path", "target")
@@ -99,6 +101,12 @@ sys.modules["smbclient"] = fake_smb
 bridge._smb_session = lambda vmid: ("srv", r"\\srv\C$")
 d = _orig_list_dir(1, "")
 r.append(("real list_dir skips symlinks", [e["name"] for e in d["entries"]]==["ok.txt","SubDir"] and d["total"]==2))
+# --- download-zip: multi-selection (file + folder) -> one zip, cookie auth
+import io as _io, zipfile as _zf
+dz=cA.get("/api/download-zip", params=[("vmid",201),("path","ok.txt"),("path","SubDir")])
+names=_zf.ZipFile(_io.BytesIO(dz.content)).namelist() if dz.status_code==200 else []
+r.append(("download-zip multi", dz.status_code==200 and sorted(names)==["SubDir/b.txt","ok.txt"]))
+r.append(("download-zip no cookie 401", client().get("/api/download-zip", params=[("vmid",201),("path","ok.txt")]).status_code==401))
 
 ok=sum(1 for _,v in r if v)
 for name,v in r: print(("PASS" if v else "FAIL"), name)

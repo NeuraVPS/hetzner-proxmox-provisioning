@@ -301,6 +301,85 @@ def api_download_folder(vmid: int, path: str,
         headers={"Content-Disposition": f'attachment; filename="{base_name}.zip"'})
 
 
+@app.get("/api/download-zip")
+def api_download_zip(vmid: int, path: List[str] = Query(...),
+                     payload: Dict[str, Any] = Depends(require_session)):
+    """One ZIP of a multi-selection (files and/or folders; repeated ?path=).
+    Streamed like download-folder; symlinks skipped; arcname collisions
+    deduped with a numeric suffix."""
+    _authz_vmid(payload, vmid)
+    uid = payload["uid"]
+    import smbclient
+    from smbprotocol.exceptions import SMBLinkRedirectionError
+    _srv, root = bridge._smb_session(vmid)
+    rels = [bridge._safe_rel(p) for p in path if bridge._safe_rel(p)]
+    if not rels:
+        raise HTTPException(400, "no paths")
+
+    def walk(rel: str):
+        for nm in smbclient.listdir(bridge._unc(root, rel)):
+            child = rel + "\\" + nm
+            try:
+                st = smbclient.stat(bridge._unc(root, child))
+            except SMBLinkRedirectionError:
+                continue
+            if st.st_mode & 0o040000:
+                yield from walk(child)
+            else:
+                yield child
+
+    used: set = set()
+
+    def arcname(name: str) -> str:
+        cand, n = name, 1
+        while cand.lower() in used:
+            n += 1
+            stem, dot, ext = name.rpartition(".")
+            cand = f"{stem} ({n}).{ext}" if dot else f"{name} ({n})"
+        used.add(cand.lower())
+        return cand
+
+    def items():  # (arcname, file-rel) pairs, folders recursed
+        for rel in rels:
+            base = rel.split("\\")[-1]
+            try:
+                st = smbclient.stat(bridge._unc(root, rel))
+            except SMBLinkRedirectionError:
+                continue
+            if st.st_mode & 0o040000:
+                prefix = arcname(base)
+                for frel in walk(rel):
+                    yield prefix + "/" + frel[len(rel):].lstrip("\\").replace("\\", "/"), frel
+            else:
+                yield arcname(base), rel
+
+    first = rels[0].split("\\")[-1]
+    zname = first if len(rels) == 1 else f"{first} (+{len(rels)-1})"
+
+    def gen():
+        buf = io.BytesIO()
+        zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
+        for arc, frel in items():
+            with bridge.open_read(vmid, frel) as f, zf.open(arc, "w") as zdst:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    _throttle(uid, len(chunk))
+                    zdst.write(chunk)
+            data = buf.getvalue()
+            if data:
+                yield data
+                buf.seek(0)
+                buf.truncate(0)
+        zf.close()
+        yield buf.getvalue()
+
+    return StreamingResponse(
+        gen(), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zname}.zip"'})
+
+
 @app.post("/api/upload")
 async def api_upload(request: Request, vmid: int, path: str,
                      file: UploadFile,

@@ -43,6 +43,8 @@ document.documentElement.dataset.theme=t;})();
   main { flex:1; overflow:auto; padding:0 8px 8px; }
   table { width:100%; border-collapse:collapse; background:var(--panel); }
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th.ck,td.ck { width:34px; padding:8px 2px 8px 12px; }
+  .ck input { width:17px; height:17px; accent-color:var(--accent); cursor:pointer; }
   th { position:sticky; top:0; background:var(--th-bg); color:var(--muted); font-weight:600; z-index:1; }
   tr.row { cursor:default; user-select:none; }
   tr.row:hover { background:var(--row-hover); }
@@ -94,7 +96,7 @@ document.documentElement.dataset.theme=t;})();
   <div class="crumbs" id="crumbs"></div>
   <main>
     <table>
-      <thead><tr><th id="thName"></th><th class="size" id="thSize"></th><th class="date" id="thDate"></th></tr></thead>
+      <thead><tr><th class="ck"><input type="checkbox" id="selAll"></th><th id="thName"></th><th class="size" id="thSize"></th><th class="date" id="thDate"></th></tr></thead>
       <tbody id="list"></tbody>
     </table>
     <div class="empty" id="empty" hidden></div>
@@ -127,6 +129,7 @@ const MSG = {
     loading:"Cargando…", noServers:"No hay servidores encendidos.",
     items:n=>`${n} elemento(s)`, emptyFolder:"Carpeta vacía",
     selected:n=>`${n} seleccionado${n===1?"":"s"}`,
+    selectAll:"Seleccionar todo",
     clipBar:(n,op)=>`Portapapeles: ${n} elemento(s) para ${op==="move"?"mover":"copiar"}`,
     clipSet:(n,op)=>`${n} elemento(s) ${op==="move"?"cortado(s)":"copiado(s)"}`,
     moving:"Moviendo…", copying:"Copiando…",
@@ -152,6 +155,7 @@ const MSG = {
     loading:"Loading…", noServers:"No servers are powered on.",
     items:n=>`${n} item(s)`, emptyFolder:"Empty folder",
     selected:n=>`${n} selected`,
+    selectAll:"Select all",
     clipBar:(n,op)=>`Clipboard: ${n} item(s) to ${op==="move"?"move":"copy"}`,
     clipSet:(n,op)=>`${n} item(s) ${op==="move"?"cut":"copied"}`,
     moving:"Moving…", copying:"Copying…",
@@ -184,13 +188,14 @@ function applyStatic(){
   set("#mkdir",T.mkdir); set("#download",T.download); set("#copy",T.copy); set("#cut",T.cut);
   set("#paste",T.paste); set("#rename",T.rename); set("#del",T.del);
   $("#thName").textContent=T.thName; $("#thSize").textContent=T.thSize; $("#thDate").textContent=T.thDate;
+  $("#selAll").title=T.selectAll;
   $("#sel").textContent=T.selected(0);
 }
 applyStatic();
 
 const fmtSize = n => { if(!n) return ""; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<4){n/=1024;i++;} return n.toFixed(i?1:0)+" "+u[i]; };
 const fmtDate = t => t? new Date(t*1000).toLocaleString(T.dateLocale,{dateStyle:"short",timeStyle:"short"}) : "";
-let STATE = { vmid:null, path:"", goodPath:"", entries:[], sel:new Set(), clip:null }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path
+let STATE = { vmid:null, path:"", goodPath:"", entries:[], view:[], sel:new Set(), clip:null }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path; view = rendered name order
 
 function toast(msg, ms=2600){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),ms); }
 function status(msg){ $("#status").innerHTML = msg||""; }
@@ -250,7 +255,7 @@ async function list(){
     const d = await apiJSON(`list?vmid=${reqVmid}&path=${encodeURIComponent(reqPath)}`);
     if(STATE.path!==reqPath || STATE.vmid!==reqVmid) return; // superseded by a newer navigation
     STATE.goodPath = reqPath;
-    STATE.entries = d.entries; STATE.sel.clear();
+    STATE.entries = d.entries; STATE.sel.clear(); lastAnchor=null;
     render();
     status(T.items(d.total));
   } catch(e){
@@ -261,18 +266,22 @@ async function list(){
     status(""); toast(T.errList(e.message));
   }
 }
+let lastAnchor=null; // last plainly-clicked name, the Shift-range anchor
 function render(){
   const tb=$("#list"); tb.innerHTML="";
   const empty=$("#empty");
   // folders first, then files, both alpha
   const es=[...STATE.entries].sort((a,b)=> (b.isDir-a.isDir) || a.name.localeCompare(b.name,LANG));
+  STATE.view = es.map(e=>e.name); // rendered order, for Shift ranges / select-all
   if(!es.length){ empty.hidden=false; empty.textContent=T.emptyFolder; } else empty.hidden=true;
   const cutSet = new Set((STATE.clip&&STATE.clip.op==="move"? STATE.clip.items:[]).filter(i=>i.vmid===STATE.vmid).map(i=>i.path));
   es.forEach(en=>{
     const tr=document.createElement("tr"); tr.className="row"+(cutSet.has(joinPath(STATE.path,en.name))?" cut":"");
     tr.dataset.name=en.name; tr.dataset.dir=en.isDir?"1":"";
-    tr.innerHTML=`<td class="name"><span class="ic">${en.isDir?"📁":"📄"}</span>${escapeHtml(en.name)}</td>`+
+    tr.innerHTML=`<td class="ck"><input type="checkbox" tabindex="-1"${STATE.sel.has(en.name)?" checked":""}></td>`+
+                 `<td class="name"><span class="ic">${en.isDir?"📁":"📄"}</span>${escapeHtml(en.name)}</td>`+
                  `<td class="size">${en.isDir?"":fmtSize(en.size)}</td><td class="date">${fmtDate(en.mtime)}</td>`;
+    tr.querySelector("input").onclick=ev=>{ ev.stopPropagation(); toggleSel(en.name); };
     tr.onclick=(ev)=>selectRow(en.name, ev);
     tr.ondblclick=()=>{ if(en.isDir){ STATE.path=joinPath(STATE.path,en.name); list(); } else download1(en.name); };
     if(STATE.sel.has(en.name)) tr.classList.add("sel");
@@ -281,12 +290,35 @@ function render(){
   renderCrumbs(); updateBar();
 }
 function escapeHtml(s){ return s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function toggleSel(name){ // checkbox path: additive, no modifier needed (mobile!)
+  STATE.sel.has(name)?STATE.sel.delete(name):STATE.sel.add(name);
+  lastAnchor=name; syncSelUI();
+}
 function selectRow(name, ev){
-  if(ev.ctrlKey||ev.metaKey){ STATE.sel.has(name)?STATE.sel.delete(name):STATE.sel.add(name); }
-  else { STATE.sel.clear(); STATE.sel.add(name); }
-  [...$("#list").children].forEach(tr=>tr.classList.toggle("sel", STATE.sel.has(tr.dataset.name)));
+  const v=STATE.view||[];
+  if(ev.shiftKey && lastAnchor!==null && v.includes(lastAnchor)){
+    const a=v.indexOf(lastAnchor), b=v.indexOf(name), [i,j]=a<b?[a,b]:[b,a];
+    if(!(ev.ctrlKey||ev.metaKey)) STATE.sel.clear();
+    for(let k=i;k<=j;k++) STATE.sel.add(v[k]);
+  } else if(ev.ctrlKey||ev.metaKey){
+    STATE.sel.has(name)?STATE.sel.delete(name):STATE.sel.add(name); lastAnchor=name;
+  } else { STATE.sel.clear(); STATE.sel.add(name); lastAnchor=name; }
+  syncSelUI();
+}
+function syncSelUI(){
+  [...$("#list").children].forEach(tr=>{
+    const on=STATE.sel.has(tr.dataset.name);
+    tr.classList.toggle("sel", on);
+    const ck=tr.querySelector("input"); if(ck) ck.checked=on;
+  });
   updateBar();
 }
+$("#selAll").onclick=()=>{
+  const v=STATE.view||[];
+  if(STATE.sel.size===v.length && v.length){ STATE.sel.clear(); }
+  else { STATE.sel = new Set(v); }
+  syncSelUI();
+};
 function renderCrumbs(){
   const c=$("#crumbs"); c.innerHTML="";
   const mk=(label,path)=>{ const a=document.createElement("a"); a.textContent=label; a.onclick=()=>{STATE.path=path; list();}; return a; };
@@ -299,10 +331,12 @@ function updateBar(){
   $("#sel").textContent = T.selected(n);
   $("#clip").textContent = STATE.clip ? T.clipBar(STATE.clip.items.length, STATE.clip.op) : "";
   const one=n===1, any=n>=1;
-  $("#download").disabled=!one; $("#rename").disabled=!one;
+  $("#download").disabled=!any; $("#rename").disabled=!one;
   $("#copy").disabled=!any; $("#cut").disabled=!any; $("#del").disabled=!any;
   $("#paste").disabled=!STATE.clip;
   $("#up").disabled=!STATE.path;
+  const total=(STATE.view||[]).length, all=total>0 && n===total;
+  const sa=$("#selAll"); sa.checked=all; sa.indeterminate=n>0 && !all;
 }
 
 // ---- Toolbar actions ----
@@ -325,10 +359,16 @@ $("#paste").onclick=async()=>{
     STATE.clip=null; list();
   }catch(e){ status(""); toast(T.errPaste(e.message)); }
 };
-$("#download").onclick=()=>{ const e=selEntries()[0]; if(e) e.isDir?downloadFolder(e.name):download1(e.name); };
-function dlUrl(p,folder){ return `/api/${folder?"download-folder":"download"}?vmid=${STATE.vmid}&path=${encodeURIComponent(p)}`; } // auth = session cookie
-function download1(name){ window.location = dlUrl(joinPath(STATE.path,name),false); }
-function downloadFolder(name){ toast(T.zip); window.location = dlUrl(joinPath(STATE.path,name),true); }
+$("#download").onclick=()=>{
+  const es=selEntries(); if(!es.length) return;
+  if(es.length===1 && !es[0].isDir) return download1(es[0].name);
+  // multi-selection and/or folders -> one ZIP (auth = session cookie)
+  toast(T.zip);
+  window.location = `/api/download-zip?vmid=${STATE.vmid}&`+
+    es.map(e=>`path=${encodeURIComponent(joinPath(STATE.path,e.name))}`).join("&");
+};
+function dlUrl(p){ return `/api/download?vmid=${STATE.vmid}&path=${encodeURIComponent(p)}`; } // auth = session cookie
+function download1(name){ window.location = dlUrl(joinPath(STATE.path,name)); }
 $("#mkdir").onclick=()=>prompt2(T.mkdirTitle,T.mkdirLabel,"",async v=>{
   if(!v) return; await apiJSON("mkdir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vmid:STATE.vmid,path:joinPath(STATE.path,v)})}); list();
 });
