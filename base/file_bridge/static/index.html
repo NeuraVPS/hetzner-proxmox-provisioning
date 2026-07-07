@@ -190,7 +190,7 @@ applyStatic();
 
 const fmtSize = n => { if(!n) return ""; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<4){n/=1024;i++;} return n.toFixed(i?1:0)+" "+u[i]; };
 const fmtDate = t => t? new Date(t*1000).toLocaleString(T.dateLocale,{dateStyle:"short",timeStyle:"short"}) : "";
-let STATE = { vmid:null, path:"", entries:[], sel:new Set(), clip:null }; // clip={op,items:[{vmid,path,name}]}
+let STATE = { vmid:null, path:"", goodPath:"", entries:[], sel:new Set(), clip:null }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path
 
 function toast(msg, ms=2600){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),ms); }
 function status(msg){ $("#status").innerHTML = msg||""; }
@@ -239,18 +239,27 @@ async function loadServers(){
   STATE.vmid = d.servers[0].vmid;
   sel.value = STATE.vmid;
 }
-$("#server").onchange = e => { STATE.vmid = +e.target.value; STATE.path=""; STATE.sel.clear(); list(); };
+$("#server").onchange = e => { STATE.vmid = +e.target.value; STATE.path=""; STATE.goodPath=""; STATE.sel.clear(); list(); };
 
 // ---- Listing ----
 function joinPath(p, name){ return p ? p+"\\"+name : name; }
 async function list(){
+  const reqPath = STATE.path, reqVmid = STATE.vmid;
   status('<span class="spin"></span> '+T.loading);
   try {
-    const d = await apiJSON(`list?vmid=${STATE.vmid}&path=${encodeURIComponent(STATE.path)}`);
+    const d = await apiJSON(`list?vmid=${reqVmid}&path=${encodeURIComponent(reqPath)}`);
+    if(STATE.path!==reqPath || STATE.vmid!==reqVmid) return; // superseded by a newer navigation
+    STATE.goodPath = reqPath;
     STATE.entries = d.entries; STATE.sel.clear();
     render();
     status(T.items(d.total));
-  } catch(e){ status(""); toast(T.errList(e.message)); }
+  } catch(e){
+    // Don't strand STATE.path on a folder that failed to open: revert to the
+    // listing actually on screen, or the next double-click would chain paths
+    // ("My Servers\MetaTrader\Program Files" bug, 2026-07-08).
+    if(STATE.path===reqPath && STATE.vmid===reqVmid){ STATE.path = STATE.goodPath; renderCrumbs(); updateBar(); }
+    status(""); toast(T.errList(e.message));
+  }
 }
 function render(){
   const tb=$("#list"); tb.innerHTML="";
