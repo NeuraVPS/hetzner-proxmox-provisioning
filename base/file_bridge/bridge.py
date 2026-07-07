@@ -189,6 +189,7 @@ def _unc(root: str, rel: str) -> str:
 def list_dir(vmid: int, path: str, offset: int = 0,
              limit: int = LIST_PAGE_SIZE) -> Dict[str, Any]:
     import smbclient
+    from smbprotocol.exceptions import SMBLinkRedirectionError
     _server, root = _smb_session(vmid)
     rel = _safe_rel(path)
     target = _unc(root, rel)
@@ -196,6 +197,7 @@ def list_dir(vmid: int, path: str, offset: int = 0,
     names.sort(key=str.lower)
     page = names[offset:offset + limit]
     entries = []
+    skipped = 0
     for name in page:
         full = target + "\\" + name
         try:
@@ -207,9 +209,15 @@ def list_dir(vmid: int, path: str, offset: int = 0,
                 "size": 0 if is_dir else st.st_size,
                 "mtime": int(st.st_mtime),
             })
+        except SMBLinkRedirectionError:
+            # Windows SYMLINK resolved client-side (e.g. the cross-server
+            # links under C:\My Servers, or Users\All Users). Explorer hides
+            # these; the web browser's server dropdown covers cross-server —
+            # skip them instead of 500ing the whole listing (bug 2026-07-08).
+            skipped += 1
         except OSError:
             entries.append({"name": name, "isDir": False, "size": 0, "mtime": 0})
-    return {"path": rel, "total": len(names), "offset": offset,
+    return {"path": rel, "total": len(names) - skipped, "offset": offset,
             "entries": entries}
 
 
@@ -243,9 +251,19 @@ def remove(vmid: int, path: str) -> None:
 
 
 def _rmtree(smbclient, unc_dir: str) -> None:
+    from smbprotocol.exceptions import SMBLinkRedirectionError
     for name in smbclient.listdir(unc_dir):
         child = unc_dir + "\\" + name
-        st = smbclient.stat(child)
+        try:
+            st = smbclient.stat(child)
+        except SMBLinkRedirectionError:
+            # Windows symlink: delete the LINK itself (never follow it —
+            # its target may be another VM). Dir-link first, file fallback.
+            try:
+                smbclient.rmdir(child)
+            except OSError:
+                smbclient.remove(child)
+            continue
         if st.st_mode & 0o040000:
             _rmtree(smbclient, child)
         else:
@@ -278,13 +296,17 @@ def _copy_file_stream(src_vmid: int, src_path: str,
 
 
 def _copy_tree(smbclient, src_vmid, src_rel, dst_vmid, dst_rel) -> int:
+    from smbprotocol.exceptions import SMBLinkRedirectionError
     mkdir(dst_vmid, dst_rel)
     _s_server, s_root = _smb_session(src_vmid)
     total = 0
     for name in smbclient.listdir(_unc(s_root, src_rel)):
         s_child = (src_rel + "\\" + name) if src_rel else name
         d_child = (dst_rel + "\\" + name) if dst_rel else name
-        st = smbclient.stat(_unc(s_root, s_child))
+        try:
+            st = smbclient.stat(_unc(s_root, s_child))
+        except SMBLinkRedirectionError:
+            continue  # never copy through symlinks (cross-server links!)
         if st.st_mode & 0o040000:
             total += _copy_tree(smbclient, src_vmid, s_child, dst_vmid, d_child)
         else:

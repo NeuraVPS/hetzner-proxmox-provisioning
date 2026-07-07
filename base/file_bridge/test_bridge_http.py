@@ -2,6 +2,7 @@ import base64, hashlib, hmac, json, os, tempfile, time, sys
 os.environ["FILE_BRIDGE_REDEEMED_FILE"] = os.path.join(tempfile.mkdtemp(), "redeemed.json")
 import bridge
 bridge.TOKEN_SECRET = "test-secret-123"
+_orig_list_dir = bridge.list_dir  # real one, tested below with a fake smbclient
 # mock the SMB layer (already validated live) so we test HTTP logic only
 STATE = {"list_calls": [], "paste_calls": []}
 bridge.list_dir = lambda vmid,path,offset=0,limit=500: {"path":path,"total":2,"offset":offset,"entries":[{"name":"a.txt","isDir":False,"size":10,"mtime":0},{"name":"My Servers","isDir":True,"size":0,"mtime":0}]}
@@ -80,6 +81,24 @@ r.append(("2nd link redeems", cE.post("/api/session",headers={"Authorization":f"
 app._redeemed.clear()          # simulate process restart
 app._load_redeemed()           # reload from REDEEMED_PATH
 r.append(("reuse blocked AFTER restart", client().post("/api/session",headers={"Authorization":f"Bearer {tok2}"}).status_code==401))
+
+# --- real list_dir: Windows symlinks are SKIPPED, not a 500 (bug 2026-07-08,
+# C:\My Servers cross-server links / Users\All Users blew up the listing)
+import types
+from smbprotocol.exceptions import SMBLinkRedirectionError
+fake_smb = types.ModuleType("smbclient")
+fake_smb.listdir = lambda unc: ["VM100 - link", "ok.txt", "SubDir"]
+def _fake_stat(unc):
+    name = unc.split("\\")[-1]
+    if "link" in name: raise SMBLinkRedirectionError("path", "target")
+    st = types.SimpleNamespace()
+    st.st_mode, st.st_size, st.st_mtime = (0o040755, 0, 1000) if name=="SubDir" else (0o100644, 10, 1000)
+    return st
+fake_smb.stat = _fake_stat
+sys.modules["smbclient"] = fake_smb
+bridge._smb_session = lambda vmid: ("srv", r"\\srv\C$")
+d = _orig_list_dir(1, "")
+r.append(("real list_dir skips symlinks", [e["name"] for e in d["entries"]]==["ok.txt","SubDir"] and d["total"]==2))
 
 ok=sum(1 for _,v in r if v)
 for name,v in r: print(("PASS" if v else "FAIL"), name)

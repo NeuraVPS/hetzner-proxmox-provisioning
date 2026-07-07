@@ -258,6 +258,7 @@ def api_download_folder(vmid: int, path: str,
     _authz_vmid(payload, vmid)
     uid = payload["uid"]
     import smbclient
+    from smbprotocol.exceptions import SMBLinkRedirectionError
     _srv, root = bridge._smb_session(vmid)
     base_rel = bridge._safe_rel(path)
     base_name = base_rel.split("\\")[-1] or f"vm{vmid}"
@@ -265,7 +266,10 @@ def api_download_folder(vmid: int, path: str,
     def walk(rel: str):
         for nm in smbclient.listdir(bridge._unc(root, rel)):
             child = (rel + "\\" + nm) if rel else nm
-            st = smbclient.stat(bridge._unc(root, child))
+            try:
+                st = smbclient.stat(bridge._unc(root, child))
+            except SMBLinkRedirectionError:
+                continue  # don't zip through symlinks (cross-server links)
             if st.st_mode & 0o040000:
                 yield from walk(child)
             else:

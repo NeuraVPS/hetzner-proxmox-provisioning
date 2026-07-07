@@ -58,6 +58,23 @@ between the token-minting Cloud Function (phase 4, pending) and both bridges.
   in "Transferir archivos"; the bridge serves its own single-pane UI at `/`
   (`static/index.html` here).
 
+## Update 2026-07-08 (v3.2) — symlink 500s + UI path desync
+
+- Operator repro on VM 203: opening `My Servers`/`Users` → 500. Cause:
+  `smbclient.stat()` raises `SMBLinkRedirectionError` (NOT an OSError) on
+  Windows SYMLINKS resolved client-side — `C:\My Servers` holds the
+  cross-server SMB links (setup_smb_symlinks), `Users` has `All Users`.
+  Junctions are fine (server-side). Fix: `list_dir` skips symlink entries
+  (like Explorer hides them; the web UI's server dropdown IS the
+  cross-server path), and the recursive walkers (`_rmtree`, `_copy_tree`,
+  zip `walk`) skip/handle them instead of aborting mid-operation.
+- UI: a failed navigation left `STATE.path` on the broken folder while the
+  view stayed put → next double-clicks chained nonsense paths
+  (`My Servers\MetaTrader\Program Files`). `list()` now reverts to the
+  last successfully listed path on error (+ stale-response guard).
+- Deployed b0+b1 (restart) — live verify on VM 203: `My Servers` and
+  `Users` list 200 with links skipped. Suite 26/26.
+
 ## Update 2026-07-08 (v3.1) — redeemed-set persistence + host binding
 
 - The two v3 residuals are closed (operator OK'd invalidating old links):
