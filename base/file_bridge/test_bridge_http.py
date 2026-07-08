@@ -63,6 +63,17 @@ r.append(("download w/o cookie 401", client().get(f"/api/download?vmid=201&path=
 rn=cA.post("/api/session")
 r.append(("renew resumes", rn.status_code==200 and rn.json().get("resumed")==True))
 r.append(("renew exp <= cap", rn.json()["exp"]<=rn.json()["cap"]))
+# --- CROSS-SESSION (2026-07-08 leak): with a session cookie already active,
+# opening a NEW link (different servers) must REDEEM the new one, not resume
+# the stale cookie. Use a dedicated client so cA (uidA, 201/444) is untouched.
+cZ=client()
+cZ.post("/api/session",headers={"Authorization":f"Bearer {mint('uidZ',SRV)}"})   # cookie = 201/444
+OTHER=[{"vmid":999,"name":"Other cust","type":"mt"}]
+sb=cZ.post("/api/session",headers={"Authorization":f"Bearer {mint('uidZ2',OTHER)}"})  # present link B
+r.append(("new link redeems over stale cookie", sb.status_code==200 and not sb.json().get("resumed")))
+new_vmids=sorted(s["vmid"] for s in cZ.get("/api/servers").json()["servers"])
+r.append(("session now shows the NEW link's servers only", new_vmids==[999]))
+r.append(("stale servers (201/444) gone", 201 not in new_vmids and 444 not in new_vmids))
 # --- a session token is NOT a link token
 cC=client()
 r.append(("session token can't redeem", cC.post("/api/session",headers={"Authorization":f"Bearer {COOKIE}"}).status_code==401))

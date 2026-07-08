@@ -132,47 +132,55 @@ def require_session(request: Request) -> Dict[str, Any]:
 @app.post("/api/session")
 def api_session(request: Request, response: Response,
                 t: Optional[str] = Query(None)):
-    """Resume-or-redeem. With a valid session cookie: slide it (renewal).
-    Else: redeem the CF link token (Bearer or ?t=) — single use — and set
-    the session cookie. The UI calls this at boot and every ~20 min."""
+    """Redeem-or-resume. A presented LINK token (Bearer or ?t=) always mints
+    a NEW session — a browser OPEN — replacing any existing cookie. Only when
+    NO token is presented (the ~20-min renewal ping) do we slide the existing
+    cookie session. The UI sends the link token at boot and nothing on renew.
+
+    CRITICAL: the token must be checked BEFORE the cookie. Otherwise opening a
+    second server's browser in the same browser keeps the FIRST server's
+    session (the cookie is one per files-* origin) — a cross-customer leak
+    where e.g. an admin who opened customer A's browser then opened customer
+    B's kept seeing A's servers (and had SMB access to them). 2026-07-08."""
     now = int(time.time())
+    raw = _bearer(request) or t
+    if raw:
+        try:
+            payload = bridge.verify_token(raw)
+        except bridge.TokenError as e:
+            raise HTTPException(401, f"invalid token: {e}")
+        if payload.get("sid"):
+            raise HTTPException(401, "not a link token")
+        # Host binding (v3.1): the CF stamps the hostname the link was minted
+        # for; without this a link could redeem once per REGION (each base has
+        # its own redeemed set, and both serve both files-* hostnames).
+        req_host = (request.headers.get("host") or "").split(":")[0].lower()
+        if str(payload.get("host") or "").lower() != req_host:
+            raise HTTPException(401, "wrong host")
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        minted_at = int(payload["exp"]) - CF_TOKEN_TTL
+        cap = minted_at + SESSION_CAP
+        if now >= cap:  # can't happen while links live 1h, keep the invariant
+            raise HTTPException(401, "link too old")
+        with _redeem_lock:
+            _prune_redeemed()
+            if digest in _redeemed:
+                raise HTTPException(401, "link already used")
+            _redeemed[digest] = int(payload["exp"])
+            _save_redeemed()
+        sess = {"uid": payload["uid"], "servers": payload["servers"],
+                "sid": secrets.token_hex(8), "cap": cap,
+                "exp": min(now + SESSION_TTL, cap)}
+        _set_session_cookie(response, sess)
+        return {"ok": True, "exp": sess["exp"], "cap": cap}
+    # No token → renewal ping: slide the existing cookie session.
     sess = _session_from_cookie(request)
     if sess:
         sess["exp"] = min(now + SESSION_TTL, int(sess["cap"]))
         _set_session_cookie(response, sess)
         return {"ok": True, "exp": sess["exp"], "cap": sess["cap"],
                 "resumed": True}
-    raw = _bearer(request) or t
-    if not raw:
-        raise HTTPException(401, "missing token")
-    try:
-        payload = bridge.verify_token(raw)
-    except bridge.TokenError as e:
-        raise HTTPException(401, f"invalid token: {e}")
-    if payload.get("sid"):
-        raise HTTPException(401, "not a link token")
-    # Host binding (v3.1): the CF stamps the hostname the link was minted
-    # for; without this a link could redeem once per REGION (each base has
-    # its own redeemed set, and both serve both files-* hostnames).
-    req_host = (request.headers.get("host") or "").split(":")[0].lower()
-    if str(payload.get("host") or "").lower() != req_host:
-        raise HTTPException(401, "wrong host")
-    digest = hashlib.sha256(raw.encode()).hexdigest()
-    minted_at = int(payload["exp"]) - CF_TOKEN_TTL
-    cap = minted_at + SESSION_CAP
-    if now >= cap:  # can't happen while links live 1h, but keep the invariant
-        raise HTTPException(401, "link too old")
-    with _redeem_lock:
-        _prune_redeemed()
-        if digest in _redeemed:
-            raise HTTPException(401, "link already used")
-        _redeemed[digest] = int(payload["exp"])
-        _save_redeemed()
-    sess = {"uid": payload["uid"], "servers": payload["servers"],
-            "sid": secrets.token_hex(8), "cap": cap,
-            "exp": min(now + SESSION_TTL, cap)}
-    _set_session_cookie(response, sess)
-    return {"ok": True, "exp": sess["exp"], "cap": cap}
+    raise HTTPException(401, "missing token")
 
 
 def _authz_vmid(payload: Dict[str, Any], vmid: int) -> bridge.ServerRef:

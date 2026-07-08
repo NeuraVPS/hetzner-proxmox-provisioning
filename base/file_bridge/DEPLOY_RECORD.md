@@ -58,6 +58,24 @@ between the token-minting Cloud Function (phase 4, pending) and both bridges.
   in "Transferir archivos"; the bridge serves its own single-pane UI at `/`
   (`static/index.html` here).
 
+## Update 2026-07-08 (v3.4) — CROSS-TENANT LEAK FIX: redeem link over stale cookie
+
+- **Bug (cross-customer leak):** `/api/session` was "resume-or-redeem" —
+  it checked the `fb_session` cookie FIRST and, if valid, slid it and
+  **ignored any presented link token**. Since the cookie is one per
+  `files-*` origin, opening a SECOND customer's browser in the same browser
+  kept the FIRST session: an admin who opened customer A's file browser and
+  then customer B's kept seeing A's servers (VMs 1920/1903/1867/1868 of
+  mj_bradford surfaced while opening admin@hobbiecode's) **and had SMB
+  read/write access to them.** (Non-admins were never affected — they can
+  only ever mint links for their own servers.)
+- **Fix:** a presented link token (Bearer/`?t=`) is now redeemed FIRST into
+  a NEW session, replacing any existing cookie (a browser OPEN); the cookie
+  is only resumed when NO token is presented (the ~20-min renewal ping).
+- Deployed b0+b1 (restart). Tests 31/31 (3 new cross-session cases) +
+  live E2E on files-hel: link A→[201], then link B on the same cookie→[777]
+  (not [201]).
+
 ## Update 2026-07-08 (v3.3) — pre-select the origin server (?vmid=)
 
 - `static/index.html`: `loadServers()` reads `?vmid=` and pre-selects that
