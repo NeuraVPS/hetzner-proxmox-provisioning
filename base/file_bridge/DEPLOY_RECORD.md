@@ -58,6 +58,19 @@ between the token-minting Cloud Function (phase 4, pending) and both bridges.
   in "Transferir archivos"; the bridge serves its own single-pane UI at `/`
   (`static/index.html` here).
 
+## Update 2026-07-08 (v3.3) — pre-select the origin server (?vmid=)
+
+- `static/index.html`: `loadServers()` reads `?vmid=` and pre-selects that
+  server in the dropdown (falls back to the first if absent/not in the list).
+  The token-minting CF (NeuraVPS `get_file_browser_url`) now appends
+  `&vmid=<clicked server's proxmoxId>` to the redirect. Backward-compatible
+  both ways (old CF → no vmid → first server; old bridge → ignores the param).
+- Companion: NeuraVPS adds a `/files?serverId=` Firebase page (a stable,
+  copyable entry point like `/console`) that mints + redirects here; the panel
+  and admin/servers now link to it.
+- UI-only on the base; copied to b0+b1 `/opt/file-bridge/static/` (served per
+  request, no restart).
+
 ## Update 2026-07-08 (v3.2) — symlink 500s + UI path desync
 
 - Operator repro on VM 203: opening `My Servers`/`Users` → 500. Cause:
