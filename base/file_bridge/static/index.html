@@ -245,7 +245,10 @@ async function loadServers(){
   const sel = $("#server"); sel.innerHTML="";
   d.servers.forEach(s=>{ const o=document.createElement("option"); o.value=s.vmid; o.textContent=`${s.name} (VM ${s.vmid})`; sel.appendChild(o); });
   if(!d.servers.length){ status(T.noServers); return; }
-  STATE.vmid = d.servers[0].vmid;
+  // Pre-select the server the browser was opened from (?vmid=), if present
+  // and in the list; otherwise default to the first.
+  const wantVmid = parseInt(qs.get("vmid")||"", 10);
+  STATE.vmid = d.servers.some(s=>s.vmid===wantVmid) ? wantVmid : d.servers[0].vmid;
   sel.value = STATE.vmid;
 }
 $("#server").onchange = e => { STATE.vmid = +e.target.value; STATE.path=""; STATE.goodPath=""; STATE.sel.clear(); list(); };
