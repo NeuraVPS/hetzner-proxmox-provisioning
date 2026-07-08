@@ -37,9 +37,14 @@ document.documentElement.dataset.theme=t;})();
   .btn:disabled { opacity:.45; cursor:default; }
   .btn.danger:hover:not(:disabled) { background:var(--danger-bg); border-color:var(--danger); color:var(--danger); }
   .sep { width:1px; height:22px; background:var(--line); margin:0 4px; }
-  .crumbs { padding:8px 14px; color:var(--muted); display:flex; gap:4px; align-items:center; flex-wrap:wrap; }
+  .crumbs { padding:8px 14px; color:var(--muted); display:flex; gap:3px; align-items:center; flex-wrap:wrap; }
   .crumbs a { color:var(--accent); cursor:pointer; text-decoration:none; }
   .crumbs a:hover { text-decoration:underline; }
+  .crumbs .crumbsep { color:var(--muted); }
+  .crumbs .crumbtoggle { border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:6px; padding:2px 7px; margin-right:5px; cursor:pointer; font-size:13px; line-height:1.5; }
+  .crumbs .crumbtoggle:hover { background:var(--accent-bg); border-color:var(--accent); }
+  .crumbs .pathinput { flex:1 1 220px; min-width:150px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:var(--input-bg); color:var(--ink); font:inherit; }
+  .crumbs .pathinput:focus { outline:none; border-color:var(--accent); }
   main { flex:1; overflow:auto; padding:0 8px 8px; }
   table { width:100%; border-collapse:collapse; background:var(--panel); }
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
@@ -130,6 +135,7 @@ const MSG = {
     thName:"Nombre", thSize:"Tamaño", thDate:"Modificado",
     loading:"Cargando…", noServers:"No hay servidores encendidos.",
     items:n=>`${n} elemento(s)`, emptyFolder:"Carpeta vacía",
+    pathModeEdit:"Escribir la ruta a mano", pathModeClick:"Ruta con carpetas clicables",
     selected:n=>`${n} seleccionado${n===1?"":"s"}`,
     selectAll:"Seleccionar todo",
     clipBar:(n,op)=>`Portapapeles: ${n} elemento(s) para ${op==="move"?"mover":"copiar"}`,
@@ -156,6 +162,7 @@ const MSG = {
     thName:"Name", thSize:"Size", thDate:"Modified",
     loading:"Loading…", noServers:"No servers are powered on.",
     items:n=>`${n} item(s)`, emptyFolder:"Empty folder",
+    pathModeEdit:"Type the path manually", pathModeClick:"Clickable folder path",
     selected:n=>`${n} selected`,
     selectAll:"Select all",
     clipBar:(n,op)=>`Clipboard: ${n} item(s) to ${op==="move"?"move":"copy"}`,
@@ -181,7 +188,8 @@ const LANG = (langParam==="es"||langParam==="en") ? langParam
 const T = MSG[LANG];
 
 let STATE = { vmid:null, path:"", goodPath:"", entries:[], view:[], sel:new Set(), clip:null,
-              sort:{key:"name",dir:1} }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path; view = rendered name order
+              sort:{key:"name",dir:1}, pathEdit:false }; // clip={op,items:[{vmid,path,name}]}; goodPath = last successfully LISTED path; view = rendered name order; pathEdit = editable-URL mode (persisted)
+try{ STATE.pathEdit = localStorage.getItem("fb_pathedit")==="1"; }catch(e){}
 
 function applyStatic(){
   document.documentElement.lang = LANG;
@@ -349,12 +357,48 @@ $("#selAll").onclick=()=>{
   else { STATE.sel = new Set(v); }
   syncSelUI();
 };
+// A typed "C:\Foo\Bar" (or /Foo/Bar, or Foo\Bar) -> the STATE.path form
+// (relative to C:, no drive, no leading/trailing/duplicate backslashes).
+function parseTypedPath(s){
+  s=(s||"").trim().replace(/\//g,"\\");
+  s=s.replace(/^[a-zA-Z]:/,"");            // drop a leading drive letter "C:"
+  s=s.replace(/^\\+/,"").replace(/\\+$/,""); // trim leading/trailing "\"
+  return s.replace(/\\{2,}/g,"\\");         // collapse doubles
+}
+let _focusPathInput=false; // one-shot: focus the path input after next render
 function renderCrumbs(){
   const c=$("#crumbs"); c.innerHTML="";
-  const mk=(label,path)=>{ const a=document.createElement("a"); a.textContent=label; a.onclick=()=>{STATE.path=path; list();}; return a; };
-  c.appendChild(mk("C:\\",""));
+  // Persistent toggle: clickable breadcrumbs <-> editable path bar.
+  const toggle=document.createElement("button");
+  toggle.className="crumbtoggle";
+  toggle.title=STATE.pathEdit?T.pathModeClick:T.pathModeEdit;
+  toggle.textContent=STATE.pathEdit?"🗂️":"✏️";
+  toggle.onclick=()=>{ STATE.pathEdit=!STATE.pathEdit; try{localStorage.setItem("fb_pathedit",STATE.pathEdit?"1":"");}catch(e){} if(STATE.pathEdit)_focusPathInput=true; renderCrumbs(); };
+  c.appendChild(toggle);
+
+  if(STATE.pathEdit){
+    // Editable mode (persists across navigations): type a path + Enter.
+    const inp=document.createElement("input");
+    inp.type="text"; inp.className="pathinput"; inp.spellcheck=false;
+    inp.value="C:\\"+STATE.path;
+    inp.onkeydown=e=>{
+      if(e.key==="Enter"){ e.preventDefault(); const p=parseTypedPath(inp.value); _focusPathInput=true; if(p!==STATE.path){ STATE.path=p; STATE.sel.clear(); } list(); }
+      else if(e.key==="Escape"){ inp.value="C:\\"+STATE.path; inp.blur(); }
+    };
+    c.appendChild(inp);
+    if(_focusPathInput){ _focusPathInput=false; setTimeout(()=>{ inp.focus(); const n=inp.value.length; try{inp.setSelectionRange(n,n);}catch(e){} },0); }
+    return;
+  }
+
+  // Clickable breadcrumbs. Drive crumb is "C:" and the root "\" is a plain
+  // separator, so root shows "C:\" and deeper paths never double the "\".
+  const mk=(label,path)=>{ const a=document.createElement("a"); a.textContent=label; a.onclick=()=>{STATE.path=path; STATE.sel.clear(); list();}; return a; };
+  const sep=()=>{ const s=document.createElement("span"); s.className="crumbsep"; s.textContent="\\"; return s; };
+  c.appendChild(mk("C:",""));
+  c.appendChild(sep());                    // the root backslash
+  const segs=STATE.path.split("\\").filter(Boolean);
   let acc="";
-  STATE.path.split("\\").filter(Boolean).forEach(seg=>{ acc=acc?acc+"\\"+seg:seg; c.append(" \\ ", mk(seg,acc)); });
+  segs.forEach((seg,i)=>{ acc=acc?acc+"\\"+seg:seg; c.appendChild(mk(seg,acc)); if(i<segs.length-1) c.appendChild(sep()); });
 }
 function updateBar(){
   const n=STATE.sel.size;
