@@ -366,6 +366,7 @@ function parseTypedPath(s){
   return s.replace(/\\{2,}/g,"\\");         // collapse doubles
 }
 let _focusPathInput=false; // one-shot: focus the path input after next render
+let _pathCaret=null;       // desired caret offset after that focus (null = end)
 function renderCrumbs(){
   const c=$("#crumbs"); c.innerHTML="";
   // Persistent toggle: clickable breadcrumbs <-> editable path bar.
@@ -382,11 +383,11 @@ function renderCrumbs(){
     inp.type="text"; inp.className="pathinput"; inp.spellcheck=false;
     inp.value="C:\\"+STATE.path;
     inp.onkeydown=e=>{
-      if(e.key==="Enter"){ e.preventDefault(); const p=parseTypedPath(inp.value); _focusPathInput=true; if(p!==STATE.path){ STATE.path=p; STATE.sel.clear(); } list(); }
+      if(e.key==="Enter"){ e.preventDefault(); const p=parseTypedPath(inp.value); _focusPathInput=true; _pathCaret=inp.selectionStart; if(p!==STATE.path){ STATE.path=p; STATE.sel.clear(); } list(); }
       else if(e.key==="Escape"){ inp.value="C:\\"+STATE.path; inp.blur(); }
     };
     c.appendChild(inp);
-    if(_focusPathInput){ _focusPathInput=false; setTimeout(()=>{ inp.focus(); const n=inp.value.length; try{inp.setSelectionRange(n,n);}catch(e){} },0); }
+    if(_focusPathInput){ _focusPathInput=false; const caret=_pathCaret; _pathCaret=null; setTimeout(()=>{ inp.focus(); const n=inp.value.length; const pos=(caret==null)?n:Math.min(caret,n); try{inp.setSelectionRange(pos,pos);}catch(e){} },0); }
     return;
   }
 
