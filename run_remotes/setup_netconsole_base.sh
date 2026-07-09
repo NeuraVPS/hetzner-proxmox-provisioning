@@ -52,6 +52,23 @@ RestartSec=2
 WantedBy=multi-user.target
 SVC
 
+# logrotate for the per-source collector logs. copytruncate because the collector
+# holds every file open; netconsole is low-volume (kernel events only) so the
+# copy/truncate race is negligible. maxsize guards against a boot-looping node.
+cat > /etc/logrotate.d/neuravps-netconsole <<'LR'
+/var/log/netconsole/*.log {
+    weekly
+    rotate 8
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+LR
+
 # --- 2) /64 allowlist refresh script + timer ---------------------------------
 cat > /usr/local/sbin/netconsole-fleet-allow.py <<'PY'
 #!/usr/bin/env python3
