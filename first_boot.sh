@@ -448,6 +448,23 @@ printf 'vm.swappiness=%s\nvm.page-cluster=0\n' "$SWAPPINESS" > /etc/sysctl.d/99-
 rm -f /etc/sysctl.d/99-proxmox-swap.conf
 sysctl -p /etc/sysctl.d/99-neuravps-memprofile.conf 2>/dev/null || true
 
+# Kernel self-recovery from a hard freeze / panic. Silent-freeze mitigation
+# (incident 2026-07-08, node 0000008: a hard lockup with no trace; the fleet
+# default kernel.panic=0 = "halt forever", so it took a ~23-min watchdog/manual
+# reset instead of self-recovering). With these:
+#   panic=10          -> reboot 10s after any panic
+#   hardlockup_panic  -> a hard lockup (NMI watchdog) BECOMES a panic -> reboot
+#   panic_on_oops     -> an oops BECOMES a panic -> reboot
+# Combined with crashkernel/kdump (below) the reboot also leaves a vmcore, so the
+# NEXT freeze is finally root-causeable. nmi_watchdog is on by default.
+# NOTE: softlockup_panic is intentionally NOT set (transient under heavy IO).
+cat > /etc/sysctl.d/99-neuravps-stability.conf <<'SYSCTL'
+kernel.panic = 10
+kernel.hardlockup_panic = 1
+kernel.panic_on_oops = 1
+SYSCTL
+sysctl -p /etc/sysctl.d/99-neuravps-stability.conf 2>/dev/null || true
+
 # zswap (ALL classes): compressed in-RAM swap cache in front of the swap
 # partitions. Built into the kernel (no modprobe.d), so a oneshot unit
 # re-applies the params each boot. Keep in sync with
@@ -548,6 +565,47 @@ if [ -f "$GRUB_DEFAULT" ]; then
 else
   log "WARNING: $GRUB_DEFAULT not found, skipping GRUB configuration"
 fi
+
+# ---- Effective kernel cmdline: systemd-boot / proxmox-boot-tool ----
+# These ZFS-root UEFI nodes boot via proxmox-boot-tool (systemd-boot), NOT GRUB:
+# the GRUB_CMDLINE_LINUX above does NOT reach /proc/cmdline (verified 2026-07-09;
+# the GPU blacklist still applies via /etc/modprobe.d). Kernel params that must
+# actually take effect therefore go in /etc/kernel/cmdline + a refresh:
+#   crashkernel=512M        reserve RAM so kdump can capture the next hard freeze
+#                           as a /var/crash vmcore (real root cause).
+#   processor.max_cstate=1  C-STATE MITIGATION for the silent AX162/EPYC freeze
+#                           (caps idle at C1, no deep CC6). Small idle-power cost;
+#                           only added on AMD hosts. REVIEW: drop if the freeze
+#                           proves unrelated to C-states.
+KCMDLINE=/etc/kernel/cmdline
+if [ -f "$KCMDLINE" ] && command -v proxmox-boot-tool >/dev/null 2>&1; then
+  ADD=""
+  grep -qw 'crashkernel=512M' "$KCMDLINE" || ADD="$ADD crashkernel=512M"
+  if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo; then
+    grep -qw 'processor.max_cstate=1' "$KCMDLINE" || ADD="$ADD processor.max_cstate=1"
+  fi
+  if [ -n "$ADD" ]; then
+    CUR="$(tr -s ' ' < "$KCMDLINE" | sed 's/[[:space:]]*$//')"
+    printf '%s%s\n' "$CUR" "$ADD" > "$KCMDLINE"
+    proxmox-boot-tool refresh || log "WARNING: proxmox-boot-tool refresh failed"
+    log "Kernel cmdline updated ->$ADD (active after the first_boot reboot)"
+  else
+    log "Kernel cmdline already has crashkernel/max_cstate; nothing to add"
+  fi
+else
+  log "WARNING: /etc/kernel/cmdline or proxmox-boot-tool missing — crashkernel/max_cstate NOT applied"
+fi
+
+# kdump: capture a vmcore to /var/crash on the next panic/hard-lockup, so the
+# silent freeze is finally diagnosable. Needs the crashkernel= reservation above
+# (active only after the first_boot reboot), so we enable (not --now) here.
+log "Installing + enabling kdump-tools (crashdump capture)"
+DEBIAN_FRONTEND=noninteractive apt-get install -y kdump-tools makedumpfile || log "WARNING: kdump-tools install failed"
+if [ -f /etc/default/kdump-tools ]; then
+  sed -i 's/^#\?[[:space:]]*USE_KDUMP=.*/USE_KDUMP=1/' /etc/default/kdump-tools
+  grep -q '^USE_KDUMP=1' /etc/default/kdump-tools || echo 'USE_KDUMP=1' >> /etc/default/kdump-tools
+fi
+systemctl enable kdump-tools 2>/dev/null || log "WARNING: kdump-tools enable failed"
 
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
