@@ -286,6 +286,11 @@ table ip6 rdpguard {
 }
 
 table inet filter {
+    # Firestore-driven allowlist of every node's IPv6 /64 (populated + refreshed
+    # by netconsole-fleet-allow.timer); gates the netconsole collector below so
+    # UDP 6666 is only reachable from our own nodes, never the public internet.
+    set nc_fleet_v6 { type ipv6_addr; flags interval; auto-merge; }
+
     # Fast-path: kernel flowtable for offloading established flows.
     # Once a connection is added to @ft, subsequent packets bypass the full
     # netfilter hook traversal (including NAT), cutting per-packet latency
@@ -306,6 +311,10 @@ table inet filter {
         # Required if nginx terminates TLS / handles HTTP redirects or ACME.
         tcp dport 80 accept
         tcp dport 443 accept
+        # netconsole from fleet nodes over IPv6 (kernel-console freeze capture,
+        # UDP 6666 -> netconsole-collector.service), restricted to our nodes' /64s
+        # via @nc_fleet_v6. See docs/INCIDENT_2026-07-08_node0000008_freeze.md.
+        udp dport 6666 ip6 saddr @nc_fleet_v6 accept
     }
 
     chain forward {

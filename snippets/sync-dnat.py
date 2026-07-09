@@ -342,6 +342,73 @@ def sync_all_statuses():
             update_status_in_firestore(vmid, actual_status)
 
 
+def _boot_history_crashloop(max_boots=4, window_sec=900):
+    """Record this boot and report whether the node is in a reboot loop.
+
+    Returns True if there have been > max_boots boots within the last window_sec
+    seconds — in which case node_boot_reconcile() must NOT auto-start VMs, so a
+    guest (or a hardware fault) that keeps taking the node down can't drive a
+    start -> crash -> reboot -> start loop. Fails SAFE (returns False) on any
+    error so a transient FS problem never blocks recovery.
+    """
+    try:
+        d = Path("/var/lib/neuravps")
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "boot_history"
+        now = time.time()
+        hist = []
+        if f.exists():
+            hist = [float(x) for x in f.read_text().split() if x.strip()]
+        hist = [t for t in hist if 0 <= now - t < window_sec]
+        hist.append(now)
+        f.write_text(" ".join(f"{t:.0f}" for t in hist[-20:]))
+        return len(hist) > max_boots
+    except Exception as e:
+        logger.warning(f"boot-history check failed ({e}); assuming NOT a reboot loop")
+        return False
+
+
+def node_boot_reconcile():
+    """Bring VMs back to their DESIRED state at node boot, without erasing it.
+
+    For each VM that Firestore says should be `running` but is physically stopped
+    after this (unplanned) reboot, `qm start` it — guarded by a reboot-loop
+    detector. A VM physically running but whose Firestore status lags is synced
+    up. We NEVER downgrade running->stopped here.
+
+    Why (incident 2026-07-08, node 0000008): the old node-boot path called
+    sync_all_statuses(), which — seeing every VM physically stopped right after a
+    reboot — overwrote Firestore running->stopped for ALL of them, ERASING the
+    record of what should be running; combined with no auto-start, all 12 VMs
+    stayed down until a human restarted each one. This restores them, and keeps
+    the desired state intact even when we deliberately don't auto-start (loop).
+    """
+    all_vm_status = get_all_vms()
+    logger.info(f"All VMs: {sorted(all_vm_status.keys())}")
+    loop = _boot_history_crashloop()
+    if loop:
+        logger.warning(
+            "REBOOT LOOP detected (many reboots in a short window) — NOT auto-starting "
+            "VMs this boot. Desired state left intact for the operator to resolve."
+        )
+    for vmid, actual_status in all_vm_status.items():
+        desired = get_firestore_status(vmid)
+        if desired == "running" and actual_status != "running":
+            if loop:
+                logger.warning(f"VM {vmid}: desired=running but node in reboot loop — skipping auto-start (Firestore left 'running')")
+                continue
+            logger.info(f"VM {vmid}: desired=running, stopped after node reboot — auto-starting")
+            try:
+                run(["qm", "start", str(vmid)])
+                time.sleep(2)  # small stagger so N guests don't all boot at once
+            except subprocess.CalledProcessError as e:
+                logger.error(f"auto-start VM {vmid} failed ({e.stderr or e}); Firestore desired state ('running') left intact")
+        elif desired is not None and desired != "running" and actual_status == "running":
+            logger.info(f"VM {vmid}: running on host but Firestore={desired}; syncing up to running")
+            update_status_in_firestore(vmid, "running")
+        # else: already matches, or desired stopped/None & VM stopped -> no-op (never clobber)
+
+
 # ---------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------
@@ -365,16 +432,16 @@ def main():
     # node-boot: stamp lastNodeBootAt, sync all statuses, then honor any
     # user-requested post-boot action (VPS E dedicated nodes only).
     if len(sys.argv) >= 2 and sys.argv[1] == "node-boot":
-        logger.info("node-boot: updating lastNodeBootAt and syncing VM statuses")
+        logger.info("node-boot: updating lastNodeBootAt and reconciling VMs to desired state")
         update_proxmox_node_last_boot_at()
         try:
-            sync_all_statuses()
+            node_boot_reconcile()
         except Exception as e:
-            # Never let a transient `qm list` / status-sync failure skip the
+            # Never let a transient `qm list` / reconcile failure skip the
             # maintenance finalize below. If it did, the panel would stay stuck
             # on "upgrading"/"rebooting" and the node would be locked out of all
             # future maintenance — exactly the failure this whole path guards.
-            logger.warning(f"node-boot: status sync failed, continuing to finalize: {e}")
+            logger.warning(f"node-boot: reconcile failed, continuing to finalize: {e}")
         handle_pending_post_boot_action()
         logger.info("Sync complete.")
         return

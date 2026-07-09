@@ -448,6 +448,23 @@ printf 'vm.swappiness=%s\nvm.page-cluster=0\n' "$SWAPPINESS" > /etc/sysctl.d/99-
 rm -f /etc/sysctl.d/99-proxmox-swap.conf
 sysctl -p /etc/sysctl.d/99-neuravps-memprofile.conf 2>/dev/null || true
 
+# Kernel self-recovery from a hard freeze / panic. Silent-freeze mitigation
+# (incident 2026-07-08, node 0000008: a hard lockup with no trace; the fleet
+# default kernel.panic=0 = "halt forever", so it took a ~23-min watchdog/manual
+# reset instead of self-recovering). With these:
+#   panic=10          -> reboot 10s after any panic
+#   hardlockup_panic  -> a hard lockup (NMI watchdog) BECOMES a panic -> reboot
+#   panic_on_oops     -> an oops BECOMES a panic -> reboot
+# Combined with crashkernel/kdump (below) the reboot also leaves a vmcore, so the
+# NEXT freeze is finally root-causeable. nmi_watchdog is on by default.
+# NOTE: softlockup_panic is intentionally NOT set (transient under heavy IO).
+cat > /etc/sysctl.d/99-neuravps-stability.conf <<'SYSCTL'
+kernel.panic = 10
+kernel.hardlockup_panic = 1
+kernel.panic_on_oops = 1
+SYSCTL
+sysctl -p /etc/sysctl.d/99-neuravps-stability.conf 2>/dev/null || true
+
 # zswap (ALL classes): compressed in-RAM swap cache in front of the swap
 # partitions. Built into the kernel (no modprobe.d), so a oneshot unit
 # re-applies the params each boot. Keep in sync with
@@ -547,6 +564,36 @@ if [ -f "$GRUB_DEFAULT" ]; then
   log "GRUB updated with integrated GPUs disabled (nomodeset + blacklist xe,i915,amdgpu)"
 else
   log "WARNING: $GRUB_DEFAULT not found, skipping GRUB configuration"
+fi
+
+# ---- Effective kernel cmdline: systemd-boot / proxmox-boot-tool ----
+# These ZFS-root UEFI nodes boot via proxmox-boot-tool (systemd-boot), NOT GRUB:
+# the GRUB_CMDLINE_LINUX above does NOT reach /proc/cmdline (verified 2026-07-09;
+# the GPU blacklist still applies via /etc/modprobe.d). Kernel params that must
+# actually take effect therefore go in /etc/kernel/cmdline + a refresh:
+#   processor.max_cstate=1  C-STATE MITIGATION for the silent AX162/EPYC freeze —
+#                           caps idle at C1 (no deep CC6). VALIDATED on canary
+#                           0000032 (2026-07-09): removed the C2 idle state.
+#                           AMD hosts only. Small idle-power cost; drop if the
+#                           freeze ever proves unrelated to C-states.
+#
+# NOTE: kdump/crashkernel deliberately NOT added. Canary 2026-07-09 (0000032):
+# with kdump armed, a panic kexecs into a crash kernel that HANGS on this AX162
+# hardware — captures nothing (/var/crash empty) AND leaves the node dead (kexec
+# bypasses panic=10), needing a manual Hetzner hw-reset. Worse than no kdump. The
+# clean auto-reboot (panic=10, below) is what we rely on. See
+# docs/INCIDENT_2026-07-08_node0000008_freeze.md for the full canary write-up +
+# untested capture follow-ups (efi_pstore / netconsole).
+KCMDLINE=/etc/kernel/cmdline
+if [ -f "$KCMDLINE" ] && command -v proxmox-boot-tool >/dev/null 2>&1; then
+  if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && ! grep -qw 'processor.max_cstate=1' "$KCMDLINE"; then
+    CUR="$(tr -s ' ' < "$KCMDLINE" | sed 's/[[:space:]]*$//')"
+    printf '%s processor.max_cstate=1\n' "$CUR" > "$KCMDLINE"
+    proxmox-boot-tool refresh || log "WARNING: proxmox-boot-tool refresh failed"
+    log "Kernel cmdline: added processor.max_cstate=1 (active after the first_boot reboot)"
+  fi
+else
+  log "WARNING: /etc/kernel/cmdline or proxmox-boot-tool missing — processor.max_cstate NOT applied"
 fi
 
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
@@ -665,6 +712,109 @@ else
     FIRST_BOOT_FAILED=1
   fi
 fi
+
+############################################
+# netconsole: stream this node's kernel console (the panic run-up) to the region
+# BASE, so a silent AX162/EPYC freeze can be diagnosed instead of leaving us
+# blind again (see docs/INCIDENT_2026-07-08_node0000008_freeze.md). Same helper
+# (v3, IPv6 over configfs) + unit as run_remotes/apply_freeze_mitigations.sh, so
+# a freshly reinstalled node matches a live-patched one. Region BASE = the node's
+# Firestore `location` (authoritative), falling back to the nearest base by RTT
+# when creds/Firestore are unavailable, then to HEL. errexit-safe on purpose.
+# netconsole streams over IPv6; the base only accepts our nodes' /64s.
+############################################
+log "Configuring netconsole (kernel console -> region BASE over IPv6)"
+NC_HEL=2a01:4f9:3070:3984::2   # b1 (Helsinki) IPv6
+NC_FSN=2a01:4f8:2b03:18a9::2   # b0 (Falkenstein) IPv6
+NC_BASE=""
+NC_LOC=""
+if [ -s /etc/firebase-credentials.json ]; then
+  NC_LOC="$(python3 - <<'PY' 2>/dev/null || true
+import subprocess
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    firebase_admin.initialize_app(credentials.Certificate("/etc/firebase-credentials.json"))
+    d = firestore.client().collection("proxmox_nodes").document(host).get()
+    print(((d.to_dict() or {}).get("location") or "").strip())
+except Exception:
+    pass
+PY
+)"
+fi
+case "$NC_LOC" in
+  Helsinki)    NC_BASE=$NC_HEL; log "netconsole: location=Helsinki -> $NC_BASE" ;;
+  Falkenstein) NC_BASE=$NC_FSN; log "netconsole: location=Falkenstein -> $NC_BASE" ;;
+  ?*)          log "netconsole: unrecognized location '$NC_LOC'; probing by RTT" ;;
+esac
+if [ -z "$NC_BASE" ]; then
+  NC_BEST=""; NC_BESTMS=100000
+  for ip in "$NC_HEL" "$NC_FSN"; do
+    ms="$(ping6 -c2 -w3 "$ip" 2>/dev/null | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' || true)"
+    [ -n "$ms" ] || continue
+    msi="$(awk -v m="$ms" 'BEGIN{printf "%d", m*100}')"
+    if [ "$msi" -lt "$NC_BESTMS" ]; then NC_BESTMS=$msi; NC_BEST=$ip; fi
+  done
+  [ -n "$NC_BEST" ] && { NC_BASE=$NC_BEST; log "netconsole: nearest base by RTT -> $NC_BASE"; }
+fi
+[ -n "$NC_BASE" ] || { NC_BASE=$NC_HEL; log "netconsole: defaulting to HEL base $NC_BASE"; }
+printf 'BASE_IP=%s\nPORT=6666\n' "$NC_BASE" > /etc/neuravps-netconsole.conf
+cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
+#!/bin/bash
+#NCVER=3
+. /etc/neuravps-netconsole.conf 2>/dev/null
+[ -n "$BASE_IP" ] || exit 0
+PORT=${PORT:-6666}
+# BASE_IP is the region base's IPv6. Resolve v6 src/dev/gateway + the gateway
+# MAC (NDP), retrying while routes/neighbours settle at boot.
+MAC=""; SRC=""; DEV=""; GW=""
+for _try in $(seq 1 10); do
+  read -r SRC DEV GW < <(ip -6 route get "$BASE_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src")s=$(i+1); if($i=="dev")d=$(i+1); if($i=="via")g=$(i+1)}} END{print s, d, g}')
+  [ -n "$GW" ] || GW="$BASE_IP"
+  ping6 -c1 -W1 "$GW" >/dev/null 2>&1
+  MAC=$(ip -6 neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+  [ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] && break
+  sleep 3
+done
+[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: v6 params incompletos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+# IPv6 netconsole must go through configfs — the module-param path does not
+# transmit v6 on this kernel (validated 2026-07-09). Reload the module clean
+# (drop any stale param target), then (re)create our dynamic target.
+modprobe -r netconsole 2>/dev/null
+modprobe netconsole 2>/dev/null
+CG=/sys/kernel/config/netconsole
+[ -d "$CG" ] || { logger "neuravps-netconsole: configfs netconsole no disponible"; exit 1; }
+T="$CG/neuravps"
+[ -d "$T" ] && { echo 0 > "$T/enabled" 2>/dev/null; rmdir "$T" 2>/dev/null; }
+mkdir -p "$T" 2>/dev/null || { logger "neuravps-netconsole: no pude crear target configfs"; exit 1; }
+echo "$DEV"     > "$T/dev_name"
+echo "$SRC"     > "$T/local_ip"
+echo "$BASE_IP" > "$T/remote_ip"
+echo "$MAC"     > "$T/remote_mac"
+echo "$PORT"    > "$T/remote_port"
+if echo 1 > "$T/enabled" 2>/dev/null; then
+  logger "neuravps-netconsole: [v6/configfs] $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
+else
+  logger "neuravps-netconsole: enable configfs FALLO"; exit 1
+fi
+NCH
+chmod +x /usr/local/sbin/neuravps-netconsole.sh
+cat > /etc/systemd/system/neuravps-netconsole.service <<'UNIT'
+[Unit]
+Description=NeuraVPS netconsole (stream kernel console to region BASE)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuravps-netconsole.sh
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable neuravps-netconsole.service >/dev/null 2>&1 || true
+/usr/local/sbin/neuravps-netconsole.sh >/dev/null 2>&1 || true
 
 pve-firewall restart || true
 
