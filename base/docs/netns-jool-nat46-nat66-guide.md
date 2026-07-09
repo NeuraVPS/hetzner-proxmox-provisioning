@@ -306,6 +306,9 @@ table inet filter {
         # Required if nginx terminates TLS / handles HTTP redirects or ACME.
         tcp dport 80 accept
         tcp dport 443 accept
+        # netconsole from fleet nodes (kernel-console freeze capture, UDP 6666 ->
+        # netconsole-collector.service). See docs/INCIDENT_2026-07-08_node0000008_freeze.md.
+        udp dport 6666 accept
     }
 
     chain forward {

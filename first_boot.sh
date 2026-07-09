@@ -713,6 +713,92 @@ else
   fi
 fi
 
+############################################
+# netconsole: stream this node's kernel console (the panic run-up) to the region
+# BASE, so a silent AX162/EPYC freeze can be diagnosed instead of leaving us
+# blind again (see docs/INCIDENT_2026-07-08_node0000008_freeze.md). Same helper
+# (v2) + unit as the live-apply run_remotes/apply_freeze_mitigations.sh, so a
+# freshly reinstalled node matches a live-patched one. Region BASE = the node's
+# Firestore `location` (authoritative), falling back to the nearest base by RTT
+# when creds/Firestore are unavailable, then to HEL. errexit-safe on purpose.
+############################################
+log "Configuring netconsole (kernel console -> region BASE)"
+NC_HEL=37.27.135.250    # b1 (Helsinki)
+NC_FSN=188.40.153.120   # b0 (Falkenstein)
+NC_BASE=""
+NC_LOC=""
+if [ -s /etc/firebase-credentials.json ]; then
+  NC_LOC="$(python3 - <<'PY' 2>/dev/null || true
+import subprocess
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    firebase_admin.initialize_app(credentials.Certificate("/etc/firebase-credentials.json"))
+    d = firestore.client().collection("proxmox_nodes").document(host).get()
+    print(((d.to_dict() or {}).get("location") or "").strip())
+except Exception:
+    pass
+PY
+)"
+fi
+case "$NC_LOC" in
+  Helsinki)    NC_BASE=$NC_HEL; log "netconsole: location=Helsinki -> $NC_BASE" ;;
+  Falkenstein) NC_BASE=$NC_FSN; log "netconsole: location=Falkenstein -> $NC_BASE" ;;
+  ?*)          log "netconsole: unrecognized location '$NC_LOC'; probing by RTT" ;;
+esac
+if [ -z "$NC_BASE" ]; then
+  NC_BEST=""; NC_BESTMS=100000
+  for ip in "$NC_HEL" "$NC_FSN"; do
+    ms="$(ping -c2 -w3 "$ip" 2>/dev/null | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' || true)"
+    [ -n "$ms" ] || continue
+    msi="$(awk -v m="$ms" 'BEGIN{printf "%d", m*100}')"
+    if [ "$msi" -lt "$NC_BESTMS" ]; then NC_BESTMS=$msi; NC_BEST=$ip; fi
+  done
+  [ -n "$NC_BEST" ] && { NC_BASE=$NC_BEST; log "netconsole: nearest base by RTT -> $NC_BASE"; }
+fi
+[ -n "$NC_BASE" ] || { NC_BASE=$NC_HEL; log "netconsole: defaulting to HEL base $NC_BASE"; }
+printf 'BASE_IP=%s\nPORT=6666\n' "$NC_BASE" > /etc/neuravps-netconsole.conf
+cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
+#!/bin/bash
+#NCVER=2
+. /etc/neuravps-netconsole.conf 2>/dev/null
+[ -n "$BASE_IP" ] || exit 0
+PORT=${PORT:-6666}
+# At boot the route/ARP may not be ready, so a single ping can miss the gateway
+# MAC. Retry until we have all params (up to ~30s) before giving up.
+MAC=""; SRC=""; DEV=""
+for _try in $(seq 1 10); do
+  GW=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* via \([0-9.]*\).*/\1/p')
+  DEV=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+  SRC=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+  [ -z "$GW" ] && GW="$BASE_IP"
+  ping -c1 -W1 "$GW" >/dev/null 2>&1
+  MAC=$(ip neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+  [ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] && break
+  sleep 3
+done
+[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: params incompletos tras reintentos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+modprobe -r netconsole 2>/dev/null
+modprobe netconsole netconsole="${PORT}@${SRC}/${DEV},${PORT}@${BASE_IP}/${MAC}" && logger "neuravps-netconsole: $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
+NCH
+chmod +x /usr/local/sbin/neuravps-netconsole.sh
+cat > /etc/systemd/system/neuravps-netconsole.service <<'UNIT'
+[Unit]
+Description=NeuraVPS netconsole (stream kernel console to region BASE)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuravps-netconsole.sh
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable neuravps-netconsole.service >/dev/null 2>&1 || true
+/usr/local/sbin/neuravps-netconsole.sh >/dev/null 2>&1 || true
+
 pve-firewall restart || true
 
 ############################################
