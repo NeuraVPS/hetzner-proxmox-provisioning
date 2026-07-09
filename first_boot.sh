@@ -571,41 +571,30 @@ fi
 # the GRUB_CMDLINE_LINUX above does NOT reach /proc/cmdline (verified 2026-07-09;
 # the GPU blacklist still applies via /etc/modprobe.d). Kernel params that must
 # actually take effect therefore go in /etc/kernel/cmdline + a refresh:
-#   crashkernel=512M        reserve RAM so kdump can capture the next hard freeze
-#                           as a /var/crash vmcore (real root cause).
-#   processor.max_cstate=1  C-STATE MITIGATION for the silent AX162/EPYC freeze
-#                           (caps idle at C1, no deep CC6). Small idle-power cost;
-#                           only added on AMD hosts. REVIEW: drop if the freeze
-#                           proves unrelated to C-states.
+#   processor.max_cstate=1  C-STATE MITIGATION for the silent AX162/EPYC freeze —
+#                           caps idle at C1 (no deep CC6). VALIDATED on canary
+#                           0000032 (2026-07-09): removed the C2 idle state.
+#                           AMD hosts only. Small idle-power cost; drop if the
+#                           freeze ever proves unrelated to C-states.
+#
+# NOTE: kdump/crashkernel deliberately NOT added. Canary 2026-07-09 (0000032):
+# with kdump armed, a panic kexecs into a crash kernel that HANGS on this AX162
+# hardware — captures nothing (/var/crash empty) AND leaves the node dead (kexec
+# bypasses panic=10), needing a manual Hetzner hw-reset. Worse than no kdump. The
+# clean auto-reboot (panic=10, below) is what we rely on. See
+# docs/INCIDENT_2026-07-08_node0000008_freeze.md for the full canary write-up +
+# untested capture follow-ups (efi_pstore / netconsole).
 KCMDLINE=/etc/kernel/cmdline
 if [ -f "$KCMDLINE" ] && command -v proxmox-boot-tool >/dev/null 2>&1; then
-  ADD=""
-  grep -qw 'crashkernel=512M' "$KCMDLINE" || ADD="$ADD crashkernel=512M"
-  if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo; then
-    grep -qw 'processor.max_cstate=1' "$KCMDLINE" || ADD="$ADD processor.max_cstate=1"
-  fi
-  if [ -n "$ADD" ]; then
+  if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && ! grep -qw 'processor.max_cstate=1' "$KCMDLINE"; then
     CUR="$(tr -s ' ' < "$KCMDLINE" | sed 's/[[:space:]]*$//')"
-    printf '%s%s\n' "$CUR" "$ADD" > "$KCMDLINE"
+    printf '%s processor.max_cstate=1\n' "$CUR" > "$KCMDLINE"
     proxmox-boot-tool refresh || log "WARNING: proxmox-boot-tool refresh failed"
-    log "Kernel cmdline updated ->$ADD (active after the first_boot reboot)"
-  else
-    log "Kernel cmdline already has crashkernel/max_cstate; nothing to add"
+    log "Kernel cmdline: added processor.max_cstate=1 (active after the first_boot reboot)"
   fi
 else
-  log "WARNING: /etc/kernel/cmdline or proxmox-boot-tool missing — crashkernel/max_cstate NOT applied"
+  log "WARNING: /etc/kernel/cmdline or proxmox-boot-tool missing — processor.max_cstate NOT applied"
 fi
-
-# kdump: capture a vmcore to /var/crash on the next panic/hard-lockup, so the
-# silent freeze is finally diagnosable. Needs the crashkernel= reservation above
-# (active only after the first_boot reboot), so we enable (not --now) here.
-log "Installing + enabling kdump-tools (crashdump capture)"
-DEBIAN_FRONTEND=noninteractive apt-get install -y kdump-tools makedumpfile || log "WARNING: kdump-tools install failed"
-if [ -f /etc/default/kdump-tools ]; then
-  sed -i 's/^#\?[[:space:]]*USE_KDUMP=.*/USE_KDUMP=1/' /etc/default/kdump-tools
-  grep -q '^USE_KDUMP=1' /etc/default/kdump-tools || echo 'USE_KDUMP=1' >> /etc/default/kdump-tools
-fi
-systemctl enable kdump-tools 2>/dev/null || log "WARNING: kdump-tools enable failed"
 
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
