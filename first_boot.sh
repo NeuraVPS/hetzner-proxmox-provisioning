@@ -717,14 +717,15 @@ fi
 # netconsole: stream this node's kernel console (the panic run-up) to the region
 # BASE, so a silent AX162/EPYC freeze can be diagnosed instead of leaving us
 # blind again (see docs/INCIDENT_2026-07-08_node0000008_freeze.md). Same helper
-# (v2) + unit as the live-apply run_remotes/apply_freeze_mitigations.sh, so a
-# freshly reinstalled node matches a live-patched one. Region BASE = the node's
+# (v3, IPv6 over configfs) + unit as run_remotes/apply_freeze_mitigations.sh, so
+# a freshly reinstalled node matches a live-patched one. Region BASE = the node's
 # Firestore `location` (authoritative), falling back to the nearest base by RTT
 # when creds/Firestore are unavailable, then to HEL. errexit-safe on purpose.
+# netconsole streams over IPv6; the base only accepts our nodes' /64s.
 ############################################
-log "Configuring netconsole (kernel console -> region BASE)"
-NC_HEL=37.27.135.250    # b1 (Helsinki)
-NC_FSN=188.40.153.120   # b0 (Falkenstein)
+log "Configuring netconsole (kernel console -> region BASE over IPv6)"
+NC_HEL=2a01:4f9:3070:3984::2   # b1 (Helsinki) IPv6
+NC_FSN=2a01:4f8:2b03:18a9::2   # b0 (Falkenstein) IPv6
 NC_BASE=""
 NC_LOC=""
 if [ -s /etc/firebase-credentials.json ]; then
@@ -750,7 +751,7 @@ esac
 if [ -z "$NC_BASE" ]; then
   NC_BEST=""; NC_BESTMS=100000
   for ip in "$NC_HEL" "$NC_FSN"; do
-    ms="$(ping -c2 -w3 "$ip" 2>/dev/null | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' || true)"
+    ms="$(ping6 -c2 -w3 "$ip" 2>/dev/null | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' || true)"
     [ -n "$ms" ] || continue
     msi="$(awk -v m="$ms" 'BEGIN{printf "%d", m*100}')"
     if [ "$msi" -lt "$NC_BESTMS" ]; then NC_BESTMS=$msi; NC_BEST=$ip; fi
@@ -761,26 +762,42 @@ fi
 printf 'BASE_IP=%s\nPORT=6666\n' "$NC_BASE" > /etc/neuravps-netconsole.conf
 cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
 #!/bin/bash
-#NCVER=2
+#NCVER=3
 . /etc/neuravps-netconsole.conf 2>/dev/null
 [ -n "$BASE_IP" ] || exit 0
 PORT=${PORT:-6666}
-# At boot the route/ARP may not be ready, so a single ping can miss the gateway
-# MAC. Retry until we have all params (up to ~30s) before giving up.
-MAC=""; SRC=""; DEV=""
+# BASE_IP is the region base's IPv6. Resolve v6 src/dev/gateway + the gateway
+# MAC (NDP), retrying while routes/neighbours settle at boot.
+MAC=""; SRC=""; DEV=""; GW=""
 for _try in $(seq 1 10); do
-  GW=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* via \([0-9.]*\).*/\1/p')
-  DEV=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
-  SRC=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
-  [ -z "$GW" ] && GW="$BASE_IP"
-  ping -c1 -W1 "$GW" >/dev/null 2>&1
-  MAC=$(ip neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+  read -r SRC DEV GW < <(ip -6 route get "$BASE_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src")s=$(i+1); if($i=="dev")d=$(i+1); if($i=="via")g=$(i+1)}} END{print s, d, g}')
+  [ -n "$GW" ] || GW="$BASE_IP"
+  ping6 -c1 -W1 "$GW" >/dev/null 2>&1
+  MAC=$(ip -6 neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
   [ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] && break
   sleep 3
 done
-[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: params incompletos tras reintentos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: v6 params incompletos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+# IPv6 netconsole must go through configfs — the module-param path does not
+# transmit v6 on this kernel (validated 2026-07-09). Reload the module clean
+# (drop any stale param target), then (re)create our dynamic target.
 modprobe -r netconsole 2>/dev/null
-modprobe netconsole netconsole="${PORT}@${SRC}/${DEV},${PORT}@${BASE_IP}/${MAC}" && logger "neuravps-netconsole: $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
+modprobe netconsole 2>/dev/null
+CG=/sys/kernel/config/netconsole
+[ -d "$CG" ] || { logger "neuravps-netconsole: configfs netconsole no disponible"; exit 1; }
+T="$CG/neuravps"
+[ -d "$T" ] && { echo 0 > "$T/enabled" 2>/dev/null; rmdir "$T" 2>/dev/null; }
+mkdir -p "$T" 2>/dev/null || { logger "neuravps-netconsole: no pude crear target configfs"; exit 1; }
+echo "$DEV"     > "$T/dev_name"
+echo "$SRC"     > "$T/local_ip"
+echo "$BASE_IP" > "$T/remote_ip"
+echo "$MAC"     > "$T/remote_mac"
+echo "$PORT"    > "$T/remote_port"
+if echo 1 > "$T/enabled" 2>/dev/null; then
+  logger "neuravps-netconsole: [v6/configfs] $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
+else
+  logger "neuravps-netconsole: enable configfs FALLO"; exit 1
+fi
 NCH
 chmod +x /usr/local/sbin/neuravps-netconsole.sh
 cat > /etc/systemd/system/neuravps-netconsole.service <<'UNIT'

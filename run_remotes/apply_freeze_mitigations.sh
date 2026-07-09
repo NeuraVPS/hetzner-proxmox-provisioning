@@ -16,8 +16,10 @@
 #
 # Run FROM the region's BASE (it can `ssh <node>` directly AND is the netconsole
 # collector target):
-#   b1$ ./apply_freeze_mitigations.sh --base-ip 37.27.135.250  [-n] p2 p3 ...
-#   b0$ ./apply_freeze_mitigations.sh --base-ip 188.40.153.120 [-n] -f fsn.txt
+#   b1$ ./apply_freeze_mitigations.sh --base-ip 2a01:4f9:3070:3984::2 [-n] p2 p3 ...
+#   b0$ ./apply_freeze_mitigations.sh --base-ip 2a01:4f8:2b03:18a9::2 [-n] -f fsn.txt
+# --base-ip is the region base's IPv6 (netconsole streams over IPv6; the
+# collector only accepts our nodes' /64s).
 #     -n = DRY-RUN (report only). Needs the netconsole-collector service on the BASE.
 # max_cstate needs a reboot; reboot ONLY nodes with 0 running VMs (check `qm list`).
 
@@ -50,32 +52,48 @@ if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && [ -f "$KC" ] && command -v
 fi
 # 3) netconsole: region BASE in a conf, a static helper that re-derives the
 #    gateway MAC each boot, a oneshot unit, enable + run live.
-if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! grep -q '#NCVER=2' /usr/local/sbin/neuravps-netconsole.sh 2>/dev/null; then
+if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! grep -q '#NCVER=3' /usr/local/sbin/neuravps-netconsole.sh 2>/dev/null; then
   changed="$changed netconsole"
   if [ "$DRY" != 1 ]; then
     printf 'BASE_IP=%s\nPORT=6666\n' "$BASE_IP" > /etc/neuravps-netconsole.conf
     cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
 #!/bin/bash
-#NCVER=2
+#NCVER=3
 . /etc/neuravps-netconsole.conf 2>/dev/null
 [ -n "$BASE_IP" ] || exit 0
 PORT=${PORT:-6666}
-# Retry: at boot the route/ARP may not be ready, so a single ping can miss the
-# gateway MAC. Loop until we have all params (up to ~30s) before giving up.
-MAC=""; SRC=""; DEV=""
+# BASE_IP is the region base's IPv6. Resolve v6 src/dev/gateway + the gateway
+# MAC (NDP), retrying while routes/neighbours settle at boot.
+MAC=""; SRC=""; DEV=""; GW=""
 for _try in $(seq 1 10); do
-  GW=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* via \([0-9.]*\).*/\1/p')
-  DEV=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
-  SRC=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
-  [ -z "$GW" ] && GW="$BASE_IP"
-  ping -c1 -W1 "$GW" >/dev/null 2>&1
-  MAC=$(ip neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+  read -r SRC DEV GW < <(ip -6 route get "$BASE_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src")s=$(i+1); if($i=="dev")d=$(i+1); if($i=="via")g=$(i+1)}} END{print s, d, g}')
+  [ -n "$GW" ] || GW="$BASE_IP"
+  ping6 -c1 -W1 "$GW" >/dev/null 2>&1
+  MAC=$(ip -6 neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
   [ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] && break
   sleep 3
 done
-[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: params incompletos tras reintentos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: v6 params incompletos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+# IPv6 netconsole must go through configfs — the module-param path does not
+# transmit v6 on this kernel (validated 2026-07-09). Reload the module clean
+# (drop any stale param target), then (re)create our dynamic target.
 modprobe -r netconsole 2>/dev/null
-modprobe netconsole netconsole="${PORT}@${SRC}/${DEV},${PORT}@${BASE_IP}/${MAC}" && logger "neuravps-netconsole: $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
+modprobe netconsole 2>/dev/null
+CG=/sys/kernel/config/netconsole
+[ -d "$CG" ] || { logger "neuravps-netconsole: configfs netconsole no disponible"; exit 1; }
+T="$CG/neuravps"
+[ -d "$T" ] && { echo 0 > "$T/enabled" 2>/dev/null; rmdir "$T" 2>/dev/null; }
+mkdir -p "$T" 2>/dev/null || { logger "neuravps-netconsole: no pude crear target configfs"; exit 1; }
+echo "$DEV"     > "$T/dev_name"
+echo "$SRC"     > "$T/local_ip"
+echo "$BASE_IP" > "$T/remote_ip"
+echo "$MAC"     > "$T/remote_mac"
+echo "$PORT"    > "$T/remote_port"
+if echo 1 > "$T/enabled" 2>/dev/null; then
+  logger "neuravps-netconsole: [v6/configfs] $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
+else
+  logger "neuravps-netconsole: enable configfs FALLO"; exit 1
+fi
 NCH
     chmod +x /usr/local/sbin/neuravps-netconsole.sh
     cat > /etc/systemd/system/neuravps-netconsole.service <<'UNIT'
