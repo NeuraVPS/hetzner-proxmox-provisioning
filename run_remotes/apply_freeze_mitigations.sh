@@ -50,22 +50,30 @@ if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && [ -f "$KC" ] && command -v
 fi
 # 3) netconsole: region BASE in a conf, a static helper that re-derives the
 #    gateway MAC each boot, a oneshot unit, enable + run live.
-if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! lsmod 2>/dev/null | grep -q '^netconsole'; then
+if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! grep -q '#NCVER=2' /usr/local/sbin/neuravps-netconsole.sh 2>/dev/null; then
   changed="$changed netconsole"
   if [ "$DRY" != 1 ]; then
     printf 'BASE_IP=%s\nPORT=6666\n' "$BASE_IP" > /etc/neuravps-netconsole.conf
     cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
 #!/bin/bash
+#NCVER=2
 . /etc/neuravps-netconsole.conf 2>/dev/null
 [ -n "$BASE_IP" ] || exit 0
 PORT=${PORT:-6666}
-GW=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* via \([0-9.]*\).*/\1/p')
-DEV=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
-SRC=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
-[ -z "$GW" ] && GW="$BASE_IP"
-ping -c1 -W1 "$GW" >/dev/null 2>&1
-MAC=$(ip neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
-[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: params incompletos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
+# Retry: at boot the route/ARP may not be ready, so a single ping can miss the
+# gateway MAC. Loop until we have all params (up to ~30s) before giving up.
+MAC=""; SRC=""; DEV=""
+for _try in $(seq 1 10); do
+  GW=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* via \([0-9.]*\).*/\1/p')
+  DEV=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+  SRC=$(ip route get "$BASE_IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+  [ -z "$GW" ] && GW="$BASE_IP"
+  ping -c1 -W1 "$GW" >/dev/null 2>&1
+  MAC=$(ip neigh show "$GW" dev "$DEV" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+  [ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] && break
+  sleep 3
+done
+[ -n "$MAC" ] && [ -n "$SRC" ] && [ -n "$DEV" ] || { logger "neuravps-netconsole: params incompletos tras reintentos (gw=$GW src=$SRC dev=$DEV mac=$MAC)"; exit 1; }
 modprobe -r netconsole 2>/dev/null
 modprobe netconsole netconsole="${PORT}@${SRC}/${DEV},${PORT}@${BASE_IP}/${MAC}" && logger "neuravps-netconsole: $SRC/$DEV -> $BASE_IP/$MAC (gw $GW)"
 NCH
