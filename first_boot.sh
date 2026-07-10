@@ -596,6 +596,21 @@ else
   log "WARNING: /etc/kernel/cmdline or proxmox-boot-tool missing — processor.max_cstate NOT applied"
 fi
 
+# HARDWARE watchdog (AMD only): the SP5100/SB800 chipset TCO hardware-resets a
+# fully-dead node in seconds — softdog needs a half-alive kernel and took 23 min
+# on the 0000008 freeze. Validated 2026-07-10 (drill on 0000032: unrecoverable
+# kernel -> HW reset -> back in <4 min) on both AX162/EPYC-Genoa and
+# AX102/Ryzen-7950X3D; sp5100_tco binds on all our AMD hardware. watchdog-mux
+# adopts it on the first_boot reboot below. Intel hosts stay on softdog.
+if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo; then
+  PHAM=/etc/default/pve-ha-manager
+  [ -f "$PHAM" ] || touch "$PHAM"
+  if ! grep -q '^WATCHDOG_MODULE=sp5100_tco$' "$PHAM"; then
+    { grep -vE '^WATCHDOG_MODULE=' "$PHAM"; echo 'WATCHDOG_MODULE=sp5100_tco'; } > "$PHAM.tco" && mv "$PHAM.tco" "$PHAM"
+    log "Watchdog: set WATCHDOG_MODULE=sp5100_tco (HW watchdog; active after the first_boot reboot)"
+  fi
+fi
+
 ############## CLUSTER SPECIFIC CONFIGURATION ##############
 # Proxmox firewall: datacenter baseline with IPv6 ipset gating
 echo "==> Configuring Proxmox firewall (datacenter baseline)"
