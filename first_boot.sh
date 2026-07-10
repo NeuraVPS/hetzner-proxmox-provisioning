@@ -777,14 +777,16 @@ fi
 printf 'BASE_IP=%s\nPORT=6666\n' "$NC_BASE" > /etc/neuravps-netconsole.conf
 cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
 #!/bin/bash
-#NCVER=3
+#NCVER=4
 . /etc/neuravps-netconsole.conf 2>/dev/null
 [ -n "$BASE_IP" ] || exit 0
 PORT=${PORT:-6666}
 # BASE_IP is the region base's IPv6. Resolve v6 src/dev/gateway + the gateway
-# MAC (NDP), retrying while routes/neighbours settle at boot.
+# MAC (NDP), retrying while routes/neighbours settle at boot. Generous loop
+# (network-online.target can fire before IPv6/NDP is ready); the unit also
+# restarts on failure as a backstop.
 MAC=""; SRC=""; DEV=""; GW=""
-for _try in $(seq 1 10); do
+for _try in $(seq 1 20); do
   read -r SRC DEV GW < <(ip -6 route get "$BASE_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src")s=$(i+1); if($i=="dev")d=$(i+1); if($i=="via")g=$(i+1)}} END{print s, d, g}')
   [ -n "$GW" ] || GW="$BASE_IP"
   ping6 -c1 -W1 "$GW" >/dev/null 2>&1
@@ -820,10 +822,16 @@ cat > /etc/systemd/system/neuravps-netconsole.service <<'UNIT'
 Description=NeuraVPS netconsole (stream kernel console to region BASE)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=30
 [Service]
-Type=oneshot
+# Type=simple (not oneshot) so Restart= applies: if the helper gives up before
+# IPv6/NDP is ready at boot, systemd retries until netconsole is up.
+Type=simple
 ExecStart=/usr/local/sbin/neuravps-netconsole.sh
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
 [Install]
 WantedBy=multi-user.target
 UNIT
