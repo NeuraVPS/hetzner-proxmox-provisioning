@@ -74,8 +74,13 @@ cat > /usr/local/sbin/netconsole-fleet-allow.py <<'PY'
 #!/usr/bin/env python3
 # Keep the nft set `inet filter nc_fleet_v6` equal to the /64 of every node's
 # IPv6 (Firestore proxmox_nodes.ip), so the netconsole collector (UDP 6666) only
-# accepts kernel-console traffic from our own nodes' /64 ranges.
+# accepts kernel-console traffic from our own nodes' /64 ranges. Elements are
+# also persisted to /etc/nftables.d/nc-fleet-v6.nft (included by
+# /etc/nftables.conf, same idiom as base-nat-elements.nft) so a base reboot
+# reloads the allowlist immediately instead of dropping node kernel logs until
+# this timer's first successful Firestore query.
 import ipaddress
+import os
 import subprocess
 import sys
 
@@ -134,6 +139,15 @@ p = subprocess.run(["nft", "-f", "-"], input=script, text=True, capture_output=T
 if p.returncode != 0:
     log(f"nft update failed: {p.stderr.strip()}")
     sys.exit(1)
+# Persist the elements for boot-time reload (atomic write: tmp + rename).
+try:
+    os.makedirs("/etc/nftables.d", exist_ok=True)
+    tmp = "/etc/nftables.d/.nc-fleet-v6.nft.tmp"
+    with open(tmp, "w") as fh:
+        fh.write("add element inet filter nc_fleet_v6 { " + ", ".join(nets) + " }\n")
+    os.replace(tmp, "/etc/nftables.d/nc-fleet-v6.nft")
+except Exception as e:  # noqa: BLE001
+    log(f"include-file write failed (runtime set updated anyway): {e}")
 print(f"nc_fleet_v6: {len(nets)} /64s")
 PY
 chmod +x /usr/local/sbin/netconsole-fleet-allow.py
@@ -182,6 +196,13 @@ if [ -f "$F" ]; then
     else
       sed -i 's/^\( *\)tcp dport 443 accept *$/\1tcp dport 443 accept\n\1udp dport 6666 ip6 saddr @nc_fleet_v6 accept/' "$F"
     fi
+  fi
+  # Reload the persisted /64 elements at boot (flush ruleset would otherwise
+  # leave the set empty — dropping node kernel logs — until the timer's first
+  # successful Firestore query). Glob include: a missing elements file is
+  # silently skipped instead of invalidating the whole ruleset.
+  if ! grep -q 'nc-fleet-v6' "$F"; then
+    printf '\n# netconsole /64 allowlist elements (maintained by netconsole-fleet-allow.py)\ninclude "/etc/nftables.d/nc-fleet-v6*.nft"\n' >> "$F"
   fi
   if nft -c -f "$F" >/dev/null 2>&1; then echo "persistent: OK"; else echo "persistent: SYNTAX FAIL -> reverted"; cp -a "${F}.bak-ncv6" "$F"; fi
 fi

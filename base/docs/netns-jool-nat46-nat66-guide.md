@@ -328,6 +328,13 @@ table inet filter {
         iifname "veth-host" oifname "enp6s0" accept
     }
 }
+
+# netconsole /64 allowlist elements (maintained by netconsole-fleet-allow.py +
+# timer; see run_remotes/setup_netconsole_base.sh). Reloads the fleet /64s at
+# boot so `flush ruleset` doesn't leave @nc_fleet_v6 empty until the timer's
+# first Firestore query. Glob include on purpose: a missing elements file is
+# silently skipped instead of failing the whole ruleset like a plain include.
+include "/etc/nftables.d/nc-fleet-v6*.nft"
 ```
 
 Enable:
