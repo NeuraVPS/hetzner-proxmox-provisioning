@@ -50,6 +50,15 @@ if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && [ -f "$KC" ] && command -v
   changed="$changed cmdline(reboot)"
   [ "$DRY" != 1 ] && { CUR="$(tr -s ' ' < "$KC" | sed 's/[[:space:]]*$//')"; printf '%s processor.max_cstate=1\n' "$CUR" > "$KC"; proxmox-boot-tool refresh >/dev/null 2>&1; }
 fi
+# 2b) HW watchdog sp5100_tco (AMD; armed on next reboot). The chipset TCO resets
+#     a fully-dead node in seconds vs softdog's 23 min on the 0000008 freeze
+#     (validated 2026-07-10; binds on AX162/EPYC + AX102/Ryzen). Staged only —
+#     watchdog-mux adopts it on reboot; no live watchdog swap on running nodes.
+PHAM=/etc/default/pve-ha-manager
+if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && ! grep -q '^WATCHDOG_MODULE=sp5100_tco$' "$PHAM" 2>/dev/null; then
+  changed="$changed watchdog(reboot)"
+  [ "$DRY" != 1 ] && { [ -f "$PHAM" ] || touch "$PHAM"; { grep -vE '^WATCHDOG_MODULE=' "$PHAM"; echo 'WATCHDOG_MODULE=sp5100_tco'; } > "$PHAM.tco" && mv "$PHAM.tco" "$PHAM"; }
+fi
 # 3) netconsole: region BASE in a conf, a static helper that re-derives the
 #    gateway MAC each boot, a oneshot unit, enable + run live.
 if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! grep -q '#NCVER=3' /usr/local/sbin/neuravps-netconsole.sh 2>/dev/null; then
@@ -115,7 +124,8 @@ fi
 P=$(sysctl -n kernel.panic 2>/dev/null); H=$(sysctl -n kernel.hardlockup_panic 2>/dev/null); O=$(sysctl -n kernel.panic_on_oops 2>/dev/null)
 CS=$(grep -qw processor.max_cstate=1 /proc/cmdline && echo live || echo pending)
 NC=$([ -d /sys/module/netconsole ] && echo up || echo down)
-echo "sysctls=${P}/${H}/${O} max_cstate=${CS} netconsole=${NC} changed=[${changed:- none}]"
+WD=$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null | grep -q 'SP5100 TCO' && echo tco-live || { grep -q '^WATCHDOG_MODULE=sp5100_tco$' /etc/default/pve-ha-manager 2>/dev/null && echo tco-pending || echo softdog; })
+echo "sysctls=${P}/${H}/${O} max_cstate=${CS} watchdog=${WD} netconsole=${NC} changed=[${changed:- none}]"
 PAYLOAD
 export B64; B64=$(printf '%s' "$REMOTE" | base64 -w0)
 export DRY BASE_IP
