@@ -898,6 +898,43 @@ smartd -q onecheck 2>/dev/null || true
 systemctl restart smartd || true
 log "smartd NVMe filter installed"
 
+# --- Balloon reconciler (AX162/SQX nodes only, 2026-07-11) -------------------
+# "RAM follows activity": PVE autoballooning is blind to guest distress — a
+# guest squeezed below its working set pages to its OWN pagefile (invisible to
+# host PSI/swap; the VM 201 0x1A pressure). A 1-min timer samples per-VM
+# virtio-balloon major_page_faults and raises/lowers balloon floors within a
+# node budget. SQX-only: AX102/MT5 fits via KSM (no squeeze), EX44 is 1-VM.
+if hostname | grep -q 'AX162'; then
+  if curl -sSL --retry 3 --retry-delay 5 \
+      https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes/neuravps-balloon-reconciler.sh \
+      -o /usr/local/sbin/neuravps-balloon-reconciler.sh \
+      && grep -q '#NBRVER=' /usr/local/sbin/neuravps-balloon-reconciler.sh; then
+    chmod +x /usr/local/sbin/neuravps-balloon-reconciler.sh
+    cat > /etc/systemd/system/neuravps-balloon-reconciler.service <<'NBRUNIT'
+[Unit]
+Description=NeuraVPS balloon reconciler (RAM follows activity on over-committed SQX nodes)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuravps-balloon-reconciler.sh
+NBRUNIT
+    cat > /etc/systemd/system/neuravps-balloon-reconciler.timer <<'NBRTIMER'
+[Unit]
+Description=Run neuravps-balloon-reconciler every minute
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+[Install]
+WantedBy=timers.target
+NBRTIMER
+    systemctl daemon-reload
+    systemctl enable neuravps-balloon-reconciler.timer >/dev/null 2>&1 || true
+    log "Balloon reconciler installed + timer enabled (SQX node)"
+  else
+    log "WARNING: balloon reconciler download failed — install later via fleet apply"
+  fi
+fi
+
 # Put PXE entries FIRST in the permanent BootOrder. install.sh already does
 # this in rescue, but the first REAL boot makes the firmware register fresh
 # entries for the new ESPs and PREPEND them (seen on 0000008: BootOrder became
