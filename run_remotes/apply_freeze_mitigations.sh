@@ -61,13 +61,13 @@ if grep -qi 'AuthenticAMD\|AMD EPYC' /proc/cpuinfo && ! grep -q '^WATCHDOG_MODUL
 fi
 # 3) netconsole: region BASE in a conf, a static helper that re-derives the
 #    gateway MAC each boot, a oneshot unit, enable + run live.
-if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! grep -q '#NCVER=4' /usr/local/sbin/neuravps-netconsole.sh 2>/dev/null; then
+if [ "$(sed -n 's/^BASE_IP=//p' /etc/neuravps-netconsole.conf 2>/dev/null)" != "$BASE_IP" ] || ! grep -q '#NCVER=5' /usr/local/sbin/neuravps-netconsole.sh 2>/dev/null; then
   changed="$changed netconsole"
   if [ "$DRY" != 1 ]; then
     printf 'BASE_IP=%s\nPORT=6666\n' "$BASE_IP" > /etc/neuravps-netconsole.conf
     cat > /usr/local/sbin/neuravps-netconsole.sh <<'NCH'
 #!/bin/bash
-#NCVER=4
+#NCVER=5
 . /etc/neuravps-netconsole.conf 2>/dev/null
 [ -n "$BASE_IP" ] || exit 0
 PORT=${PORT:-6666}
@@ -76,7 +76,7 @@ PORT=${PORT:-6666}
 # (network-online.target can fire before IPv6/NDP is ready); the unit also
 # restarts on failure as a backstop.
 MAC=""; SRC=""; DEV=""; GW=""
-for _try in $(seq 1 20); do
+for _try in $(seq 1 60); do
   read -r SRC DEV GW < <(ip -6 route get "$BASE_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src")s=$(i+1); if($i=="dev")d=$(i+1); if($i=="via")g=$(i+1)}} END{print s, d, g}')
   [ -n "$GW" ] || GW="$BASE_IP"
   ping6 -c1 -W1 "$GW" >/dev/null 2>&1
@@ -113,15 +113,18 @@ Description=NeuraVPS netconsole (stream kernel console to region BASE)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600
-StartLimitBurst=30
+StartLimitBurst=60
 [Service]
-# Type=simple (not oneshot) so Restart= applies: if the helper gives up before
-# IPv6/NDP is ready at boot, systemd retries until netconsole is up.
+# Type=simple + Restart=on-failure, and NO RemainAfterExit: the helper configures
+# netconsole then exits; if IPv6/NDP isn't ready at boot it exits 1 and systemd
+# retries. RemainAfterExit=yes SUPPRESSES Restart (systemd treats the exit as a
+# completed run) — that is what left units 'failed' with no retry after the
+# 2026-07 fleet reboots. On success the helper exits 0 -> the unit goes inactive
+# (dead): correct for a run-once setup and NOT reported by `systemctl --failed`.
 Type=simple
 ExecStart=/usr/local/sbin/neuravps-netconsole.sh
-RemainAfterExit=yes
 Restart=on-failure
-RestartSec=10
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT
