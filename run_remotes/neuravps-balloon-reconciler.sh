@@ -17,7 +17,7 @@
 # Per-run sustained rates are exported to /var/run/neuravps-balloon-rates.tsv
 # for the node_health @@GUESTPAGING probe (sustained > point-sample).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=1
+#NBRVER=2
 set -u
 RAISE_FAULTS_PS=${RAISE_FAULTS_PS:-100}   # sustained faults/s to trigger a raise
 IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
@@ -48,7 +48,9 @@ for pf in /var/run/qemu-server/*.pid; do
   mx=$(awk -F': ' '/^memory:/{print $2;exit}' "$conf"); mx=${mx:-0}
   fl=$(awk -F': ' '/^balloon:/{print $2;exit}' "$conf"); fl=${fl:-0}
   committed=$(( committed + mx ))
-  [ "$fl" -gt 0 ] && [ "$mx" -gt "$fl" ] || continue   # ballooning disabled/fixed
+  [ "$fl" -gt 0 ] || continue   # balloon:0 = ballooning disabled
+  # NB: fl==mx stays managed (a VM we raised to max must lower again later);
+  # deliberately-fixed VMs are protected by the floors.json-only LOWER rule.
   CUR_FLOOR[$v]=$fl; CUR_MAX[$v]=$mx
   floors_sum=$(( floors_sum + fl ))
 done
@@ -99,10 +101,10 @@ if v not in d: d[v]=fl; json.dump(d,open(p,"w"))
 PY
           if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
             floors_sum=$(( floors_sum + new - fl ))
-            logger "neuravps-balloon: RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
+            logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
           fi
         else
-          logger "neuravps-balloon: vm $v thrashing ${rate}/s but NO BUDGET (floors_sum=${floors_sum}+${STEP_MB}>${budget_mb}MB or avail=${avail_mb}MB<${HOST_FREE_MIN_MB}) — placement should relieve this node"
+          logger -t neuravps-balloon " vm $v thrashing ${rate}/s but NO BUDGET (floors_sum=${floors_sum}+${STEP_MB}>${budget_mb}MB or avail=${avail_mb}MB<${HOST_FREE_MIN_MB}) — placement should relieve this node"
         fi
       fi
     elif [ "$rate" -lt "$IDLE_FAULTS_PS" ]; then
@@ -112,14 +114,15 @@ PY
         orig=$(python3 - "$FLOORS" "$v" "$mx" "$fl" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1])); v=sys.argv[2]; mx=int(sys.argv[3]); fl=int(sys.argv[4])
-print(d.get(v, min(fl, mx*30//100)))
+print(d.get(v, ""))
 PY
 )
-        if [ "$fl" -gt "$orig" ]; then
+        # only lower what WE raised: no floors.json entry -> hands off
+        if [ -n "$orig" ] && [ "$fl" -gt "$orig" ]; then
           new=$(( fl - STEP_MB )); [ "$new" -lt "$orig" ] && new=$orig
           if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
             floors_sum=$(( floors_sum - fl + new ))
-            logger "neuravps-balloon: LOWER vm $v floor ${fl}->${new}MB (idle ${idle} runs; original=${orig}MB)"
+            logger -t neuravps-balloon " LOWER vm $v floor ${fl}->${new}MB (idle ${idle} runs; original=${orig}MB)"
           fi
         fi
       fi
