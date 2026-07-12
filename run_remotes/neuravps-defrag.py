@@ -31,7 +31,7 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=2
+#NDFVER=3
 """
 import fcntl
 import json
@@ -135,6 +135,8 @@ def main():
         n["ram"] += ram
         n["fl"] += fl
         n["cores"] += cores
+        if d.get("status") != "running":
+            n["has_stopped"] = True
         if d.get("status") == "running" and d.get("proxmoxId"):
             n["vms"].append({"vmid": int(d["proxmoxId"]), "ram": ram,
                              "fl": fl, "cores": cores})
@@ -164,7 +166,12 @@ def main():
                 if free - cores < 0:
                     continue
                 key = free
-            if best is None or key > best[1]:
+            # BEST-FIT: fullest fitting node (min headroom), and NEVER an
+            # empty node — empties are the operator's drain/maintenance
+            # reserve (worst-fit here is what consumed them on 07-12).
+            if len(dn["vms"]) == 0 and dn["ram"] <= 0 and dn["cores"] <= 0:
+                continue
+            if best is None or key < best[1]:
                 best = (did, key)
         return best[0] if best else None
 
@@ -258,6 +265,37 @@ def main():
                 if dst:
                     book(vm, nid, dst, f"defrag ({min(ch, fh):.0f}GB stranded)")
                 break
+
+    # ---- phase 3: consolidation (restore the empty-node reserve) ----
+    CONSOL_MAX_VMS = int(cfg.get("consolidateMaxVms") or 6)
+    for nid in sorted(nodes, key=lambda k: len(nodes[k]["vms"])):
+        if len(moves) >= max_moves:
+            break
+        n = nodes[nid]
+        total_vms = n["n_docs"] if "n_docs" in n else None
+        # movable = running VMs we know; a node also holding STOPPED vms can
+        # never fully empty (we never power-cycle stopped trading VMs) -> skip.
+        if not (0 < len(n["vms"]) <= CONSOL_MAX_VMS):
+            continue
+        if n.get("has_stopped"):
+            continue
+        planned = []
+        snapshot = {k: (v["ram"], v["fl"], v["cores"], len(v["vms"])) for k, v in nodes.items()}
+        ok = True
+        for vm in sorted(n["vms"], key=lambda v: -v["ram"]):
+            dst = pick_dest(n["model"], vm["ram"], vm["fl"], vm["cores"],
+                            {nid})
+            if not dst:
+                ok = False
+                break
+            book(vm, nid, dst, f"consolidación (vaciar {nid.split('-')[0]})")
+            planned.append(vm)
+        if not ok or len(moves) > max_moves:
+            # rollback this node's bookings (couldn't fully empty)
+            for k, (r, f, c, _) in snapshot.items():
+                nodes[k]["ram"], nodes[k]["fl"], nodes[k]["cores"] = r, f, c
+            moves[:] = [m for m in moves if m[1] != nid or "consolid" not in m[3]]
+            continue
 
     moves[:] = moves[:max_moves]
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
