@@ -553,7 +553,9 @@ REMOTE_FW="${REMOTE_BASE}/firewall.fw"
 FW_TMP="$(mktemp)"
 if "${SSH_BASE[@]}" "cat '$REMOTE_FW'" >"$FW_TMP" 2>/dev/null && [[ -s "$FW_TMP" ]]; then
   if [[ "$ORIG_VMID" != "$TARGET_VMID" ]]; then
-    sed -i "s/${ORIG_VMID}/${TARGET_VMID}/g" "$FW_TMP"
+    # \b: a blind numeric replace mangles values that merely CONTAIN the vmid
+    # (vmid=100 turns "dport 3100" into "dport 3<target>") and IPv6 suffixes.
+    sed -i -E "s/\b${ORIG_VMID}\b/${TARGET_VMID}/g" "$FW_TMP"
   fi
   mkdir -p /etc/pve/firewall
   install_pve_cfg_file "$FW_TMP" "/etc/pve/firewall/${TARGET_VMID}.fw"

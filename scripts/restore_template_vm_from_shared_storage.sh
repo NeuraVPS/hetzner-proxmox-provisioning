@@ -399,7 +399,9 @@ OLD_VMID_FOR_FW="$(sed -nE 's/.*vm-([0-9]+)-disk-[0-9]+.*/\1/p' <<<"${REMOTE_TOK
 [[ -z "$OLD_VMID_FOR_FW" ]] && OLD_VMID_FOR_FW="100"
 if "${SSH_BASE[@]}" "cat '$REMOTE_FW'" >"$FW_TMP" 2>/dev/null && [[ -s "$FW_TMP" ]]; then
   if [[ "$OLD_VMID_FOR_FW" != "$VMID" ]]; then
-    sed -i "s/${OLD_VMID_FOR_FW}/${VMID}/g" "$FW_TMP"
+    # \b: a blind numeric replace mangles values that merely CONTAIN the vmid
+    # (vmid=100 turns "dport 3100" into "dport 3<target>") and IPv6 suffixes.
+    sed -i -E "s/\b${OLD_VMID_FOR_FW}\b/${VMID}/g" "$FW_TMP"
   fi
   mkdir -p /etc/pve/firewall
   install_pve_cfg_file "$FW_TMP" "/etc/pve/firewall/${VMID}.fw"
