@@ -1,0 +1,7 @@
+[Unit]
+Description=Run neuravps-defrag daily at 06:30 UTC (after the 06:00 salud sweep)
+[Timer]
+OnCalendar=*-*-* 06:30:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target

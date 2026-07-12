@@ -1,0 +1,6 @@
+[Unit]
+Description=NeuraVPS daily defrag (fleet reorganization: corrections + crumb recovery)
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-defrag.py
+TimeoutStartSec=4h
