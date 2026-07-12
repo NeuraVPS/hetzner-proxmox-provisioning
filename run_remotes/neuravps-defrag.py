@@ -31,7 +31,7 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=4
+#NDFVER=5
 """
 import fcntl
 import json
@@ -110,6 +110,15 @@ def main():
         return 0
     dry = bool(cfg.get("dryRun"))
     max_moves = int(cfg.get("maxMovesPerRun") or 8)
+    # Operator 2026-07-13: a failed migration is ESCALATED and excluded from
+    # future planning (skip-list), but the run/chain continues with the rest.
+    SKIP_FILE = "/var/lib/neuravps-defrag-skip.txt"
+    try:
+        skip_vmids = {int(x) for x in open(SKIP_FILE).read().split()}
+    except Exception:
+        skip_vmids = set()
+    if skip_vmids:
+        log(f"skip-list activa ({len(skip_vmids)} vmids escalados): {sorted(skip_vmids)}")
 
     # ---- fleet state ----
     nodes = {}
@@ -139,7 +148,8 @@ def main():
         # the temporary power-on with the vm_no_internet firewall group), so
         # nodes holding stopped trading VMs CAN reach 0%. Paused VMs are the
         # only exclusion (precheck rejects them; 1884 lesson).
-        if d.get("status") in ("running", "stopped") and d.get("proxmoxId"):
+        if (d.get("status") in ("running", "stopped") and d.get("proxmoxId")
+                and int(d.get("proxmoxId")) not in skip_vmids):
             n["vms"].append({"vmid": int(d["proxmoxId"]), "ram": ram,
                              "fl": fl, "cores": cores,
                              "st": d.get("status")})
@@ -373,12 +383,23 @@ def main():
         a["usedRamFloorGb"] = round(a["usedRamFloorGb"], 2)
         db.collection("proxmox_nodes").document(nid).update(a)
 
+    failed_vmids = []
+    if fail:
+        import glob
+        el = sorted(glob.glob(f"{LOG_DIR}/errors-*.log"))
+        if el:
+            failed_vmids = sorted({int(m) for m in re.findall(
+                r"FAIL\s+vmid=(\d+)", open(el[-1]).read())})
+        with open(SKIP_FILE, "a") as f:
+            for v in failed_vmids:
+                f.write(f"{v}\n")
+        log(f"ESCALACIÓN: {fail} migración(es) FAILED (vmids {failed_vmids}) — "
+            f"VMs a salvo en origen (rollback), añadidas a skip-list; la cadena "
+            f"CONTINÚA con el resto (operador 2026-07-13)")
     db.collection("defrag_runs").document(run_id).update(
         {"executed": len(verified), "ok": ok, "fail": fail,
-         "status": "failed" if fail else "done"})
-    if fail:
-        log(f"!!! {fail} migration(s) FAILED — check {LOG_DIR}; VMs rolled back to source")
-        return 1
+         "failedVmids": failed_vmids,
+         "status": "done-with-failures" if fail else "done"})
     return 0
 
 
