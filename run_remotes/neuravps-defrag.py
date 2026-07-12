@@ -31,11 +31,12 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=1
+#NDFVER=2
 """
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -88,11 +89,15 @@ def main():
         log("another defrag run holds the lock — exiting")
         return 0
 
-    # never fight a manual migration on this base
-    r = subprocess.run(["pgrep", "-f", r"migrate_vms?(_batch)?\.sh"],
-                       capture_output=True, text=True)
-    if r.stdout.strip():
-        log(f"manual migration in progress (pids {r.stdout.split()}) — skipping run")
+    # never fight a manual migration on this base. Match only REAL script
+    # executions (bash <path>/migrate_vm*.sh ...) — a plain pgrep -f also
+    # matches watcher loops whose cmdline merely MENTIONS the script (stale
+    # "while pgrep ..." shells false-blocked the very first run, 2026-07-12).
+    ps = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True, text=True)
+    busy = [ln.split()[0] for ln in ps.stdout.splitlines()
+            if re.search(r"^\s*\d+\s+(\S*/)?bash\s+(\S*/)?migrate_vms?(_batch)?\.sh(\s|$)", ln)]
+    if busy:
+        log(f"manual migration in progress (pids {busy}) — skipping run")
         return 0
 
     firebase_admin.initialize_app(
