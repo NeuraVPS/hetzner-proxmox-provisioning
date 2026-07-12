@@ -1060,6 +1060,28 @@ _enroll_efi_dst() {
 # is reachable for the in-guest IPv6 reconfig. We restore "stopped" at the end.
 if (( WAS_STOPPED == 1 )); then
   _enroll_efi_dst
+  # --- Operator procedure (2026-07-13): the temporary power-on of a STOPPED
+  # trading VM must not let MetaTrader/EAs reach the internet (an auto-started
+  # terminal could open trades). Save the VM's original firewall config, force
+  # the datacenter-wide `vm_no_internet` security group ON (+ NIC firewall=1),
+  # start -> in-guest IPv6 reconfig -> shutdown, then restore EXACTLY the
+  # original firewall state (file content and net0 string).
+  NOINT_FW="/etc/pve/firewall/${VMID}.fw"
+  NOINT_ORIG_B64=$(dst_ssh "[ -f '${NOINT_FW}' ] && base64 -w0 '${NOINT_FW}' || true" 2>/dev/null)
+  NOINT_NET0_ORIG=$(dst_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^net0: //p' | tr -d '\r')
+  NOINT_NET0_MODIFIED=0
+  dst_ssh "grep -q '^\[group vm_no_internet\]' /etc/pve/firewall/cluster.fw 2>/dev/null" \
+    || _warn "cluster.fw has no [group vm_no_internet] on dest — the guard rule will be a no-op."
+  if [[ -n "$NOINT_NET0_ORIG" && "$NOINT_NET0_ORIG" != *firewall=1* ]]; then
+    if dst_ssh "qm set '${VMID}' --net0 '${NOINT_NET0_ORIG},firewall=1'" >/dev/null 2>&1; then
+      NOINT_NET0_MODIFIED=1
+    else
+      _warn "could not set firewall=1 on net0 — no_internet guard may not filter."
+    fi
+  fi
+  dst_ssh "printf '[OPTIONS]\nenable: 1\n\n[RULES]\nGROUP vm_no_internet\n' > '${NOINT_FW}'" >/dev/null 2>&1 \
+    && _ok "Firewall vm_no_internet ON for the temporary power-on." \
+    || _warn "could not write ${NOINT_FW} — proceeding without the internet guard."
   _info "Starting VM ${VMID} on dest to apply in-guest reconfig (was stopped pre-migration)…"
   if dst_ssh "qm start '${VMID}'" >/dev/null 2>&1; then
     _ok "qm start issued."
@@ -1311,6 +1333,19 @@ if (( WAS_STOPPED == 1 )); then
   else
     _warn "VM ${VMID} still running after shutdown timeout — left running for triage."
   fi
+  # Restore the ORIGINAL firewall state (the guard was only for the temporary
+  # power-on). File first, then the net0 string if we added firewall=1.
+  if [[ -n "${NOINT_ORIG_B64}" ]]; then
+    dst_ssh "echo '${NOINT_ORIG_B64}' | base64 -d > '${NOINT_FW}'" >/dev/null 2>&1 \
+      || _warn "could not restore original ${NOINT_FW} — review manually."
+  else
+    dst_ssh "rm -f '${NOINT_FW}'" >/dev/null 2>&1 || true
+  fi
+  if (( NOINT_NET0_MODIFIED == 1 )); then
+    dst_ssh "qm set '${VMID}' --net0 '${NOINT_NET0_ORIG}'" >/dev/null 2>&1 \
+      || _warn "could not restore original net0 (firewall=1 left on — harmless but review)."
+  fi
+  _ok "Firewall state restored to original."
 fi
 
 _ok "Migration complete: VMID=${VMID}  ${SRC_NODE} → ${DST_NODE}  ipv6=${EXPECTED_VM_IPV6}"

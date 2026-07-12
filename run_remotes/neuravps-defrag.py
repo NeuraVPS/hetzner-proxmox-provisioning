@@ -31,7 +31,7 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=3
+#NDFVER=4
 """
 import fcntl
 import json
@@ -135,11 +135,14 @@ def main():
         n["ram"] += ram
         n["fl"] += fl
         n["cores"] += cores
-        if d.get("status") != "running":
-            n["has_stopped"] = True
-        if d.get("status") == "running" and d.get("proxmoxId"):
+        # 2026-07-13: stopped VMs are migratable too (offline path now wraps
+        # the temporary power-on with the vm_no_internet firewall group), so
+        # nodes holding stopped trading VMs CAN reach 0%. Paused VMs are the
+        # only exclusion (precheck rejects them; 1884 lesson).
+        if d.get("status") in ("running", "stopped") and d.get("proxmoxId"):
             n["vms"].append({"vmid": int(d["proxmoxId"]), "ram": ram,
-                             "fl": fl, "cores": cores})
+                             "fl": fl, "cores": cores,
+                             "st": d.get("status")})
 
     def sqx_head(n):
         return COMMIT * n["g"] - n["ram"], FLOOR * n["g"] - n["fl"]
@@ -277,8 +280,6 @@ def main():
         # never fully empty (we never power-cycle stopped trading VMs) -> skip.
         if not (0 < len(n["vms"]) <= CONSOL_MAX_VMS):
             continue
-        if n.get("has_stopped"):
-            continue
         planned = []
         snapshot = {k: (v["ram"], v["fl"], v["cores"], len(v["vms"])) for k, v in nodes.items()}
         ok = True
@@ -318,14 +319,19 @@ def main():
     verified = []
     for vmid, src, dst, reason in moves:
         ip = nodes[src]["ip"]
-        st = subprocess.run(
+        out = subprocess.run(
             SSH + [f"root@{ip}",
-                   f"qm status {vmid} --verbose 2>/dev/null | awk -F': ' '/^qmpstatus:/{{print $2}}'"],
-            capture_output=True, text=True, timeout=25).stdout.strip()
-        if st == "running":
+                   f"qm status {vmid} --verbose 2>/dev/null | awk -F': ' "
+                   f"'/^status:/{{s=$2}} /^qmpstatus:/{{q=$2}} END{{print s, q}}'"],
+            capture_output=True, text=True, timeout=25).stdout.split()
+        st = out[0] if out else ""
+        qmp = out[1] if len(out) > 1 else ""
+        # stopped -> offline path (firewall-guarded power-on); running needs
+        # qmpstatus==running (a PAUSED vm reports status running — never move).
+        if st == "stopped" or (st == "running" and qmp == "running"):
             verified.append((vmid, src, dst, reason))
         else:
-            log(f"SKIP vm {vmid}: qmpstatus={st or 'unknown'} (not running)")
+            log(f"SKIP vm {vmid}: status={st or '?'} qmp={qmp or '?'} (paused/raro)")
     if not verified:
         db.collection("defrag_runs").document(run_id).update({"status": "nothing-verified"})
         return 0
