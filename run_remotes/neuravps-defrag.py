@@ -31,7 +31,7 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=5
+#NDFVER=6
 """
 import fcntl
 import json
@@ -169,7 +169,12 @@ def main():
                 if dn["g"] <= 0:
                     continue
                 ch, fh = sqx_head(dn)
-                if ch - ram < 5 or fh - fl < 2:
+                # Margins (v6): leave dests room for the BALLOON RECONCILER,
+                # which raises floors live in +4G steps. Packing to within
+                # 2GB of the floor budget made passes oscillate (2026-07-14:
+                # a 25-move pass left 5 nodes over-gate + 14 floor-starved as
+                # soon as reconcilers acted). 12GB = 3 reconciler steps.
+                if ch - ram < 8 or fh - fl < 12:
                     continue
                 if not leftover_clean(ch - ram):
                     continue
