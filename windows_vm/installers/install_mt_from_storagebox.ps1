@@ -24,6 +24,20 @@
 .PARAMETER MetaTraderVersion
   Major version: 5 (default) or 4. Chooses zip name, folder labels, and terminal/editor executables. File associations are applied only for version 5.
 
+.PARAMETER ZipVariant
+  Optional payload variant: extracts MetaTrader<ver>-<Variant>.zip instead of MetaTrader<ver>.zip
+  (e.g. -ZipVariant PDFY99 -> MetaTrader5-PDFY99.zip, the Portfolios.io DFY preconfigured build).
+
+.PARAMETER PinToTaskbar
+  Pin all instances to the taskbar (LayoutModification.xml into Default + every real profile,
+  clearing each profile's Taskband blob offline so the pins apply at next logon).
+
+.PARAMETER NoDesktopShortcuts
+  Skip desktop shortcuts and delete pre-existing ones for this MT version.
+
+.PARAMETER AddToStartup
+  Create an all-users Startup shortcut per instance (auto-launch at logon, minimised hint).
+
 .EXAMPLE
   .\install_mt_from_storagebox.ps1 -SmbPassword $env:STORAGEBOX_SMB_PASSWORD
 
@@ -47,13 +61,32 @@ param(
     [int]$MetaTraderVersion = 5,
 
     [ValidateRange(1, 999)]
-    [int]$InstanceCount = 1
+    [int]$InstanceCount = 1,
+
+    # Optional zip variant: MetaTrader<ver>-<Variant>.zip instead of MetaTrader<ver>.zip
+    # (e.g. -ZipVariant PDFY99 -> MetaTrader5-PDFY99.zip, the Portfolios.io DFY build).
+    [ValidatePattern('^[A-Za-z0-9._-]*$')]
+    [string]$ZipVariant = '',
+
+    # Pin every installed instance to the taskbar via LayoutModification.xml
+    # (Default profile + every real user profile; offline-safe, applies at next logon).
+    [switch]$PinToTaskbar,
+
+    # Do not create desktop shortcuts, and remove any pre-existing ones for this MT version.
+    [switch]$NoDesktopShortcuts,
+
+    # Create an all-users Startup shortcut per instance (auto-launch at logon, minimised).
+    [switch]$AddToStartup
 )
 
 $ErrorActionPreference = 'Stop'
 
 $UncRoot = '\\u560363-sub1.your-storagebox.de\u560363-sub1'
-$ZipName = "MetaTrader$MetaTraderVersion.zip"
+if ($ZipVariant) {
+    $ZipName = "MetaTrader$MetaTraderVersion-$ZipVariant.zip"
+} else {
+    $ZipName = "MetaTrader$MetaTraderVersion.zip"
+}
 $ZipUnc  = Join-Path -Path $UncRoot -ChildPath $ZipName
 $SmbUser = 'u560363-sub1'
 
@@ -137,6 +170,7 @@ $MtRoot        = 'C:\MetaTrader'
 # Start Menu folder name is always "MetaTrader"; version (4/5) appears only in each shortcut label (Get-MtInstanceFolderName).
 $StartMenuMt   = Join-Path -Path 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs' -ChildPath 'MetaTrader'
 $PublicDesktop = 'C:\Users\Public\Desktop'
+$AllUsersStartup = 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp'
 
 if ($MetaTraderVersion -eq 5) {
     $TerminalExeName = 'terminal64.exe'
@@ -167,7 +201,8 @@ function New-MtShellShortcut {
     param(
         [Parameter(Mandatory)][string]$ShortcutPath,
         [Parameter(Mandatory)][string]$TargetPath,
-        [Parameter(Mandatory)][string]$WorkingDirectory
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [int]$WindowStyle = 1                       # 1=Normal, 3=Maximized, 7=Minimized
     )
     if (-not $ShortcutPath.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase)) {
         $ShortcutPath = "$ShortcutPath.lnk"
@@ -204,6 +239,7 @@ function New-MtShellShortcut {
 `$s = `$w.CreateShortcut(`$Lnk)
 `$s.TargetPath = `$Tgt
 `$s.WorkingDirectory = `$Wrk
+`$s.WindowStyle = $WindowStyle
 if (Test-Path -LiteralPath `$Tgt) { `$s.IconLocation = (`$Tgt + ',0') }
 `$s.Save()
 "@
@@ -225,6 +261,7 @@ if (Test-Path -LiteralPath `$Tgt) { `$s.IconLocation = (`$Tgt + ',0') }
         $sc = $shell.CreateShortcut($lnkFull)
         $sc.TargetPath = $targetFull
         $sc.WorkingDirectory = $workFull
+        $sc.WindowStyle = $WindowStyle
         if (Test-Path -LiteralPath $targetFull) {
             $sc.IconLocation = "$targetFull,0"
         }
@@ -330,6 +367,21 @@ try {
         Copy-Item -LiteralPath $firstPath -Destination $dest -Recurse -Force
     }
 
+    if ($NoDesktopShortcuts) {
+        # Remove any pre-existing desktop shortcuts for this MT version (Public + user desktops).
+        $desktopDirs = @($PublicDesktop) + @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'Desktop' })
+        foreach ($dk in ($desktopDirs | Select-Object -Unique)) {
+            Get-ChildItem -LiteralPath $dk -Filter ('MetaTrader {0} - *.lnk' -f $MetaTraderVersion) -ErrorAction SilentlyContinue |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($AddToStartup) {
+        # Drop stale Startup entries for this MT version before recreating (idempotent re-runs).
+        Get-ChildItem -LiteralPath $AllUsersStartup -Filter ('MetaTrader {0} - *.lnk' -f $MetaTraderVersion) -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
     for ($i = 1; $i -le $InstanceCount; $i++) {
         $folder = Get-MtInstancePath -Index $i
         $terminalExe = Join-Path -Path $folder -ChildPath $TerminalExeName
@@ -341,8 +393,17 @@ try {
         $desktopLink = Join-Path -Path $PublicDesktop -ChildPath $label
         $startMenuLink = Join-Path -Path $StartMenuMt -ChildPath $label
 
-        New-MtShellShortcut -ShortcutPath $desktopLink -TargetPath $terminalExe -WorkingDirectory $folder
+        if (-not $NoDesktopShortcuts) {
+            New-MtShellShortcut -ShortcutPath $desktopLink -TargetPath $terminalExe -WorkingDirectory $folder
+        }
         New-MtShellShortcut -ShortcutPath $startMenuLink -TargetPath $terminalExe -WorkingDirectory $folder
+
+        if ($AddToStartup) {
+            # MetaTrader restores its own saved window placement; WindowStyle 7 is a best-effort
+            # hint - the durable minimised state comes from the config baked into the zip variant.
+            $startupLink = Join-Path -Path $AllUsersStartup -ChildPath $label
+            New-MtShellShortcut -ShortcutPath $startupLink -TargetPath $terminalExe -WorkingDirectory $folder -WindowStyle 7
+        }
     }
 
     if ($MetaTraderVersion -eq 4) {
@@ -467,6 +528,116 @@ try {
         Set-MtDefaultIconRegValueRegExe -KeyPathUnderHKLM 'SOFTWARE\Classes\metaeditor5\DefaultIcon' -ExePath $editorExe -IconIndex 1
         Update-MtShellIconCache
     }
+
+    if ($PinToTaskbar) {
+        # Pin every instance to the taskbar for current AND future users. LayoutModification.xml
+        # is the only supported pin mechanism on Server 2025 (no "Pin to taskbar" verb). Explorer
+        # applies it while building the taskbar at logon whenever the profile has no
+        # Taskband\Favorites blob, so for existing profiles we clear that blob offline and the
+        # next logon rebuilds the pins. Runs fine as SYSTEM with nobody logged in (guest agent).
+        $pinLinks = 1..$InstanceCount | ForEach-Object {
+            Join-Path -Path $StartMenuMt -ChildPath ((Get-MtInstanceFolderName -Index $_) + '.lnk')
+        }
+        $pinApps = ($pinLinks | ForEach-Object {
+            '        <taskbar:DesktopApp DesktopApplicationLinkPath="' + $_ + '" />'
+        }) -join "`r`n"
+        $layoutXml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<LayoutModificationTemplate
+    xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification"
+    xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout"
+    xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout"
+    xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout"
+    Version="1">
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+    <defaultlayout:TaskbarLayout>
+      <taskbar:TaskbarPinList>
+$pinApps
+      </taskbar:TaskbarPinList>
+    </defaultlayout:TaskbarLayout>
+  </CustomTaskbarLayoutCollection>
+</LayoutModificationTemplate>
+"@
+        function Write-MtLayoutXml {
+            param([Parameter(Mandatory)][string]$ProfileRoot)
+            $shellDir = Join-Path -Path $ProfileRoot -ChildPath 'AppData\Local\Microsoft\Windows\Shell'
+            New-Item -ItemType Directory -Path $shellDir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path -Path $shellDir -ChildPath 'LayoutModification.xml') -Value $layoutXml -Encoding UTF8
+        }
+        function Invoke-MtRegExe {
+            # reg.exe via Start-Process: native stderr must not reach PS streams
+            # ($ErrorActionPreference='Stop' turns it into a terminating NativeCommandError).
+            param([Parameter(Mandatory)][string[]]$ArgumentList)
+            $p = Start-Process -FilePath 'reg.exe' -ArgumentList $ArgumentList -Wait -NoNewWindow -PassThru
+            return $p.ExitCode
+        }
+
+        Write-MtLayoutXml -ProfileRoot 'C:\Users\Default'
+
+        $taskbandSub = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
+        $profiles = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+            Where-Object { $_.SID -like 'S-1-5-21-*' -and $_.LocalPath -and (Test-Path -LiteralPath $_.LocalPath) }
+        foreach ($prof in $profiles) {
+            try {
+                Write-MtLayoutXml -ProfileRoot $prof.LocalPath
+
+                # Stale pinned shortcuts would dedup-collide as "... (2)" labels on rebuild.
+                $pinDir = Join-Path -Path $prof.LocalPath -ChildPath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+                if (Test-Path -LiteralPath $pinDir) {
+                    Get-ChildItem -LiteralPath $pinDir -Filter '*.lnk' -ErrorAction SilentlyContinue |
+                        Remove-Item -Force -ErrorAction SilentlyContinue
+                }
+
+                if (Test-Path ("Registry::HKEY_USERS\{0}" -f $prof.SID)) {
+                    # Hive loaded (session active): edit in place. Note a live Explorer will
+                    # write its in-memory pins back at logoff; during provisioning no session
+                    # exists, so this branch only matters for operator-attended runs.
+                    $tk = "Registry::HKEY_USERS\$($prof.SID)\$taskbandSub"
+                    if (Test-Path $tk) {
+                        Remove-ItemProperty -Path $tk -Name Favorites        -ErrorAction SilentlyContinue
+                        Remove-ItemProperty -Path $tk -Name FavoritesResolve -ErrorAction SilentlyContinue
+                    }
+                } else {
+                    $ntuser = Join-Path -Path $prof.LocalPath -ChildPath 'NTUSER.DAT'
+                    if (Test-Path -LiteralPath $ntuser) {
+                        $mount = 'HKU\NeuraVpsPinTmp'
+                        if ((Invoke-MtRegExe -ArgumentList @('load', $mount, $ntuser)) -eq 0) {
+                            try {
+                                Invoke-MtRegExe -ArgumentList @('delete', "$mount\$taskbandSub", '/v', 'Favorites', '/f') | Out-Null
+                                Invoke-MtRegExe -ArgumentList @('delete', "$mount\$taskbandSub", '/v', 'FavoritesResolve', '/f') | Out-Null
+                            } finally {
+                                if ((Invoke-MtRegExe -ArgumentList @('unload', $mount)) -ne 0) {
+                                    Start-Sleep -Milliseconds 500
+                                    Invoke-MtRegExe -ArgumentList @('unload', $mount) | Out-Null
+                                }
+                            }
+                        } else {
+                            Write-Warning ("PinToTaskbar: could not load hive for {0}; pins apply only after Taskband reset" -f $prof.LocalPath)
+                        }
+                    }
+                }
+            } catch {
+                Write-Warning ("PinToTaskbar: profile {0} skipped: {1}" -f $prof.LocalPath, $_.Exception.Message)
+            }
+        }
+
+        # Provisioned VMs run with AutoAdminLogon, so Explorer is normally already live when this
+        # script executes. A live Explorer holds the pin list in memory and would write it back
+        # over the cleared Taskband blob at logoff, so restart it: the fresh instance finds no
+        # blob, reads LayoutModification.xml, and persists the pins. AutoRestartShell (default 1)
+        # brings it back in the user's session. No-op when nobody is logged on.
+        if (Get-Process -Name explorer -ErrorAction SilentlyContinue) {
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            $deadline = (Get-Date).AddSeconds(30)
+            do {
+                Start-Sleep -Seconds 2
+                $back = Get-Process -Name explorer -ErrorAction SilentlyContinue
+            } while (-not $back -and (Get-Date) -lt $deadline)
+            if (-not $back) {
+                Write-Warning 'PinToTaskbar: Explorer did not auto-restart; pins apply at next logon.'
+            }
+        }
+    }
 }
 finally {
     if (Get-Command Remove-SmbGlobalMapping -ErrorAction SilentlyContinue) {
@@ -475,7 +646,10 @@ finally {
     Remove-SmbMapping -RemotePath $UncRoot -Force -ErrorAction SilentlyContinue
 }
 
-$summary = "Done: $InstanceCount MetaTrader $MetaTraderVersion instance(s) under $MtRoot; desktop and Start Menu shortcuts applied."
+$summary = "Done: $InstanceCount MetaTrader $MetaTraderVersion instance(s) under $MtRoot (zip: $ZipName); Start Menu shortcuts applied."
+if (-not $NoDesktopShortcuts) { $summary += ' Desktop shortcuts applied.' }
+if ($AddToStartup)            { $summary += ' Startup shortcuts applied.' }
+if ($PinToTaskbar)            { $summary += ' Taskbar pin layout applied.' }
 if ($MetaTraderVersion -eq 5) {
     $summary += ' File associations (001) applied.'
 }
