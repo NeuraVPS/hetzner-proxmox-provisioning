@@ -15,32 +15,53 @@
 #   CF_URL=https://failover-watchdog-....a.run.app
 #   TOKEN=<shared bearer token = GCP secret FAILOVER_WATCHDOG_TOKEN>
 #   THRESHOLD=6             # consecutive failures before reporting (~3 min)
+#   RECOVER_OK=4            # consecutive OK ticks (~2 min) before clearing fails
 #
-# State in /run (resets on boot): consecutive-failure counter + report backoff.
+# State in /run (resets on boot): consecutive-failure counter + OK-streak +
+# report backoff.
 set -u
 ENV_FILE=/etc/neuravps/failover-watchdog.env
 [ -r "$ENV_FILE" ] || { echo "failover-watchdog: missing $ENV_FILE"; exit 0; }
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 : "${THRESHOLD:=6}"
+: "${RECOVER_OK:=4}"
 
 STATE=/run/failover-watchdog.fails
+OKSTREAK=/run/failover-watchdog.okstreak
 BACKOFF=/run/failover-watchdog.lastreport
 
 peer_alive() {
-  ping -6 -c1 -W2 "$PEER_V6" >/dev/null 2>&1 && return 0
-  ping -4 -c1 -W2 "$PEER_V4" >/dev/null 2>&1 && return 0
+  # APPLICATION-layer only: a zombie host whose kernel still answers ping and
+  # ACKs SYNs (2026-07-13: b1 froze exactly like that) must NOT count as
+  # alive. nginx completing a TLS exchange or sshd sending its banner is the
+  # bar — both require live userspace.
+  curl -ksS --max-time 4 -o /dev/null "https://[$PEER_V6]/" 2>/dev/null && return 0
+  curl -ksS --max-time 4 -o /dev/null "https://$PEER_V4/" 2>/dev/null && return 0
+  timeout 4 bash -c "exec 3<>/dev/tcp/$PEER_V4/22 && head -c4 <&3" 2>/dev/null | grep -q "SSH-" && return 0
   return 1
 }
 
 if peer_alive; then
-  if [ -s "$STATE" ] && [ "$(cat "$STATE")" -ge "$THRESHOLD" ]; then
-    echo "failover-watchdog: peer $PEER recovered (was down)"
+  OK=$(( $(cat "$OKSTREAK" 2>/dev/null || echo 0) + 1 ))
+  echo "$OK" > "$OKSTREAK"
+  FAILS=$(cat "$STATE" 2>/dev/null || echo 0)
+  # Anti-flap hysteresis: a single good tick must not wipe the failure
+  # counter (2026-07-13: b1 flapped up for ~30 s, the counter reset, and the
+  # 6/6 threshold was never re-reached while customers stayed down). Only a
+  # RECOVER_OK-tick stable streak clears it.
+  if [ "$FAILS" -gt 0 ] && [ "$OK" -lt "$RECOVER_OK" ]; then
+    echo "failover-watchdog: peer $PEER ok (streak ${OK}/${RECOVER_OK}); fails=${FAILS} retained (anti-flap)"
+    exit 0
+  fi
+  if [ "$FAILS" -ge "$THRESHOLD" ]; then
+    echo "failover-watchdog: peer $PEER recovered (stable for ${RECOVER_OK} ticks)"
   fi
   echo 0 > "$STATE"
   exit 0
 fi
 
+echo 0 > "$OKSTREAK"
 FAILS=$(( $(cat "$STATE" 2>/dev/null || echo 0) + 1 ))
 echo "$FAILS" > "$STATE"
 echo "failover-watchdog: peer $PEER unreachable (${FAILS}/${THRESHOLD})"
