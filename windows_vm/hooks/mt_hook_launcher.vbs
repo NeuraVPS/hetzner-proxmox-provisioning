@@ -5,6 +5,9 @@ Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set args = WScript.Arguments
 
+Dim lockDir
+lockDir = "C:\ProgramData\NeuraVPS\mt_hook.lock.d"
+
 If args.Count < 1 Then
   WScript.Quit 2
 End If
@@ -44,6 +47,12 @@ If Err.Number = 0 Then hasDebugger = True
 Err.Clear
 On Error GoTo 0
 
+' Serialize delete/launch/re-add of the shared IFEO Debugger key so that many
+' MetaTrader terminals auto-starting at logon cannot race it (a race lets the
+' re-added key re-intercept a concurrent relaunch -> wscript/reg fork-bomb).
+Dim gotLock
+gotLock = AcquireLock()
+
 shell.Run "reg delete " & QuoteArg(ifeoKey) & " /v Debugger /f", 0, True
 
 Dim previousCwd, launchDir, launchCmd
@@ -68,6 +77,39 @@ On Error GoTo 0
 If hasDebugger Then
   shell.Run "reg add " & QuoteArg(ifeoKey) & " /v Debugger /t REG_SZ /d " & QuoteArg(debuggerValue) & " /f", 0, True
 End If
+
+If gotLock Then ReleaseLock()
+
+Function AcquireLock()
+  Dim iters
+  iters = 0
+  Do
+    On Error Resume Next
+    Err.Clear
+    fso.CreateFolder(lockDir)
+    If Err.Number = 0 Then
+      On Error GoTo 0
+      AcquireLock = True
+      Exit Function
+    End If
+    Err.Clear
+    If fso.FolderExists(lockDir) Then
+      If DateDiff("s", fso.GetFolder(lockDir).DateLastModified, Now) > 12 Then
+        fso.DeleteFolder lockDir, True
+      End If
+    End If
+    On Error GoTo 0
+    WScript.Sleep 35
+    iters = iters + 1
+  Loop While iters < 400
+  AcquireLock = False
+End Function
+
+Sub ReleaseLock()
+  On Error Resume Next
+  If fso.FolderExists(lockDir) Then fso.DeleteFolder lockDir, True
+  On Error GoTo 0
+End Sub
 
 Function QuoteArg(value)
   QuoteArg = """" & Replace(value, """", """""") & """"
