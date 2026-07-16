@@ -53,8 +53,14 @@ net.ipv6.conf.all.forwarding=1
 # (replace enp6s0 if your WAN interface is different)
 net.ipv6.conf.enp6s0.accept_ra=2
 
-net.netfilter.nf_conntrack_max=524288
-net.netfilter.nf_conntrack_buckets=131072
+# nf_conntrack_max raised 2026-07-16: a BASE tracks every RDP/SMB flow for a
+# whole region — or BOTH regions while it holds the failover VIPs. 262144 (the
+# RAM-derived default) and even 524288 filled under a distributed RDP
+# brute-force; the kernel then dropped packets, which presented as a
+# Helsinki-wide "network flap". Buckets ~= max/4. See
+# base/docs/INCIDENT_2026-07-16_b1_conntrack_flap.md and the RDP guards in §7.
+net.netfilter.nf_conntrack_max=1048576
+net.netfilter.nf_conntrack_buckets=262144
 net.core.somaxconn=65535
 net.core.netdev_max_backlog=250000
 net.ipv4.tcp_max_syn_backlog=262144
@@ -258,18 +264,28 @@ table ip6 nat {
 # first install and is rewritten atomically on every sync.
 include "/etc/nftables.d/base-nat-elements.nft"
 
-# RDP brute-force guard — per-(source,port) rate limit on NEW RDP
-# connections (TCP SYN to the 20000-29999 RDP range). Own table so its
-# lifecycle is independent from `ip6 nat` (sync-base-nat reconciles those
-# map elements) — safe to add/remove atomically without touching NAT.
-# filter prerouting at -150 runs BEFORE dstnat (-100) and, in family ip6,
-# sees each client exactly once: native v6 directly, v4 clients as their
-# jool/SIIT-translated source 64:ff9b:1::<v4> (unique per client). Keyed
-# (saddr . dport): a fleet sweep (1 SYN per port) never trips; a bot
-# hammering one VM's port does. Legit RDP clients open 1-3 connections per
-# session (mstsc auto-reconnect ≈ 12/min worst case stays at the limit);
-# excess is dropped and the source recovers as soon as its rate falls back
-# under the limit. RDP's UDP transport is untouched (starts after TCP auth).
+# RDP brute-force guard — TWO layers (2026-07-16 incident, see
+# base/docs/INCIDENT_2026-07-16_b1_conntrack_flap.md):
+#
+#  (1) ip6 rdpguard — per-(source,port) rate limit on NEW RDP connections
+#      (TCP SYN to 20000-29999). filter prerouting at -150 runs BEFORE dstnat
+#      (-100). CAVEAT that drove the incident: at this hook a *v4* client is
+#      NOT visible as itself — v4 RDP is DNAT'd by `table ip nat` to 10.0.0.3
+#      and reaches here with saddr = the *VIP* (~all v4 traffic collapses to
+#      one address). Only native-v6 clients keep their real saddr here. So the
+#      (saddr . dport) key works ONLY because `dport` is unique per VM — it is
+#      effectively a per-DESTINATION-VM limit for v4, and a true per-source
+#      limit for native v6. A per-source-only rule at THIS layer would bucket
+#      every v4 client into the VIP and drop them all — do NOT add one here.
+#      Own table so its lifecycle is independent from `ip6 nat`.
+#
+#  (2) ip rdpguard (below) — the per-SOURCE layer, on the v4 ingress BEFORE
+#      the DNAT collapses the client IP. Needed because the (saddr.dport) key
+#      above is blind to a bot spraying ONE SYN at each of 10k+ RDP ports:
+#      every (src,port) stays under 12/min while the source opens thousands/min
+#      in aggregate, filling conntrack until the table overflows and the base
+#      drops packets (= the 2026-07-13 & -16 "network flap"). RDP's UDP
+#      transport is untouched (starts after TCP auth).
 table ip6 rdpguard {
     counter bf_drops {
     }
@@ -282,6 +298,52 @@ table ip6 rdpguard {
     chain pre {
         type filter hook prerouting priority -150; policy accept;
         tcp dport 20000-29999 tcp flags & (syn|ack) == syn add @bf { ip6 saddr . tcp dport limit rate over 12/minute burst 6 packets } counter name bf_drops drop comment "drop excess new RDP conns per source+port"
+    }
+}
+
+# Per-SOURCE RDP guard on the v4 ingress — chain runs at raw priority (-300),
+# BEFORE conntrack (-200) and BEFORE the `ip nat` DNAT (-100) that sends v4
+# RDP to 10.0.0.3 and collapses the client IP on the ip6/NAT64 side. So here
+# `ip saddr` is the real client and dropped packets never even create a
+# conntrack entry. bf_static = hand-maintained blocklist of confirmed
+# brute-force sources (plain v4; /24s allowed). bf_src = inline per-source
+# rate meter: excess NEW RDP SYNs over 60/min per source are dropped (NOT a
+# persistent ban — under-rate sources always pass). bf_allow = trusted
+# infra/ops (our bases + on-demand a monitoring box running the RDP sweep).
+table ip rdpguard {
+    counter bf_v4_drops {
+    }
+    set bf_allow {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = {
+            188.40.153.120,   # b0
+            37.27.135.250     # b1
+        }
+    }
+    set bf_static {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = {
+            176.120.22.179,
+            91.202.233.79,
+            45.227.254.0/24,
+            194.165.16.0/24
+        }
+    }
+    set bf_src {
+        type ipv4_addr
+        flags dynamic
+        timeout 1h
+        size 65536
+    }
+    chain pre {
+        type filter hook prerouting priority -300; policy accept;
+        ip saddr @bf_allow accept comment "trusted infra/ops — exempt from RDP guard"
+        ip saddr @bf_static counter name bf_v4_drops drop comment "confirmed RDP brute-force sources"
+        tcp dport 20000-29999 tcp flags & (syn|ack) == syn add @bf_src { ip saddr limit rate over 60/minute burst 30 packets } counter name bf_v4_drops drop comment "rate-limit excess new RDP conns per source (anti port-spray)"
     }
 }
 
