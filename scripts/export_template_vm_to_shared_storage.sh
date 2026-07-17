@@ -119,6 +119,19 @@ dedupe_tokens_first_seen() {
   awk '!seen[$0]++'
 }
 
+# Verify an uploaded file is present and non-empty by parsing an `ls -la` listing
+# LOCALLY. The Hetzner storage box SSH endpoint is a restricted command set
+# (scp/rsync/ls/dd/mkdir/rm/cat/…) that does NOT include `test`/`[`/`echo`, so a
+# remote `[ -s file ]` fails with "Command not found" and made every otherwise
+# successful export exit non-zero. $1 = `ls -la` text, $2 = basename to require.
+remote_listing_has_nonempty() {
+  awk -v want="$2" '
+    { name = $NF; size = $5 + 0 }
+    name == want && size > 0 { ok = 1 }
+    END { exit ok ? 0 : 1 }
+  ' <<<"$1"
+}
+
 usage() {
   cat <<'EOF'
 Export a Proxmox VM as a template to the shared storage box (inverse of
@@ -371,10 +384,17 @@ fi
 echo "Verifying remote uploads..."
 REMOTE_LISTING="$("${SSH_BASE[@]}" "ls -la '${REMOTE_BASE}/'" 2>&1)" || die "Could not list remote dir for verification"
 echo "${REMOTE_LISTING}"
-"${SSH_BASE[@]}" "[ -s '${REMOTE_BASE}/config.conf' ]" \
+# Verify every expected file is present and non-empty by parsing the listing above
+# locally (the storage box shell has no `test`/`[` — a remote `[ -s file ]` errors
+# "Command not found" and would spuriously fail an otherwise-successful export).
+for ((i = 0; i < n; i++)); do
+  remote_listing_has_nonempty "$REMOTE_LISTING" "disk${i}.stream.zst" \
+    || die "Remote disk${i}.stream.zst is missing or empty after upload"
+done
+remote_listing_has_nonempty "$REMOTE_LISTING" "config.conf" \
   || die "Remote config.conf is missing or empty after upload"
 if [[ -f "$FW_PATH" ]]; then
-  "${SSH_BASE[@]}" "[ -s '${REMOTE_BASE}/firewall.fw' ]" \
+  remote_listing_has_nonempty "$REMOTE_LISTING" "firewall.fw" \
     || die "Remote firewall.fw is missing or empty after upload"
 fi
 
