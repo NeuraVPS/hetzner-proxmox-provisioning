@@ -6,8 +6,11 @@ Runs ON a BASE (b0) via systemd timer at 06:30 UTC, after the 06:00 salud
 sweep has reconciled counters. Two phases, corrections first:
 
   1. CORRECTION — nodes over their placement limits:
-       SQX (AX162): usedRam > 1.5xgbRam OR floors > 0.6xgbRam
-       MT5 (AX102): usedCores > max_cores
+       SQX (AX162): usedRam > 1.5xbase OR floors > 0.6xbase — base RAM =
+                    max_base_ram DECLARADO en admin/nodos (2026-07-17), con
+                    gbRam synced como fallback para docs antiguos
+       MT5 (AX102): usedCores > max_cores (sin fallback fijo: cap ausente =
+                    nodo NI over-gate NI destino)
      -> move the smallest RUNNING VMs out until back within limits.
   2. DEFRAG (SQX) — nodes where no sellable plan fits but >=5 GB remain
      stranded -> move the smallest RUNNING VM whose departure makes the hole
@@ -31,7 +34,7 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=6
+#NDFVER=7
 """
 import fcntl
 import json
@@ -130,7 +133,8 @@ def main():
         nodes[nd.id] = {
             "model": model, "ip": d.get("ip") or "", "frozen": bool(d.get("frozen")),
             "status": str(d.get("status") or "").strip(),
-            "g": float(d.get("gbRam") or 0), "cap": int(d.get("max_cores") or 96),
+            "g": float(d.get("max_base_ram") or d.get("gbRam") or 0),
+            "cap": int(d.get("max_cores") or 0),
             "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [],
         }
     for s in db.collection("servers").stream():
@@ -229,7 +233,7 @@ def main():
                 guard += 1
         elif n["model"] == "MT5":
             guard = 0
-            while n["cores"] > n["cap"] and guard < 6:
+            while n["cap"] > 0 and n["cores"] > n["cap"] and guard < 6:
                 cand = sorted(n["vms"], key=lambda v: v["cores"])
                 moved = False
                 for vm in cand:
