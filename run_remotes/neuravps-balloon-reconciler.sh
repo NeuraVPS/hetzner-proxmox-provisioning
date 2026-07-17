@@ -18,12 +18,16 @@
 # for the node_health @@GUESTPAGING probe (sustained > point-sample).
 # Per-run STATUS is exported to /var/run/neuravps-balloon-status.json for the
 # fleet thrash-relief pass (defrag --relief on the base): floors/budget plus
-# the VMs that have been thrashing-with-NO-BUDGET for >= BLOCKED_RUNS_MIN
-# consecutive runs (i.e. local automation is exhausted — only moving a VM off
-# this node can help). Short blips (a neighbour about to idle-lower frees
-# budget) never surface: they resolve locally within minutes.
+# the VMs whose blocked LEAKY counter reached BLOCKED_RUNS_MIN: +1 per
+# thrashing-with-NO-BUDGET run, -1 (decay, not reset) per calm run. This
+# catches both SUSTAINED blockage (~10 min) and OSCILLATING thrashers (bursts
+# every few minutes on a starved node — vm 808/1892 pattern, 2026-07-17 —
+# which a consecutive counter never catches), while one-off blips (a
+# neighbour's idle-lower about to free budget) decay away. Hard reset only on
+# a successful raise / floor==max (local automation worked or is exhausted
+# entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=3
+#NBRVER=4
 set -u
 RAISE_FAULTS_PS=${RAISE_FAULTS_PS:-100}   # sustained faults/s to trigger a raise
 IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
@@ -31,7 +35,7 @@ IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # ~30 min idle before lowering
 STEP_MB=${STEP_MB:-4096}
 FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-60}  # sum(floors) cap as % of node RAM
 HOST_FREE_MIN_MB=${HOST_FREE_MIN_MB:-12288}
-BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # consecutive NO-BUDGET runs (~min) before asking for relief
+BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # leaky blocked-counter level (+1 blocked/-1 calm run) that asks for relief
 [ -f /etc/default/neuravps-balloon-reconciler ] && . /etc/default/neuravps-balloon-reconciler
 
 STATE_DIR=/var/lib/neuravps-balloon
@@ -124,17 +128,13 @@ PY
           fi
         else
           blocked=$(( blocked + 1 ))
-          logger -t neuravps-balloon " vm $v thrashing ${rate}/s but NO BUDGET (floors_sum=${floors_sum}+${STEP_MB}>${budget_mb}MB or avail=${avail_mb}MB<${HOST_FREE_MIN_MB}; blocked ${blocked} run(s)) — placement should relieve this node"
-          if [ "$blocked" -ge "$BLOCKED_RUNS_MIN" ]; then
-            [ -n "$blocked_json" ] && blocked_json="${blocked_json},"
-            blocked_json="${blocked_json}{\"vmid\":${v},\"rate\":${rate},\"floor_mb\":${fl},\"max_mb\":${mx},\"blocked_runs\":${blocked}}"
-          fi
+          logger -t neuravps-balloon " vm $v thrashing ${rate}/s but NO BUDGET (floors_sum=${floors_sum}+${STEP_MB}>${budget_mb}MB or avail=${avail_mb}MB<${HOST_FREE_MIN_MB}; blocked level ${blocked}) — placement should relieve this node"
         fi
       else
         blocked=0   # floor already at max: nothing placement can add (entitlement case)
       fi
     elif [ "$rate" -lt "$IDLE_FAULTS_PS" ]; then
-      blocked=0
+      [ "$blocked" -gt 0 ] && blocked=$(( blocked - 1 ))   # decay, not reset (oscillators)
       idle=$(( idle + 1 ))
       if [ "$idle" -ge "$IDLE_RUNS_TO_LOWER" ]; then
         fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
@@ -155,8 +155,14 @@ PY
       fi
     else
       idle=0
-      blocked=0
+      [ "$blocked" -gt 0 ] && blocked=$(( blocked - 1 ))   # decay, not reset (oscillators)
     fi
+  fi
+  # emit on LEVEL, not on this-run state: an oscillator at level >= MIN must be
+  # visible to the hourly relief tick even if this exact minute was calm
+  if [ "$blocked" -ge "$BLOCKED_RUNS_MIN" ]; then
+    [ -n "$blocked_json" ] && blocked_json="${blocked_json},"
+    blocked_json="${blocked_json}{\"vmid\":${v},\"rate\":${rate:--1},\"floor_mb\":${CUR_FLOOR[$v]},\"max_mb\":${CUR_MAX[$v]},\"blocked_runs\":${blocked}}"
   fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$v" "$f1" "$now" "$idle" "$blocked" >> "$tmp_samples"
 done
