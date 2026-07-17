@@ -7,10 +7,11 @@ key so they intercept each target `.exe` and relaunch it with the right options:
 - `sqx144_hook_launcher.vbs` — SQX **v144** engine `StrategyQuantX.exe`. Byte-identical to the v143 launcher **except its recursion-guard IFEO key is `StrategyQuantX.exe`** (see the fork-bomb warning below). **v144-ONLY — see the gate below.**
 - `mt_hook_launcher.vbs` — MetaTrader `terminal64/metaeditor64/terminal/metaeditor.exe` → ensures `/portable` on non-shortcut launches (e.g. MT's self-update relaunch) so the terminal keeps using its portable data dir. **Portable-data boxes ONLY — see the gate below.**
 
-## ⚠️ Two hard gates learned the hard way (2026-07-16 incident)
+## ⚠️ Hard gates learned the hard way
 
 The 2026-07-16 fleet sweep applied steps 3+4 below unconditionally and caused
-two regressions. Both gates are now mandatory:
+two regressions (gates 1–2). A third gate (gate 3, 2026-07-17) is a scripting
+hazard in the install steps themselves. All three are now mandatory:
 
 1. **`StrategyQuantX.exe` → `sqx144_hook_launcher.vbs` ONLY on boxes with a real
    v144 install** (a `C:\SQX*144*` / `StrategyQuant*144*` dir). On **v143**
@@ -31,6 +32,16 @@ two regressions. Both gates are now mandatory:
    hook. Remediation on a wrongly-hooked box: delete the 4 MT Debugger values —
    agent doc §9.9.28(a).
 
+3. **Never `New-Item -Path <IFEO key> -Force` on a key that already exists** — in
+   PowerShell that *recreates* the key and silently deletes its subkeys, which on
+   `StrategyQuantX_nocheck.exe` includes the `PerfOptions` subkey holding
+   `CpuPriorityClass=6` (SQX high-priority). Re-running the install steps on an
+   already-configured box would drop high-priority. Step 3/4 below guard every
+   create with `if (-not (Test-Path $k)) { New-Item … }` so a re-run only ensures
+   the key exists and sets `Debugger`, never clobbering `PerfOptions`. (Seen
+   2026-07-17 during the template hook refresh: an unguarded re-assert wiped
+   high-priority; it had to be restored with a fresh `PerfOptions` write.)
+
 ## Install (gated — apply per the gates above)
 
 1. Copy the three `.vbs` files into `C:\ProgramData\NeuraVPS\`.
@@ -50,15 +61,19 @@ two regressions. Both gates are now mandatory:
    v144 install exists** (gate 1):
 
    ```powershell
+   # NOTE: `New-Item -Path <IFEO key> -Force` on a key that ALREADY EXISTS wipes its
+   # subkeys — including the PerfOptions subkey that carries StrategyQuantX_nocheck.exe's
+   # CpuPriorityClass=6 (high-priority) setting. Guard every create with Test-Path so a
+   # re-run only ensures the key exists and never clobbers PerfOptions (see gate 3 below).
    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\StrategyQuantX_nocheck.exe'
-   New-Item -Path $k -Force | Out-Null
+   if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
    Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\sqx_hook_launcher.vbs"'
 
    $has144 = @(Get-ChildItem 'C:\' -Directory -EA SilentlyContinue |
      Where-Object { $_.Name -match 'SQX.*144|StrategyQuant.*144' }).Count -gt 0
    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\StrategyQuantX.exe'
    if ($has144) {
-     New-Item -Path $k -Force | Out-Null
+     if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
      Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\sqx144_hook_launcher.vbs"'
    } else {
      # v143-only box: this IFEO must NOT exist (silent launcher death otherwise)
@@ -73,7 +88,7 @@ two regressions. Both gates are now mandatory:
    ```powershell
    foreach ($exe in 'terminal64.exe','metaeditor64.exe','terminal.exe','metaeditor.exe') {
      $k = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$exe"
-     New-Item -Path $k -Force | Out-Null
+     if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }  # Test-Path guard: never -Force an existing key (wipes subkeys)
      Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\mt_hook_launcher.vbs"'
    }
    ```
