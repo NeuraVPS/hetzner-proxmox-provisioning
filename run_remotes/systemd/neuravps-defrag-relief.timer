@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly NeuraVPS thrash-relief pass
+
+[Timer]
+# :20 offset — clear of the 06:30 daily run (flock also prevents overlap; the
+# relief tick would simply skip). Missing a tick is fine, no Persistent.
+OnCalendar=*-*-* *:20:00
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -34,7 +34,29 @@ Safety rails:
 
 The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
-#NDFVER=7
+
+RELIEF MODE (--relief, hourly timer): the harm-targeted intra-day pass. The
+daily 06:30 run plans from Firestore counters, but balloon-reconciler floors
+DRIFT during the day (raises consume budget), so a node can become
+floor-starved with a thrashing guest hours before the next daily run (seen
+live: node 0000053 vm 808, 2026-07-17 — reconciler logging "NO BUDGET —
+placement should relieve this node" with nobody listening). Relief mode:
+  * reads /var/run/neuravps-balloon-status.json from every SQX node (written
+    by reconciler #NBRVER>=3): LIVE floors_sum + the VMs blocked-thrashing
+    >= ~10 consecutive minutes (local automation exhausted, floor < max —
+    floor==max cases are in-guest overload i.e. entitlement, never listed).
+  * overrides each node's floors with the live value (Firestore is stale
+    intra-day) so source detection AND destination margins use truth.
+  * for each node with sustained-blocked guests: move the smallest RUNNING
+    VM out (a stopped VM frees no live floors) -> the local reconciler gets
+    budget and raises the thrasher within ~1 min.
+  * blocked guests with NO fitting destination are ESCALATED in the log +
+    run doc (capacity problem = operator decision); the node_health daily
+    sweep independently warns when a thrasher persists >24h.
+  * skips daily phases 1/1.5/2/3 entirely; cap reliefMaxMovesPerRun
+    (default 4); journals to defrag_runs ONLY when it found work (hourly
+    empty ticks stay out of Firestore).
+#NDFVER=8
 """
 import fcntl
 import json
@@ -85,6 +107,7 @@ def fits_any_plan(commit_h, floor_h):
 
 
 def main():
+    relief = "--relief" in sys.argv[1:]
     lock = open("/run/neuravps-defrag.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -210,8 +233,75 @@ def main():
         sn["vms"] = [v for v in sn["vms"] if v["vmid"] != vm["vmid"]]
         moves.append((vm["vmid"], src, dst, reason))
 
+    # ---- relief mode: harm-targeted intra-day pass (see module docstring) ----
+    live_blocked = {}   # nid -> [{vmid, rate, floor_mb, ...}] (sustained-blocked)
+    if relief:
+        import concurrent.futures as cf
+        STATUS_MAX_AGE_S = 900
+
+        def read_status(nid):
+            ip = nodes[nid]["ip"]
+            if not ip:
+                return nid, None
+            try:
+                p = subprocess.run(
+                    SSH + [f"root@{ip}",
+                           "cat /var/run/neuravps-balloon-status.json 2>/dev/null"],
+                    capture_output=True, text=True, timeout=12)
+                return nid, json.loads(p.stdout.strip() or "null")
+            except Exception:
+                return nid, None
+
+        sqx_ids = [nid for nid, n in nodes.items() if n["model"] == "SQX"]
+        now_e = time.time()
+        fresh = 0
+        with cf.ThreadPoolExecutor(max_workers=12) as ex:
+            for nid, st in ex.map(read_status, sqx_ids):
+                if not isinstance(st, dict):
+                    continue
+                try:
+                    if now_e - float(st.get("ts") or 0) > STATUS_MAX_AGE_S:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                fresh += 1
+                n = nodes[nid]
+                # Live floors (reconciler raises drift intra-day; Firestore is
+                # the 06:00 sync). Take the max: live only counts RUNNING VMs,
+                # Firestore also reserves stopped ones — both must hold.
+                live_fl = float(st.get("floors_sum_mb") or 0) / 1024.0
+                if live_fl > n["fl"]:
+                    n["fl"] = live_fl
+                if st.get("blocked"):
+                    live_blocked[nid] = st["blocked"]
+        log(f"relief: {fresh}/{len(sqx_ids)} nodes reporting, "
+            f"{len(live_blocked)} with sustained-blocked thrashers")
+        relief_max = min(int(cfg.get("reliefMaxMovesPerRun") or 4), max_moves)
+        for nid in sorted(live_blocked):
+            if len(moves) >= relief_max:
+                log(f"relief: move cap {relief_max} reached — remaining nodes wait for next tick")
+                break
+            n = nodes[nid]
+            vm_list = ",".join(str(b.get("vmid")) for b in live_blocked[nid][:3])
+            worst = max((int(b.get("rate") or 0) for b in live_blocked[nid]), default=0)
+            picked = None
+            # smallest RUNNING VM out — a stopped VM frees no live floors
+            for vm in sorted(n["vms"], key=lambda v: v["ram"]):
+                if vm["st"] != "running":
+                    continue
+                dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
+                if dst:
+                    picked = (vm, dst)
+                    break
+            if picked:
+                book(picked[0], nid, picked[1],
+                     f"thrash-relief (vm {vm_list} blocked @{worst}/s, reconciler NO BUDGET)")
+            else:
+                log(f"ESCALATION {nid}: vm {vm_list} blocked-thrashing @{worst}/s but no "
+                    f"destination fits — needs operator (capacity)")
+
     # ---- phase 1: corrections ----
-    for nid in sorted(nodes):
+    for nid in sorted(nodes) if not relief else []:
         n = nodes[nid]
         if n["model"] == "SQX" and n["g"] > 0:
             guard = 0
@@ -255,7 +345,7 @@ def main():
     # thrashing guest's floor). Moving one small VM out restores burst
     # headroom. Seen live on 0000192 (2026-07-12: vms 795/865/812 thrashing,
     # reconciler logging NO BUDGET for hours).
-    for nid in sorted(nodes):
+    for nid in sorted(nodes) if not relief else []:
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
@@ -271,7 +361,7 @@ def main():
                 break
 
     # ---- phase 2: SQX crumb defrag ----
-    for nid in sorted(nodes):
+    for nid in sorted(nodes) if not relief else []:
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
@@ -290,7 +380,7 @@ def main():
 
     # ---- phase 3: consolidation (restore the empty-node reserve) ----
     CONSOL_MAX_VMS = int(cfg.get("consolidateMaxVms") or 6)
-    for nid in sorted(nodes, key=lambda k: len(nodes[k]["vms"])):
+    for nid in (sorted(nodes, key=lambda k: len(nodes[k]["vms"])) if not relief else []):
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
@@ -318,6 +408,10 @@ def main():
             continue
 
     moves[:] = moves[:max_moves]
+    if relief and not moves and not live_blocked:
+        # hourly tick with nothing to do: syslog only, no Firestore clutter
+        log("relief: no sustained-blocked thrashers — nothing to do")
+        return 0
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     plan_txt = [f"{m[0]} {m[1].split('-')[0]}->{m[2].split('-')[0]} [{m[3]}]" for m in moves]
     log(f"plan: {len(moves)} move(s)" + (f" (DRY-RUN)" if dry else ""))
@@ -325,10 +419,17 @@ def main():
         log("  " + t)
 
     doc = {"at": firestore.SERVER_TIMESTAMP, "dryRun": dry, "planned": plan_txt,
-           "executed": 0, "ok": 0, "fail": 0, "status": "planned"}
+           "executed": 0, "ok": 0, "fail": 0, "status": "planned", "relief": relief}
+    if relief and live_blocked:
+        doc["blockedNodes"] = {
+            nid: [f"vm {b.get('vmid')} @{b.get('rate')}/s" for b in bl[:5]]
+            for nid, bl in live_blocked.items()}
     db.collection("defrag_runs").document(run_id).set(doc)
     if not moves:
-        db.collection("defrag_runs").document(run_id).update({"status": "empty"})
+        # relief with blocked thrashers but no fitting destination = capacity
+        # problem — the one case that genuinely needs the operator.
+        db.collection("defrag_runs").document(run_id).update(
+            {"status": "no-dest" if (relief and live_blocked) else "empty"})
         return 0
     if dry:
         db.collection("defrag_runs").document(run_id).update({"status": "dry-run"})

@@ -1,0 +1,10 @@
+[Unit]
+Description=NeuraVPS thrash-relief (hourly harm-targeted placement; defrag --relief)
+# Same script/lock/kill-switch as the daily defrag: config/defrag {enabled,
+# dryRun, reliefMaxMovesPerRun}. Moves the smallest RUNNING VM off nodes whose
+# balloon reconciler reports sustained NO-BUDGET thrashers (status.json).
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-defrag.py --relief
+TimeoutStartSec=2h
