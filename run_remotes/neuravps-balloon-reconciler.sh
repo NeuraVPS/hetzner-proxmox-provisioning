@@ -9,8 +9,26 @@
 #   * guest thrashing  -> RAISE its balloon floor (qm set --balloon) in +4G
 #     steps up to its configured max — IF the node has budget:
 #       sum(all floors)+step <= 60% node RAM  AND  MemAvailable >= 12G margin
-#   * guest idle >= 30 consecutive runs -> lower the floor -4G/run back toward
-#     its ORIGINAL (plan) floor, never below.
+#   * guest calm -> LEAKY idle credit: +1 per calm run, -1 per mildly-busy
+#     run, hard reset to 0 ONLY on a thrashing (>= RAISE) run. At >= 30
+#     credit, lower the floor -4G toward its ORIGINAL (plan) floor, never
+#     below, then hold LOWER_COOLDOWN_RUNS calm runs before the next step.
+#
+#     v5 (2026-07-18) made that credit leaky. v4 required 30 CONSECUTIVE calm
+#     runs and reset to 0 on ANY run >= IDLE_FAULTS_PS (5/s -- barely above
+#     noise), so floors only ever ratcheted UP. Measured fleet-wide before the
+#     change: 92 VMs still pinned above their original floor holding 976 GB,
+#     20 of them at their configured max; those raised VMs run >= 5 faults/s
+#     in 21.8% of minutes (vs 4.1% fleet-wide -- the reconciler raises exactly
+#     the busy ones), so P(30 consecutive calm) = 0.06% per attempt. They
+#     could never give the memory back. Raising the threshold alone does not
+#     fix it (10/s -> 1.05%, 25/s -> 2.53%); dropping the "consecutive"
+#     requirement does: at 21.8% busy the credit drifts +0.56/run, reaching 30
+#     in ~53 min. Same leak the `blocked` counter got in v4, same reason.
+#     Walk-back is deliberately PACED (cooldown) rather than 4G every calm
+#     run: a guest that just went quiet may still have a large working set
+#     (SQX between backtests), so we probe downward slowly and let the raise
+#     path -- which reacts in ~1 min -- veto. Slow-decrease/fast-increase.
 # Original floors persist in /var/lib/neuravps-balloon/floors.json. A VM that
 # arrives already-bumped (migrated in) with no record: original is estimated as
 # min(current_floor, 30% of max) — observed plan floors are ~30% of max.
@@ -27,11 +45,12 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=4
+#NBRVER=5
 set -u
 RAISE_FAULTS_PS=${RAISE_FAULTS_PS:-100}   # sustained faults/s to trigger a raise
 IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
-IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # ~30 min idle before lowering
+IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # idle CREDIT (leaky) before lowering
+LOWER_COOLDOWN_RUNS=${LOWER_COOLDOWN_RUNS:-5}  # calm runs to re-earn between -4G steps
 STEP_MB=${STEP_MB:-4096}
 FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-60}  # sum(floors) cap as % of node RAM
 HOST_FREE_MIN_MB=${HOST_FREE_MIN_MB:-12288}
@@ -109,7 +128,7 @@ for v in "${!CUR_FLOOR[@]}"; do
   if [ "$rate" -ge 0 ]; then
     printf '%s\t%s\n' "$v" "$rate" >> "$tmp_rates"
     if [ "$rate" -ge "$RAISE_FAULTS_PS" ]; then
-      idle=0
+      idle=0   # genuine distress: hard reset is deliberate (only band that does)
       fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
       new=$(( fl + STEP_MB )); [ "$new" -gt "$mx" ] && new=$mx
       if [ "$new" -gt "$fl" ]; then
@@ -149,12 +168,25 @@ PY
           new=$(( fl - STEP_MB )); [ "$new" -lt "$orig" ] && new=$orig
           if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
             floors_sum=$(( floors_sum - fl + new ))
-            logger -t neuravps-balloon " LOWER vm $v floor ${fl}->${new}MB (idle ${idle} runs; original=${orig}MB)"
+            logger -t neuravps-balloon " LOWER vm $v floor ${fl}->${new}MB (idle credit ${idle}; original=${orig}MB)"
+            # PACE the walk-back: spend the credit so the next -4G step needs
+            # LOWER_COOLDOWN_RUNS more calm runs. A guest that just went quiet
+            # may still hold a large working set (SQX between backtests) --
+            # probe downward, don't strip it in one burst. Raising reacts in
+            # ~1 run, so an over-shoot self-corrects cheaply.
+            idle=$(( IDLE_RUNS_TO_LOWER - LOWER_COOLDOWN_RUNS ))
+            [ "$idle" -lt 0 ] && idle=0
           fi
         fi
       fi
     else
-      idle=0
+      # MIDDLE BAND (IDLE_FAULTS_PS <= rate < RAISE_FAULTS_PS): mild activity,
+      # NOT distress. v4 hard-reset idle here; with IDLE_FAULTS_PS=5 (barely
+      # above noise) that is what made floors a one-way ratchet -- a raised VM
+      # sits in this band 22% of minutes, so 30 CONSECUTIVE calm runs never
+      # happened (p=0.06%). Decay instead: a busy minute COSTS a calm minute,
+      # it does not erase the credit earned so far.
+      [ "$idle" -gt 0 ] && idle=$(( idle - 1 ))
       [ "$blocked" -gt 0 ] && blocked=$(( blocked - 1 ))   # decay, not reset (oscillators)
     fi
   fi
