@@ -29,6 +29,30 @@
 #     run: a guest that just went quiet may still have a large working set
 #     (SQX between backtests), so we probe downward slowly and let the raise
 #     path -- which reacts in ~1 min -- veto. Slow-decrease/fast-increase.
+#
+#     v6 (2026-07-19) TURNED THE WALK-BACK OFF. 24h on a 4-node canary: it does
+#     not work, and the premise behind it was wrong.
+#       * It did not converge. LOWER 216 vs RAISE 223 over 24h, 21 VMs both
+#         lowered AND raised (vm 1347: 28/25, vm 219: 28/27). Net floors HELD
+#         went UP, 183 -> 198 GB. A treadmill, not a give-back.
+#       * The premise was wrong. The 976 GB above "original" is not memory the
+#         reconciler forgot to return -- it is a LEARNED working set. Those
+#         floors were raised because the plan floor was already proven too
+#         small. `orig` is therefore the one level we know is inadequate, and
+#         it is exactly where the walk-back aims. v4's ratchet was not purely
+#         a bug: it was accumulating a measurement.
+#       * And it is not symmetric, which is what makes it unsafe. Lowering is
+#         unconditional; RAISING NEEDS FLOOR BUDGET. On a floor-starved node
+#         there is none, so the walk-back can strip memory it can never give
+#         back. Observed on 0000053: vm 1347 walked 23.5 -> 9.5 GB in 4 steps
+#         over 17 min, then thrashed at 129-2824 faults/s with "NO BUDGET",
+#         blocked level climbing to 4. The guest was left in distress by the
+#         mechanism that was supposed to be free. 7 VMs, 45.3 GB stripped.
+#     Anything that revisits this needs a per-VM floor-of-the-floor that
+#     REMEMBERS a bounce and backs off (exponentially), not a fixed cooldown --
+#     and it must refuse to lower at all on a node without the budget to undo
+#     it. The real win stays what phase 1.5/relief already do: move VMs off
+#     starved nodes. Packing was never the bottleneck; see the memory note.
 # Original floors persist in /var/lib/neuravps-balloon/floors.json. A VM that
 # arrives already-bumped (migrated in) with no record: original is estimated as
 # min(current_floor, 30% of max) — observed plan floors are ~30% of max.
@@ -45,8 +69,14 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=5
+#NBRVER=6
 set -u
+# v6 (2026-07-19): the v5 walk-back is OFF BY DEFAULT. It was measured on a
+# 4-node canary for 24h and it does not work -- see the header. first_boot.sh
+# curls THIS FILE from master onto every new node, so the default has to be the
+# safe one; set LOWER_ENABLED=1 in /etc/default/neuravps-balloon-reconciler to
+# experiment on a node you are watching.
+LOWER_ENABLED=${LOWER_ENABLED:-0}
 RAISE_FAULTS_PS=${RAISE_FAULTS_PS:-100}   # sustained faults/s to trigger a raise
 IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
 IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # idle CREDIT (leaky) before lowering
@@ -155,7 +185,7 @@ PY
     elif [ "$rate" -lt "$IDLE_FAULTS_PS" ]; then
       [ "$blocked" -gt 0 ] && blocked=$(( blocked - 1 ))   # decay, not reset (oscillators)
       idle=$(( idle + 1 ))
-      if [ "$idle" -ge "$IDLE_RUNS_TO_LOWER" ]; then
+      if [ "$LOWER_ENABLED" = 1 ] && [ "$idle" -ge "$IDLE_RUNS_TO_LOWER" ]; then
         fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
         orig=$(python3 - "$FLOORS" "$v" "$mx" "$fl" <<'PY'
 import json,sys
