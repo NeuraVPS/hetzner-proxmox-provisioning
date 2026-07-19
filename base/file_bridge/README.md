@@ -41,6 +41,7 @@ once per region).
 | `file-bridge.service` | systemd unit (`/opt/file-bridge`, uvicorn 127.0.0.1:8088, hardened). |
 | `requirements.txt` | venv deps. |
 | `test_bridge_http.py` | HTTP-layer tests (mocked SMB). |
+| `test_dragdrop_ui.js` | UI tests for `static/index.html` drag-and-drop, in jsdom (`npm install jsdom && node test_dragdrop_ui.js`). |
 
 ## Deploy (per base)
 
