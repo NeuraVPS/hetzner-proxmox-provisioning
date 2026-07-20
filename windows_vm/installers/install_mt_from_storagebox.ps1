@@ -479,6 +479,7 @@ public class NvU {
  [DllImport("user32.dll",CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr h,StringBuilder s,int m);
  [DllImport("user32.dll",CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr h,StringBuilder s,int m);
  [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h,int id);
+ [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll",SetLastError=true)] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h,int m,IntPtr w,IntPtr l);
@@ -504,22 +505,42 @@ public class NvU {
  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
 }
 "@
-$script:q1=0;$script:q2='';$script:q3=$null
-function NvFindDlg($fpid,$title){
-  $r=New-Object System.Collections.ArrayList;$script:q1=$fpid;$script:q2=$title;$script:q3=$r
+# Dialogs are identified STRUCTURALLY, by control id - never by window title. MT5's control
+# ids are compile-time constants and identical in every language, but the titles are
+# localised ("Options"/"Opciones", "Expert Advisors"/"Asesores Expertos"), and NeuraVPS
+# provisions Windows in en and es. Title matching silently found nothing on an es box.
+#   10322 = "Allow WebRequest for listed URL" checkbox (only on the Expert Advisors page)
+#   12324 = the account wizard's "Next >" button (present ONLY on that wizard)
+$script:q1=0;$script:q3=$null
+$script:nvWant=0;$script:nvFound=$false
+function NvHasDesc($top,$id){
+  $script:nvWant=$id;$script:nvFound=$false
+  $cb=[NvEnumCb]{ param($h,$l) if([NvU]::GetDlgCtrlID($h) -eq $script:nvWant){ $script:nvFound=$true }; return $true }
+  [void][NvU]::EnumChildWindows($top,$cb,[IntPtr]::Zero)
+  return $script:nvFound
+}
+# every top-level #32770 owned by this pid
+function NvDlgsFor($fpid){
+  $r=New-Object System.Collections.ArrayList;$script:q1=$fpid;$script:q3=$r
   $cb=[NvEnumCb]{ param($h,$l)
     $sb=New-Object Text.StringBuilder 64;[void][NvU]::GetClassName($h,$sb,64)
     if($sb.ToString() -eq '#32770'){ $pp=0;[void][NvU]::GetWindowThreadProcessId($h,[ref]$pp)
-      $t=New-Object Text.StringBuilder 96;[void][NvU]::GetWindowText($h,$t,96)
-      if($pp -eq $script:q1 -and $t.ToString() -eq $script:q2){ [void]$script:q3.Add($h) } } ; return $true }
+      if($pp -eq $script:q1){ [void]$script:q3.Add($h) } } ; return $true }
   [void][NvU]::EnumWindows($cb,[IntPtr]::Zero); return $r
 }
-function NvFindPage($dlg,$title){
-  $r=New-Object System.Collections.ArrayList;$script:pg=$title;$script:pr=$r
+# the Options dialog: carries the WebRequest checkbox somewhere below it (all tab pages
+# exist as child #32770s at once), and is NOT the account wizard.
+function NvFindOptions($fpid){
+  foreach($d in (NvDlgsFor $fpid)){ if((NvHasDesc $d 10322) -and -not (NvHasDesc $d 12324)){ return $d } }
+  return [IntPtr]::Zero
+}
+# the Expert Advisors page: the child #32770 that directly owns the checkbox
+function NvFindEaPage($dlg){
+  $r=New-Object System.Collections.ArrayList;$script:pr=$r
   $cb=[NvEnumCb]{ param($h,$l)
     $sb=New-Object Text.StringBuilder 64;[void][NvU]::GetClassName($h,$sb,64)
-    if($sb.ToString() -eq '#32770'){ $t=New-Object Text.StringBuilder 96;[void][NvU]::GetWindowText($h,$t,96)
-      if($t.ToString() -eq $script:pg){ [void]$script:pr.Add($h) } } ; return $true }
+    if($sb.ToString() -eq '#32770' -and ([NvU]::GetDlgItem($h,10322) -ne [IntPtr]::Zero)){ [void]$script:pr.Add($h) }
+    return $true }
   [void][NvU]::EnumChildWindows($dlg,$cb,[IntPtr]::Zero)
   if($r.Count -gt 0){ return $r[0] } else { return [IntPtr]::Zero }
 }
@@ -544,7 +565,7 @@ function NvInject($proc,$inst){
   if($hwnd -eq [IntPtr]::Zero){ L "  [$inst] no main window"; return $false }
   $me=[NvU]::GetCurrentThreadId()
   # the first-run "Open an Account" wizard is MODAL and blocks Options -> cancel it
-  foreach($w in (NvFindDlg $proc.Id 'Open an Account')){ $c=[NvU]::GetDlgItem($w,2); if($c -ne [IntPtr]::Zero){ [void][NvU]::SendMessage($c,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero) } }
+  foreach($w in (NvDlgsFor $proc.Id)){ if(NvHasDesc $w 12324){ $c=[NvU]::GetDlgItem($w,2); if($c -ne [IntPtr]::Zero){ [void][NvU]::SendMessage($c,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero) } } }
   Start-Sleep -Milliseconds 500
   # Ctrl+O only lands while our input queue is attached to the terminal's thread
   $tt=0;[void][NvU]::GetWindowThreadProcessId($hwnd,[ref]$tt)
@@ -556,7 +577,7 @@ function NvInject($proc,$inst){
   [NvU]::keybd_event(0x11,0,2,[IntPtr]::Zero)
   [void][NvU]::AttachThreadInput($me,$tt,$false)
   $dlg=[IntPtr]::Zero
-  for($i=0;$i -lt 14;$i++){ Start-Sleep -Milliseconds 300; $o=NvFindDlg $proc.Id 'Options'; if($o.Count -gt 0){ $dlg=$o[0]; break } }
+  for($i=0;$i -lt 14;$i++){ Start-Sleep -Milliseconds 300; $o=NvFindOptions $proc.Id; if($o -ne [IntPtr]::Zero){ $dlg=$o; break } }
   if($dlg -eq [IntPtr]::Zero){ L "  [$inst] Options did not open"; return $false }
   $dtt=0;[void][NvU]::GetWindowThreadProcessId($dlg,[ref]$dtt)
   [void][NvU]::AttachThreadInput($me,$dtt,$true)
@@ -564,7 +585,7 @@ function NvInject($proc,$inst){
   # the console desktop can be small; MT5 centres Options partly off-screen -> move it on-screen
   [void][NvU]::SetWindowPos($dlg,[IntPtr]::Zero,20,20,0,0,0x0005);Start-Sleep -Milliseconds 250
   # every tab page exists as a child #32770; the WebRequest controls live on "Expert Advisors"
-  $ea=NvFindPage $dlg 'Expert Advisors'
+  $ea=NvFindEaPage $dlg
   if($ea -eq [IntPtr]::Zero){ L "  [$inst] no Expert Advisors page"; [void][NvU]::AttachThreadInput($me,$dtt,$false); return $false }
   $tab=[NvU]::GetDlgItem($dlg,12320);$tcnt=[int][NvU]::SendMessage($tab,0x1304,[IntPtr]::Zero,[IntPtr]::Zero)
   for($ti=0; ($ti -lt $tcnt) -and (-not [NvU]::IsWindowVisible($ea)); $ti++){ $tp=NvItemCentre $tab 0x130A $ti; if($tp -ne $null){ NvClick $tp; Start-Sleep -Milliseconds 320 } }
