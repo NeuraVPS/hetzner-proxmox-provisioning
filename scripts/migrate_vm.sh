@@ -647,6 +647,17 @@ HOOKSCRIPT_DETACHED=0
 MAINTENANCE_SET=0
 MIGRATION_DONE=0
 WAS_STOPPED=0  # 1 if the source VM was stopped pre-migration (we started it temporarily on dest)
+# 1 when the migration COMMITTED but left the VM in a state the customer cannot
+# reach — in practice: the guest agent was down so the in-guest IPv6 could not
+# be re-bound to the destination prefix, and/or the post-migration RDP probe
+# never came up. Rolling back is not possible at that point (the VM already
+# lives on dest), so we finish every reconciliation step and then exit NON-ZERO
+# so the caller records a FAILURE. Before this (2026-07-24) those were plain
+# _warns and the script still exited 0: migrate_vms_batch counted the move as
+# ok, neuravps-defrag journalled ok=1/fail=0, and a customer was left
+# unreachable with every layer reporting success.
+MIGRATION_DEGRADED=0
+DEGRADED_REASON=""
 
 _rollback() {
   local rc=$?
@@ -1229,6 +1240,8 @@ PSEOF
   if (( RECONFIG_OK == 1 )); then
     _ok "In-guest IPv6 reconfigured + verified: ${EXPECTED_VM_IPV6} bound on dest VM (attempt ${_try})."
   else
+    MIGRATION_DEGRADED=1
+    DEGRADED_REASON="in-guest IPv6 reconfig NOT verified (guest may still hold the source-prefix IP)"
     _warn "In-guest IPv6 reconfig NOT verified after 4 attempts — the guest may still hold the source-prefix IP (customer unreachable via connectionUrl AND direct RDP). Fix: re-run this script (idempotent) or apply the PS_RECONFIG netsh block via 'qm guest exec ${VMID}'. Continuing — NAT/Firestore will still point at ${EXPECTED_VM_IPV6}."
   fi
 elif [[ "${OSTYPE:-}" != win* ]]; then
@@ -1292,6 +1305,8 @@ if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/
     sleep 5
   done
   if (( conn_rc != 0 )); then
+    MIGRATION_DEGRADED=1
+    DEGRADED_REASON="${DEGRADED_REASON:+${DEGRADED_REASON}; }VM unreachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after ${CONNECTIVITY_TIMEOUT}s"
     _warn "VM ${VMID} unreachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after ${CONNECTIVITY_TIMEOUT}s. Most likely the in-guest IPv6 reconfig didn't apply — check the VM's network interface on ${DST_NODE}."
   fi
 fi
@@ -1346,6 +1361,15 @@ if (( WAS_STOPPED == 1 )); then
       || _warn "could not restore original net0 (firewall=1 left on — harmless but review)."
   fi
   _ok "Firewall state restored to original."
+fi
+
+if (( MIGRATION_DEGRADED == 1 )); then
+  # MIGRATION_DONE is already 1, so the EXIT trap only closes SSH — nothing is
+  # rolled back and the VM stays where it is. We exit non-zero purely to tell
+  # the caller (migrate_vms_batch / neuravps-defrag) that a HUMAN must finish
+  # this one, instead of silently counting it as a success.
+  _warn "Migration COMMITTED BUT DEGRADED: VMID=${VMID}  ${SRC_NODE} → ${DST_NODE}  ipv6=${EXPECTED_VM_IPV6}"
+  _die "MIGRATION_DEGRADED vm=${VMID} dest=${DST_NODE}: ${DEGRADED_REASON}. The VM is running on the destination but the CUSTOMER CANNOT REACH IT. Manual fix: re-run 'migrate_vm.sh ${VMID} ${NEW_NODE_NUM}' (idempotent — it retries the in-guest rebind), or apply the netsh reconfig via 'qm guest exec ${VMID}' once the guest agent answers."
 fi
 
 _ok "Migration complete: VMID=${VMID}  ${SRC_NODE} → ${DST_NODE}  ipv6=${EXPECTED_VM_IPV6}"
