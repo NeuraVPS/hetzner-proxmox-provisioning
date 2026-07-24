@@ -1305,8 +1305,16 @@ if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/
     sleep 5
   done
   if (( conn_rc != 0 )); then
-    MIGRATION_DEGRADED=1
-    DEGRADED_REASON="${DEGRADED_REASON:+${DEGRADED_REASON}; }VM unreachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after ${CONNECTIVITY_TIMEOUT}s"
+    # A silent RDP port only ESCALATES to a hard failure when the in-guest
+    # rebind ALSO failed — that pair is the stranded-customer signature. On its
+    # own it is not proof of harm: the customer may have RDP disabled
+    # (rdpEnabled=false is a normal per-VM setting) or Windows may still be
+    # finishing its boot. Failing the run on that would abort defrag passes for
+    # healthy migrations and train the operator to ignore the alert, which is
+    # worse than the silence we are fixing.
+    if (( MIGRATION_DEGRADED == 1 )); then
+      DEGRADED_REASON="${DEGRADED_REASON}; RDP also never came up after ${CONNECTIVITY_TIMEOUT}s"
+    fi
     _warn "VM ${VMID} unreachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after ${CONNECTIVITY_TIMEOUT}s. Most likely the in-guest IPv6 reconfig didn't apply — check the VM's network interface on ${DST_NODE}."
   fi
 fi
