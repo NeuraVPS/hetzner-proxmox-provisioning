@@ -161,3 +161,48 @@ connections to a given port. An attacker needs thousands and gets 12.
 
 The ip6 table already had this rule. Only v4 — the family that judges
 essentially every real client — was missing it.
+
+
+## Slow DISTRIBUTED attacks on one VM — `hotPortMinTotal` / `hotPortMinSrc`
+
+The hardest case, and the one that was actually hurting a customer. Six sources
+at ~2 connections/min each, all aimed at port 21845:
+
+* invisible to port diversity — they touch ONE port
+* invisible to the connection flood — ~12 connections each, far under 100
+* invisible to every rate limit — 2/min is slower than any real client
+
+And rate limiting could not have fixed it anyway: **the auth attempts ride
+inside connections that are already open.** No new SYN is ever sent, so there
+is nothing to rate-limit. Only a block drops packets on an established
+connection.
+
+Two conditions must BOTH hold, which is what makes blocking safe here:
+
+* the port carries `hotPortMinTotal` (20) connections — measured on b1, 472
+  customer ports sat at 1-4 and 422 at 5-9;
+* and the source contributes `hotPortMinSrc` (5) of them — a real client holds
+  1-4 (p95 = 4).
+
+Armed, it picked exactly the four heaviest of that cluster and nothing else.
+Effect on the attacked VM within four minutes: live connections **67 → 16**,
+failed logons **12.4/min → 4.8/min**.
+
+**It does not reach zero, and that is deliberate.** The remaining sources hold
+fewer than 5 connections each; catching them would mean dropping the threshold
+into the range where real clients live. Closing that last gap needs evidence
+the BASE does not have — which is the argument for making NAT46 carry the
+client's real address (see below).
+
+## Known gap: the guest cannot see who is attacking it
+
+NAT46 rewrites the source into our own prefix, so the in-guest Security log
+records our address, never the client's. That is why the strongest possible
+signal is unavailable: a VM with thousands of 4625s and zero 4624s KNOWS it is
+under attack, but cannot say by whom, and the BASE — which knows the addresses
+— cannot see the failed logons.
+
+Encoding the client IPv4 into the NAT46 source (RFC 6052 style, a /96 inside
+the VM's own prefix) would join the two halves and let a VM's own failed-logon
+flood drive blocks at the edge. It is a change to the data path for every
+customer, so it belongs in a planned window, not during an attack.

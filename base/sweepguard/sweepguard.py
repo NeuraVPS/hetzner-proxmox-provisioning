@@ -62,6 +62,8 @@ DEFAULTS = {
     "dryRun": False,         # validado en vivo 2026-07-25; un BASE nuevo protege desde el minuto 0
     "minPorts": 20,          # 3x el cliente con mas servidores (7)
     "maxConns": 100,         # conexiones RDP VIVAS simultaneas; nada legitimo paso de 30
+    "hotPortMinTotal": 20,   # un puerto de cliente con tantas conexiones esta bajo ataque
+    "hotPortMinSrc": 5,      # y la fuente que aporta tanto a ESE puerto es parte del ataque
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
 }
@@ -203,12 +205,70 @@ def flooders(family, cfg):
     return {a: n for a, n in per_src.items() if n >= cfg["maxConns"]}
 
 
+def hot_port_abusers(family, cfg):
+    """(addr -> conns) for sources piling connections onto ONE attacked port.
+
+    Detectors 1 and 2 both miss the slow DISTRIBUTED attack on a single VM:
+    six sources at ~2 conns/min each touch one port (invisible to minPorts),
+    hold ~12 connections each (invisible to maxConns) and stay far under the
+    per-source rate limit. Measured on b1: the VM behind port 21845 had 17936
+    failed logons in 24h and ZERO successful ones.
+
+    Rate limiting cannot fix that case at all — the auth attempts ride INSIDE
+    connections already open, so no new SYN is ever sent and nothing is there
+    to rate limit. Only a block drops packets on an established connection.
+
+    Two conditions must BOTH hold, which is what keeps it safe:
+      * the port itself carries `hotPortMinTotal` connections — no real
+        customer VM does (measured: 472 ports at 1-4, 422 at 5-9);
+      * and this source contributes `hotPortMinSrc` of them — a real client
+        holds 1-4 (measured p95 = 4).
+    """
+    want = "ipv4" if family == "ip" else "ipv6"
+    pair = defaultdict(int)
+    per_port = defaultdict(int)
+    try:
+        with open(CONNTRACK) as fh:
+            for ln in fh:
+                if not ln.startswith(want) or " tcp " not in ln or "dport=" not in ln:
+                    continue
+                m = _CT_RE.search(ln)
+                if not m:
+                    continue
+                port = int(m.group(2))
+                if not (20000 <= port <= 29999):
+                    continue
+                addr = m.group(1)
+                if family == "ip6":
+                    try:
+                        if ipaddress.ip_address(addr) in NAT64:
+                            continue
+                    except ValueError:
+                        continue
+                pair[(addr, port)] += 1
+                per_port[port] += 1
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log(f"{family}: conntrack unreadable ({exc}) — hot-port detector skipped")
+        return {}
+
+    out = {}
+    for (addr, port), n in pair.items():
+        if n >= cfg["hotPortMinSrc"] and per_port[port] >= cfg["hotPortMinTotal"]:
+            out[addr] = max(out.get(addr, 0), n)
+    return out
+
+
 def run_family(family, cfg):
-    # dos detectores independientes; la razon se conserva para el log
+    # tres detectores independientes; la razon se conserva para el log
     cand = {a: ("ports", n) for a, n in sweepers(family, cfg).items()}
     for a, n in flooders(family, cfg).items():
         if a not in cand:                      # diversidad de puertos manda
             cand[a] = ("conns", n)
+    for a, n in hot_port_abusers(family, cfg).items():
+        if a not in cand:
+            cand[a] = ("hotport", n)
     if not cand:
         return 0
     allow = set_elements(family, "bf_allow")
@@ -234,8 +294,9 @@ def run_family(family, cfg):
         picked = picked[:cfg["maxAddsPerRun"]]
 
     for addr, why, metric in picked:
-        what = ("%d distinct ports" % metric if why == "ports"
-                else "%d live connections" % metric)
+        what = {"ports": "%d distinct ports" % metric,
+                "conns": "%d live connections" % metric,
+                "hotport": "%d connections onto ONE attacked port" % metric}[why]
         if cfg["dryRun"]:
             log(f"{family}: DRY-RUN would block {addr} ({what})")
             continue
