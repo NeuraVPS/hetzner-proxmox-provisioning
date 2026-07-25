@@ -10,8 +10,9 @@ under the limit, and under the per-(source,port) ip6 limit too. No rate
 threshold separates it from a real client, because it is not fast.
 
 What DOES separate them is PORT DIVERSITY:
-  * a real client opens its own VM's port — the busiest customer owns 7 servers;
-  * a sweeper touched 20-686 distinct ports in one conntrack sample.
+  * a real client opens its own VM's ports — the busiest customer owns 7
+    servers, and RDP+SMB on the same machine count as ONE (see vm_slot);
+  * a sweeper touched 20-686 distinct machines in one conntrack sample.
 
 So this counts DISTINCT DESTINATION PORTS per source over a rolling window
 (nftables set `bf_seen`, populated by a no-verdict rule) and drops sources over
@@ -68,6 +69,21 @@ DEFAULTS = {
     "blockSeconds": 86400,   # 24h
 }
 NAT64 = ipaddress.ip_network("64:ff9b:1::/96")
+
+# La base reenvia DOS puertos por VM: RDP en 2xxxx y SMB (445) en 1xxxx, con el
+# MISMO sufijo — 10202 y 20202 son la misma maquina. Contar puertos a secas
+# duplicaria a cada cliente (7 servidores -> 14 puertos) y estrecharia el margen
+# de minPorts a la mitad. Se normaliza a "ranura de VM" para contar MAQUINAS.
+PORT_LO, PORT_HI = 10000, 29999
+
+
+def vm_slot(port):
+    """Puerto reenviado -> identidad de VM (RDP y SMB de la misma maquina = 1)."""
+    return port - 10000 if port < 20000 else port - 20000
+
+
+def in_range(port):
+    return PORT_LO <= port <= PORT_HI
 # src= puede ser v4 (1.2.3.4) o v6 (2a01:...); dport= llega despues en la misma linea
 _CT_RE = re.compile(r"src=([0-9a-fA-F.:]+)\s.*?dport=(\d+)")
 
@@ -162,7 +178,12 @@ def sweepers(family, cfg):
                     continue
             except ValueError:
                 continue
-        per_src[addr].add(port)
+        try:
+            if not in_range(int(port)):
+                continue
+        except (TypeError, ValueError):
+            continue
+        per_src[addr].add(vm_slot(int(port)))     # cuenta MAQUINAS, no puertos
     return {a: len(p) for a, p in per_src.items() if len(p) >= cfg["minPorts"]}
 
 
@@ -187,7 +208,7 @@ def flooders(family, cfg):
                 m = _CT_RE.search(ln)
                 if not m:
                     continue
-                if not (20000 <= int(m.group(2)) <= 29999):
+                if not in_range(int(m.group(2))):
                     continue
                 addr = m.group(1)
                 if family == "ip6":
@@ -236,7 +257,7 @@ def hot_port_abusers(family, cfg):
                 if not m:
                     continue
                 port = int(m.group(2))
-                if not (20000 <= port <= 29999):
+                if not in_range(port):
                     continue
                 addr = m.group(1)
                 if family == "ip6":
