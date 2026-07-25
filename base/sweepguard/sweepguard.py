@@ -18,6 +18,26 @@ So this counts DISTINCT DESTINATION PORTS per source over a rolling window
 the threshold into `bf_auto`, a set with a TIMEOUT so every automatic block
 expires by itself.
 
+SECOND DETECTOR — connection flood (added 2026-07-25)
+-----------------------------------------------------
+Port diversity alone leaves a hole: `bf_seen` records a source on its NEW SYN
+and ages out after 1h, so an attacker that OPENS many connections and HOLDS
+them becomes invisible. Measured on b1: six sources with 100-1372 live RDP
+connections had `bf_seen` counts of ZERO — two coordinated /24 clusters,
+2725 connections, completely unseen by the sweep detector.
+
+So a source is also blocked on live RDP connections held concurrently
+(`maxConns`), read straight from conntrack. A real client needs 1-3 TCP
+connections per RDP session and the busiest customer owns 7 servers. Measured
+distribution on b1 at the time of writing:
+
+    1000+ conns   2 sources      30-100 conns   2 sources, BOTH attackers
+    300-1000      3 sources      10-30          9 sources  <- highest legit
+    100-300      11 sources       1-10        185 sources
+
+Nothing legitimate sat between 30 and 100, so the default of 100 keeps a 3x
+margin over the busiest real source ever observed.
+
 Safety (this runs at the edge; a mistake blocks paying customers)
 ---------------------------------------------------------------
   * `bf_allow` always wins — it is checked first in the chain AND here.
@@ -31,6 +51,7 @@ Safety (this runs at the edge; a mistake blocks paying customers)
 """
 import ipaddress
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -40,10 +61,13 @@ DEFAULTS = {
     "enabled": True,
     "dryRun": False,         # validado en vivo 2026-07-25; un BASE nuevo protege desde el minuto 0
     "minPorts": 20,          # 3x el cliente con mas servidores (7)
+    "maxConns": 100,         # conexiones RDP VIVAS simultaneas; nada legitimo paso de 30
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
 }
 NAT64 = ipaddress.ip_network("64:ff9b:1::/96")
+# src= puede ser v4 (1.2.3.4) o v6 (2a01:...); dport= llega despues en la misma linea
+_CT_RE = re.compile(r"src=([0-9a-fA-F.:]+)\s.*?dport=(\d+)")
 
 
 def log(msg):
@@ -140,8 +164,51 @@ def sweepers(family, cfg):
     return {a: len(p) for a, p in per_src.items() if len(p) >= cfg["minPorts"]}
 
 
+CONNTRACK = "/proc/net/nf_conntrack"
+
+
+def flooders(family, cfg):
+    """(addr -> live RDP connection count) for sources over `maxConns`.
+
+    Counts what the source is holding open RIGHT NOW, which needs no state
+    between runs and cannot be evaded by going slow — the trick that defeats
+    the port-diversity detector."""
+    want = "ipv4" if family == "ip" else "ipv6"
+    per_src = defaultdict(int)
+    try:
+        with open(CONNTRACK) as fh:
+            for ln in fh:
+                if not ln.startswith(want) or " tcp " not in ln:
+                    continue
+                if "dport=" not in ln:
+                    continue
+                m = _CT_RE.search(ln)
+                if not m:
+                    continue
+                if not (20000 <= int(m.group(2)) <= 29999):
+                    continue
+                addr = m.group(1)
+                if family == "ip6":
+                    try:
+                        if ipaddress.ip_address(addr) in NAT64:
+                            continue
+                    except ValueError:
+                        continue
+                per_src[addr] += 1
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log(f"{family}: conntrack unreadable ({exc}) — flood detector skipped")
+        return {}
+    return {a: n for a, n in per_src.items() if n >= cfg["maxConns"]}
+
+
 def run_family(family, cfg):
-    cand = sweepers(family, cfg)
+    # dos detectores independientes; la razon se conserva para el log
+    cand = {a: ("ports", n) for a, n in sweepers(family, cfg).items()}
+    for a, n in flooders(family, cfg).items():
+        if a not in cand:                      # diversidad de puertos manda
+            cand[a] = ("conns", n)
     if not cand:
         return 0
     allow = set_elements(family, "bf_allow")
@@ -149,15 +216,15 @@ def run_family(family, cfg):
     already = plain_addrs(family, "bf_auto")
 
     picked = []
-    for addr, nports in sorted(cand.items(), key=lambda kv: -kv[1]):
+    for addr, (why, metric) in sorted(cand.items(), key=lambda kv: -kv[1][1]):
         if addr in already:
             continue
         if covered_by_lists(family, addr, allow):
-            log(f"{family}: SKIP {addr} ({nports} ports) — in bf_allow")
+            log(f"{family}: SKIP {addr} ({metric} {why}) — in bf_allow")
             continue
         if covered_by_lists(family, addr, static):
             continue          # ya bloqueada a mano
-        picked.append((addr, nports))
+        picked.append((addr, why, metric))
 
     if not picked:
         return 0
@@ -166,17 +233,18 @@ def run_family(family, cfg):
             f"{cfg['maxAddsPerRun']} — blocking the worst ones only")
         picked = picked[:cfg["maxAddsPerRun"]]
 
-    for addr, nports in picked:
+    for addr, why, metric in picked:
+        what = ("%d distinct ports" % metric if why == "ports"
+                else "%d live connections" % metric)
         if cfg["dryRun"]:
-            log(f"{family}: DRY-RUN would block {addr} ({nports} distinct ports)")
+            log(f"{family}: DRY-RUN would block {addr} ({what})")
             continue
         r = subprocess.run(
             ["nft", "add", "element", family, "rdpguard", "bf_auto",
              "{ %s timeout %ds }" % (addr, cfg["blockSeconds"])],
             capture_output=True, text=True)
         if r.returncode == 0:
-            log(f"{family}: BLOCKED {addr} ({nports} distinct ports) "
-                f"for {cfg['blockSeconds']}s")
+            log(f"{family}: BLOCKED {addr} ({what}) for {cfg['blockSeconds']}s")
         else:
             log(f"{family}: FAILED to block {addr}: {r.stderr.strip()[:120]}")
     return len(picked)

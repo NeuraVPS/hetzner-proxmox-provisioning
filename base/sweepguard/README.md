@@ -11,6 +11,29 @@ on one VM and left the customer staring at a black screen.
 A real client opens its own VM's port; the busiest customer owns 7 servers. The
 sweepers touch 20-686 distinct ports.
 
+## Two independent detectors
+
+**1 — port diversity.** A real client opens its own VM's port; the busiest
+customer owns 7 servers. Sweepers touch 20-686. See below.
+
+**2 — connection flood** (added 2026-07-25, after the operator asked whether
+100+ attempts/min is simply an attack regardless of who it is — it is).
+Detector 1 has a hole: `bf_seen` records a source on its NEW SYN and ages out
+after 1h, so an attacker that opens many connections and HOLDS them goes
+unseen. Measured on b1: six sources holding 100-1372 live RDP connections had
+a `bf_seen` count of ZERO — two coordinated /24 clusters (`88.214.25.121/123/
+124/125` and `91.238.181.92/94`), 2725 connections, invisible to detector 1.
+
+`maxConns` (default 100) blocks on connections held concurrently, read from
+conntrack. Live distribution on b1 when it was written:
+
+    1000+ conns    2 sources        30-100 conns    2 sources, BOTH attackers
+    300-1000       3 sources        10-30           9 sources  <- highest legit
+    100-300       11 sources         1-10         185 sources
+
+Nothing legitimate sat between 30 and 100. Armed, it blocked exactly those six
+and nothing else.
+
 ## How it works
 * `bf_seen` (`addr . port`, 1h timeout) — a no-verdict rule records every new
   RDP SYN as a (source, port) pair.
@@ -36,6 +59,8 @@ judges NATIVE v6 clients (NAT66).
     enabled       kill switch
     dryRun        log what WOULD be blocked, block nothing (ships ON)
     minPorts      distinct-port threshold (20 = 3x the largest real customer)
+    maxConns      live concurrent RDP connections (100 = 3x the busiest real
+                  source ever observed)
     maxAddsPerRun cap on blocks per run, bounds the blast radius of a bug
     blockSeconds  how long an automatic block lasts (86400)
 
