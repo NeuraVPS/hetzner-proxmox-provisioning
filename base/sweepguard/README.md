@@ -11,7 +11,12 @@ on one VM and left the customer staring at a black screen.
 A real client opens its own VM's port; the busiest customer owns 7 servers. The
 sweepers touch 20-686 distinct ports.
 
-## Two independent detectors
+## Three layers
+
+`deploy_portguard.sh` adds a **third**, and it turned out to be the one that
+matters most for actual customer harm — see "Concentrated attacks" below.
+
+## Two independent detectors (sweepguard.py)
 
 **1 — port diversity.** A real client opens its own VM's port; the busiest
 customer owns 7 servers. Sweepers touch 20-686. See below.
@@ -120,3 +125,39 @@ and it self-heals in 24h regardless:
     nft delete element ip rdpguard bf_auto { <their.public.ip> }
 
 Then persist the allow entry in `/etc/nftables.conf`.
+
+
+## Concentrated attacks — `deploy_portguard.sh`
+
+The operator's framing, which was right: a botnet spread thin across many VMs
+costs us little. The damage is one VM taking thousands of attempts, because
+that is what locks the customer's account and wedges their RDP.
+
+The v4 table had no per-(source,port) limit — only 60/min per source. So one IP
+could hammer ONE VM at 60 attempts/min forever, and several IPs coordinating on
+one port were invisible to everything:
+
+* port-diversity (`minPorts` 20) — they touch 1-2 ports
+* connection flood (`maxConns` 100) — connect→fail→close leaves ~1 live
+  connection at any instant no matter how fast they go
+* per-source rate (`bf_src` 60/min) — they stay under it
+
+Measured the moment the rule went in, on b1: port **21845 under attack from six
+distinct sources at once**. In-guest confirmation on that VM:
+
+| VM | failed logons 24h | successful RDP 24h | top target |
+|---|---|---|---|
+| 1845 (port 21845) | **17936** | **0** | ADMINISTRATOR ×16589 |
+| 389 (port 20389) | 1189 | **0** | ADMINISTRATOR ×739 |
+
+Zero successful logins under that volume is a paying customer locked out of
+their own machine.
+
+**Rate limit, not a block, and that is deliberate.** It can only throttle; it
+can never lock anyone out. A real client needs ONE successful connection, and
+12/min with burst 15 leaves that untouched even during an RDP auto-reconnect
+storm. Measured legitimate behaviour: median **1**, p95 **4** concurrent
+connections to a given port. An attacker needs thousands and gets 12.
+
+The ip6 table already had this rule. Only v4 — the family that judges
+essentially every real client — was missing it.
