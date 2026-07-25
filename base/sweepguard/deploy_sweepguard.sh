@@ -52,13 +52,13 @@ if [ ! -f /etc/neuravps-sweepguard.json ]; then
   cat > /etc/neuravps-sweepguard.json <<'JSON'
 {
   "enabled": true,
-  "dryRun": true,
+  "dryRun": false,
   "minPorts": 20,
-  "maxAddsPerRun": 50,
+  "maxAddsPerRun": 200,
   "blockSeconds": 86400
 }
 JSON
-  echo "  creada /etc/neuravps-sweepguard.json (dryRun=true)"
+  echo "  creada /etc/neuravps-sweepguard.json (dryRun=false — arma al instante)"
 else
   echo "  config ya existe (no la toco)"
 fi

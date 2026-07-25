@@ -23,7 +23,7 @@ Safety (this runs at the edge; a mistake blocks paying customers)
   * `bf_allow` always wins — it is checked first in the chain AND here.
   * `bf_auto` entries EXPIRE (default 24h): a wrong block heals itself.
   * `maxAddsPerRun` caps the blast radius of a bug in this script.
-  * `dryRun` (default ON) only logs what it WOULD block.
+  * `dryRun` only logs what it WOULD block (default OFF — validated 2026-07-25).
   * `enabled: false` is a kill switch; a missing/corrupt config disables it.
   * The v4 family is authoritative for v4 clients: on the ip6 side they all
     arrive SNATed to the BASE's own VIP, so ip6 only judges NATIVE v6 sources
@@ -38,9 +38,9 @@ from collections import defaultdict
 CONFIG = "/etc/neuravps-sweepguard.json"
 DEFAULTS = {
     "enabled": True,
-    "dryRun": True,          # empieza observando; armar solo tras validar
+    "dryRun": False,         # validado en vivo 2026-07-25; un BASE nuevo protege desde el minuto 0
     "minPorts": 20,          # 3x el cliente con mas servidores (7)
-    "maxAddsPerRun": 50,
+    "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
 }
 NAT64 = ipaddress.ip_network("64:ff9b:1::/96")

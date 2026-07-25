@@ -39,5 +39,31 @@ judges NATIVE v6 clients (NAT66).
     maxAddsPerRun cap on blocks per run, bounds the blast radius of a bug
     blockSeconds  how long an automatic block lasts (86400)
 
-Ship with `dryRun: true`, watch `journalctl -u neuravps-sweepguard` for a few
-days, confirm no customer ever appears, then set it to false.
+**Armed since 2026-07-25** (was dry-run for one day; new BASEs now ship armed).
+
+The dry-run measured the port-diversity distribution the design rests on, and
+the gap is wide enough to act on:
+
+| distinct ports | b0 | b1 |
+|---|---|---|
+| 200+ | 0 | 60 |
+| 50-200 | 0 | 6 |
+| 20-50 | 1 | 1 |
+| 8-20 | 0 | 1 |
+| under 8 | 84 | 126 |
+
+The highest non-sweeper was 16 ports (`88.198.66.15`, a rented Hetzner box that
+was ALSO over the 60/min rate limit — an attacker, just a slower one); every
+other legitimate source sat at 1-4. Arming blocked 68 sources and immediately
+started dropping ~185 pps of attack traffic on b1.
+
+**The one realistic false positive is a shared egress IP** — an office or prop
+firm where 20+ people each RDP into their own VPS from one NAT. Symptom: a
+group of customers loses RDP at the same moment, from the same location, with
+everything green on our side. Fix in 10 seconds, and it self-heals in 24h
+anyway:
+
+    nft add element ip rdpguard bf_allow { <their.public.ip> }
+    nft delete element ip rdpguard bf_auto { <their.public.ip> }
+
+Then persist the allow entry in `/etc/nftables.conf`.
