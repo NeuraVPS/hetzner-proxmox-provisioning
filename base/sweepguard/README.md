@@ -57,11 +57,39 @@ was ALSO over the 60/min rate limit — an attacker, just a slower one); every
 other legitimate source sat at 1-4. Arming blocked 68 sources and immediately
 started dropping ~185 pps of attack traffic on b1.
 
-**The one realistic false positive is a shared egress IP** — an office or prop
-firm where 20+ people each RDP into their own VPS from one NAT. Symptom: a
-group of customers loses RDP at the same moment, from the same location, with
-everything green on our side. Fix in 10 seconds, and it self-heals in 24h
-anyway:
+## What does NOT identify a customer
+
+Four candidate signals were tested against the 67 blocked sources on b1.
+**All four fail**, which is why port diversity is the only input:
+
+| signal | why it fails |
+|---|---|
+| rDNS / geography | The heaviest attacker is `customer.sntochl1.isp.starlink.com` — a residential Starlink line at 730 ports. Also seen: FTTH, Telecom Italia "business", ISPs in Peru/Brazil/Argentina. A botnet *is* compromised home machines. |
+| ESTABLISHED connection | 31 of the 67 have one; one holds 2846. Brute-forcers complete the TCP handshake, then fail auth. |
+| hitting real assigned ports | Median blocked source hits **99.7%** ports that map to a live VM. They work from a target list, they do not sweep blindly. |
+| in-guest successful logon (4624) | The guest never sees the client's public IP — NAT46 rewrites the source to an address in our own prefix. Only the BASE ever sees the real IP, which is precisely why the block belongs here. |
+
+Byte accounting (`net.netfilter.nf_conntrack_acct=1`, enabled on both BASEs
+2026-07-25, persisted in `/etc/sysctl.d/99-neuravps-conntrack.conf`) is the one
+signal that *would* discriminate — a real session moves megabytes, a brute-force
+moves kilobytes. It was off, so there is no history; revisit once there is.
+
+## The false positive this design can actually produce
+
+The detector's only input is (source IP, destination port). So the ONLY way a
+customer gets caught is **many distinct customers sharing one source IP**:
+a shared office egress, carrier-grade NAT on a mobile/ISP pool, a popular VPN
+exit node, or a reseller. Which of those it would be is not predictable, and as
+the table above shows it is not identifiable from the address either.
+
+What IS measured is the margin. Lowest source ever blocked: **27 ports**.
+Largest legitimate source observed: **18** (`88.198.66.15` — itself
+attacker-shaped: rented Hetzner box, also over the 60/min rate limit). Every
+other free source sits at 1-4. The largest real customer owns 7 servers.
+
+Symptom if it ever happens: a group of customers loses RDP at the same moment,
+from the same location, with everything green on our side. Fix in 10 seconds,
+and it self-heals in 24h regardless:
 
     nft add element ip rdpguard bf_allow { <their.public.ip> }
     nft delete element ip rdpguard bf_auto { <their.public.ip> }
