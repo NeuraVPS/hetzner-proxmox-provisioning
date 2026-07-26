@@ -1,5 +1,13 @@
 # Prepare Windows Template
 
+## VM config (Proxmox side, not the guest)
+
+- **`cpu: x86-64-v3` — never `host`.** The template's `config.conf` is cloned verbatim into every new customer VM, so a host-passthrough template pins each guest to the exact silicon of the node it was born on: live migration then only works onto a same-or-newer CPU of the *same vendor* (the VMs 708/1670 failure, see the pre-check in [`scripts/migrate_vm.sh`](../scripts/migrate_vm.sh)). A baseline model lets any new VM hot-migrate anywhere in the fleet, including across CPU types and vendors.
+  - `x86-64-v3` is the highest generic model the whole fleet can run: PVE expands it to `qemu64,+aes,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,…,enforce`, and every current CPU (EPYC Genoa, Ryzen 7950X3D/5950X, Intel i5-13500) supports all of it. `x86-64-v4` additionally needs AVX-512, which the Intel EX44 nodes do **not** have — and because PVE appends `enforce`, a v4 VM would simply fail to start there.
+  - Trade-off accepted 2026-07-26: the guest's Task Manager shows a generic *"QEMU Virtual CPU version 2.5+"* instead of the real model name, and AVX-512 is hidden on Genoa.
+  - `export_template_vm_to_shared_storage.sh` refuses to upload a template with `cpu: host`/`max` (override: `ALLOW_HOST_CPU=1`), so a future refresh cannot silently revert this.
+  - Existing customer VMs keep `cpu: host` — this only applies to VMs created from the templates from now on.
+
 ## Checklist
 
 - Apply Windows and Winget updates

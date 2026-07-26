@@ -820,6 +820,23 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
       _cpu_first="${CPU_RAW%%,*}"                       # strip ",flags=..." etc.
       if [[ "$_cpu_first" == cputype=* ]]; then CPU_MODEL="${_cpu_first#cputype=}"; else CPU_MODEL="$_cpu_first"; fi
     fi
+    # The config is a statement of intent, not of fact: `qm set --cpu` on a
+    # running VM only takes effect at its next start, so a guest whose config
+    # already reads x86-64-v3 can still be EXECUTING with host-passthrough
+    # CPUID. Deciding from the config alone would skip this entire check for
+    # exactly those VMs — the ones mid-transition from `host` to a baseline
+    # model, i.e. the ones being moved onto a different CPU type in the first
+    # place. Trust the live QEMU cmdline instead (same source of truth as the
+    # memory check in 0b); fall back to the config if it can't be read.
+    _run_cpu=$(src_ssh "tr '\\0' '\\n' < /proc/\$(cat /var/run/qemu-server/${VMID}.pid 2>/dev/null)/cmdline 2>/dev/null" \
+               | grep -A1 -x -- '-cpu' | tail -1 | tr -d '\r' || true)
+    if [[ -n "$_run_cpu" && "$_run_cpu" != "-cpu" ]]; then
+      _run_model="${_run_cpu%%,*}"
+      if [[ -n "$_run_model" && "$_run_model" != "$CPU_MODEL" ]]; then
+        _warn "VM config says cpu=${CPU_MODEL:-<proxmox default>} but the RUNNING guest was started with '${_run_model}' (pending change, applies on its next reboot) — the compatibility check follows what is actually running."
+        CPU_MODEL="$_run_model"
+      fi
+    fi
     _cpu_lc=$(printf '%s' "$CPU_MODEL" | tr '[:upper:]' '[:lower:]')
     if [[ "$_cpu_lc" == "host" || "$_cpu_lc" == "max" ]]; then
       _info "VM uses cpu=${CPU_MODEL} (host passthrough) on a LIVE migration — verifying source/dest CPU compatibility…"
