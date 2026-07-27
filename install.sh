@@ -61,6 +61,8 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 #                                                              + reboot storms while KSM re-warms
 #   i5-13500                   (EX44/64, legacy VPS E) -> 23   46 GB; the pool is the tightest (512 GB sold
 #                                                              on ~450 GB usable); no new signups on this class
+#   Ryzen 7 PRO 8700GE         (AX42/64, 2x512 GB)     -> 23   46 GB; same shape as the EX44 above (64 GB RAM,
+#                                                              ~448 GB usable pool) -> same reserve
 #   Xeon 6787P                 (R470 — being retired)  -> 256  unchanged until the class is gone
 # Detection keys on SILICON + RAM, never the hostname — hostnames have lied
 # before (0000186/192/193 "AX162-R" are Naples/48-thread boxes). Unknown
@@ -77,6 +79,9 @@ if [ -z "${SWAP_GB_PER_DISK:-}" ]; then
       if [ "${_SWAP_RAM_GB:-0}" -ge 320 ]; then SWAP_GB_PER_DISK=75; else SWAP_GB_PER_DISK=100; fi ;;
     *"Ryzen 9 7950X3D"*) SWAP_GB_PER_DISK=100 ;;
     *"i5-13500"*)        SWAP_GB_PER_DISK=23 ;;
+    # AX42-1: 64 GB RAM on a ~448 GB pool — the EX44's profile, so the EX44's
+    # reserve. Measured 2026-07-27 on 0000184 (the evaluation box).
+    *"Ryzen 7 PRO 8700GE"*) SWAP_GB_PER_DISK=23 ;;
     *"Xeon"*"6787P"*)    SWAP_GB_PER_DISK=256 ;;
     *)
       SWAP_GB_PER_DISK=23
