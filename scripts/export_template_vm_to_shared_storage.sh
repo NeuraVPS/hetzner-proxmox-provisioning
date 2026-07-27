@@ -268,16 +268,20 @@ echo "VM ${VMID} status: ${VM_STATUS:-unknown}"
 # migration then only works onto a same-or-newer CPU of the SAME vendor, and
 # breaks entirely once the fleet mixes CPU types (the VMs 708/1670 failure —
 # see the pre-check in migrate_vm.sh). Templates must ship a baseline model so
-# a fresh VM can hot-migrate anywhere. x86-64-v3 (AVX2+AES, the fleet's highest
-# common denominator) is the standard; x86-64-v4 needs AVX-512, which the Intel
-# EX44 nodes don't have, so it would fail to start there (PVE appends `enforce`).
+# a fresh VM can hot-migrate anywhere. The standard since 2026-07-27 is
+# x86-64-v4 (AVX-512): every AMD node in the fleet runs it — EPYC 9454P/9454,
+# Ryzen 9 7950X3D, Ryzen 7 PRO 8700GE — verified by booting a v4 probe VM on one
+# of each. The Intel EX44s (i5-13500) have no AVX-512 and would refuse to start
+# (PVE appends `enforce`), so proxmox_client steps a clone down to x86-64-v3 when
+# the destination node lacks the flags. That only ever happens on a REINSTALL:
+# new orders never land on an EX44, and the EX44 tier is being retired.
 TPL_CPU="$(sed -n 's/^cpu:[[:space:]]*//p' "$CONF_PATH" | head -1 | tr -d '\r')"
 TPL_CPU_MODEL="${TPL_CPU%%,*}"
 TPL_CPU_MODEL="${TPL_CPU_MODEL#cputype=}"
 case "$(printf '%s' "$TPL_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" in
   host | max | '')
     if [[ "$ALLOW_HOST_CPU" != "1" ]]; then
-      die "VM ${VMID} has cpu: ${TPL_CPU_MODEL:-<proxmox default>} — templates must use a baseline CPU model so clones stay live-migratable across CPU types. Fix with: qm set ${VMID} --cpu x86-64-v3   (then re-run). Override with ALLOW_HOST_CPU=1 only if you really mean to ship a host-pinned template."
+      die "VM ${VMID} has cpu: ${TPL_CPU_MODEL:-<proxmox default>} — templates must use a baseline CPU model so clones stay live-migratable across CPU types. Fix with: qm set ${VMID} --cpu x86-64-v4   (then re-run). Override with ALLOW_HOST_CPU=1 only if you really mean to ship a host-pinned template."
     fi
     echo "WARN: exporting a host-passthrough template (cpu: ${TPL_CPU_MODEL:-<default>}) because ALLOW_HOST_CPU=1 — clones will NOT be freely live-migratable"
     ;;
