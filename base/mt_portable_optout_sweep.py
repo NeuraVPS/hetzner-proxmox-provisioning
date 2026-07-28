@@ -36,13 +36,23 @@ Each AppData profile carries `origin.txt` naming the installation it belongs
 to, so the pairing is read, not guessed. That is the same comparison gate 2
 describes, done at fleet scale instead of by hand.
 
-Decision (deliberately conservative — a wrong opt-out would *create* the
-problem on a healthy machine, so every condition must hold):
+Decision (deliberately conservative — a wrong call would *create* the problem
+on a healthy machine, so every condition must hold):
 
-    opt out install D  <=>  some AppData profile P with origin == D where
-                            P has an accounts file
-                            AND P has strictly more EAs than D
-                            AND P has at least one terminal log
+    unhook install D  <=>  some AppData profile P with origin == D where
+                           P has an accounts file
+                           AND P has strictly more EAs than D
+                           AND P has at least one terminal log
+                           AND D's newest terminal log is NOT newer than P's
+
+That last clause is the rollback guard. If the portable side carries the more
+recent log, the customer has been working there since the hook went on, and
+sending them back to AppData would present a stale state — exactly the "my
+bots are gone" the hook itself causes, except self-inflicted while fixing it.
+Those boxes are reported as BLOCKED, never touched automatically.
+
+The hook is machine-wide, so ONE blocked install disqualifies the whole VM:
+there is no partial unhook.
 
 Usage
 -----
@@ -76,13 +86,14 @@ function Probe($dir) {
          (Test-Path (Join-Path $dir 'config\accounts.dat'))
   $eas = (Get-ChildItem (Join-Path $dir 'MQL4\Experts'),(Join-Path $dir 'MQL5\Experts') `
           -Recurse -Include *.ex4,*.ex5 -EA SilentlyContinue).Count
-  $log = Get-ChildItem (Join-Path $dir 'logs\*.log') -EA SilentlyContinue |
-         Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  $logs = Get-ChildItem (Join-Path $dir 'logs\*.log') -EA SilentlyContinue |
+          Sort-Object LastWriteTime -Descending | Select-Object -First 30
   [pscustomobject]@{
     exists   = (Test-Path $dir)
     accounts = [bool]$acc
     eas      = [int]$eas
-    lastLog  = $(if ($log) { $log.LastWriteTime.ToString('yyyy-MM-dd') } else { $null })
+    lastLog  = $(if ($logs) { $logs[0].LastWriteTime.ToString('yyyy-MM-dd') } else { $null })
+    logDates = @($logs | ForEach-Object { $_.LastWriteTime.ToString('yyyy-MM-dd') } | Select-Object -Unique)
   }
 }
 
@@ -129,14 +140,42 @@ def guest_exec(node_ip: str, vmid: str, ps: str, timeout: int = 150):
     return json.loads(out.stdout)
 
 
+# Portable-side log days after AppData went quiet that count as real use
+# rather than a blank look-and-close. MetaTrader writes one log per day.
+_SUSTAINED_USE_DAYS = 2
+
+# Above this many EAs, the portable side is not "the empty folder the hook
+# points at" — it holds a real set of its own, and unhooking is a judgement
+# call rather than a correction.
+_EMPTY_PORTABLE_MAX_EAS = 5
+# AppData must be richer by a real margin, not by rounding noise.
+_MEANINGFUL_EA_MARGIN = 5
+
+
 def norm(p) -> str:
     return (p or "").strip().strip('"').rstrip("\\").lower()
 
 
 def decide(data: dict):
-    """Installs whose data really lives in AppData. See the module docstring."""
+    """Split this VM's installs into (safe to unhook, rollback risk).
+
+    Safe: the data really lives in AppData and the portable side has not been
+    worked in since — unhooking simply gives the customer their own data back.
+
+    Rollback risk: the portable side carries the MORE RECENT terminal log, so
+    the customer has been working there. Unhooking would send the terminal
+    back to AppData and present a stale state — any EA, setting or chart
+    layout saved since the hook went on would appear to have vanished. That is
+    the same "my bots are gone" the hook itself caused, except this time we
+    would be causing it while fixing it.
+
+    This is not hypothetical: vm327's owner hit the portable flip on
+    2026-07-18 and it was fixed by COPYING his full EA set into both folders
+    rather than by unhooking. Ten days of work later, the two sides are no
+    longer equivalent.
+    """
     installs = {norm(k): v for k, v in (data.get("installs") or {}).items()}
-    out = {}
+    safe, risky = {}, {}
     for prof in data.get("profiles") or []:
         origin = norm(prof.get("origin"))
         inst = installs.get(origin)
@@ -146,14 +185,48 @@ def decide(data: dict):
             continue
         if not prof.get("lastLog"):
             continue
-        if int(prof.get("eas") or 0) <= int(inst.get("eas") or 0):
+        # A genuinely portable box keeps its data in the install dir and has
+        # at most a stub AppData profile. Those are correctly hooked and need
+        # nothing — they must not be reported at all, or the list fills with
+        # healthy machines and the real cases get lost in it.
+        if int(prof.get("eas") or 0) < _MEANINGFUL_EA_MARGIN:
             continue
-        out[origin] = {
+        p_eas, i_eas = int(prof.get("eas") or 0), int(inst.get("eas") or 0)
+        # The whole premise of unhooking is "the portable side is empty and
+        # the real data is in AppData". A portable side carrying its own real
+        # EA set breaks that premise: the two are either both live, or someone
+        # copied the set into both (which is how the 2026-07-18 incident on
+        # vm327 was resolved — appdata 53 vs install 52, 51 vs 50, 88 vs 85).
+        # A one-EA edge there is noise, not evidence. Demand a real margin.
+        if i_eas > _EMPTY_PORTABLE_MAX_EAS or p_eas < i_eas + _MEANINGFUL_EA_MARGIN:
+            if i_eas > 0:
+                row_amb = {
+                    "profileEas": p_eas, "installEas": i_eas,
+                    "profileLastLog": prof.get("lastLog"),
+                    "installLastLog": inst.get("lastLog"),
+                    "hash": prof.get("hash"), "portableDaysAfter": None,
+                    "why": "both sides populated — premise does not hold",
+                }
+                risky[origin] = row_amb
+            continue
+        row = {
             "profileEas": prof.get("eas"), "installEas": inst.get("eas"),
-            "profileLastLog": prof.get("lastLog"), "installLastLog": inst.get("lastLog"),
+            "profileLastLog": prof.get("lastLog"),
+            "installLastLog": inst.get("lastLog"),
             "hash": prof.get("hash"),
         }
-    return out
+        # How many DAYS was the portable side used after AppData went quiet?
+        # One or two is a customer opening the terminal, finding it blank and
+        # closing it again — the stub launch the hook itself provokes, which
+        # must not be mistaken for work. Sustained use leaves a log per day.
+        prof_log = prof.get("lastLog")
+        newer = [d for d in (inst.get("logDates") or []) if prof_log and d > prof_log]
+        row["portableDaysAfter"] = len(newer)
+        if len(newer) >= _SUSTAINED_USE_DAYS:
+            risky[origin] = row
+        else:
+            safe[origin] = row
+    return safe, risky
 
 
 UNHOOK_PS = r'''
@@ -230,22 +303,43 @@ def main() -> int:
         results = list(pool.map(run, rows))
 
     failed = [r for r in results if r[3] is None]
-    affected = []
+    affected, blocked = [], []
     for vmid, ip, email, payload, _ in results:
         if payload is None:
             continue
-        opts = decide(payload)
-        if opts:
-            affected.append((vmid, ip, email, payload, opts))
+        if not payload.get("hook"):
+            continue  # nothing to remove — already unhooked, or never hooked
+        safe, risky = decide(payload)
+        # The IFEO hook is machine-wide, not per-installation: removing it
+        # affects EVERY terminal on the VM. So one rollback-risk install is
+        # enough to disqualify the whole box — there is no partial unhook.
+        if risky:
+            blocked.append((vmid, ip, email, payload, safe, risky))
+        elif safe:
+            affected.append((vmid, ip, email, payload, safe))
 
     print(f"VMs probed        : {len(rows)}   unreachable/failed: {len(failed)}")
-    print(f"VMs needing the hook removed: {len(affected)}")
+    print(f"VMs safe to unhook          : {len(affected)}")
+    print(f"VMs BLOCKED (rollback risk) : {len(blocked)}")
     if failed:
         # Never let these blend into "clean": a VM we could not read is a VM we
         # have not cleared, and it has to be chased rather than assumed fine.
         print("\n⚠ NOT ASSESSED — re-run these, do not treat them as clean:")
         for vmid, _ip, email, _p, why in failed:
             print(f"   vm{vmid:<6} {email:<38} {why}")
+    if blocked:
+        print("\n⛔ BLOCKED — the portable side has the more recent activity. "
+              "Unhooking would roll the customer back; needs a human:")
+        for vmid, _ip, email, payload, _safe, risky in blocked:
+            print(f"   vm{vmid:<6} {email:<38} terminals running={payload.get('running')}")
+            for d, o in sorted(risky.items()):
+                if o.get("why"):
+                    print(f"        {d:<34} appdata EAs={o['profileEas']} vs "
+                          f"install {o['installEas']} — {o['why']}")
+                else:
+                    print(f"        {d:<34} portable used {o['portableDaysAfter']} "
+                          f"days after appdata ({o['installLastLog']} > "
+                          f"{o['profileLastLog']})")
     print()
     for vmid, _ip, email, payload, opts in sorted(
             affected, key=lambda t: -sum(o["profileEas"] for o in t[4].values())):
