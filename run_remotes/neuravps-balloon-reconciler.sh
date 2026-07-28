@@ -82,7 +82,24 @@ IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
 IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # idle CREDIT (leaky) before lowering
 LOWER_COOLDOWN_RUNS=${LOWER_COOLDOWN_RUNS:-5}  # calm runs to re-earn between -4G steps
 STEP_MB=${STEP_MB:-4096}
-FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-60}  # sum(floors) cap as % of node RAM
+FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-70}  # sum(floors) cap as % of node RAM
+# 70 since 2026-07-28 (was 60). At 60 the cap was refusing customers RAM they
+# already pay for on nodes with ~50 GB of physically FREE memory: 5 of 56 SQX
+# nodes were budget-blocked with 251 GB idle between them, and the hourly relief
+# escalated "no destination" because every candidate node was equally capped
+# (13 nodes >=95% of budget, 23 more at 85-95%). Guiding case: 0000056 vm1835, a
+# vps-d pinned at 14,848 MB of its contracted 35,840 MB, thrashing while its host
+# sat on 50 GB free.
+# Safe because the REAL starvation guard is HOST_FREE_MIN_MB below (12 GB), which
+# is unchanged and independent: the reconciler still refuses to raise a floor
+# when the host is genuinely short. The 60% was a conservative proxy in front of
+# a gate that already exists. Rolled out fleet-wide via
+# /etc/default/neuravps-balloon-reconciler (sourced by v4/v5/v6 alike, so it did
+# not require redeploying the script); after the change no node in the fleet has
+# a blocked guest and floors sit at 81% of the new budget.
+# NOTE: this is NOT auto_provision's SQX_FLOOR_BUDGET_FACTOR (still 0.60), which
+# gates how many VMs are SOLD per node. Two knobs on purpose — raising the sales
+# gate would spend this headroom on new VMs and bring the thrashing back.
 HOST_FREE_MIN_MB=${HOST_FREE_MIN_MB:-12288}
 BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # leaky blocked-counter level (+1 blocked/-1 calm run) that asks for relief
 [ -f /etc/default/neuravps-balloon-reconciler ] && . /etc/default/neuravps-balloon-reconciler
