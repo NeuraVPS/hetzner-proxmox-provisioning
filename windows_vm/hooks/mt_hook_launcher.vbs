@@ -8,6 +8,22 @@ Set args = WScript.Arguments
 Dim lockDir
 lockDir = "C:\ProgramData\NeuraVPS\mt_hook.lock.d"
 
+' Installations that must NOT be forced into portable mode: one directory per
+' line, '#' comments and blanks ignored. Written once per VM by
+' base/mt_portable_optout_sweep.py, which decides from the AppData side
+' (origin.txt + EA counts + terminal logs) rather than guessing at launch.
+'
+' Why an external list instead of a check here: a legacy terminal opened even
+' once under the forced /portable writes a stub config\accounts.ini into its
+' install directory, so from that moment the install dir *looks* populated and
+' any launch-time heuristic keeps hiding the customer's real data. The decision
+' has to be made with the AppData side in view, and only once.
+'
+' Missing file = no opt-outs = force /portable exactly as before, so a fresh
+' VM keeps the invariant with no extra state.
+Dim optOutFile
+optOutFile = "C:\ProgramData\NeuraVPS\mt_portable_optout.txt"
+
 If args.Count < 1 Then
   WScript.Quit 2
 End If
@@ -17,7 +33,7 @@ target = Replace(CStr(args(0)), """", "")
 exeName = LCase(fso.GetFileName(target))
 ifeoKey = ""
 isUpdate = HasUpdateFlag(args)
-forwardArgs = BuildForwardArgs(args, isUpdate)
+forwardArgs = BuildForwardArgs(args)
 launchTarget = target
 
 Select Case exeName
@@ -36,6 +52,18 @@ Select Case exeName
   Case Else
     WScript.Quit 4
 End Select
+
+' Decide /portable only now: it depends on the RESOLVED installation, which
+' ResolveMT5Target may have redirected. /update* runs keep the original command
+' line untouched, as before.
+If Not isUpdate Then
+  If Not ArgsHavePortable(args) Then
+    If Not IsPortableOptedOut(launchTarget) Then
+      If Len(forwardArgs) > 0 Then forwardArgs = forwardArgs & " "
+      forwardArgs = forwardArgs & "/portable"
+    End If
+  End If
+End If
 
 Dim debuggerPath, debuggerValue, hasDebugger
 debuggerPath = ifeoKey & "\Debugger"
@@ -115,25 +143,64 @@ Function QuoteArg(value)
   QuoteArg = """" & Replace(value, """", """""") & """"
 End Function
 
-Function BuildForwardArgs(arguments, preserveOriginal)
-  Dim i, raw, item, parts, hasPortable
+Function BuildForwardArgs(arguments)
+  Dim i, parts
   parts = ""
-  hasPortable = False
 
   For i = 1 To arguments.Count - 1
-    raw = CStr(arguments(i))
-    item = Trim(raw)
-    If LCase(item) = "/portable" Then hasPortable = True
     If Len(parts) > 0 Then parts = parts & " "
-    parts = parts & FormatForwardArg(raw)
+    parts = parts & FormatForwardArg(CStr(arguments(i)))
   Next
 
-  If Not preserveOriginal And Not hasPortable Then
-    If Len(parts) > 0 Then parts = parts & " "
-    parts = parts & "/portable"
-  End If
-
   BuildForwardArgs = parts
+End Function
+
+Function ArgsHavePortable(arguments)
+  Dim i
+  ArgsHavePortable = False
+  For i = 1 To arguments.Count - 1
+    If LCase(Trim(CStr(arguments(i)))) = "/portable" Then
+      ArgsHavePortable = True
+      Exit Function
+    End If
+  Next
+End Function
+
+' True when this installation's real data lives in %APPDATA% and forcing
+' /portable would hide it. See the note on optOutFile above.
+Function IsPortableOptedOut(exePath)
+  Dim installDir, stream, line
+  IsPortableOptedOut = False
+
+  On Error Resume Next
+  installDir = NormalizeDir(fso.GetParentFolderName(exePath))
+  If Err.Number <> 0 Then Err.Clear : Exit Function
+  If Len(installDir) = 0 Then Exit Function
+  If Not fso.FileExists(optOutFile) Then Exit Function
+
+  Set stream = fso.OpenTextFile(optOutFile, 1, False)
+  If Err.Number <> 0 Then Err.Clear : Exit Function
+  On Error GoTo 0
+
+  Do Until stream.AtEndOfStream
+    line = Trim(stream.ReadLine)
+    If Len(line) > 0 And Left(line, 1) <> "#" Then
+      If NormalizeDir(line) = installDir Then
+        IsPortableOptedOut = True
+        Exit Do
+      End If
+    End If
+  Loop
+  stream.Close
+End Function
+
+Function NormalizeDir(value)
+  Dim v
+  v = LCase(Trim(Replace(CStr(value), """", "")))
+  Do While Len(v) > 0 And Right(v, 1) = "\"
+    v = Left(v, Len(v) - 1)
+  Loop
+  NormalizeDir = v
 End Function
 
 ' MT5's /updateadmin parser scans GetCommandLineW() looking for /flag:"value"
