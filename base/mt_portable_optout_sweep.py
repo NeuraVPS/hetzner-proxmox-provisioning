@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-"""Decide, once per VM, which MetaTrader installs must NOT be forced portable.
+"""Find the MetaTrader boxes that violate hook gate 2, and unhook them.
 
 Background
 ----------
-`windows_vm/hooks/mt_hook_launcher.vbs` re-adds `/portable` to every MT launch
-so that an MT self-update wiping the flag off a shortcut, or a `.ex5`/`.mq5`
-opened through its file association, can never start a terminal in
-non-portable mode. That invariant is correct and wanted for every installation
-whose data has always lived next to the executable.
+`windows_vm/hooks/README.md` gate 2 already states the rule: **the MT hook
+belongs only on boxes whose real data is portable.** It re-adds `/portable` to
+every launch, so that an MT self-update wiping the flag off a shortcut, or a
+`.ex5`/`.mq5` opened through its file association, cannot start a terminal
+non-portable. Right and wanted where the data lives next to the executable.
 
-It is wrong for installations that predate the hook and ran non-portable at
-some point: their real data sits in `%APPDATA%\\MetaQuotes\\Terminal\\<hash>`,
-and forcing portable points the terminal at its install directory instead, so
-it opens with no account, no EAs and no charts. Nothing is lost, but the
-customer sees a freshly-installed terminal (real case 2026-07-27: 238 EAs
-across four live MT4 instances, invisible).
+On a box whose terminals really run from `%APPDATA%\\MetaQuotes\\Terminal\\
+<hash>`, forcing portable points MetaTrader at its install directory instead,
+so it opens with no account, no EAs and no charts. Nothing is deleted — the
+customer simply sees a freshly-installed terminal and concludes they lost
+everything (real case 2026-07-27, four live MT4 instances invisible).
 
-Why a list instead of a check inside the hook
----------------------------------------------
+The 2026-07-16 sweep applied the hook without that gate. This finds the boxes
+where it should never have gone, and takes it back off them.
+
+Removing the hook is per-terminal correct on its own, because the SHORTCUT
+already encodes the right choice: one carrying `/portable` still launches
+portable, one without it goes back to AppData. The hook only ever existed to
+survive the flag being wiped — and on a non-portable box there is no flag to
+survive, so nothing is lost by removing it.
+
+Why the judgement can't live inside the hook
+--------------------------------------------
 The moment such a terminal is opened once under the forced flag, MetaTrader
 writes a stub `config\\accounts.ini` into the install directory. From then on
 that directory *looks* populated, so any launch-time heuristic that inspects
@@ -25,7 +33,8 @@ only the portable side keeps hiding the customer's data. The call has to be
 made with the AppData side in view — and it only has to be made once.
 
 Each AppData profile carries `origin.txt` naming the installation it belongs
-to, so the pairing is read, not guessed.
+to, so the pairing is read, not guessed. That is the same comparison gate 2
+describes, done at fleet scale instead of by hand.
 
 Decision (deliberately conservative — a wrong opt-out would *create* the
 problem on a healthy machine, so every condition must hold):
@@ -37,10 +46,16 @@ problem on a healthy machine, so every condition must hold):
 
 Usage
 -----
-    python3 mt_portable_optout_sweep.py vms.txt            # dry run, reports
-    python3 mt_portable_optout_sweep.py vms.txt --apply    # writes the lists
+    python3 mt_portable_optout_sweep.py vms.txt              # dry run, reports
+    python3 mt_portable_optout_sweep.py vms.txt --unhook     # removes the hook
+    python3 mt_portable_optout_sweep.py vms.txt --unhook --only 933,327
 
-`vms.txt`: one `vmid node_ipv6 [email]` per line. Read-only unless --apply.
+`vms.txt`: one `vmid node_ipv6 [email]` per line. Read-only unless --unhook.
+
+`--unhook` deletes ONLY the IFEO `Debugger` value for the four MetaTrader
+executables, and only where it points at our own launcher — a Debugger set by
+anything else is left alone. It never stops or restarts a terminal: running
+ones keep running, and the change takes effect at their next launch.
 """
 
 import argparse
@@ -50,7 +65,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-OPTOUT_PATH = r"C:\ProgramData\NeuraVPS\mt_portable_optout.txt"
+
 
 # Emits one JSON object: the AppData profiles (with the install each belongs
 # to) and the state of every installation directory they point at.
@@ -95,6 +110,7 @@ $hook = [bool]((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVer
   running = (Get-Process terminal,terminal64 -EA SilentlyContinue).Count
   profiles = $profiles
   installs = $installs
+  complete = $true
 } | ConvertTo-Json -Depth 6 -Compress
 '''
 
@@ -140,30 +156,48 @@ def decide(data: dict):
     return out
 
 
-def write_optout(node_ip: str, vmid: str, dirs):
-    body = "\n".join([
-        "# NeuraVPS - installations that must NOT be forced into portable mode.",
-        "# Their real MetaTrader data lives in %APPDATA%\\MetaQuotes\\Terminal.",
-        "# Generated by base/mt_portable_optout_sweep.py. One directory per line.",
-        *sorted(dirs),
-        "",
-    ])
-    b64 = base64.b64encode(body.encode("utf-8")).decode()
-    ps = (
-        "$ErrorActionPreference='Stop'\n"
-        "New-Item -ItemType Directory -Force -Path 'C:\\ProgramData\\NeuraVPS' | Out-Null\n"
-        f"$b='{b64}'\n"
-        f"[IO.File]::WriteAllBytes('{OPTOUT_PATH}',[Convert]::FromBase64String($b))\n"
-        f"'WROTE {{0}} bytes' -f (Get-Item '{OPTOUT_PATH}').Length\n"
-    )
-    return guest_exec(node_ip, vmid, ps).get("out-data", "").strip()
+UNHOOK_PS = r'''
+$ErrorActionPreference='SilentlyContinue'
+$base = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+$done = @()
+foreach ($exe in 'terminal.exe','terminal64.exe','metaeditor.exe','metaeditor64.exe') {
+  $p = Join-Path $base $exe
+  if (-not (Test-Path $p)) { continue }
+  $dbg = (Get-ItemProperty $p).Debugger
+  if ([string]::IsNullOrEmpty($dbg)) {
+    # Inert leftover: the key with no Debugger intercepts nothing, but it is a
+    # dead interception point in the launch path. Drop it if it holds nothing
+    # else, so the box is genuinely clean.
+    $props = (Get-Item $p).Property | Where-Object { $_ -ne 'Debugger' }
+    if (-not $props -and -not (Get-Item $p).SubKeyCount) { Remove-Item $p -Recurse -Force; $done += "$exe=removed-empty-key" }
+    else { $done += "$exe=left-other-values" }
+    continue
+  }
+  if ($dbg -match 'mt_hook_launcher\.vbs') {
+    Remove-ItemProperty -Path $p -Name Debugger -Force
+    $props = (Get-Item $p).Property
+    if (-not $props -and -not (Get-Item $p).SubKeyCount) { Remove-Item $p -Recurse -Force }
+    $done += "$exe=unhooked"
+  } else {
+    # Someone else's debugger — not ours to touch.
+    $done += "$exe=FOREIGN:$dbg"
+  }
+}
+if ($done.Count -eq 0) { 'no-mt-hook-present' } else { $done -join ' ' }
+'''
+
+
+def unhook(node_ip: str, vmid: str) -> str:
+    """Remove our MT hook from this VM's launch path. Never touches terminals."""
+    return (guest_exec(node_ip, vmid, UNHOOK_PS).get("out-data") or "").strip()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("vmlist")
-    ap.add_argument("--apply", action="store_true",
-                    help="write the list on the affected VMs (default: report only)")
+    ap.add_argument("--unhook", action="store_true",
+                    help="remove our MT hook from the affected VMs "
+                         "(default: report only)")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--only", help="restrict to these comma-separated vmids")
     args = ap.parse_args()
@@ -181,6 +215,13 @@ def main() -> int:
             payload = json.loads(data.get("out-data") or "{}")
         except Exception as exc:
             return vmid, ip, email, None, f"{type(exc).__name__}"
+        # `complete` is emitted last, so its absence means the probe died
+        # part-way and the profile list is short — which would silently
+        # classify an affected VM as clean and skip a customer. Seen for real:
+        # vm327's PowerShell hit an OutOfMemoryException on a busy MT box.
+        # A partial read must be reported as a failure, never as "nothing here".
+        if not payload.get("complete"):
+            return vmid, ip, email, None, "incomplete probe (guest-side failure)"
         if isinstance(payload.get("installs"), list):   # PS emits [] when empty
             payload["installs"] = {}
         return vmid, ip, email, payload, None
@@ -198,7 +239,13 @@ def main() -> int:
             affected.append((vmid, ip, email, payload, opts))
 
     print(f"VMs probed        : {len(rows)}   unreachable/failed: {len(failed)}")
-    print(f"VMs needing an opt-out list: {len(affected)}")
+    print(f"VMs needing the hook removed: {len(affected)}")
+    if failed:
+        # Never let these blend into "clean": a VM we could not read is a VM we
+        # have not cleared, and it has to be chased rather than assumed fine.
+        print("\n⚠ NOT ASSESSED — re-run these, do not treat them as clean:")
+        for vmid, _ip, email, _p, why in failed:
+            print(f"   vm{vmid:<6} {email:<38} {why}")
     print()
     for vmid, _ip, email, payload, opts in sorted(
             affected, key=lambda t: -sum(o["profileEas"] for o in t[4].values())):
@@ -209,13 +256,18 @@ def main() -> int:
             print(f"       {d:<34} appdata EAs={o['profileEas']:<4} "
                   f"(install has {o['installEas']}), last log {o['profileLastLog']}")
 
-    if not args.apply:
-        print("\n(dry run — nothing written; pass --apply to write the lists)")
+    if not args.unhook:
+        print("\n(dry run — nothing changed; pass --unhook to remove the hook)")
         return 0
 
-    print("\napplying…")
-    for vmid, ip, email, _payload, opts in affected:
-        print(f"  vm{vmid}: {write_optout(ip, vmid, opts.keys())}")
+    print("\nunhooking…")
+    failures = 0
+    for vmid, ip, email, _payload, _opts in affected:
+        res = unhook(ip, vmid)
+        if "FOREIGN" in res or not res:
+            failures += 1
+        print(f"  vm{vmid:<6} {email:<38} {res or '(no output)'}")
+    print(f"\ndone: {len(affected) - failures} clean, {failures} needing a look")
     return 0
 
 
