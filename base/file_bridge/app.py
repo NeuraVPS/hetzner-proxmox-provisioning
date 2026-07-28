@@ -10,7 +10,6 @@ Run: uvicorn app:app --host 127.0.0.1 --port 8088  (see systemd unit).
 """
 
 import hashlib
-import io
 import json
 import os
 import secrets
@@ -209,6 +208,93 @@ def _throttle(uid: str, nbytes: int) -> None:
     _buckets[uid] = [tokens, time.monotonic()]
 
 
+# --- Streamed ZIP -----------------------------------------------------------
+
+# A directory tree deeper than this is a loop, not a real layout. Windows
+# junctions (e.g. `AppData\Local\Application Data` -> its own parent) are
+# resolved server-side, so SMB shows them as ordinary directories and the
+# symlink skip below never fires — only a depth bound stops the recursion.
+_MAX_WALK_DEPTH = 64
+
+
+class _ZipStreamSink:
+    """Write-only, non-seekable sink for `zipfile.ZipFile`.
+
+    `ZipFile` rewinds to its cumulative `start_dir` before each member
+    whenever the underlying file is seekable. Handing it a `BytesIO` and
+    then truncating that buffer after every member (which is what this
+    module used to do) meant each rewind seeked past the end of an empty
+    buffer, and `BytesIO` zero-fills such a gap — so every member was
+    emitted with the whole archive-so-far in front of it as NUL padding.
+    Growth was quadratic: a 17 MB folder of ~200 files streamed as ~1.7 GB
+    and never finished.
+
+    Refusing `seek()` puts `ZipFile` on its data-descriptor path, which
+    never rewinds, so bytes can be drained and discarded as they are
+    produced. `tell()` must still work — `ZipFile` records member offsets
+    with it — so we keep our own running total.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: List[bytes] = []
+        self._pos = 0
+
+    def write(self, data) -> int:
+        b = bytes(data)
+        self._chunks.append(b)
+        self._pos += len(b)
+        return len(b)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, *_args, **_kwargs):
+        raise OSError("file bridge zip stream is not seekable")
+
+    def flush(self) -> None:
+        pass
+
+    def drain(self) -> bytes:
+        """Hand back everything written since the last drain."""
+        if not self._chunks:
+            return b""
+        out = b"".join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+def _stream_zip(uid: str, vmid: int, items):
+    """Yield a ZIP of `items` — (arcname, file-rel) pairs — as it is built.
+
+    Drains inside the read loop, so peak memory is one 1 MiB chunk rather
+    than one whole member.
+    """
+    sink = _ZipStreamSink()
+    zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED)
+    for arc, frel in items:
+        # force_zip64: the member size is unknown when we open it, and on a
+        # non-seekable stream zipfile cannot go back and widen the header,
+        # so anything over 4 GiB would raise at close without this.
+        with bridge.open_read(vmid, frel) as f, \
+                zf.open(arc, "w", force_zip64=True) as zdst:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                _throttle(uid, len(chunk))
+                zdst.write(chunk)
+                data = sink.drain()
+                if data:
+                    yield data
+        data = sink.drain()
+        if data:
+            yield data
+    zf.close()
+    tail = sink.drain()
+    if tail:
+        yield tail
+
+
 # --- Endpoints --------------------------------------------------------------
 
 @app.get("/api/health")
@@ -261,8 +347,7 @@ def api_download(vmid: int, path: str,
 @app.get("/api/download-folder")
 def api_download_folder(vmid: int, path: str,
                         payload: Dict[str, Any] = Depends(require_session)):
-    """Zip-on-the-fly of a folder (capped). Streamed; not seekable, so the
-    zip is stored (no compression) to keep memory flat."""
+    """Zip-on-the-fly of a folder. Streamed; stored (no compression)."""
     _authz_vmid(payload, vmid)
     uid = payload["uid"]
     import smbclient
@@ -271,7 +356,9 @@ def api_download_folder(vmid: int, path: str,
     base_rel = bridge._safe_rel(path)
     base_name = base_rel.split("\\")[-1] or f"vm{vmid}"
 
-    def walk(rel: str):
+    def walk(rel: str, depth: int = 0):
+        if depth >= _MAX_WALK_DEPTH:
+            return
         for nm in smbclient.listdir(bridge._unc(root, rel)):
             child = (rel + "\\" + nm) if rel else nm
             try:
@@ -279,33 +366,17 @@ def api_download_folder(vmid: int, path: str,
             except SMBLinkRedirectionError:
                 continue  # don't zip through symlinks (cross-server links)
             if st.st_mode & 0o040000:
-                yield from walk(child)
+                yield from walk(child, depth + 1)
             else:
                 yield child
 
-    def gen():
-        buf = io.BytesIO()
-        zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
+    def items():
         for filerel in walk(base_rel):
             arc = filerel[len(base_rel):].lstrip("\\").replace("\\", "/")
-            with bridge.open_read(vmid, filerel) as f, \
-                    zf.open(arc or filerel.split("\\")[-1], "w") as zdst:
-                while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    _throttle(uid, len(chunk))
-                    zdst.write(chunk)
-            data = buf.getvalue()
-            if data:
-                yield data
-                buf.seek(0)
-                buf.truncate(0)
-        zf.close()
-        yield buf.getvalue()
+            yield arc or filerel.split("\\")[-1], filerel
 
     return StreamingResponse(
-        gen(), media_type="application/zip",
+        _stream_zip(uid, vmid, items()), media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{base_name}.zip"'})
 
 
@@ -324,7 +395,9 @@ def api_download_zip(vmid: int, path: List[str] = Query(...),
     if not rels:
         raise HTTPException(400, "no paths")
 
-    def walk(rel: str):
+    def walk(rel: str, depth: int = 0):
+        if depth >= _MAX_WALK_DEPTH:
+            return
         for nm in smbclient.listdir(bridge._unc(root, rel)):
             child = rel + "\\" + nm
             try:
@@ -332,7 +405,7 @@ def api_download_zip(vmid: int, path: List[str] = Query(...),
             except SMBLinkRedirectionError:
                 continue
             if st.st_mode & 0o040000:
-                yield from walk(child)
+                yield from walk(child, depth + 1)
             else:
                 yield child
 
@@ -364,27 +437,8 @@ def api_download_zip(vmid: int, path: List[str] = Query(...),
     first = rels[0].split("\\")[-1]
     zname = first if len(rels) == 1 else f"{first} (+{len(rels)-1})"
 
-    def gen():
-        buf = io.BytesIO()
-        zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
-        for arc, frel in items():
-            with bridge.open_read(vmid, frel) as f, zf.open(arc, "w") as zdst:
-                while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    _throttle(uid, len(chunk))
-                    zdst.write(chunk)
-            data = buf.getvalue()
-            if data:
-                yield data
-                buf.seek(0)
-                buf.truncate(0)
-        zf.close()
-        yield buf.getvalue()
-
     return StreamingResponse(
-        gen(), media_type="application/zip",
+        _stream_zip(uid, vmid, items()), media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{zname}.zip"'})
 
 

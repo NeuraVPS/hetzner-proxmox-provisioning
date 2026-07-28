@@ -119,6 +119,41 @@ names=_zf.ZipFile(_io.BytesIO(dz.content)).namelist() if dz.status_code==200 els
 r.append(("download-zip multi", dz.status_code==200 and sorted(names)==["SubDir/b.txt","ok.txt"]))
 r.append(("download-zip no cookie 401", client().get("/api/download-zip", params=[("vmid",201),("path","ok.txt")]).status_code==401))
 
+# --- streamed zip must not amplify (regression: quadratic NUL padding) ------
+# The old generator truncated the BytesIO after every member while ZipFile
+# kept seeking back to its cumulative start_dir, so each member was emitted
+# behind a copy of the whole archive so far as NUL bytes. A 17 MB folder
+# streamed as ~1.7 GB. Guard the *ratio*, which is what the customer saw.
+_PAYLOAD = b"x" * 8192
+_NFILES = 40
+_many = {r"\\srv\C$\Many": [f"f{i:03d}.bin" for i in range(_NFILES)]}
+_tree.update(_many)
+_tree[r"\\srv\C$"] = _tree[r"\\srv\C$"] + ["Many"]
+def _fake_stat2(unc):
+    name = unc.split("\\")[-1]
+    if "link" in name: raise SMBLinkRedirectionError("path", "target")
+    st = types.SimpleNamespace()
+    isdir = name in ("SubDir", "Many")
+    st.st_mode = 0o040755 if isdir else 0o100644
+    st.st_size, st.st_mtime = (0 if isdir else len(_PAYLOAD)), 1000
+    return st
+fake_smb.stat = _fake_stat2
+_orig_open_read = bridge.open_read
+bridge.open_read = lambda vmid, rel: _io.BytesIO(_PAYLOAD)
+try:
+    dz2 = cA.get("/api/download-zip", params=[("vmid",201),("path","Many")])
+    real = len(_PAYLOAD) * _NFILES
+    ratio = len(dz2.content) / real
+    zf2 = _zf.ZipFile(_io.BytesIO(dz2.content))
+    r.append(("streamed zip size ~= payload (no amplification)",
+              dz2.status_code == 200 and ratio < 1.2))
+    r.append(("streamed zip is readable and complete",
+              len(zf2.namelist()) == _NFILES
+              and zf2.testzip() is None
+              and zf2.read("Many/f000.bin") == _PAYLOAD))
+finally:
+    bridge.open_read = _orig_open_read
+
 ok=sum(1 for _,v in r if v)
 for name,v in r: print(("PASS" if v else "FAIL"), name)
 print(f"\n{ok}/{len(r)} passed")
