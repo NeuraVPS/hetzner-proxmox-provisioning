@@ -1,0 +1,20 @@
+[Unit]
+Description=NeuraVPS: VM status watchdog (every 5 min)
+Documentation=https://github.com/NeuraVPS/hetzner-proxmox-provisioning
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+# Spread the fleet out. Without this, ~200 nodes would hit Firestore in the
+# same second every five minutes; with it, each node picks its own offset and
+# keeps it (Persistent state), so the load is flat rather than spiky.
+RandomizedDelaySec=120
+FixedRandomDelay=true
+
+# Do NOT catch up on missed runs after a node reboot: node-boot already
+# reconciles every VM, so a replay here would only duplicate that work.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

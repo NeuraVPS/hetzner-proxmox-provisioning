@@ -13,7 +13,16 @@ Commands:
     sync-dnat.py <VMID> post-start         — Set status running.
     sync-dnat.py <VMID> post-stop          — Set status stopped.
   Manual sync:
-    sync-dnat.py                           — Sync all VM statuses.
+    sync-dnat.py                           — Sync all VM statuses (reads
+                                              Firestore once per VM).
+  Watchdog (systemd timer, every 5 min):
+    sync-dnat.py watch                     — Same reconciliation, but compares
+                                              against a LOCAL cache of what we
+                                              last wrote, so a run where nothing
+                                              changed costs ZERO Firestore
+                                              operations. Catches the case a
+                                              hook cannot: the hook process
+                                              dying before its write lands.
   Node boot:
     sync-dnat.py node-boot                 — Set proxmox_nodes/<host>.lastNodeBootAt
                                               and sync all VM statuses.
@@ -146,6 +155,58 @@ def get_all_vms():
     return vm_status
 
 # ---------------------------------------------------------------
+# Local mirror of what Firestore has been told
+# ---------------------------------------------------------------
+# The hooks are the fast path, but a hook is a process: it can be killed
+# between "Firebase initialized" and the write landing, and then nothing ever
+# corrects the document (there is no reconciliation anywhere else). VMs
+# 1980/1985/1986 sat at "stopped" in the panel while running, on 2026-07-30.
+#
+# A timer that re-read Firestore to check would cost one query per VM per run —
+# ~1M reads/day across the fleet. So the timer compares against this file
+# instead: the status we last SUCCESSFULLY wrote. Nothing changed since the
+# last run means no Firestore call at all, read or write.
+#
+# It can only ever be stale in the safe direction: it is written after the
+# write succeeds, so a failed or killed write leaves it showing the old value
+# and the next run retries. `sync-dnat.py` with no args still does the real
+# thing (reads Firestore) for the rare out-of-band drift.
+_STATUS_CACHE = Path("/var/lib/neuravps/vm_status_cache.json")
+
+
+def _load_status_cache():
+    try:
+        import json
+        with _STATUS_CACHE.open() as fh:
+            raw = json.load(fh)
+        return {int(k): str(v) for k, v in raw.items()}
+    except Exception:
+        # Missing or corrupt: treat as "we know nothing", which makes the next
+        # run push every VM once and rebuild the file. Never fatal.
+        return {}
+
+
+def _save_status_cache(cache):
+    try:
+        import json
+        _STATUS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _STATUS_CACHE.with_suffix(".tmp")
+        with tmp.open("w") as fh:
+            json.dump({str(k): v for k, v in cache.items()}, fh)
+        tmp.replace(_STATUS_CACHE)
+    except Exception as e:
+        # A cache we cannot persist only costs a redundant write next run.
+        logger.warning(f"Could not persist VM status cache: {e}")
+
+
+def _remember_status(vmid, status):
+    cache = _load_status_cache()
+    if cache.get(int(vmid)) != status:
+        cache[int(vmid)] = status
+        _save_status_cache(cache)
+
+
+# ---------------------------------------------------------------
 # Firestore sync (status + node boot timestamp)
 # ---------------------------------------------------------------
 def _query_local_server_doc(db, vmid):
@@ -220,6 +281,9 @@ def update_status_in_firestore(vmid, status):
                     'lastStatusUpdate': firestore.SERVER_TIMESTAMP,
                 })
                 logger.info(f"Updated Firestore server {doc_snapshot.id} (VM {vmid}): status={status}")
+            # Only now, with the write acknowledged: the watchdog trusts this
+            # file to mean "Firestore has it".
+            _remember_status(vmid, status)
             return
         except Exception as e:
             if attempt == attempts:
@@ -340,6 +404,40 @@ def sync_all_statuses():
         if firestore_status != actual_status:
             logger.info(f"VM {vmid} status changed from {firestore_status} to {actual_status}, updating Firestore")
             update_status_in_firestore(vmid, actual_status)
+        else:
+            # Already correct — record it so the watchdog does not re-push what
+            # this pass just confirmed.
+            _remember_status(vmid, actual_status)
+
+
+def watch_statuses():
+    """Cheap reconciliation for the systemd timer.
+
+    Compares the node's real VM states against the local cache of what we last
+    wrote. Only a genuine difference reaches Firestore, so a quiet run costs one
+    `qm list` (~0.4 s of CPU) and nothing else — no reads, no writes, no quota.
+
+    This exists for one failure only: a hook that died before its write landed.
+    Everything else is already handled by the hooks themselves.
+    """
+    actual = get_all_vms()
+    cache = _load_status_cache()
+    drifted = {vmid: st for vmid, st in actual.items() if cache.get(vmid) != st}
+
+    # Forget VMs that no longer exist here (destroyed or migrated away) so the
+    # file cannot grow without bound across a node's life.
+    stale = [vmid for vmid in cache if vmid not in actual]
+    if stale:
+        for vmid in stale:
+            cache.pop(vmid, None)
+        _save_status_cache(cache)
+
+    if not drifted:
+        return 0
+    logger.info(f"watch: {len(drifted)} VM(s) out of sync with Firestore: {drifted}")
+    for vmid, status in drifted.items():
+        update_status_in_firestore(vmid, status)
+    return len(drifted)
 
 
 def _boot_history_crashloop(max_boots=4, window_sec=900):
@@ -468,6 +566,13 @@ def main():
             return
 
         # Other phases (pre-start, pre-stop): nothing to do
+        return
+
+    # Watchdog mode: local diff only, for the systemd timer.
+    if len(sys.argv) >= 2 and sys.argv[1] == "watch":
+        fixed = watch_statuses()
+        if fixed:
+            logger.info(f"watch: corrected {fixed} status(es) a hook had missed")
         return
 
     # Manual mode (no args): sync all statuses
