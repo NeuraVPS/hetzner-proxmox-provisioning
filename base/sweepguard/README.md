@@ -100,9 +100,21 @@ Four candidate signals were tested against the 67 blocked sources on b1.
 | in-guest successful logon (4624) | The guest never sees the client's public IP — NAT46 rewrites the source to an address in our own prefix. Only the BASE ever sees the real IP, which is precisely why the block belongs here. |
 
 Byte accounting (`net.netfilter.nf_conntrack_acct=1`, enabled on both BASEs
-2026-07-25, persisted in `/etc/sysctl.d/99-neuravps-conntrack.conf`) is the one
-signal that *would* discriminate — a real session moves megabytes, a brute-force
-moves kilobytes. It was off, so there is no history; revisit once there is.
+2026-07-25, persisted in `/etc/sysctl.d/99-neuravps-conntrack.conf`) was the one
+signal that looked like it *would* discriminate — a real session moves
+megabytes, a brute-force moves kilobytes.
+
+**Revisited 2026-07-29: it does not.** With accounting on for four days, the
+largest byte total on ANY (source, port) pair in the customer range on b1 was
+**1767 bytes**; attackers p99 = 236, everything else p99 = 897. The RDP data
+path is not accounted here, so there is nothing to discriminate with. Two more
+were tested the same day and also fail:
+
+| signal | why it fails |
+|---|---|
+| conntrack byte counters | Max 1767 B over 1441 pairs. No separation. |
+| TCP state / connection age | Attackers p90 64006, others p90 307405 — but the ranges overlap all the way to the maximum. |
+| "familiar source" memory per port | Learning who connects to a port while it is *not* under attack looks sound, and fails: it memorised `88.214.25.121/124` and `91.238.181.94` — the very clusters the hot-port detector exists to catch — because they hold 1-4 connections across a handful of VMs, which is exactly a customer's shape. Built, measured, discarded. |
 
 ## The false positive this design can actually produce
 
@@ -125,6 +137,46 @@ and it self-heals in 24h regardless:
     nft delete element ip rdpguard bf_auto { <their.public.ip> }
 
 Then persist the allow entry in `/etc/nftables.conf`.
+
+### The false positive the HOT-PORT detector produces — and it did
+
+That analysis covers detectors 1 and 2. Detector 3 (hot-port, below) has a
+different and worse failure mode, and it is **structural, not a margin
+problem**: the legitimate owner of the attacked port is, by definition, one of
+the sources piling connections onto it. When their VM stops answering they
+reconnect, and the retries push them over `hotPortMinSrc`.
+
+**Real case, 2026-07-29.** A customer with 4 servers reached 6 connections on
+his own port during an attack on it and was blocked for 24h. Because the block
+is by source IP on the shared v4 VIP, he lost **all four servers and the VNC
+console at once** — the one symptom support reads as "our edge is down". He was
+IPv4-only at home, so every check we ran (all over IPv6, from allow-listed
+addresses) came back green. Ten hours down, five support emails, no diagnosis —
+and the log line said only `6 connections onto ONE attacked port`, without the
+port, so nobody could even tell whose machine it was.
+
+Two changes came out of it, both in `sweepguard.py`:
+
+* the hot-port log now always names the **port and the VM**, plus a `NOTE` line
+  spelling out that this detector is ambiguous;
+* `hotPortBlockSeconds` (default **3600**) replaces the 24h block for this
+  detector only. A real attacker is re-detected on the next 5-minute pass, so
+  protection is unchanged; a wrongly-blocked customer gets their service back in
+  1h instead of 24h.
+
+The thresholds were deliberately NOT raised: 6 is already above the measured
+p95 of 4, so no threshold separates these two populations.
+
+**Triage, when a customer says "all my servers AND the VNC console died at once,
+and it works from my phone":** that shape is a source-IP block until proven
+otherwise. Check it first, before touching anything else:
+
+    journalctl -u neuravps-sweepguard.service --since "24 hours ago" | grep <their.ip>
+    nft get element ip rdpguard bf_auto { <their.public.ip> }
+
+Their address will not be in the guest logs — everything arrives SNATed to the
+BASE VIP — so get it from the customer (`ifconfig.me`) or match the ISP against
+the hot-port blocks in the journal.
 
 
 ## Concentrated attacks — `deploy_portguard.sh`
