@@ -44,7 +44,7 @@ set -euo pipefail
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | OVERWRITE=1 bash -s -- 100 windows-es
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | OVERWRITE=1 bash -s -- 101 windows-en
 #
-# IMPORTANT: env vars (OVERWRITE, ALLOW_RUNNING_VM, ALLOW_HOST_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*) must go
+# IMPORTANT: env vars (OVERWRITE, ALLOW_RUNNING_VM, REQUIRE_BASELINE_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*) must go
 # AFTER the pipe, prefixing `bash`. `VAR=x curl ... | bash` attaches VAR to curl only —
 # bash sees no value. Use `curl ... | VAR=x bash` instead.
 #
@@ -160,7 +160,7 @@ always pull the latest master revision):
   the "|", curl treats "bash", "--", "100", "windows-en" as extra URLs to fetch
   and fails with: curl: (6) Could not resolve host: bash
 
-  IMPORTANT 2: env vars (OVERWRITE, ALLOW_RUNNING_VM, ALLOW_HOST_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*)
+  IMPORTANT 2: env vars (OVERWRITE, ALLOW_RUNNING_VM, REQUIRE_BASELINE_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*)
   must go AFTER the pipe, prefixing `bash`. `VAR=x curl ... | bash` attaches VAR
   to curl only — bash sees no value. Use `curl ... | VAR=x bash` instead.
 
@@ -169,8 +169,8 @@ Environment:
   ZFS_PARENT          default: rpool/data
   SNAPSHOT_NAME       default: stable   (the snapshot tag created on each volume before send)
   ALLOW_RUNNING_VM    default: 0        (set 1 to allow exporting a running VM — NOT recommended)
-  ALLOW_HOST_CPU      default: 0        (set 1 to allow exporting a template with cpu: host/max — NOT recommended,
-                                         clones would be pinned to the birth node's silicon)
+  REQUIRE_BASELINE_CPU default: 0       (set 1 to refuse exporting a template on cpu: host/max — only useful
+                                         if the fleet ever mixes CPU vendors again)
   OVERWRITE           default: 0        (set 1 to replace an existing template under template_key)
   KEEP_SNAPSHOT       default: 1        (set 0 to destroy the local @<SNAPSHOT_NAME> snapshots after upload)
 EOF
@@ -219,7 +219,7 @@ STORAGE_BOX_BASE_PATH="${STORAGE_BOX_BASE_PATH:-$DEFAULT_STORAGE_BOX_BASE_PATH}"
 ZFS_PARENT="${ZFS_PARENT:-rpool/data}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-stable}"
 ALLOW_RUNNING_VM="${ALLOW_RUNNING_VM:-0}"
-ALLOW_HOST_CPU="${ALLOW_HOST_CPU:-0}"
+REQUIRE_BASELINE_CPU="${REQUIRE_BASELINE_CPU:-0}"
 OVERWRITE="${OVERWRITE:-0}"
 KEEP_SNAPSHOT="${KEEP_SNAPSHOT:-1}"
 
@@ -262,31 +262,39 @@ if [[ "$VM_STATUS" == "running" ]]; then
 fi
 echo "VM ${VMID} status: ${VM_STATUS:-unknown}"
 
-# Refuse to export a template whose CPU is host-passthrough. The config is
-# uploaded as-is and every new customer VM is cloned from it, so `cpu: host`
-# would chain each new guest to the exact silicon of its birth node: live
-# migration then only works onto a same-or-newer CPU of the SAME vendor, and
-# breaks entirely once the fleet mixes CPU types (the VMs 708/1670 failure —
-# see the pre-check in migrate_vm.sh). Templates must ship a baseline model so
-# a fresh VM can hot-migrate anywhere. The standard since 2026-07-27 is
-# x86-64-v4 (AVX-512): every AMD node in the fleet runs it — EPYC 9454P/9454,
-# Ryzen 9 7950X3D, Ryzen 7 PRO 8700GE — verified by booting a v4 probe VM on one
-# of each. The Intel EX44s (i5-13500) have no AVX-512 and would refuse to start
-# (PVE appends `enforce`), so proxmox_client steps a clone down to x86-64-v3 when
-# the destination node lacks the flags. That only ever happens on a REINSTALL:
-# new orders never land on an EX44, and the EX44 tier is being retired.
+# Template CPU model. The fleet standard is `cpu: host` (operator decision
+# 2026-07-30): every remaining node is Zen 4 — EPYC 9454P/9454 on the AX162s,
+# Ryzen 9 7950X3D on the AX102s — and a manual AX102 -> AX162 live migration
+# was verified by hand. host gives the guest the real silicon: measured on one
+# VM, one node, changing only this line, Windows reports
+#   x86-64-v4 -> "QEMU Virtual CPU 2.5+", L2 4 MB, L3 16 MB
+#   host      -> "AMD EPYC 9454P 48-Core", L3 128 MB
+# because PVE's x86-64-v4 is not a model at all: it is qemu64 plus flags, so
+# the guest gets the instructions but a synthetic cache and identity.
+#
+# The cost is real and deliberate: a cpu: host guest can only live-migrate onto
+# a same-vendor, same-or-newer CPU. That is enforced at migration time by the
+# pre-check in migrate_vm.sh (0a), which refuses cross-vendor moves and blocks
+# any destination missing a feature the running guest has — so the failure mode
+# is a refused migration, never the silent resume crash of VMs 708/1670.
+#
+# Set REQUIRE_BASELINE_CPU=1 to go back to demanding a named model, which is
+# what a fleet mixing CPU vendors would need.
 TPL_CPU="$(sed -n 's/^cpu:[[:space:]]*//p' "$CONF_PATH" | head -1 | tr -d '\r')"
 TPL_CPU_MODEL="${TPL_CPU%%,*}"
 TPL_CPU_MODEL="${TPL_CPU_MODEL#cputype=}"
 case "$(printf '%s' "$TPL_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" in
-  host | max | '')
-    if [[ "$ALLOW_HOST_CPU" != "1" ]]; then
-      die "VM ${VMID} has cpu: ${TPL_CPU_MODEL:-<proxmox default>} — templates must use a baseline CPU model so clones stay live-migratable across CPU types. Fix with: qm set ${VMID} --cpu x86-64-v4   (then re-run). Override with ALLOW_HOST_CPU=1 only if you really mean to ship a host-pinned template."
+  host | max)
+    if [[ "$REQUIRE_BASELINE_CPU" == "1" ]]; then
+      die "VM ${VMID} has cpu: ${TPL_CPU_MODEL} but REQUIRE_BASELINE_CPU=1 — set a named model first, e.g. qm set ${VMID} --cpu x86-64-v4"
     fi
-    echo "WARN: exporting a host-passthrough template (cpu: ${TPL_CPU_MODEL:-<default>}) because ALLOW_HOST_CPU=1 — clones will NOT be freely live-migratable"
+    echo "VM ${VMID} cpu model: ${TPL_CPU} (fleet standard — clones get the real silicon; migration is gated by migrate_vm.sh)"
+    ;;
+  '')
+    die "VM ${VMID} has no cpu: line — it would inherit the Proxmox default (kvm64), which is far slower than the fleet standard. Fix with: qm set ${VMID} --cpu host   (then re-run)."
     ;;
   *)
-    echo "VM ${VMID} cpu model: ${TPL_CPU} (baseline — clones stay live-migratable)"
+    echo "WARN: VM ${VMID} cpu model: ${TPL_CPU} — the fleet standard is 'host'. Clones will run on a named model and lose the real cache/identity."
     ;;
 esac
 
