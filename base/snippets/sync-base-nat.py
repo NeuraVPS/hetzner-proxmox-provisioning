@@ -1060,8 +1060,39 @@ def sync_nodes_apply_state(nodes: dict[str, str], reload_nginx: bool = True):
     logger.info("PVE nodes map: %d entries", len(nodes))
 
 
-def sync_nodes_full():
+# A full sync REPLACES the node map. If the Firestore read comes back short --
+# a blip, a half-finished pagination, an exception swallowed upstream -- the
+# replacement silently strips every missing node from the nginx PVE map, from
+# /etc/hosts and from the firewall IPSET.
+#
+# That is not hypothetical: on 2026-07-29 a full sync on b1 wrote 28 nodes
+# instead of 236. The 208 missing ones lost their PVE console (the map's
+# `default ""` turns into a bare HTTP 404), and node 0000235 received a
+# cluster.fw listing only 28 hosts. Nothing alerted; it surfaced because an
+# operator clicked a console link and got a 404.
+#
+# A real fleet never loses a fifth of its nodes between two runs, so treat a
+# large shrink as a bad read and refuse to write. Removing many nodes on
+# purpose stays possible with --force.
+SHRINK_GUARD_PCT = float(os.environ.get("PVE_MAP_SHRINK_GUARD_PCT", "80"))
+
+
+def sync_nodes_full(force: bool = False):
     nodes = firestore_list_proxmox_nodes()
+    prev = read_pve_nodes_state()
+    if prev and not force:
+        floor = len(prev) * SHRINK_GUARD_PCT / 100.0
+        if len(nodes) < floor:
+            logger.error(
+                "sync nodes full: REFUSING to write — Firestore returned %d node(s) "
+                "but the current state has %d (below the %.0f%% floor of %.0f). "
+                "This is almost always a partial read, and writing it would drop "
+                "%d node(s) from the PVE map, /etc/hosts and the firewall IPSET. "
+                "State left untouched. Re-run when Firestore answers fully, or "
+                "pass --force if the removal is intentional.",
+                len(nodes), len(prev), SHRINK_GUARD_PCT, floor, len(prev) - len(nodes),
+            )
+            sys.exit(1)
     sync_nodes_apply_state(nodes)
     logger.info("sync nodes full done (%d from Firestore)", len(nodes))
 
@@ -1198,8 +1229,12 @@ def sync_nodes_sync_firewall():
 
 def main_sync_nodes():
     args = sys.argv[3:]
+    force = False
+    if "--force" in args:
+        force = True
+        args = [a for a in args if a != "--force"]
     if not args:
-        sync_nodes_full()
+        sync_nodes_full(force=force)
         return
     if args[0] == "add":
         if len(args) < 3:
@@ -1230,7 +1265,7 @@ def main_sync_nodes():
         return
     if len(args) != 1:
         print(
-            "Usage: sync-base-nat.py sync nodes\n"
+            "Usage: sync-base-nat.py sync nodes [--force]\n"
             "       sync-base-nat.py sync nodes <nodeId>\n"
             "       sync-base-nat.py sync nodes add <nodeId> <ipv6>\n"
             "       sync-base-nat.py sync nodes del <nodeId>\n"
