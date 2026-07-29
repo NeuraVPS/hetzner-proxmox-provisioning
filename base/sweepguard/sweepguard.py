@@ -52,12 +52,9 @@ Safety (this runs at the edge; a mistake blocks paying customers)
 """
 import ipaddress
 import json
-import os
 import re
 import subprocess
 import sys
-import tempfile
-import time
 from collections import defaultdict
 
 CONFIG = "/etc/neuravps-sweepguard.json"
@@ -263,12 +260,27 @@ def hot_port_abusers(family, cfg):
     de origen en la VIP compartida. Diez horas de corte y cinco correos de
     soporte sin diagnostico, porque el log no decia ni que puerto era.
 
-    Por eso el detector consulta la memoria de fuentes habituales: una fuente
-    vista en ese puerto MIENTRAS NO estaba atacado, hace mas de
-    `familiarMinAgeH`, es el dueño y queda exenta. Los otros dos detectores
-    (diversidad de puertos e inundacion) no son ambiguos y siguen aplicandose
-    a todo el mundo, asi que un atacante paciente que se hiciera "habitual"
-    sigue cubierto por ellos.
+    NO hay forma fiable de separarlos desde la BASE. Conviene no engañarse: se
+    probaron cuatro discriminantes con medidas reales sobre b1 (2026-07-29) y
+    los cuatro fallan.
+      * bytes en conntrack — el camino de datos no se contabiliza aqui: maximo
+        medido 1767 bytes, atacante y cliente indistinguibles;
+      * estado/antiguedad TCP — atacantes p90 64006 vs resto p90 307405, pero
+        solapan hasta el maximo del rango;
+      * memoria de "fuentes habituales" del puerto — aprendia como habituales
+        a 88.214.25.121/124 y 91.238.181.94, los mismos clusters que este
+        detector existe para cazar: mantienen 1-4 conexiones sobre pocas VMs,
+        exactamente el perfil de un cliente;
+      * el invitado como arbitro — no sirve: todo llega SNATeado a la VIP de la
+        BASE, asi que en los 4624/4625 de Windows solo se ve la BASE.
+
+    Mientras no exista un arbitro de verdad (correlacionar el 4624 del invitado
+    con la fuente que tenia la conexion en ese instante), este detector se
+    asume AMBIGUO y se le acotan los daños: bloqueo corto
+    (`hotPortBlockSeconds` — al atacante se le vuelve a detectar en la pasada
+    siguiente, 5 min despues; al cliente mal bloqueado se le devuelve el
+    servicio en 1h en vez de en 24h), y el puerto y la VM SIEMPRE en el log,
+    para que soporte responda en dos minutos y no en diez horas.
     """
     want = "ipv4" if family == "ip" else "ipv6"
     pair = defaultdict(int)
@@ -309,13 +321,13 @@ def hot_port_abusers(family, cfg):
     return out
 
 
-def run_family(family, cfg, fam):
+def run_family(family, cfg):
     # tres detectores independientes; la razon se conserva para el log
     cand = {a: ("ports", n, None) for a, n in sweepers(family, cfg).items()}
     for a, n in flooders(family, cfg).items():
         if a not in cand:                      # diversidad de puertos manda
             cand[a] = ("conns", n, None)
-    for a, (n, port) in hot_port_abusers(family, cfg, fam).items():
+    for a, (n, port) in hot_port_abusers(family, cfg).items():
         if a not in cand:
             cand[a] = ("hotport", n, port)
     if not cand:
@@ -384,14 +396,12 @@ def main():
         log("disabled by config — nothing to do")
         return 0
 
-    fam = load_familiar()
     total = 0
     for family in ("ip", "ip6"):
         try:
-            total += run_family(family, cfg, fam)
+            total += run_family(family, cfg)
         except Exception as exc:            # nunca romper el timer
             log(f"{family}: ERROR {exc}")
-    save_familiar(fam, cfg)
     if total:
         log(f"done: {total} sweeper(s) {'identified' if cfg['dryRun'] else 'blocked'}")
     return 0
