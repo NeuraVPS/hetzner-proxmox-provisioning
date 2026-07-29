@@ -196,7 +196,15 @@ def main():
     def placeable(n):
         return not n["frozen"] and not n["status"]
 
-    def pick_dest(model, ram, fl, cores, exclude):
+    def pick_dest(model, ram, fl, cores, exclude, tidy=True):
+        """tidy=False drops the leftover_clean() packing rule. Relief passes
+        False: that rule exists to keep the fleet SELLABLE, and trading
+        sellability against a customer who is thrashing is the wrong way round.
+        It also fails at its own job here — refusing the move leaves the source
+        over-full AND the destination's headroom unused, so nothing is
+        preserved (0000214 vm 1868, 2026-07-29: blocked 2h at up to 3023
+        faults/s while 0000209 sat on 37.5 GB, rejected only because moving a
+        19 GB guest would have left an 18.5 GB gap no plan can fill)."""
         best = None
         for did, dn in nodes.items():
             if dn["model"] != model or did in exclude or not placeable(dn):
@@ -212,7 +220,7 @@ def main():
                 # soon as reconcilers acted). 12GB = 3 reconciler steps.
                 if ch - ram < 8 or fh - fl < 12:
                     continue
-                if not leftover_clean(ch - ram):
+                if tidy and not leftover_clean(ch - ram):
                     continue
                 key = ch
             else:
@@ -298,7 +306,8 @@ def main():
             for vm in sorted(n["vms"], key=lambda v: v["ram"]):
                 if vm["st"] != "running":
                     continue
-                dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
+                dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid},
+                                tidy=False)
                 if dst:
                     picked = (vm, dst)
                     break
