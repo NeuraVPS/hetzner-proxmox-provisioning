@@ -1,0 +1,20 @@
+[Unit]
+Description=NeuraVPS: correct any VM status a Proxmox hook failed to write
+Documentation=https://github.com/NeuraVPS/hetzner-proxmox-provisioning
+After=pve-guests.service
+ConditionPathExists=/var/lib/svz/snippets/sync-dnat.py
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /var/lib/svz/snippets/sync-dnat.py watch
+
+# Nice + idle IO: this is a janitor, it must never compete with a guest.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+# A run that hangs (Firestore unreachable) must not pile up with the next one.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
