@@ -71,8 +71,8 @@ os.environ.setdefault("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.js
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# FLOOR must match the reconciler's FLOOR_BUDGET_PCT (70 since 2026-07-28,
-# prov PR#105). It is the ceiling floors ACTUALLY grow to on a node, so it is
+# FLOOR must match the reconciler's FLOOR_BUDGET_PCT (80 since 2026-07-29;
+# was 70 for one day, 60 before that). It is the ceiling floors ACTUALLY grow to on a node, so it is
 # what "does this destination have room" has to be measured against. Leaving it
 # at 0.60 while reconcilers filled to 0.70 made every node look over-budget and
 # relief escalated "no destination" on a fleet that had plenty — caught live on
@@ -80,7 +80,7 @@ from firebase_admin import credentials, firestore
 # NOT the same number as auto_provision.SQX_FLOOR_BUDGET_FACTOR (0.60), which
 # answers a different question: "should we SELL another VM here". Defrag
 # consolidates existing VMs tighter than we sell, on purpose.
-COMMIT, FLOOR = 1.5, 0.70
+COMMIT, FLOOR = 1.5, 0.80
 PLAN_SIZES = [19, 23, 31, 35, 60]          # SQX sellable GB sizes (vps-a..e)
 PLANS = [("vps-a", 19, 5.7), ("vps-b", 23, 6.9), ("vps-c", 31, 9.3),
          ("vps-d", 35, 10.5), ("vps-e", 60, 18.0)]
