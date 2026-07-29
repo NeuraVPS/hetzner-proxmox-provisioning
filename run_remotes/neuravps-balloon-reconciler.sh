@@ -82,8 +82,8 @@ IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
 IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # idle CREDIT (leaky) before lowering
 LOWER_COOLDOWN_RUNS=${LOWER_COOLDOWN_RUNS:-5}  # calm runs to re-earn between -4G steps
 STEP_MB=${STEP_MB:-4096}
-FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-70}  # sum(floors) cap as % of node RAM
-# 70 since 2026-07-28 (was 60). At 60 the cap was refusing customers RAM they
+FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-80}  # sum(floors) cap as % of node RAM
+# 80 since 2026-07-29 (60 -> 70 on the 28th, 70 -> 80 the next day). At 60 the cap was refusing customers RAM they
 # already pay for on nodes with ~50 GB of physically FREE memory: 5 of 56 SQX
 # nodes were budget-blocked with 251 GB idle between them, and the hourly relief
 # escalated "no destination" because every candidate node was equally capped
@@ -97,9 +97,21 @@ FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-70}  # sum(floors) cap as % of node RAM
 # /etc/default/neuravps-balloon-reconciler (sourced by v4/v5/v6 alike, so it did
 # not require redeploying the script); after the change no node in the fleet has
 # a blocked guest and floors sit at 81% of the new budget.
+# 2026-07-29: the fleet absorbed the whole 60->70 raise in ONE DAY — 37 of 56
+# nodes reached >=95% of the new ceiling and the best destination in the entire
+# fleet fell 1.1 GB short of accepting the smallest plan that exists, so relief
+# escalated "no destination" hourly with real customers thrashing (0000204
+# vm1868 2h at up to 3023 faults/s, 0000056 vm1835 pinned at 41% of its
+# contracted RAM, 0000054 vm492). Simulated before applying: if every floor grew
+# to the new 80% ceiling — a worst case that cannot actually happen — only 3 of
+# 56 nodes would approach HOST_FREE_MIN_MB, and that guard is what stops them.
+# THIS IS THE LAST NOTCH. If the fleet fills again there is no knob left to
+# turn; it needs hardware.
 # NOTE: this is NOT auto_provision's SQX_FLOOR_BUDGET_FACTOR (still 0.60), which
 # gates how many VMs are SOLD per node. Two knobs on purpose — raising the sales
 # gate would spend this headroom on new VMs and bring the thrashing back.
+# And defrag.py's FLOOR must move WITH this one: it measures destination room
+# against the same ceiling, and leaving them out of step broke relief on the 28th.
 HOST_FREE_MIN_MB=${HOST_FREE_MIN_MB:-12288}
 BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # leaky blocked-counter level (+1 blocked/-1 calm run) that asks for relief
 [ -f /etc/default/neuravps-balloon-reconciler ] && . /etc/default/neuravps-balloon-reconciler
