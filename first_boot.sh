@@ -697,6 +697,20 @@ NODEBOOTEOF
 systemctl daemon-reload
 systemctl enable node-boot-sync-dnat.service
 
+# Status watchdog. The post-start/post-stop hooks are the only thing that tells
+# Firestore a VM changed state, and a hook is a process: it can be killed
+# before its write lands, leaving the panel permanently wrong (VMs
+# 1980/1985/1986, 2026-07-30). This timer catches exactly that, and costs
+# nothing when there is nothing to catch — it compares against a local file of
+# what was last written, so a quiet run makes no Firestore call at all.
+log "Installing neuravps-vm-status-watch.timer (corrects a status a hook failed to write)"
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes/neuravps-vm-status-watch.service \
+    -o /etc/systemd/system/neuravps-vm-status-watch.service
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes/neuravps-vm-status-watch.timer \
+    -o /etc/systemd/system/neuravps-vm-status-watch.timer
+systemctl daemon-reload
+systemctl enable neuravps-vm-status-watch.timer
+
 # Pull node credentials + canonical firewall from the Storage Box.
 # Tolerant on purpose: under set -e a failure here used to abort the whole
 # script, silently skipping everything below (smartd wear filter, PXE-first
