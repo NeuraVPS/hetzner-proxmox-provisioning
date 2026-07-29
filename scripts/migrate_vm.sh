@@ -1317,6 +1317,19 @@ if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/
     if nc -w 5 -6 -z "$EXPECTED_VM_IPV6" "$RDP_GUEST_PORT" >/dev/null 2>&1; then
       _ok "VM reachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after $((SECONDS - conn_start))s."
       conn_rc=0
+      # This probe SETTLES a failed in-guest verification. The verify step only
+      # asks the guest agent whether the address is bound; this asks the network
+      # whether the customer can actually connect, from the same BASE they come
+      # through — strictly stronger evidence, and nothing but the guest itself
+      # can be answering on that address. Leaving MIGRATION_DEGRADED set here
+      # pages the operator with "the CUSTOMER CANNOT REACH IT" three lines under
+      # this success (vm 248, 2026-07-29: red alert, customer perfectly fine),
+      # which is exactly how an alert gets trained into noise.
+      if (( MIGRATION_DEGRADED == 1 )); then
+        MIGRATION_DEGRADED=0
+        DEGRADED_REASON=""
+        _ok "In-guest verification had failed, but RDP answers on [${EXPECTED_VM_IPV6}] — the address IS bound and serving. Clearing the degraded verdict."
+      fi
       break
     fi
     sleep 5
