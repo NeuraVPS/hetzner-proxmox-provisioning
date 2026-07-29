@@ -67,7 +67,25 @@ End If
 
 launchCmd = QuoteArg(launchTarget)
 If Len(forwardArgs) > 0 Then launchCmd = launchCmd & " " & forwardArgs
+
+' Count the target's processes BEFORE launching, so the wait below can tell a
+' newly-started child from one that was already running.
+Dim childName, beforeCount
+childName = fso.GetFileName(launchTarget)
+beforeCount = CountProcesses(childName)
+
 shell.Run launchCmd, 1, False
+
+' Wait for the child to actually exist before the Debugger value goes back.
+'
+' This is the fix for the self-race that made MetaTrader hang on launch with a
+' spinning cursor and no window (real case 2026-07-22): shell.Run is
+' asynchronous, so without this the re-add below could land BEFORE the child's
+' CreateProcess read IFEO — and the child was then re-intercepted by our own
+' hook, spawning another wscript instead of a terminal. The cross-process lock
+' does not help: that race is INSIDE a single invocation. Post-update CPU load
+' widens the window, and every double-click re-arms it.
+WaitForNewProcess childName, beforeCount, 15000
 
 On Error Resume Next
 shell.CurrentDirectory = previousCwd
@@ -114,6 +132,43 @@ End Sub
 Function QuoteArg(value)
   QuoteArg = """" & Replace(value, """", """""") & """"
 End Function
+
+' How many processes with this image name are running right now. Returns -1 if
+' WMI is unavailable, which the caller treats as "can't tell" and falls back to
+' a fixed pause rather than re-arming the hook immediately.
+Function CountProcesses(exeName)
+  Dim wmi, col
+  CountProcesses = -1
+  On Error Resume Next
+  Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+  If Err.Number <> 0 Then Err.Clear : Exit Function
+  Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name = '" & _
+                          Replace(exeName, "'", "''") & "'")
+  If Err.Number <> 0 Then Err.Clear : Exit Function
+  CountProcesses = col.Count
+  If Err.Number <> 0 Then Err.Clear : CountProcesses = -1
+  On Error GoTo 0
+End Function
+
+' Block until one more `exeName` exists than there was before the launch, or
+' the timeout expires. Returns True if the child was seen.
+Sub WaitForNewProcess(exeName, beforeCount, timeoutMs)
+  Dim waited, now_
+  If beforeCount < 0 Then
+    ' No WMI to observe with: a fixed pause is still far better than re-adding
+    ' the Debugger value the instant after an async launch.
+    WScript.Sleep 3000
+    Exit Sub
+  End If
+  waited = 0
+  Do While waited < timeoutMs
+    now_ = CountProcesses(exeName)
+    If now_ > beforeCount Then Exit Sub
+    If now_ < 0 Then WScript.Sleep 3000 : Exit Sub
+    WScript.Sleep 150
+    waited = waited + 150
+  Loop
+End Sub
 
 Function BuildForwardArgs(arguments, preserveOriginal)
   Dim i, raw, item, parts, hasPortable

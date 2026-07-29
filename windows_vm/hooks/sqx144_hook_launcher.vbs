@@ -87,10 +87,58 @@ Sub LaunchTarget(shellObj, fsoObj, exePath, argString)
 
   launchCmd = QuoteArg(exePath)
   If Len(argString) > 0 Then launchCmd = launchCmd & " " & argString
+
+  ' Count first, launch, then wait for the child to actually exist before the
+  ' caller puts the Debugger value back. shellObj.Run is asynchronous, so
+  ' without this the re-add can land BEFORE the child's CreateProcess reads
+  ' IFEO and the child gets re-intercepted by our own hook — a launch that
+  ' spins forever with no window (MetaTrader case 2026-07-22). The
+  ' cross-process lock does not cover it: the race is inside one invocation.
+  Dim childName, beforeCount
+  childName = fsoObj.GetFileName(exePath)
+  beforeCount = CountProcesses(childName)
+
   shellObj.Run launchCmd, 1, False
+
+  WaitForNewProcess childName, beforeCount, 15000
 
   On Error Resume Next
   shellObj.CurrentDirectory = previousCwd
   Err.Clear
   On Error GoTo 0
+End Sub
+
+' How many processes with this image name are running right now. Returns -1 if
+' WMI is unavailable, which the caller treats as "can't tell" and falls back to
+' a fixed pause rather than re-arming the hook immediately.
+Function CountProcesses(exeName)
+  Dim wmi, col
+  CountProcesses = -1
+  On Error Resume Next
+  Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+  If Err.Number <> 0 Then Err.Clear : Exit Function
+  Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name = '" & _
+                          Replace(exeName, "'", "''") & "'")
+  If Err.Number <> 0 Then Err.Clear : Exit Function
+  CountProcesses = col.Count
+  If Err.Number <> 0 Then Err.Clear : CountProcesses = -1
+  On Error GoTo 0
+End Function
+
+' Block until one more `exeName` exists than there was before the launch, or
+' the timeout expires.
+Sub WaitForNewProcess(exeName, beforeCount, timeoutMs)
+  Dim waited, now_
+  If beforeCount < 0 Then
+    WScript.Sleep 3000
+    Exit Sub
+  End If
+  waited = 0
+  Do While waited < timeoutMs
+    now_ = CountProcesses(exeName)
+    If now_ > beforeCount Then Exit Sub
+    If now_ < 0 Then WScript.Sleep 3000 : Exit Sub
+    WScript.Sleep 150
+    waited = waited + 150
+  Loop
 End Sub
