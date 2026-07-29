@@ -52,9 +52,12 @@ Safety (this runs at the edge; a mistake blocks paying customers)
 """
 import ipaddress
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from collections import defaultdict
 
 CONFIG = "/etc/neuravps-sweepguard.json"
@@ -67,6 +70,12 @@ DEFAULTS = {
     "hotPortMinSrc": 5,      # y la fuente que aporta tanto a ESE puerto es parte del ataque
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
+    # El detector hot-port es el UNICO ambiguo: el dueño legitimo del puerto
+    # atacado esta, por definicion, entre las fuentes que se apilan en el. Ver
+    # `hot_port_abusers`. Por eso su bloqueo dura menos (el atacante vuelve a
+    # detectarse en la pasada siguiente, 5 min) y respeta la memoria de
+    # fuentes habituales.
+    "hotPortBlockSeconds": 3600,    # 1h
 }
 NAT64 = ipaddress.ip_network("64:ff9b:1::/96")
 
@@ -227,7 +236,7 @@ def flooders(family, cfg):
 
 
 def hot_port_abusers(family, cfg):
-    """(addr -> conns) for sources piling connections onto ONE attacked port.
+    """(addr -> (conns, port)) for sources piling connections onto ONE attacked port.
 
     Detectors 1 and 2 both miss the slow DISTRIBUTED attack on a single VM:
     six sources at ~2 conns/min each touch one port (invisible to minPorts),
@@ -244,6 +253,22 @@ def hot_port_abusers(family, cfg):
         customer VM does (measured: 472 ports at 1-4, 422 at 5-9);
       * and this source contributes `hotPortMinSrc` of them — a real client
         holds 1-4 (measured p95 = 4).
+
+    Ese "p95 = 4" es lo unico que separaba al cliente del atacante, y NO basta:
+    el dueño del puerto atacado esta SIEMPRE entre las fuentes apiladas en el,
+    y al reconectar contra un servidor que no responde acumula intentos. Caso
+    real 2026-07-29: un cliente con 4 servidores llego a 6 conexiones sobre su
+    propio puerto durante un ataque y quedo bloqueado 24h — sin poder entrar a
+    NINGUNO de sus servidores ni a la consola VNC, porque el bloqueo es por IP
+    de origen en la VIP compartida. Diez horas de corte y cinco correos de
+    soporte sin diagnostico, porque el log no decia ni que puerto era.
+
+    Por eso el detector consulta la memoria de fuentes habituales: una fuente
+    vista en ese puerto MIENTRAS NO estaba atacado, hace mas de
+    `familiarMinAgeH`, es el dueño y queda exenta. Los otros dos detectores
+    (diversidad de puertos e inundacion) no son ambiguos y siguen aplicandose
+    a todo el mundo, asi que un atacante paciente que se hiciera "habitual"
+    sigue cubierto por ellos.
     """
     want = "ipv4" if family == "ip" else "ipv6"
     pair = defaultdict(int)
@@ -276,20 +301,23 @@ def hot_port_abusers(family, cfg):
 
     out = {}
     for (addr, port), n in pair.items():
-        if n >= cfg["hotPortMinSrc"] and per_port[port] >= cfg["hotPortMinTotal"]:
-            out[addr] = max(out.get(addr, 0), n)
+        if n < cfg["hotPortMinSrc"] or per_port[port] < cfg["hotPortMinTotal"]:
+            continue
+        prev = out.get(addr)
+        if prev is None or n > prev[0]:
+            out[addr] = (n, port)
     return out
 
 
-def run_family(family, cfg):
+def run_family(family, cfg, fam):
     # tres detectores independientes; la razon se conserva para el log
-    cand = {a: ("ports", n) for a, n in sweepers(family, cfg).items()}
+    cand = {a: ("ports", n, None) for a, n in sweepers(family, cfg).items()}
     for a, n in flooders(family, cfg).items():
         if a not in cand:                      # diversidad de puertos manda
-            cand[a] = ("conns", n)
-    for a, n in hot_port_abusers(family, cfg).items():
+            cand[a] = ("conns", n, None)
+    for a, (n, port) in hot_port_abusers(family, cfg, fam).items():
         if a not in cand:
-            cand[a] = ("hotport", n)
+            cand[a] = ("hotport", n, port)
     if not cand:
         return 0
     allow = set_elements(family, "bf_allow")
@@ -297,7 +325,7 @@ def run_family(family, cfg):
     already = plain_addrs(family, "bf_auto")
 
     picked = []
-    for addr, (why, metric) in sorted(cand.items(), key=lambda kv: -kv[1][1]):
+    for addr, (why, metric, port) in sorted(cand.items(), key=lambda kv: -kv[1][1]):
         if addr in already:
             continue
         if covered_by_lists(family, addr, allow):
@@ -305,7 +333,7 @@ def run_family(family, cfg):
             continue
         if covered_by_lists(family, addr, static):
             continue          # ya bloqueada a mano
-        picked.append((addr, why, metric))
+        picked.append((addr, why, metric, port))
 
     if not picked:
         return 0
@@ -314,19 +342,29 @@ def run_family(family, cfg):
             f"{cfg['maxAddsPerRun']} — blocking the worst ones only")
         picked = picked[:cfg["maxAddsPerRun"]]
 
-    for addr, why, metric in picked:
+    for addr, why, metric, port in picked:
+        # El puerto y la VM van SIEMPRE en el log del detector ambiguo: sin eso
+        # es imposible saber si acabamos de bloquear a un atacante o al dueño de
+        # la maquina, que es exactamente lo que costo 10h de corte el 2026-07-29.
         what = {"ports": "%d distinct ports" % metric,
                 "conns": "%d live connections" % metric,
-                "hotport": "%d connections onto ONE attacked port" % metric}[why]
+                "hotport": "%d connections onto ONE attacked port (port %s, VM %s)"
+                           % (metric, port, vm_slot(port) if port else "?")}[why]
+        secs = cfg["hotPortBlockSeconds"] if why == "hotport" else cfg["blockSeconds"]
         if cfg["dryRun"]:
-            log(f"{family}: DRY-RUN would block {addr} ({what})")
+            log(f"{family}: DRY-RUN would block {addr} ({what}) for {secs}s")
             continue
         r = subprocess.run(
             ["nft", "add", "element", family, "rdpguard", "bf_auto",
-             "{ %s timeout %ds }" % (addr, cfg["blockSeconds"])],
+             "{ %s timeout %ds }" % (addr, secs)],
             capture_output=True, text=True)
         if r.returncode == 0:
-            log(f"{family}: BLOCKED {addr} ({what}) for {cfg['blockSeconds']}s")
+            log(f"{family}: BLOCKED {addr} ({what}) for {secs}s")
+            if why == "hotport":
+                log(f"{family}: NOTE {addr} was blocked by the AMBIGUOUS detector "
+                    f"on VM {vm_slot(port) if port else '?'} — if this is that "
+                    f"customer they just lost ALL their servers and the VNC "
+                    f"console; check before assuming it is an attacker")
         else:
             log(f"{family}: FAILED to block {addr}: {r.stderr.strip()[:120]}")
     return len(picked)
@@ -346,12 +384,14 @@ def main():
         log("disabled by config — nothing to do")
         return 0
 
+    fam = load_familiar()
     total = 0
     for family in ("ip", "ip6"):
         try:
-            total += run_family(family, cfg)
+            total += run_family(family, cfg, fam)
         except Exception as exc:            # nunca romper el timer
             log(f"{family}: ERROR {exc}")
+    save_familiar(fam, cfg)
     if total:
         log(f"done: {total} sweeper(s) {'identified' if cfg['dryRun'] else 'blocked'}")
     return 0
