@@ -55,6 +55,20 @@ remote_task() {
 # Extract function body into a string
 FUNC_CONTENT=$(declare -f remote_task)
 
+# The other run_remotes scripts read the node list with jq. b0 does not have
+# jq, so this falls back to python3 (always present — sync-dnat.py is python)
+# rather than making a fleet migration depend on installing a package on the
+# base server.
+node_list() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -r 'to_entries[] | "\(.key) \(.value)"' "$1"
+    else
+        python3 -c 'import json,sys
+for k, v in json.load(open(sys.argv[1])).items():
+    print(k, v)' "$1"
+    fi
+}
+
 NODES_FILE="/var/lib/base-nat/pve_nodes.json"
 if [[ ! -f "$NODES_FILE" ]]; then
     echo "Missing $NODES_FILE"
@@ -93,4 +107,4 @@ while read -r hostname ip; do
     ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$ip" \
         "$FUNC_CONTENT; remote_task" \
         || echo "❌ Failed to connect to $hostname ($ip)"
-done < <(jq -r 'to_entries[] | "\(.key) \(.value)"' "$NODES_FILE" | sort)
+done < <(node_list "$NODES_FILE" | sort)
