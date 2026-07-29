@@ -128,12 +128,43 @@ ram_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
 avail_mb=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1024 ))
 now=$(date +%s)
 
+# --- node-level REAL disk swap-in + IO pressure ----------------------------
+# The per-VM `rate` below comes from major_page_faults, and that counter scores
+# a zswap hit exactly like a disk read. This fleet runs zswap on purpose, so
+# most "faults" are compressed RAM costing microseconds, not I/O.
+#
+# Measured 2026-07-29 across 40 SQX nodes: pswpin was 0 on 38 of them (max
+# 12/s) while zswpin reached 2030/s on one node whose PSI io was 0.00. On
+# 0000214 the same day a guest read 1216 faults/s with 0 pages/s from disk.
+# That is enough to escalate a LIVE CUSTOMER MIGRATION (defrag thrash-relief)
+# on a node doing no disk I/O at all — which is exactly what happened.
+#
+# So export the two signals that do separate harm from cheap paging. The floor
+# RAISE path deliberately keeps using faults: raising a floor is harmless and
+# self-correcting, and it is what actually helped the guest above. Only the
+# escalation needs the stricter evidence.
+SWAPST="$STATE_DIR/swapin.tsv"
+pswpin_now=$(awk '/^pswpin/{print $2}' /proc/vmstat)
+pswpin_ps=0
+if [ -r "$SWAPST" ]; then
+  read -r p_prev t_prev < "$SWAPST" 2>/dev/null || true
+  if [ -n "${p_prev:-}" ] && [ -n "${t_prev:-}" ] && [ "$now" -gt "${t_prev:-0}" ] \
+     && [ "${pswpin_now:-0}" -ge "${p_prev:-0}" ]; then
+    pswpin_ps=$(( (pswpin_now - p_prev) / (now - t_prev) ))
+  fi
+fi
+printf '%s %s\n' "${pswpin_now:-0}" "$now" > "$SWAPST" 2>/dev/null || true
+psi_io_pct=$(awk -F'avg300=' '/^some/{split($2,x," ");print x[1];exit}' \
+             /proc/pressure/io 2>/dev/null)
+psi_io_pct=${psi_io_pct:-0}
+
 write_status() {  # $1 = blocked-entries JSON fragment ("" when none)
   local tmp
   tmp=$(mktemp /var/run/.neuravps-balloon-status.XXXXXX) || return 0
   chmod 644 "$tmp"
-  printf '{"ts":%s,"ram_mb":%s,"avail_mb":%s,"committed_mb":%s,"floors_sum_mb":%s,"budget_mb":%s,"blocked":[%s]}\n' \
-    "$now" "$ram_mb" "$avail_mb" "${committed:-0}" "${floors_sum:-0}" "${budget_mb:-0}" "$1" > "$tmp"
+  printf '{"ts":%s,"ram_mb":%s,"avail_mb":%s,"committed_mb":%s,"floors_sum_mb":%s,"budget_mb":%s,"pswpin_ps":%s,"psi_io_pct":%s,"blocked":[%s]}\n' \
+    "$now" "$ram_mb" "$avail_mb" "${committed:-0}" "${floors_sum:-0}" "${budget_mb:-0}" \
+    "${pswpin_ps:-0}" "${psi_io_pct:-0}" "$1" > "$tmp"
   mv "$tmp" "$RUN_STATUS"
 }
 

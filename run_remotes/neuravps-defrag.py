@@ -252,6 +252,7 @@ def main():
 
     # ---- relief mode: harm-targeted intra-day pass (see module docstring) ----
     live_blocked = {}   # nid -> [{vmid, rate, floor_mb, ...}] (sustained-blocked)
+    live_io = {}        # nid -> (pswpin_ps, psi_io_pct) — real-I/O evidence
     if relief:
         import concurrent.futures as cf
         STATUS_MAX_AGE_S = 900
@@ -291,6 +292,10 @@ def main():
                     n["fl"] = live_fl
                 if st.get("blocked"):
                     live_blocked[nid] = st["blocked"]
+                    # Real-I/O evidence, when the node's reconciler exports it.
+                    # Absent (older reconciler) -> stays None -> we FAIL OPEN
+                    # and behave exactly as before.
+                    live_io[nid] = (st.get("pswpin_ps"), st.get("psi_io_pct"))
         log(f"relief: {fresh}/{len(sqx_ids)} nodes reporting, "
             f"{len(live_blocked)} with sustained-blocked thrashers")
         relief_max = min(int(cfg.get("reliefMaxMovesPerRun") or 4), max_moves)
@@ -301,6 +306,39 @@ def main():
             n = nodes[nid]
             vm_list = ",".join(str(b.get("vmid")) for b in live_blocked[nid][:3])
             worst = max((int(b.get("rate") or 0) for b in live_blocked[nid]), default=0)
+
+            # `worst` comes from major_page_faults, which scores a zswap hit
+            # like a disk read. With zswap on fleet-wide most of those faults
+            # are compressed RAM, so a high rate does NOT mean the guest is
+            # stalling — and this branch migrates ANOTHER customer's VM live.
+            # Real case 2026-07-29 (run 20260729-1421): vm1710 read 419/s and
+            # booked a move of vm778, while its node did 0 pages/s from disk.
+            #
+            # Ships in LOG-ONLY mode: it reports what it would have suppressed
+            # and changes nothing, so the decision can be made on a few days of
+            # real counts. Flip reliefRequireDiskIo to enforce. Missing signals
+            # (older reconciler) always count as real — fail open, never
+            # suppress on absence of data.
+            psw, psi = live_io.get(nid, (None, None))
+            min_psw = int(cfg.get("reliefMinPswpinPs") or 50)
+            min_psi = float(cfg.get("reliefMinPsiIoPct") or 1.0)
+            if psw is None or psi is None:
+                real_io = True
+            else:
+                try:
+                    real_io = int(psw) >= min_psw or float(psi) >= min_psi
+                except (TypeError, ValueError):
+                    real_io = True
+            if not real_io:
+                if cfg.get("reliefRequireDiskIo"):
+                    log(f"relief: SKIP {nid} — vm {vm_list} @{worst}/s but node shows "
+                        f"no real disk pressure (pswpin={psw}/s, psi_io={psi}%); "
+                        f"faults are zswap hits, not I/O")
+                    continue
+                log(f"relief: WOULD-SKIP {nid} — vm {vm_list} @{worst}/s with "
+                    f"pswpin={psw}/s psi_io={psi}% (below {min_psw}/s and "
+                    f"{min_psi}%); proceeding because reliefRequireDiskIo is off")
+
             picked = None
             # smallest RUNNING VM out — a stopped VM frees no live floors
             for vm in sorted(n["vms"], key=lambda v: v["ram"]):
