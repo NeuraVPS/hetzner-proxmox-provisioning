@@ -84,6 +84,25 @@ COMMIT, FLOOR = 1.5, 0.80
 PLAN_SIZES = [19, 23, 31, 35, 60]          # SQX sellable GB sizes (vps-a..e)
 PLANS = [("vps-a", 19, 5.7), ("vps-b", 23, 6.9), ("vps-c", 31, 9.3),
          ("vps-d", 35, 10.5), ("vps-e", 60, 18.0)]
+
+# Floor a guest of each plan ACTUALLY settles at — pricingPlans.json
+# max(ram_min, ram_min_observed), measured 2026-07-29 over 657 live guests.
+# Used ONLY to charge a server doc that has no ramFloorGb yet.
+#
+# `float(d.get("ramFloorGb") or 0)` used to charge such a doc ZERO, so a VM
+# with no floor made its node look emptier than empty and the daily pass
+# (which plans from Firestore, unlike the hourly relief pass that reads the
+# reconciler's LIVE floors_sum_mb) would happily pick it as a destination.
+# Real case 2026-07-30: four vps-e created outside auto_provision had no
+# ramFloorGb and hid 180.8 GB of floor on 0000185-AX162-2-LTD.
+#
+# NOTE (not fixed here, needs an operator decision): the PLANS table above is
+# itself stale — it carries the NOMINAL ram_min and a vps-e of 60 GB/18.0,
+# while a vps-e is now 48 GB with a real floor of 52.2. fits_any_plan()
+# therefore still under-estimates what a destination must reserve.
+EXPECTED_FLOOR = {"mt": 2.0, "mt-plus": 4.0, "vps-a": 9.7, "vps-b": 11.9,
+                  "vps-c": 15.5, "vps-d": 25.2, "vps-e": 52.2}
+WORST_FLOOR = max(EXPECTED_FLOOR.values())
 MIN_STRANDED = 5.0
 BATCH = "/root/migrate_vms_batch.sh"
 LOG_DIR = "/var/log/migrate_vm/defrag"
@@ -175,7 +194,13 @@ def main():
         if nid not in nodes:
             continue
         n = nodes[nid]
-        ram, fl = float(d.get("memoryGb") or 0), float(d.get("ramFloorGb") or 0)
+        ram = float(d.get("memoryGb") or 0)
+        # A missing floor is charged its PLAN's real floor (or the largest
+        # plan's when the plan is unknown too) — never 0, which would make the
+        # node look emptier than it is and invite more VMs onto it.
+        fl = d.get("ramFloorGb")
+        fl = (float(fl) if fl is not None
+              else EXPECTED_FLOOR.get(d.get("serverType"), WORST_FLOOR))
         cores = int(d.get("cores") or 0)
         n["ram"] += ram
         n["fl"] += fl
