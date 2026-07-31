@@ -32,6 +32,7 @@ Commands:
                                               local-node VM matching
                                               (proxmoxId, nodeId).
 """
+import fcntl
 import logging
 import os
 import random
@@ -419,7 +420,13 @@ def watch_statuses():
 
     This exists for one failure only: a hook that died before its write landed.
     Everything else is already handled by the hooks themselves.
+
+    It must NEVER run while node_boot_reconcile() is walking the VM list: the
+    guests it has not reached yet are legitimately stopped, and recording that
+    as the desired state makes the reconcile skip them. See BOOT_RECONCILE_LOCK.
     """
+    if _watch_should_stand_down():
+        return 0
     actual = get_all_vms()
     cache = _load_status_cache()
     drifted = {vmid: st for vmid, st in actual.items() if cache.get(vmid) != st}
@@ -438,6 +445,71 @@ def watch_statuses():
     for vmid, status in drifted.items():
         update_status_in_firestore(vmid, status)
     return len(drifted)
+
+
+# --- boot-reconcile mutual exclusion ------------------------------------------
+# node_boot_reconcile() walks the node's VMs one at a time (~4 s each — 3 min 30
+# for 47 guests on 0000202). While it walks, the guests it has not reached yet
+# are LEGITIMATELY stopped. watch_statuses() has no way to tell that apart from
+# "a hook died before its write landed", so it writes status=stopped for them —
+# and the reconcile, which reads the desired state per VM inside its own loop,
+# then sees "stopped", concludes the guest is meant to stay down, and skips it.
+#
+# That is exactly what happened on node 0000202-AX102-1 on 2026-07-30:
+#   15:29:15  reconcile starts, begins starting 47 VMs one by one
+#   15:32:41  the watch timer fires MID-WALK
+#   15:32:42  it writes stopped for the 11 VMs not yet reached
+#   15:32:52  reconcile finishes having started 36; the other 11 were skipped
+# Ten customer VMs stayed down until a human started them 1 h 36 m later. One of
+# them was a live MetaTrader box whose owner then asked us for an audit trail.
+#
+# The `onboot` flag is NOT the answer here (the reconcile is strictly better:
+# it restores the DESIRED state and survives a VM being legitimately stopped).
+# The bug is only that the two must not run at once.
+BOOT_RECONCILE_LOCK = "/run/neuravps-node-boot-reconcile.lock"
+
+# Backstop for the case where the lock cannot be taken at all (read-only /run,
+# etc.): right after a boot the watch has nothing useful to contribute anyway —
+# every hook write it could be "catching up" happened before the node went
+# down — so it simply stands down and lets the next tick (6 min) handle it.
+WATCH_BOOT_GRACE_SEC = 600
+
+
+def _node_uptime_sec():
+    """Seconds since boot, or None if /proc/uptime is unreadable."""
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _watch_should_stand_down():
+    """True when watch_statuses() must not touch Firestore this tick."""
+    up = _node_uptime_sec()
+    if up is not None and up < WATCH_BOOT_GRACE_SEC:
+        logger.info(
+            f"watch: node booted {up:.0f}s ago (< {WATCH_BOOT_GRACE_SEC}s) — standing down; "
+            "node_boot_reconcile owns VM state right after a boot")
+        return True
+    try:
+        fh = open(BOOT_RECONCILE_LOCK, "a+")  # pylint: disable=consider-using-with
+    except OSError as e:
+        # Cannot even test the lock. The reconcile could not have taken it
+        # either, so this is no worse than the pre-lock behaviour — proceed,
+        # but say so loudly.
+        logger.warning(f"watch: cannot open {BOOT_RECONCILE_LOCK} ({e}); proceeding unguarded")
+        return False
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        logger.info("watch: node_boot_reconcile is running — standing down this tick")
+        return True
+    # We hold it; keep the handle alive for the caller's whole run so a reconcile
+    # cannot start underneath us either. Released when the process exits.
+    _watch_should_stand_down.held = fh
+    return False
 
 
 def _boot_history_crashloop(max_boots=4, window_sec=900):
@@ -481,6 +553,25 @@ def node_boot_reconcile():
     stayed down until a human restarted each one. This restores them, and keeps
     the desired state intact even when we deliberately don't auto-start (loop).
     """
+    try:
+        lock_fh = open(BOOT_RECONCILE_LOCK, "a+")  # pylint: disable=consider-using-with
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+    except OSError as e:
+        # Never let a lock problem stop the recovery itself — VMs coming back up
+        # matters far more than the watch racing us.
+        logger.warning(f"could not take {BOOT_RECONCILE_LOCK} ({e}); reconciling unguarded")
+        lock_fh = None
+
+    try:
+        _node_boot_reconcile_locked()
+    finally:
+        if lock_fh is not None:
+            # flock is released by the close (and by process death, which is why
+            # a crashed reconcile can never wedge the watch permanently).
+            lock_fh.close()
+
+
+def _node_boot_reconcile_locked():
     all_vm_status = get_all_vms()
     logger.info(f"All VMs: {sorted(all_vm_status.keys())}")
     loop = _boot_history_crashloop()
