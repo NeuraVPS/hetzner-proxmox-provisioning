@@ -1,0 +1,19 @@
+[Unit]
+Description=NeuraVPS: EX44 swap-grind sentinel (detect a suffering dedicated guest)
+Documentation=https://github.com/NeuraVPS/hetzner-proxmox-provisioning
+ConditionPathExists=/usr/local/sbin/neuravps-ex44-sentinel.sh
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/sbin/neuravps-ex44-sentinel.sh
+
+# A sentinel must never compete with the guest it is protecting.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+# A hung Firestore write must not pile onto the next minute's run.
+TimeoutStartSec=50
+
+[Install]
+WantedBy=multi-user.target

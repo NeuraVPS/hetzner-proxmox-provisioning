@@ -1,0 +1,16 @@
+[Unit]
+Description=NeuraVPS: EX44 swap-grind sentinel (every minute)
+Documentation=https://github.com/NeuraVPS/hetzner-proxmox-provisioning
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60
+
+# The write path only fires on sustained distress (rate-limited to one doc per
+# node per day), so per-minute sampling costs /proc reads and nothing else.
+RandomizedDelaySec=20
+FixedRandomDelay=true
+Persistent=false
+
+[Install]
+WantedBy=timers.target
