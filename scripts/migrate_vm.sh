@@ -18,9 +18,15 @@
 # to apply the in-guest IPv6 reconfig, then gracefully shut back down so the
 # original power state is preserved.
 #
-# For ONLINE migrations the source VM's max cutover downtime is set to
-# MIGRATE_DOWNTIME seconds (default 90). There are TWO independent failure modes
-# this value is squeezed between, both proven empirically over this ~180 MiB/s
+# For ONLINE migrations the cutover-downtime budget is STAGED (2026-07-31):
+# start at MIGRATE_DOWNTIME_INITIAL (default 15 s), and a background escalator
+# raises it toward the MIGRATE_DOWNTIME ceiling (default 90 s) only while QEMU's
+# "dirty sync count" shows pre-copy failing to converge. QEMU cuts over as soon
+# as remaining/bandwidth fits the budget, so the old flat 90 didn't just allow
+# long freezes — it caused them (25/25 defrag cutovers froze 12-90 s, median
+# ~38 s). Staged, a converging guest freezes seconds; only genuine churners earn
+# the old budget. The ceiling semantics are unchanged, squeezed between TWO
+# independent failure modes proven empirically over this ~180 MiB/s
 # cross-DC WAN:
 #   (a) TOO LOW → RAM never converges → many pre-copy rounds → the tiny efidisk0
 #       drive-mirror (mirrored AFTER the big data disk) sits idle through the
@@ -127,7 +133,9 @@ case "$(hostname)" in
 esac
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
-MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # max cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default
+MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # CEILING cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default AND disable the staged escalation below.
+MIGRATE_DOWNTIME_INITIAL="${MIGRATE_DOWNTIME_INITIAL:-15}"  # STARTING cutover budget (s). QEMU cuts over as soon as remaining_dirty/bandwidth <= budget, so a 90s budget doesn't just ALLOW a 90s freeze — it CAUSES one: QEMU stops the guest with up to 90s of data still to copy instead of pre-copying it hot. Measured on 25 defrag migrations 2026-07-31: every single cutover froze the guest 12-90s (median ~38s) under the flat 90. Starting at 15s makes a converging guest freeze <=15s (typically 2-5s: it pre-copies until ~15s of data remain); guests whose dirty rate outruns the link are caught by the escalator below, which walks the budget back up to MIGRATE_DOWNTIME — so the worst case equals the old behaviour instead of failure mode (a). 0 = no staging (set the ceiling up front, old behaviour).
+DOWNTIME_ESCALATE_HARD_S="${DOWNTIME_ESCALATE_HARD_S:-600}"  # absolute pre-copy seconds after which the escalator jumps straight to the MIGRATE_DOWNTIME ceiling — bounds total pre-copy time (the efidisk0-reap window, failure mode (a)) to roughly what the flat 90s produced.
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
@@ -901,19 +909,25 @@ PY
   _apt_dist_upgrade src_ssh "source ${SRC_NODE}"
   _apt_dist_upgrade dst_ssh "dest ${DST_NODE}"
 
-  # 0c) Set the cutover downtime to MIGRATE_DOWNTIME (default 90 s) — see the
-  # header for the full rationale. Short version: too low → RAM never converges
-  # → efidisk0 mirror idles → tunnel reaps it → "mirror-efidisk0: I/O error";
-  # too high → Proxmox skips pre-copy → one multi-minute blackout → dest QEMU
-  # exits on resume (proven: ~108 s blackout OK, ~175 s killed the dest). 90 s
-  # sits under that dest-exit threshold and still forces real pre-copy. NOT a
-  # kernel-skew or bwlimit issue (both ruled out by the data). One-time HOT
-  # freeze at switchover (never a reboot/offline); travels with the VM config
-  # to dest. Irrelevant for offline migrations. Non-fatal; MIGRATE_DOWNTIME=0
-  # skips.
+  # 0c) Set the cutover downtime budget — see the header for the full
+  # failure-mode box (too low → efidisk0 reap; too high → giant blackout →
+  # dest QEMU exit). STAGED since 2026-07-31: start at MIGRATE_DOWNTIME_INITIAL
+  # (guest freezes seconds, not tens of seconds) and let the escalator walk it
+  # up toward the MIGRATE_DOWNTIME ceiling only when the guest's dirty rate
+  # keeps pre-copy from converging — the flat 90 s didn't just allow long
+  # freezes, it CAUSED them (QEMU stops the guest as soon as remaining/bw fits
+  # the budget: 25/25 defrag cutovers froze 12-90 s). Travels with the VM
+  # config to dest. Irrelevant for offline migrations. Non-fatal;
+  # MIGRATE_DOWNTIME=0 skips everything (leave VM default).
+  _DT_STAGED=0
   if [[ -n "$ONLINE_FLAG" && "${MIGRATE_DOWNTIME:-0}" != "0" ]]; then
-    if src_ssh "qm set '${VMID}' --migrate_downtime '${MIGRATE_DOWNTIME}'" >/dev/null 2>&1; then
-      _ok "Set migrate_downtime=${MIGRATE_DOWNTIME}s on source (online convergence)."
+    _dt_start="$MIGRATE_DOWNTIME"
+    if [[ "${MIGRATE_DOWNTIME_INITIAL:-0}" != "0" ]]; then
+      _dt_start="$MIGRATE_DOWNTIME_INITIAL"
+      _DT_STAGED=1
+    fi
+    if src_ssh "qm set '${VMID}' --migrate_downtime '${_dt_start}'" >/dev/null 2>&1; then
+      _ok "Set migrate_downtime=${_dt_start}s on source (staged=${_DT_STAGED}, ceiling=${MIGRATE_DOWNTIME}s)."
     else
       _warn "Could not set migrate_downtime on source; continuing (busy VMs may fail to converge over a slow link)."
     fi
@@ -988,16 +1002,80 @@ PY
     *)        _warn "Could not strip 'snaptime' on source (result=${strip_out:-empty}); remote_migrate may fail with 'only root can set snaptime'." ;;
   esac
 
+  # Downtime escalator (2026-07-31): runs BESIDE the migration and walks the
+  # cutover budget up from MIGRATE_DOWNTIME_INITIAL toward the MIGRATE_DOWNTIME
+  # ceiling only when the guest's dirty rate keeps pre-copy from converging.
+  # Convergence signal = QEMU's "dirty sync count" (memory iterations): a calm
+  # guest cuts over during rounds 1-2 and never meets the escalator; a churner
+  # accumulates rounds and earns a bigger budget stepwise (3→30s, 5→60s,
+  # 8→ceiling). DOWNTIME_ESCALATE_HARD_S bounds total pre-copy time — the
+  # efidisk0-reap window (failure mode (a)) — by jumping to the ceiling
+  # outright, so the worst case degrades to exactly the old flat-90 behaviour.
+  # HMP `migrate_set_parameter downtime-limit` takes MILLISECONDS and applies
+  # to the RUNNING migration (validated on PVE 9.2.5). Self-terminates when
+  # the migration leaves the active states or the source VM disappears
+  # (remote_migrate --delete); the parent also reaps it after pvesh returns.
+  _downtime_escalator() {
+    set +e   # parent runs -euo pipefail; in here a failed poll must never kill the loop
+    local start_ts cur target dirty status out elapsed
+    start_ts=$(date +%s)
+    cur="$MIGRATE_DOWNTIME_INITIAL"
+    for _ in $(seq 1 120); do   # ~40 min self-cap at 20 s cadence
+      sleep 20
+      out=$(src_ssh "printf 'info migrate\n' | timeout 10 qm monitor '${VMID}'" 2>/dev/null)
+      if [[ -z "$out" ]]; then
+        continue   # SSH hiccup or source VM already deleted; parent reaps us
+      fi
+      status=$(grep -oE 'Migration status: [a-z-]+' <<<"$out" | awk '{print $3}')
+      case "$status" in
+        active|postcopy-active|device|setup|cancelling) ;;
+        *) return 0 ;;   # completed/failed/none: nothing left to escalate
+      esac
+      dirty=$(grep -oE 'dirty sync count: [0-9]+' <<<"$out" | grep -oE '[0-9]+$')
+      elapsed=$(( $(date +%s) - start_ts ))
+      target="$cur"
+      if [[ "$elapsed" -ge "$DOWNTIME_ESCALATE_HARD_S" ]] || [[ -n "$dirty" && "$dirty" -ge 8 ]]; then
+        target="$MIGRATE_DOWNTIME"
+      elif [[ -n "$dirty" && "$dirty" -ge 5 ]]; then
+        target=60
+      elif [[ -n "$dirty" && "$dirty" -ge 3 ]]; then
+        target=30
+      fi
+      [[ "$target" -gt "$MIGRATE_DOWNTIME" ]] && target="$MIGRATE_DOWNTIME"
+      if [[ "$target" -gt "$cur" ]]; then
+        if src_ssh "printf 'migrate_set_parameter downtime-limit %s\n' '$(( target * 1000 ))' | timeout 10 qm monitor '${VMID}'" >/dev/null 2>&1; then
+          _info "downtime-escalator: budget ${cur}s → ${target}s (dirty rounds=${dirty:-?}, elapsed=${elapsed}s — guest dirties memory faster than the link drains it)."
+          cur="$target"
+        fi
+      fi
+      if [[ "$cur" -ge "$MIGRATE_DOWNTIME" ]]; then
+        return 0   # at ceiling: nothing left to do
+      fi
+    done
+  }
+
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   TARGET_HOST="[${DST_IPV6}]"
   _info "Starting pvesh remote_migrate (${SRC_NODE} → ${DST_NODE}, mode=${ONLINE_FLAG:-offline})…"
+  _ESC_PID=""
+  if [[ -n "$ONLINE_FLAG" && "${_DT_STAGED:-0}" == "1" ]]; then
+    _downtime_escalator &
+    _ESC_PID=$!
+    _info "downtime-escalator armed (pid ${_ESC_PID}): start ${MIGRATE_DOWNTIME_INITIAL}s, ceiling ${MIGRATE_DOWNTIME}s, hard-escalate at ${DOWNTIME_ESCALATE_HARD_S}s."
+  fi
+  _migrate_rc=0
   src_ssh "pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate' \
             --target-bridge=1 \
             --target-endpoint='apitoken=PVEAPIToken=root@pam!${TOKEN_NAME}=${TOKEN_SECRET},host=${TARGET_HOST},fingerprint=${FINGERPRINT}' \
             --target-storage='${TARGET_STORAGE}' \
             ${ONLINE_FLAG} \
             --delete" \
-    || _die "pvesh remote_migrate failed."
+    || _migrate_rc=$?
+  if [[ -n "$_ESC_PID" ]]; then
+    kill "$_ESC_PID" 2>/dev/null || true
+    wait "$_ESC_PID" 2>/dev/null || true
+  fi
+  [[ "$_migrate_rc" -eq 0 ]] || _die "pvesh remote_migrate failed."
   _ok "remote_migrate command returned."
 
   # 6) Verify the migration ACTUALLY landed. `pvesh remote_migrate` exits 0 even
