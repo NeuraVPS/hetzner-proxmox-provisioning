@@ -27,7 +27,7 @@ remote_task() {
     -o /usr/local/sbin/neuravps-ex44-sentinel.sh.new
   # Verify we got the real script, not a stale/error body (GitHub raw served
   # a pre-fix file mid-rollout once — 2026-07-16 lesson: check, then install).
-  if ! grep -q "NEXSVER=1" /usr/local/sbin/neuravps-ex44-sentinel.sh.new; then
+  if ! grep -q "NEXSVER=2" /usr/local/sbin/neuravps-ex44-sentinel.sh.new; then
     echo "❌ downloaded sentinel lacks version marker — aborting this node"
     rm -f /usr/local/sbin/neuravps-ex44-sentinel.sh.new
     return 1

@@ -10,9 +10,14 @@
 # cancellation: salud samples once a day and carves out psi-io as "load, not
 # fault" on single-tenant boxes.
 #
-# Detector: REAL disk swap-in rate ((Δpswpin−Δzswpin)×4KiB/s — the same metric
-# as salud's fleet guardrail) sampled every minute. A leaky level (+1 over
-# threshold, −1 under; same shape as the balloon reconciler's blocked counter)
+# Detector: REAL disk swap-in rate (Δpswpin×4KiB/s). On this fleet's kernels
+# (7.x, split zswap accounting) pswpin counts ONLY pages read from the swap
+# DEVICE — zswap-pool hits live in zswpin alone (measured 2026-07-31: zswpin
+# is 5-60x pswpin on every node type, which is impossible under inclusive
+# accounting). Subtracting Δzswpin — what v1 did, copying salud's guardrail —
+# goes negative and clamps to 0 forever: the detector could never fire.
+# A leaky level (+1 over threshold, −1 under; same shape as the balloon
+# reconciler's blocked counter)
 # means only SUSTAINED grinding trips — a one-minute blip decays away. At
 # level >= LEVEL_MIN it writes ONE doc to Firestore `ex44_distress` (per-node
 # cooldown ALERT_COOLDOWN_S so a bad afternoon is one alert, not sixty);
@@ -21,7 +26,7 @@
 #
 # Config overrides in /etc/default/neuravps-ex44-sentinel. --test: evaluate
 # and PRINT the would-be doc, never write, never touch the alert cooldown.
-#NEXSVER=1
+#NEXSVER=2
 set -u
 
 case "$(hostname)" in
@@ -53,13 +58,14 @@ level=${level:-0}; last_alert=${last_alert:-0}
 
 rate_mbs=0
 if [ -n "${p_psw:-}" ] && [ -n "${p_ts:-}" ] && [ "$now" -gt "$p_ts" ] \
-   && [ $(( now - p_ts )) -le 180 ] && [ "$pswpin" -ge "$p_psw" ] && [ "$zswpin" -ge "${p_zsw:-0}" ]; then
-  # pages that came back from the actual swap DEVICE (zswap-pool hits are
-  # RAM-speed and excluded), as MB/s x100 (integer math, bash has no floats)
-  rate_c=$(( ( (pswpin - p_psw) - (zswpin - p_zsw) ) * 4096 * 100 / (now - p_ts) / 1048576 ))
+   && [ $(( now - p_ts )) -le 180 ] && [ "$pswpin" -ge "$p_psw" ]; then
+  # pages read back from the actual swap DEVICE (pswpin alone on split-
+  # accounting kernels — see header), as MB/s x100 (integer math)
+  rate_c=$(( (pswpin - p_psw) * 4096 * 100 / (now - p_ts) / 1048576 ))
   [ "$rate_c" -lt 0 ] && rate_c=0
 else
   # first run / reboot / counter reset / stale sample: just record and leave
+  [ "$TEST" = 1 ] && echo "TEST: no valid delta yet (sample recorded; run again in >=1s, <=180s)"
   printf '%s %s %s %s %s\n' "$pswpin" "$zswpin" "$now" "$level" "$last_alert" > "$STATE"
   exit 0
 fi
