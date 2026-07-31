@@ -135,7 +135,7 @@ TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
 MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # CEILING cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default AND disable the staged escalation below.
 MIGRATE_DOWNTIME_INITIAL="${MIGRATE_DOWNTIME_INITIAL:-15}"  # STARTING cutover budget (s). QEMU cuts over as soon as remaining_dirty/bandwidth <= budget, so a 90s budget doesn't just ALLOW a 90s freeze — it CAUSES one: QEMU stops the guest with up to 90s of data still to copy instead of pre-copying it hot. Measured on 25 defrag migrations 2026-07-31: every single cutover froze the guest 12-90s (median ~38s) under the flat 90. Starting at 15s makes a converging guest freeze <=15s (typically 2-5s: it pre-copies until ~15s of data remain); guests whose dirty rate outruns the link are caught by the escalator below, which walks the budget back up to MIGRATE_DOWNTIME — so the worst case equals the old behaviour instead of failure mode (a). 0 = no staging (set the ceiling up front, old behaviour).
-DOWNTIME_ESCALATE_HARD_S="${DOWNTIME_ESCALATE_HARD_S:-600}"  # absolute pre-copy seconds after which the escalator jumps straight to the MIGRATE_DOWNTIME ceiling — bounds total pre-copy time (the efidisk0-reap window, failure mode (a)) to roughly what the flat 90s produced.
+DOWNTIME_ESCALATE_HARD_S="${DOWNTIME_ESCALATE_HARD_S:-600}"  # RAM-phase seconds after which the escalator jumps straight to the MIGRATE_DOWNTIME ceiling — bounds the RAM pre-copy time (the efidisk0-reap window, failure mode (a)) to roughly what the flat 90s produced. Counted from the first poll that shows RAM stats, NOT from launch: the preceding disk mirror legitimately runs 10-25+ min and must not burn this budget.
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
@@ -1017,10 +1017,15 @@ PY
   # (remote_migrate --delete); the parent also reaps it after pvesh returns.
   _downtime_escalator() {
     set +e   # parent runs -euo pipefail; in here a failed poll must never kill the loop
-    local start_ts cur target dirty status out elapsed
-    start_ts=$(date +%s)
+    local ram_ts cur target dirty status out elapsed
+    ram_ts=""   # set when the RAM phase is first observed — the hard timer
+                # counts from THERE, not from launch: the disk mirror that
+                # precedes it ran 10-25 min on today's defrag jobs, and
+                # counting it would jump every big VM straight to the ceiling
+                # before a single RAM round had run.
     cur="$MIGRATE_DOWNTIME_INITIAL"
-    for _ in $(seq 1 120); do   # ~40 min self-cap at 20 s cadence
+    for _ in $(seq 1 540); do   # ~3 h self-cap at 20 s cadence (covers the
+      # disk phase of a full zvol; must outlive it to see the RAM rounds)
       sleep 20
       out=$(src_ssh "printf 'info migrate\n' | timeout 10 qm monitor '${VMID}'" 2>/dev/null)
       if [[ -z "$out" ]]; then
@@ -1031,8 +1036,10 @@ PY
         active|postcopy-active|device|setup|cancelling) ;;
         *) return 0 ;;   # completed/failed/none: nothing left to escalate
       esac
+      grep -q 'transferred ram:' <<<"$out" && [[ -z "$ram_ts" ]] && ram_ts=$(date +%s)
+      [[ -z "$ram_ts" ]] && continue   # still in the disk phase: nothing to escalate
       dirty=$(grep -oE 'dirty sync count: [0-9]+' <<<"$out" | grep -oE '[0-9]+$')
-      elapsed=$(( $(date +%s) - start_ts ))
+      elapsed=$(( $(date +%s) - ram_ts ))
       target="$cur"
       if [[ "$elapsed" -ge "$DOWNTIME_ESCALATE_HARD_S" ]] || [[ -n "$dirty" && "$dirty" -ge 8 ]]; then
         target="$MIGRATE_DOWNTIME"
