@@ -56,7 +56,24 @@ placement should relieve this node" with nobody listening). Relief mode:
   * skips daily phases 1/1.5/2/3 entirely; cap reliefMaxMovesPerRun
     (default 4); journals to defrag_runs ONLY when it found work (hourly
     empty ticks stay out of Firestore).
-#NDFVER=8
+
+VICTIM CHOICE (v9): every migration freezes the moved guest at cutover
+(measured 2026-07-31: 12-90 s, median ~38 s over the last 25 moves), so WHO
+gets moved is customer-facing, not an implementation detail. Two rules on
+top of the old smallest-first:
+  * among the 3 smallest eligible VMs, prefer the CALMEST (lowest sustained
+    fault rate from the node's live rates.tsv): a calm guest has few dirty
+    pages -> converges in one pass -> shortest freeze, and its owner is the
+    least likely to be at the keyboard. Rates unreadable -> size order.
+  * a VM moved within the last moveCooldownH hours (default 72) goes LAST,
+    never first — vm 518 was moved 7 times in 14 days by always being the
+    smallest on whatever node ran hot. Cooldown DEPRIORITIZES, it never
+    excludes: relief must always be able to act on a thrashing node.
+State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
+
+--dry-run flag: plan + journal (as dryRun) but never execute, without
+touching the config/defrag kill-switch the hourly timers read.
+#NDFVER=9
 """
 import fcntl
 import json
@@ -77,13 +94,25 @@ from firebase_admin import credentials, firestore
 # at 0.60 while reconcilers filled to 0.70 made every node look over-budget and
 # relief escalated "no destination" on a fleet that had plenty — caught live on
 # 0000056 minutes after the rollout.
-# NOT the same number as auto_provision.SQX_FLOOR_BUDGET_FACTOR (0.60), which
-# answers a different question: "should we SELL another VM here". Defrag
-# consolidates existing VMs tighter than we sell, on purpose.
-COMMIT, FLOOR = 1.5, 0.80
-PLAN_SIZES = [19, 23, 31, 35, 60]          # SQX sellable GB sizes (vps-a..e)
-PLANS = [("vps-a", 19, 5.7), ("vps-b", 23, 6.9), ("vps-c", 31, 9.3),
-         ("vps-d", 35, 10.5), ("vps-e", 60, 18.0)]
+# FLOOR_SALES mirrors auto_provision.SQX_FLOOR_BUDGET_FACTOR
+# (config/capacityGates.json, 0.70 since 2026-07-29), which answers a
+# DIFFERENT question: "could a sale still land here". Phase 2 (crumb
+# recovery) exists to recover SELLABLE capacity, so its arithmetic has to use
+# the sales budget: measured against FLOOR (0.80) it would call the ~30 nodes
+# sitting at 95-100 % of the operational ceiling "recoverable crumbs" and
+# freeze a customer per node per day chasing holes no sale can ever fill
+# (audit 2026-07-31). Destination margins and over-gate corrections keep
+# using FLOOR: existing VMs are deliberately packed tighter than we sell.
+COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.80, 0.70
+# Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
+# max(ram_min, ram_min_observed), the same number auto_provision reserves).
+# vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
+# nominal floors (5.7-18.0) that understate the measured settle points 1.66x,
+# so fits_any_plan() under-estimated what a destination must reserve.
+# RE-MEASURE together with pricingPlans.json ram_min_observed.
+PLAN_SIZES = [19, 23, 31, 35, 48]          # SQX sellable GB sizes (vps-a..e)
+PLANS = [("vps-a", 19, 9.7), ("vps-b", 23, 11.9), ("vps-c", 31, 15.5),
+         ("vps-d", 35, 25.2), ("vps-e", 48, 52.2)]
 
 # Floor a guest of each plan ACTUALLY settles at — pricingPlans.json
 # max(ram_min, ram_min_observed), measured 2026-07-29 over 657 live guests.
@@ -95,17 +124,13 @@ PLANS = [("vps-a", 19, 5.7), ("vps-b", 23, 6.9), ("vps-c", 31, 9.3),
 # reconciler's LIVE floors_sum_mb) would happily pick it as a destination.
 # Real case 2026-07-30: four vps-e created outside auto_provision had no
 # ramFloorGb and hid 180.8 GB of floor on 0000185-AX162-2-LTD.
-#
-# NOTE (not fixed here, needs an operator decision): the PLANS table above is
-# itself stale — it carries the NOMINAL ram_min and a vps-e of 60 GB/18.0,
-# while a vps-e is now 48 GB with a real floor of 52.2. fits_any_plan()
-# therefore still under-estimates what a destination must reserve.
 EXPECTED_FLOOR = {"mt": 2.0, "mt-plus": 4.0, "vps-a": 9.7, "vps-b": 11.9,
                   "vps-c": 15.5, "vps-d": 25.2, "vps-e": 52.2}
 WORST_FLOOR = max(EXPECTED_FLOOR.values())
 MIN_STRANDED = 5.0
 BATCH = "/root/migrate_vms_batch.sh"
 LOG_DIR = "/var/log/migrate_vm/defrag"
+RECENT_FILE = "/var/lib/neuravps-defrag-recent.json"
 SSH = ["ssh", "-n", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
        "-o", "StrictHostKeyChecking=no"]
 
@@ -134,8 +159,40 @@ def fits_any_plan(commit_h, floor_h):
     return any(r <= commit_h and f <= floor_h for _, r, f in PLANS)
 
 
+def load_recent_moves(cooldown_h):
+    """vmids moved within the last cooldown_h hours ({} state file -> none)."""
+    try:
+        data = json.load(open(RECENT_FILE))
+    except Exception:
+        return set()
+    cutoff = time.time() - cooldown_h * 3600
+    try:
+        return {int(v) for v, ts in data.items() if float(ts) >= cutoff}
+    except (TypeError, ValueError):
+        return set()
+
+
+def record_recent_moves(vmids):
+    """Merge just-moved vmids into the state file; prune entries >30 days."""
+    try:
+        data = json.load(open(RECENT_FILE))
+    except Exception:
+        data = {}
+    now_e = time.time()
+    for v in vmids:
+        data[str(v)] = now_e
+    data = {v: ts for v, ts in data.items()
+            if isinstance(ts, (int, float)) and now_e - ts < 30 * 86400}
+    try:
+        with open(RECENT_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as exc:
+        log(f"WARN could not persist recent-moves state: {exc}")
+
+
 def main():
     relief = "--relief" in sys.argv[1:]
+    force_dry = "--dry-run" in sys.argv[1:]
     lock = open("/run/neuravps-defrag.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -162,8 +219,13 @@ def main():
     if not cfg or cfg.get("enabled") is not True:
         log("config/defrag missing or enabled!=true — disabled, exiting")
         return 0
-    dry = bool(cfg.get("dryRun"))
+    dry = bool(cfg.get("dryRun")) or force_dry
     max_moves = int(cfg.get("maxMovesPerRun") or 8)
+    cooldown_h = float(cfg.get("moveCooldownH") or 72)
+    recent_vmids = load_recent_moves(cooldown_h)
+    if recent_vmids:
+        log(f"cooldown {cooldown_h:.0f}h: {len(recent_vmids)} VM(s) moved "
+            f"recently go LAST in victim choice: {sorted(recent_vmids)}")
     # Operator 2026-07-13: a failed migration is ESCALATED and excluded from
     # future planning (skip-list), but the run/chain continues with the rest.
     SKIP_FILE = "/var/lib/neuravps-defrag-skip.txt"
@@ -186,7 +248,7 @@ def main():
             "status": str(d.get("status") or "").strip(),
             "g": float(d.get("max_base_ram") or d.get("gbRam") or 0),
             "cap": int(d.get("max_cores") or 0),
-            "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [],
+            "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [], "n_all": 0,
         }
     for s in db.collection("servers").stream():
         d = s.to_dict() or {}
@@ -205,6 +267,7 @@ def main():
         n["ram"] += ram
         n["fl"] += fl
         n["cores"] += cores
+        n["n_all"] += 1
         # 2026-07-13: stopped VMs are migratable too (offline path now wraps
         # the temporary power-on with the vm_no_internet firewall group), so
         # nodes holding stopped trading VMs CAN reach 0%. Paused VMs are the
@@ -261,6 +324,47 @@ def main():
             if best is None or key < best[1]:
                 best = (did, key)
         return best[0] if best else None
+
+    _rates_cache = {}
+
+    def node_rates(nid):
+        """vmid -> sustained faults/s from the node's live rates.tsv ({} on
+        any error — victim choice then falls back to pure size order). One
+        SSH per node per run, and only for nodes we are about to move a VM
+        off, so the daily planner stays Firestore-only in the common case."""
+        if nid in _rates_cache:
+            return _rates_cache[nid]
+        rates = {}
+        ip = nodes[nid]["ip"]
+        if ip:
+            try:
+                p = subprocess.run(
+                    SSH + [f"root@{ip}",
+                           "cat /var/run/neuravps-balloon-rates.tsv 2>/dev/null"],
+                    capture_output=True, text=True, timeout=12)
+                for ln in p.stdout.splitlines():
+                    cols = ln.split("\t")
+                    if len(cols) >= 2:
+                        rates[int(cols[0])] = float(cols[1])
+            except Exception:
+                rates = {}
+        _rates_cache[nid] = rates
+        return rates
+
+    def order_victims(vms, nid, sizekey=lambda v: v["ram"]):
+        """Candidates in move-preference order (v9): not-recently-moved
+        first; among the 3 smallest, calmest first (fewest dirty pages ->
+        shortest cutover freeze, least-present owner); then smallest-first.
+        Cooldown deprioritizes, never excludes — see module docstring."""
+        by_size = sorted(vms, key=lambda v: (sizekey(v), v["vmid"]))
+        head, tail = by_size[:3], by_size[3:]
+        if len(head) > 1:
+            rates = node_rates(nid)
+            head.sort(key=lambda v: (rates.get(v["vmid"], 0.0),
+                                     sizekey(v), v["vmid"]))
+        ordered = head + tail
+        return ([v for v in ordered if v["vmid"] not in recent_vmids]
+                + [v for v in ordered if v["vmid"] in recent_vmids])
 
     moves = []   # (vmid, src_id, dst_id, reason)
 
@@ -365,10 +469,11 @@ def main():
                     f"{min_psi}%); proceeding because reliefRequireDiskIo is off")
 
             picked = None
-            # smallest RUNNING VM out — a stopped VM frees no live floors
-            for vm in sorted(n["vms"], key=lambda v: v["ram"]):
-                if vm["st"] != "running":
-                    continue
+            # RUNNING VMs only — a stopped VM frees no live floors. The
+            # thrasher itself sorts last naturally: its fault rate is the
+            # highest on the node (and moving a hot guest = longest freeze).
+            for vm in order_victims([v for v in n["vms"]
+                                     if v["st"] == "running"], nid):
                 dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid},
                                 tidy=False)
                 if dst:
@@ -390,7 +495,7 @@ def main():
                 ch, fh = sqx_head(n)
                 if ch >= 0 and fh >= 0:
                     break
-                cand = sorted(n["vms"], key=lambda v: v["ram"])
+                cand = order_victims(n["vms"], nid)
                 moved = False
                 for vm in cand:
                     dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
@@ -405,7 +510,8 @@ def main():
         elif n["model"] == "MT5":
             guard = 0
             while n["cap"] > 0 and n["cores"] > n["cap"] and guard < 6:
-                cand = sorted(n["vms"], key=lambda v: v["cores"])
+                cand = order_victims(n["vms"], nid,
+                                     sizekey=lambda v: v["cores"])
                 moved = False
                 for vm in cand:
                     if vm["cores"] <= 0:
@@ -435,13 +541,18 @@ def main():
         ch, fh = sqx_head(n)
         if fh < 0 or fh >= 6.0:
             continue
-        for vm in sorted(n["vms"], key=lambda v: v["ram"]):
+        for vm in order_victims(n["vms"], nid):
             dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
             if dst:
                 book(vm, nid, dst, f"floor-starved (headroom {fh:.1f}GB blocks reconciler)")
                 break
 
-    # ---- phase 2: SQX crumb defrag ----
+    # ---- phase 2: SQX crumb defrag (SALES basis — see FLOOR_SALES) ----
+    # A crumb is capacity a SALE could use but no plan fits: measured against
+    # the 0.70 sales budget, not the 0.80 operational ceiling. A node whose
+    # floors already exceed the sales budget has nothing recoverable — it is
+    # simply full by sales standards, and "recovering" its holes would freeze
+    # a customer for capacity auto_provision can never sell.
     for nid in sorted(nodes) if not relief else []:
         if len(moves) >= max_moves:
             break
@@ -449,14 +560,17 @@ def main():
         if n["model"] != "SQX" or n["g"] <= 0:
             continue
         ch, fh = sqx_head(n)
-        if ch < 0 or fh < 0 or fits_any_plan(ch, fh) or min(ch, fh) < MIN_STRANDED:
+        fh_s = FLOOR_SALES * n["g"] - n["fl"]
+        if ch < 0 or fh < 0:
+            continue          # over the op ceiling: phase 1 territory
+        if min(ch, fh_s) < MIN_STRANDED or fits_any_plan(ch, fh_s):
             continue
         # smallest VM whose departure makes some plan fit again
-        for vm in sorted(n["vms"], key=lambda v: v["ram"]):
-            if fits_any_plan(ch + vm["ram"], fh + vm["fl"]):
+        for vm in order_victims(n["vms"], nid):
+            if fits_any_plan(ch + vm["ram"], fh_s + vm["fl"]):
                 dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
                 if dst:
-                    book(vm, nid, dst, f"defrag ({min(ch, fh):.0f}GB stranded)")
+                    book(vm, nid, dst, f"defrag ({min(ch, fh_s):.0f}GB stranded)")
                 break
 
     # ---- phase 3: consolidation (restore the empty-node reserve) ----
@@ -465,10 +579,13 @@ def main():
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
-        total_vms = n["n_docs"] if "n_docs" in n else None
-        # movable = running VMs we know; a node also holding STOPPED vms can
-        # never fully empty (we never power-cycle stopped trading VMs) -> skip.
         if not (0 < len(n["vms"]) <= CONSOL_MAX_VMS):
+            continue
+        # Consolidation only pays off when EVERY server doc on the node is
+        # movable. n_all also counts what n["vms"] excludes (paused,
+        # skip-listed, proxmoxId-less docs): moving the movable ones off such
+        # a node costs the migrations and the node STILL can't empty.
+        if len(n["vms"]) != n["n_all"]:
             continue
         planned = []
         snapshot = {k: (v["ram"], v["fl"], v["cores"], len(v["vms"])) for k, v in nodes.items()}
@@ -573,6 +690,11 @@ def main():
         a["usedRamGb"] = round(a["usedRamGb"], 2)
         a["usedRamFloorGb"] = round(a["usedRamFloorGb"], 2)
         db.collection("proxmox_nodes").document(nid).update(a)
+
+    # Feed the victim-choice cooldown BEFORE reading failures: a failed
+    # migration still froze/burdened its guest, so it counts as "recently
+    # touched" too (and it lands on the skip-list anyway).
+    record_recent_moves([v for v, *_ in verified])
 
     failed_vmids = []
     if fail:
