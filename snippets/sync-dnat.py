@@ -635,7 +635,7 @@ def boot_ram_guard(vmid: int) -> None:
         # unit after BOOT_RAM_GUARD_S unless something re-raised meanwhile.
         script = (
             f"qm set {vmid} --balloon {memory} && "
-            f"printf 'balloon {memory}\\n' | qm monitor {vmid} >/dev/null; "
+            f"printf 'balloon {memory}\\n' | timeout 5 qm monitor {vmid} >/dev/null; "
             f"sleep {BOOT_RAM_GUARD_S}; "
             f'cur=$(awk -F": " \'/^balloon:/{{print $2; exit}}\' {conf}); '
             f'[ "$cur" = "{memory}" ] && qm set {vmid} --balloon {balloon}'
