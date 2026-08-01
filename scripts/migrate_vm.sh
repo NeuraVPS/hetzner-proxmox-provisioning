@@ -122,15 +122,10 @@ set -euo pipefail
 PVE_NODES_FILE="${PVE_NODES_FILE:-/var/lib/base-nat/pve_nodes.json}"
 STATE_FILE="${STATE_FILE:-/var/lib/base-nat/state.json}"
 SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
-# The other BASE(s) serving the failover VIP. Rollback (and the success path)
-# re-sync the VM's NAT entry there too — a failed migration otherwise leaves
-# the peer's entry stale/missing with no VM start/stop event to fix it
-# (live migrations never stop the guest). Space-separated, env-overridable.
-case "$(hostname)" in
-  0000000-BASE) PEER_BASES="${PEER_BASES:-2a01:4f9:3070:3984::2}" ;;
-  0000001-BASE) PEER_BASES="${PEER_BASES:-2a01:4f8:2b03:18a9::2}" ;;  # b0 (German); was b00 pre-retirement
-  *)            PEER_BASES="${PEER_BASES:-}" ;;
-esac
+# NAT on the PEER base is NOT pushed from here: base->base SSH is deliberately
+# unauthorized (2026-08-01 key rotation). The nat64 Cloud Function converges
+# every base from Firestore within seconds of the server-doc update this
+# script performs as its final step.
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
 MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # CEILING cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default AND disable the staged escalation below.
@@ -692,17 +687,13 @@ _rollback() {
   # the hookscript chain) even though the VM kept running on source — the
   # customer's connectionUrl then dies silently while direct-IPv6 RDP still
   # works (VM 1648, 2026-07-03). Firestore routing is untouched on rollback
-  # by design, so a plain per-VM sync restores truth. Local + peer BASEs.
+  # by design, so a plain per-VM sync restores truth on THIS base. The peer's
+  # entry is only ever written by the Cloud Function converging from (correct,
+  # untouched) Firestore, so there is nothing to undo there.
   if [[ -x "$SYNC_BASE_NAT" ]]; then
-    _info "Restoring NAT entry for ${VMID} from Firestore (local + peer)…"
+    _info "Restoring NAT entry for ${VMID} from Firestore (local)…"
     "$SYNC_BASE_NAT" sync "$VMID" >/dev/null 2>&1 \
       || _warn "Local NAT restore failed — run: $SYNC_BASE_NAT sync ${VMID}"
-    local _peer
-    for _peer in $PEER_BASES; do
-      ssh -n -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no \
-        "root@${_peer}" "$SYNC_BASE_NAT sync '${VMID}'" >/dev/null 2>&1 \
-        || _warn "Peer NAT restore failed on ${_peer} — run there: $SYNC_BASE_NAT sync ${VMID}"
-    done
   fi
   _ssh_close
 }
@@ -1376,16 +1367,9 @@ if [[ -x "$SYNC_BASE_NAT" ]]; then
   else
     _warn "$SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6} failed; run it manually."
   fi
-  # Peer BASE(s) too, best-effort: live migrations fire no VM start/stop event,
-  # so without this the peer's entry stays stale until its periodic sync.
-  for _peer in $PEER_BASES; do
-    if ssh -n -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no \
-         "root@${_peer}" "$SYNC_BASE_NAT sync '${VMID}' '${EXPECTED_VM_IPV6}'" >/dev/null 2>&1; then
-      _ok "Peer NAT reconciled (${_peer})."
-    else
-      _warn "Peer NAT sync failed on ${_peer} — run there: $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6}"
-    fi
-  done
+  # The peer base is converged by the nat64 Cloud Function reacting to the
+  # Firestore update just below (~2 s end-to-end, verified 2026-08-01 across
+  # 6 defrag migrations: full map diff identical on both bases) — no push.
 else
   _warn "$SYNC_BASE_NAT not executable; skipping local NAT reconcile."
 fi
