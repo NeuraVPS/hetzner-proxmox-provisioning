@@ -54,4 +54,4 @@ while read -r hostname ip; do
     ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$ip" \
         "$FUNC_CONTENT; remote_task" \
         || echo "❌ Failed to connect to $hostname ($ip)"
-done < <(jq -r 'to_entries[] | "\(.key) \(.value)"' "$NODES_FILE" | sort)
+done < <(python3 -c "import json; d=json.load(open('$NODES_FILE')); [print(k, v) for k, v in sorted(d.items())]")
