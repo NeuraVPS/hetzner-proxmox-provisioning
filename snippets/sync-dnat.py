@@ -628,19 +628,26 @@ def boot_ram_guard(vmid: int) -> None:
                     break  # snapshot/pending sections follow the main block
         if not memory or balloon is None or balloon <= 0 or balloon >= memory:
             return  # ballooning disabled (0), unmanaged, or already full
-        run(["qm", "set", str(vmid), "--balloon", str(memory)], check=True)
-        restore = (
+        # This hook runs INSIDE `qm start`, which still holds the config lock
+        # (a direct `qm set` here exits 4, "VM is locked"). Defer the raise 5 s
+        # into a detached transient unit — by then the lock is gone and the
+        # Windows memory init is still >10 s away — and restore in the same
+        # unit after BOOT_RAM_GUARD_S unless something re-raised meanwhile.
+        script = (
+            f"qm set {vmid} --balloon {memory} && "
+            f"printf 'balloon {memory}\\n' | qm monitor {vmid} >/dev/null; "
+            f"sleep {BOOT_RAM_GUARD_S}; "
             f'cur=$(awk -F": " \'/^balloon:/{{print $2; exit}}\' {conf}); '
             f'[ "$cur" = "{memory}" ] && qm set {vmid} --balloon {balloon}'
         )
         run([
-            "systemd-run", "--collect", f"--on-active={BOOT_RAM_GUARD_S}",
+            "systemd-run", "--collect", "--on-active=5",
             f"--unit=nvps-bootram-{vmid}-{int(time.time())}",
-            "sh", "-c", restore,
+            "sh", "-c", script,
         ], check=True)
         logger.info(
-            f"Boot RAM guard: VM {vmid} floor {balloon}->{memory}MB for "
-            f"{BOOT_RAM_GUARD_S}s (then back to {balloon} unless re-raised)"
+            f"Boot RAM guard armed: VM {vmid} floor {balloon}->{memory}MB at "
+            f"+5s for {BOOT_RAM_GUARD_S}s (then back to {balloon} unless re-raised)"
         )
     except Exception as e:  # noqa: BLE001 — the hook must never fail on this
         logger.warning(f"Boot RAM guard failed for VM {vmid}: {e}")
