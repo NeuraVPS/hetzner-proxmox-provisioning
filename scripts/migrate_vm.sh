@@ -1176,15 +1176,15 @@ if (( WAS_STOPPED == 1 )); then
   # --- Operator procedure (2026-07-13): the temporary power-on of a STOPPED
   # trading VM must not let MetaTrader/EAs reach the internet (an auto-started
   # terminal could open trades). Save the VM's original firewall config, force
-  # the datacenter-wide `vm_no_internet` security group ON (+ NIC firewall=1),
+  # the datacenter-wide `vm-no-internet` security group ON (+ NIC firewall=1),
   # start -> in-guest IPv6 reconfig -> shutdown, then restore EXACTLY the
   # original firewall state (file content and net0 string).
   NOINT_FW="/etc/pve/firewall/${VMID}.fw"
   NOINT_ORIG_B64=$(dst_ssh "[ -f '${NOINT_FW}' ] && base64 -w0 '${NOINT_FW}' || true" 2>/dev/null)
   NOINT_NET0_ORIG=$(dst_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^net0: //p' | tr -d '\r')
   NOINT_NET0_MODIFIED=0
-  dst_ssh "grep -q '^\[group vm_no_internet\]' /etc/pve/firewall/cluster.fw 2>/dev/null" \
-    || _warn "cluster.fw has no [group vm_no_internet] on dest — the guard rule will be a no-op."
+  dst_ssh "grep -q '^\[group vm-no-internet\]' /etc/pve/firewall/cluster.fw 2>/dev/null" \
+    || _warn "cluster.fw has no [group vm-no-internet] on dest — the guard rule will be a no-op."
   if [[ -n "$NOINT_NET0_ORIG" && "$NOINT_NET0_ORIG" != *firewall=1* ]]; then
     if dst_ssh "qm set '${VMID}' --net0 '${NOINT_NET0_ORIG},firewall=1'" >/dev/null 2>&1; then
       NOINT_NET0_MODIFIED=1
@@ -1192,8 +1192,8 @@ if (( WAS_STOPPED == 1 )); then
       _warn "could not set firewall=1 on net0 — no_internet guard may not filter."
     fi
   fi
-  dst_ssh "printf '[OPTIONS]\nenable: 1\n\n[RULES]\nGROUP vm_no_internet\n' > '${NOINT_FW}'" >/dev/null 2>&1 \
-    && _ok "Firewall vm_no_internet ON for the temporary power-on." \
+  dst_ssh "printf '[OPTIONS]\nenable: 1\n\n[RULES]\nGROUP vm-no-internet\n' > '${NOINT_FW}'" >/dev/null 2>&1 \
+    && _ok "Firewall vm-no-internet ON for the temporary power-on." \
     || _warn "could not write ${NOINT_FW} — proceeding without the internet guard."
   _info "Starting VM ${VMID} on dest to apply in-guest reconfig (was stopped pre-migration)…"
   if dst_ssh "qm start '${VMID}'" >/dev/null 2>&1; then
