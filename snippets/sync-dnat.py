@@ -598,6 +598,54 @@ def _node_boot_reconcile_locked():
         # else: already matches, or desired stopped/None & VM stopped -> no-op (never clobber)
 
 
+BOOT_RAM_GUARD_S = 180
+
+
+def boot_ram_guard(vmid: int) -> None:
+    """Present the FULL plan RAM while the guest boots (best-effort).
+
+    `qm start` seeds the live balloon target from the config `balloon:` line
+    (the floor), and pvestatd can squeeze managed VMs further while the host
+    is busy. If that happens before Windows finishes memory init, the guest
+    LATCHES a reduced TotalVisibleMemorySize — the "booted memory-constrained"
+    support case (Task Manager shows 2 GB on a 4 GB plan) that previously only
+    a full stop+start cleared. Holding floor==memory for BOOT_RAM_GUARD_S
+    makes Windows boot seeing the full plan (pvestatd honours the floor as a
+    hard minimum); the floor is then restored — unless something legitimately
+    re-raised it meanwhile — and any later runtime squeeze is invisible to a
+    booted guest. Must never fail the hook: everything is wrapped.
+    """
+    try:
+        conf = f"/etc/pve/qemu-server/{vmid}.conf"
+        memory = balloon = None
+        with open(conf) as fh:
+            for line in fh:
+                if line.startswith("memory:"):
+                    memory = int(line.split(":", 1)[1].strip())
+                elif line.startswith("balloon:"):
+                    balloon = int(line.split(":", 1)[1].strip())
+                elif line.startswith("["):
+                    break  # snapshot/pending sections follow the main block
+        if not memory or balloon is None or balloon <= 0 or balloon >= memory:
+            return  # ballooning disabled (0), unmanaged, or already full
+        run(["qm", "set", str(vmid), "--balloon", str(memory)], check=True)
+        restore = (
+            f'cur=$(awk -F": " \'/^balloon:/{{print $2; exit}}\' {conf}); '
+            f'[ "$cur" = "{memory}" ] && qm set {vmid} --balloon {balloon}'
+        )
+        run([
+            "systemd-run", "--collect", f"--on-active={BOOT_RAM_GUARD_S}",
+            f"--unit=nvps-bootram-{vmid}-{int(time.time())}",
+            "sh", "-c", restore,
+        ], check=True)
+        logger.info(
+            f"Boot RAM guard: VM {vmid} floor {balloon}->{memory}MB for "
+            f"{BOOT_RAM_GUARD_S}s (then back to {balloon} unless re-raised)"
+        )
+    except Exception as e:  # noqa: BLE001 — the hook must never fail on this
+        logger.warning(f"Boot RAM guard failed for VM {vmid}: {e}")
+
+
 # ---------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------
@@ -646,6 +694,7 @@ def main():
 
         if phase == "post-start":
             logger.info(f"Hook: VM {triggered_vmid} post-start")
+            boot_ram_guard(triggered_vmid)
             update_status_in_firestore(triggered_vmid, "running")
             logger.info("Sync complete.")
             return
