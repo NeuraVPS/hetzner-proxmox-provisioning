@@ -382,6 +382,8 @@ def main():
     # ---- relief mode: harm-targeted intra-day pass (see module docstring) ----
     live_blocked = {}   # nid -> [{vmid, rate, floor_mb, ...}] (sustained-blocked)
     live_io = {}        # nid -> (pswpin_ps, psi_io_pct) — real-I/O evidence
+    gate_skipped = {}   # nid -> blocked list, suppressed by the zswap gate
+    dest_failed = set()  # nids whose victim search genuinely found NO dest
     if relief:
         import concurrent.futures as cf
         STATUS_MAX_AGE_S = 900
@@ -463,6 +465,12 @@ def main():
                     log(f"relief: SKIP {nid} — vm {vm_list} @{worst}/s but node shows "
                         f"no real disk pressure (pswpin={psw}/s, psi_io={psi}%); "
                         f"faults are zswap hits, not I/O")
+                    # A gate-skip is NOT a capacity problem: pick_dest was never
+                    # even consulted. Recording these under blockedNodes made
+                    # the run classify as "no-dest" and paged the operator with
+                    # a phantom "no room in the whole fleet" (run 20260801-1121
+                    # while six empty LTDs sat placeable). Track separately.
+                    gate_skipped[nid] = live_blocked[nid]
                     continue
                 log(f"relief: WOULD-SKIP {nid} — vm {vm_list} @{worst}/s with "
                     f"pswpin={psw}/s psi_io={psi}% (below {min_psw}/s and "
@@ -483,6 +491,7 @@ def main():
                 book(picked[0], nid, picked[1],
                      f"thrash-relief (vm {vm_list} blocked @{worst}/s, reconciler NO BUDGET)")
             else:
+                dest_failed.add(nid)
                 log(f"ESCALATION {nid}: vm {vm_list} blocked-thrashing @{worst}/s but no "
                     f"destination fits — needs operator (capacity)")
 
@@ -619,15 +628,28 @@ def main():
     doc = {"at": firestore.SERVER_TIMESTAMP, "dryRun": dry, "planned": plan_txt,
            "executed": 0, "ok": 0, "fail": 0, "status": "planned", "relief": relief}
     if relief and live_blocked:
-        doc["blockedNodes"] = {
-            nid: [f"vm {b.get('vmid')} @{b.get('rate')}/s" for b in bl[:5]]
-            for nid, bl in live_blocked.items()}
+        real_blocked = {nid: bl for nid, bl in live_blocked.items()
+                        if nid not in gate_skipped}
+        if real_blocked:
+            doc["blockedNodes"] = {
+                nid: [f"vm {b.get('vmid')} @{b.get('rate')}/s" for b in bl[:5]]
+                for nid, bl in real_blocked.items()}
+        if gate_skipped:
+            doc["zswapSkipped"] = {
+                nid: [f"vm {b.get('vmid')} @{b.get('rate')}/s" for b in bl[:5]]
+                for nid, bl in gate_skipped.items()}
     db.collection("defrag_runs").document(run_id).set(doc)
     if not moves:
-        # relief with blocked thrashers but no fitting destination = capacity
-        # problem — the one case that genuinely needs the operator.
-        db.collection("defrag_runs").document(run_id).update(
-            {"status": "no-dest" if (relief and live_blocked) else "empty"})
+        # "no-dest" (the one case that genuinely pages the operator: capacity)
+        # requires a victim search to have actually FAILED — not a zswap-gate
+        # skip, which by definition needed no move at all.
+        if relief and dest_failed:
+            status = "no-dest"
+        elif relief and gate_skipped:
+            status = "zswap-quiet"
+        else:
+            status = "empty"
+        db.collection("defrag_runs").document(run_id).update({"status": status})
         return 0
     if dry:
         db.collection("defrag_runs").document(run_id).update({"status": "dry-run"})
