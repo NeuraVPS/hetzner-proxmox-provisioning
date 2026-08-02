@@ -32,7 +32,25 @@ hazard in the install steps themselves. All three are now mandatory:
    hook. Remediation on a wrongly-hooked box: delete the 4 MT Debugger values —
    agent doc §9.9.28(a).
 
-3. **Never `New-Item -Path <IFEO key> -Force` on a key that already exists** — in
+3bis. **Detect a v144+ engine BY CONTENT, never by folder name** (gate 4,
+   2026-08-02). The original gate-1 snippet tested
+   `$_.Name -match 'SQX.*144|StrategyQuant.*144'`. A fleet sweep of 826 SQX
+   boxes found **15** running v143 with an **empty** folder called
+   `StrategyQuantX144` / `SQX 144` (0 files, 0 bytes) sitting in `C:\` — left
+   behind by an abandoned download. The name matched, so the gate hooked
+   `StrategyQuantX.exe`, and those customers' SQX **died silently on
+   double-click**: precisely the regression gate 1 exists to prevent, caused
+   by the gate itself. The same sweep found the mirror error: real v144
+   installs unzipped into `C:\Users\<u>\Downloads\SQX_144_.../`, which the
+   `C:\`-only scan never saw, so those boxes silently kept **no** protection.
+   The correct test is: a directory containing `StrategyQuantX.exe` and NOT
+   containing `StrategyQuantX_nocheck.exe` (>=144 dropped `_nocheck`), searched
+   across `C:\` **and** per-user `Downloads\*` / `Desktop\*`. Folder names are
+   arbitrary — real installs were found under `SQX_144`, `SQX 144`,
+   `StrategyQuantX145`, `SQ_Installer_144`, `SrtategyQuanrX144` (customer
+   typo) and even `C:\PerfLogs`.
+
+4. **Never `New-Item -Path <IFEO key> -Force` on a key that already exists** — in
    PowerShell that *recreates* the key and silently deletes its subkeys, which on
    `StrategyQuantX_nocheck.exe` includes the `PerfOptions` subkey holding
    `CpuPriorityClass=6` (SQX high-priority). Re-running the install steps on an
@@ -69,8 +87,21 @@ hazard in the install steps themselves. All three are now mandatory:
    if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
    Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\sqx_hook_launcher.vbs"'
 
-   $has144 = @(Get-ChildItem 'C:\' -Directory -EA SilentlyContinue |
-     Where-Object { $_.Name -match 'SQX.*144|StrategyQuant.*144' }).Count -gt 0
+   # Detect a real modern engine BY CONTENT, never by folder name (gate 4).
+   # >=144 dropped StrategyQuantX_nocheck.exe, so a modern install is a folder
+   # holding StrategyQuantX.exe and NOT holding StrategyQuantX_nocheck.exe.
+   # Search C:\ plus per-user Downloads/Desktop SUBfolders — customers unzip
+   # SQX there and run it in place (seen on live boxes 2026-08-02).
+   $roots = New-Object System.Collections.ArrayList
+   foreach ($p in @('C:\', 'C:\Users\*\Downloads\*', 'C:\Users\*\Desktop\*')) {
+     foreach ($d in (Get-ChildItem $p -Directory -EA SilentlyContinue)) { [void]$roots.Add($d) }
+   }
+   $has144 = $false
+   foreach ($f in $roots) {
+     if (Test-Path (Join-Path $f.FullName 'StrategyQuantX.exe')) {
+       if (-not (Test-Path (Join-Path $f.FullName 'StrategyQuantX_nocheck.exe'))) { $has144 = $true }
+     }
+   }
    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\StrategyQuantX.exe'
    if ($has144) {
      if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
