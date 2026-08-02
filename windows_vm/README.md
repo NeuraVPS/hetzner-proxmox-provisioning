@@ -1,5 +1,18 @@
 # Prepare Windows Template
 
+## Guest config (inside Windows)
+
+- **Power plan must be High performance** — the Windows default (*Balanced*)
+  parks most of the vCPUs on a multi-core guest and costs ~34% of SQX
+  benchmark throughput. Measured on a customer VPS E: 76k → 102k
+  strategies/hour from this one change, and a freshly provisioned box was
+  confirmed shipping with 16 of 22 cores parked. See
+  [`POWER_PLAN.md`](POWER_PLAN.md) for the exact commands and the verification
+  that must pass on a new box.
+- **App launch hooks (SQX / MetaTrader)** — see [`hooks/README.md`](hooks/README.md).
+  Note gate 4 there: a v144+ engine must be detected **by content**, never by
+  folder name.
+
 ## VM config (Proxmox side, not the guest)
 
 - **`cpu: x86-64-v4` — never `host`.** The template's `config.conf` is cloned verbatim into every new customer VM, so a host-passthrough template pins each guest to the exact silicon of the node it was born on: live migration then only works onto a same-or-newer CPU of the *same vendor* (the VMs 708/1670 failure, see the pre-check in [`scripts/migrate_vm.sh`](../scripts/migrate_vm.sh)). A baseline model lets any new VM hot-migrate anywhere in the fleet, including across CPU types and vendors.
