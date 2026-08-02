@@ -351,11 +351,37 @@ def main():
         _rates_cache[nid] = rates
         return rates
 
+    def agent_alive(nid, vmid):
+        """A RUNNING victim with a dead guest agent must not be picked: the
+        post-move in-guest IPv6 reconfig cannot run and the customer lands
+        UNREACHABLE while the VM runs fine (vms 854/1023, 2026-08-01 — 2 of
+        23 in an otherwise clean batch). One quick ping; migrate_vm.sh's own
+        pre-check gives a flaky agent a longer second chance. Fail-OPEN on
+        ssh/node trouble: an unreachable node is not the victim's fault."""
+        # exit-code 255 es ambiguo (ssh roto O qm fallando) — marcador explícito:
+        # sin línea RC= -> el ssh no llegó -> fail-open; RC=0 -> vivo; resto -> muerto.
+        try:
+            r = subprocess.run(
+                ["ssh", "-n", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 f"root@{nodes[nid]['ip']}",
+                 f"timeout 12 qm agent {vmid} ping >/dev/null 2>&1; echo RC=$?"],
+                capture_output=True, text=True, timeout=25)
+        except Exception:  # noqa: BLE001
+            return True
+        out = r.stdout or ""
+        if "RC=" not in out:
+            return True
+        return "RC=0" in out
+
     def order_victims(vms, nid, sizekey=lambda v: v["ram"]):
-        """Candidates in move-preference order (v9): not-recently-moved
+        """Candidates in move-preference order (v10): not-recently-moved
         first; among the 3 smallest, calmest first (fewest dirty pages ->
         shortest cutover freeze, least-present owner); then smallest-first.
-        Cooldown deprioritizes, never excludes — see module docstring."""
+        Cooldown deprioritizes, never excludes — see module docstring.
+        v10: lazy GENERATOR that additionally skips RUNNING candidates whose
+        guest agent doesn't answer (one ping per candidate actually
+        considered — callers stop at the first bookable one). Stopped VMs
+        pass ungated: the offline path boots them fresh, agent included."""
         by_size = sorted(vms, key=lambda v: (sizekey(v), v["vmid"]))
         head, tail = by_size[:3], by_size[3:]
         if len(head) > 1:
@@ -363,8 +389,13 @@ def main():
             head.sort(key=lambda v: (rates.get(v["vmid"], 0.0),
                                      sizekey(v), v["vmid"]))
         ordered = head + tail
-        return ([v for v in ordered if v["vmid"] not in recent_vmids]
-                + [v for v in ordered if v["vmid"] in recent_vmids])
+        for v in ([v for v in ordered if v["vmid"] not in recent_vmids]
+                  + [v for v in ordered if v["vmid"] in recent_vmids]):
+            if v.get("st") == "running" and not agent_alive(nid, v["vmid"]):
+                log(f"victim-skip vm {v['vmid']} ({nid}): guest agent no "
+                    f"contesta — el reconfig IPv6 fallaría; probando la siguiente")
+                continue
+            yield v
 
     moves = []   # (vmid, src_id, dst_id, reason)
 

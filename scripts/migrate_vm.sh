@@ -785,6 +785,33 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     fi
   fi
 
+  # 0c) Guest-agent pre-check — ONLINE Windows migrations only. The post-move
+  # in-guest IPv6 reconfig NEEDS the agent; with a dead one the migration
+  # "succeeds" into the worst failure mode there is: VM running on dest,
+  # CUSTOMER UNREACHABLE (vms 854/1023, 2026-08-01 — caught hours later by
+  # conncheck). Probe BEFORE any expensive work, with retries: a busy agent
+  # answers late (1023's did at ~45s) while a dead one never does.
+  # MIGRATE_SKIP_AGENT_CHECK=1 overrides for moves that deliberately need no
+  # reconfig (e.g. rolling a VM BACK to the node whose prefix its guest still
+  # holds — the 854 recovery).
+  if [[ -n "$ONLINE_FLAG" && "${MIGRATE_SKIP_AGENT_CHECK:-0}" != "1" ]]; then
+    _src_ostype=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^ostype:[[:space:]]*//p' | tr -d '\r' || true)
+    if [[ "${_src_ostype:-win}" == win* ]]; then
+      _agent_ok=0
+      for _t in 1 2 3; do
+        if src_ssh "timeout 20 qm agent '${VMID}' ping" >/dev/null 2>&1; then
+          _agent_ok=1; break
+        fi
+        (( _t < 3 )) && _info "Guest agent not answering (try ${_t}/3) — retrying…"
+      done
+      if (( _agent_ok == 1 )); then
+        _ok "Guest agent answers — the in-guest IPv6 reconfig will be possible on dest."
+      else
+        _die "Guest agent DEAD on VM ${VMID} (3 pings over ~60s). A live migration would complete but leave the guest holding the source-prefix IP: VM running, CUSTOMER UNREACHABLE (the 854/1023 mode). Fix the agent first (or power-cycle the VM), or set MIGRATE_SKIP_AGENT_CHECK=1 if this move deliberately needs no reconfig. Aborting before any data is copied."
+      fi
+    fi
+  fi
+
   # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
   # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
   # migration restores that vCPU state verbatim on the destination. The rule that
@@ -1476,6 +1503,26 @@ if (( MIGRATION_DEGRADED == 1 )); then
   # the caller (migrate_vms_batch / neuravps-defrag) that a HUMAN must finish
   # this one, instead of silently counting it as a success.
   _warn "Migration COMMITTED BUT DEGRADED: VMID=${VMID}  ${SRC_NODE} → ${DST_NODE}  ipv6=${EXPECTED_VM_IPV6}"
+  # Page the operator through the liveness sweep (ex44_distress pattern).
+  # Manual/batch runs create no defrag_runs doc, so before this the ONLY
+  # detector was conncheck's hourly sweep — how 854/1023 were caught hours
+  # late on 2026-08-01. Best-effort: never mask the _die below.
+  python3 - "$VMID" "$DST_NODE" "$DEGRADED_REASON" <<'PYDEG' || true
+import os, sys, socket
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    creds = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(credentials.Certificate(creds))
+    db = firestore.client()
+    db.collection("migration_degraded").document().set({
+        "vmid": int(sys.argv[1]), "dest": sys.argv[2], "reason": sys.argv[3],
+        "host": socket.gethostname(), "at": firestore.SERVER_TIMESTAMP,
+    })
+except Exception as e:  # noqa: BLE001
+    sys.stderr.write(f"degraded-page failed: {e}\n")
+PYDEG
   _die "MIGRATION_DEGRADED vm=${VMID} dest=${DST_NODE}: ${DEGRADED_REASON}. The VM is running on the destination but the CUSTOMER CANNOT REACH IT. Manual fix: re-run 'migrate_vm.sh ${VMID} ${NEW_NODE_NUM}' (idempotent — it retries the in-guest rebind), or apply the netsh reconfig via 'qm guest exec ${VMID}' once the guest agent answers."
 fi
 
