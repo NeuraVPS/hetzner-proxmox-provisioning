@@ -1,5 +1,28 @@
 # Prompt para el agente que actualiza las plantillas de Windows
 
+> ## 🛑 CORRECCIÓN 2026-08-03 — LEE ESTO ANTES QUE NADA
+>
+> **La Tarea 2 de abajo está MAL en su mitad de v144. NO cablees
+> `StrategyQuantX.exe`.** Ese hook **fork-bombea**, y no en teoría:
+>
+> * En la caja de un cliente (vm 998): **90 `wscript.exe` en 33 segundos y SQX
+>   sin arrancar ni una vez.**
+> * Reproducido en condiciones controladas (vm 1350, 2026-08-03): el QEMU del
+>   invitado a **764 % de CPU** y el agente sin responder, partiendo de reposo.
+>
+> Se ha retirado de las 122 máquinas de la flota. **En las plantillas solo se
+> cablea el hook de v143 (`StrategyQuantX_nocheck.exe`) y los cuatro de
+> MetaTrader.** Si `sqx144_hook_launcher.vbs` acaba en una plantilla, se lo
+> mandamos a cada cliente nuevo.
+>
+> La **Tarea 1 (perfil de energía) sigue siendo correcta y es la prioritaria.**
+>
+> Lo demás de la Tarea 2 se mantiene tal cual: la detección por CONTENIDO (no
+> por nombre de carpeta) sigue siendo la buena, sirve para saber qué versión
+> lleva la imagen, y el aviso de no hacer `New-Item -Force` sobre una clave
+> IFEO existente sigue vigente.
+
+
 > Copia todo lo que hay debajo de la línea y pásalo como prompt. Es autocontenido.
 
 ---
@@ -54,9 +77,11 @@ El nombre del ejecutable principal de StrategyQuantX **cambió de versión**:
 | SQX **<= 143** | `StrategyQuantX_nocheck.exe` | `sqx_hook_launcher.vbs` |
 | SQX **>= 144** | `StrategyQuantX.exe` | `sqx144_hook_launcher.vbs` |
 
-Hoy la plantilla solo cablea el de v143. Los clientes que actualizan a v144
-pierden en silencio la protección contra el crash *"No displays available"* al
-reconectar el Escritorio Remoto. **Hay que cablear los dos.**
+Hoy la plantilla solo cablea el de v143. **Y de momento así se queda:** el hook
+de v144 se retiró el 2026-08-03 por fork-bomb (ver la corrección al principio),
+así que los clientes de v144 se quedan sin esa protección a sabiendas — es el
+mal menor frente a que la aplicación no abra. **Cablea solo
+`StrategyQuantX_nocheck.exe`.**
 
 **Los dos VBS ya existen** en `windows_vm/hooks/`. Son idénticos salvo la
 clave IFEO de su guarda anti-recursión. **No los fusiones ni los reescribas**:
@@ -64,7 +89,7 @@ esa duplicación es deliberada.
 
 ### Tres cosas que te van a morder si no las respetas
 
-1. **Nunca apuntes `StrategyQuantX.exe` a `sqx_hook_launcher.vbs`.** Ese VBS
+1. **No cablees `StrategyQuantX.exe` en absoluto** (ver la corrección del principio). Y si algún día se rehabilita: **nunca lo apuntes a `sqx_hook_launcher.vbs`.** Ese VBS
    lleva la clave `StrategyQuantX_nocheck.exe` codificada como guarda: borraría
    la clave equivocada antes de relanzar, el IFEO se volvería a disparar sobre
    sí mismo y tendrías el **fork-bomb de wscript/reg del 2026-07-16**. Cada
@@ -102,8 +127,9 @@ Get-ChildItem $k | Where-Object { $_.PSChildName -match 'Strategy|terminal|metae
   ForEach-Object { $_.PSChildName + ' -> ' + (Get-ItemProperty $_.PSPath -Name Debugger -EA SilentlyContinue).Debugger }
 ```
 
-debe listar el ejecutable de la versión de SQX que lleve la imagen apuntando a
-**su** VBS, y los cuatro de MetaTrader a `mt_hook_launcher.vbs`.
+debe listar **`StrategyQuantX_nocheck.exe` → `sqx_hook_launcher.vbs`** y los
+cuatro de MetaTrader a `mt_hook_launcher.vbs`. **`StrategyQuantX.exe` NO debe
+aparecer**; si aparece, la imagen lleva el fork-bomb.
 
 Y **la prueba que de verdad vale**: abre SQX en la VM de prueba y comprueba en
 su propio log (`<install>\user\log\*.log`) la línea

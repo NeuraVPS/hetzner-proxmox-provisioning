@@ -1,10 +1,52 @@
 # NeuraVPS launch hooks (IFEO)
 
+> # 🛑 `sqx144_hook_launcher.vbs` IS WITHDRAWN — DO NOT WIRE IT (2026-08-03)
+>
+> **Wiring `StrategyQuantX.exe` to this launcher fork-bombs.** Not "can" —
+> does, reproducibly. It is removed from the fleet and must not be re-applied,
+> baked into a template, or recommended to anyone until the cause below is
+> found, fixed, and proven by a test that *actually launches SQX*.
+>
+> **What was seen.** Applied fleet-wide on 2026-08-02 to 122 boxes with a real
+> v144 engine (gate 4 detection, which is correct). Then:
+>
+> * **Customer box (vm 998, dual v143+v144).** The customer reported v144
+>   "will not open". Evidence from that machine: **90 `wscript.exe` copies
+>   spawned in ~33 s and StrategyQuant never started once.** Support removed
+>   the IFEO entry to unblock them.
+> * **Controlled reproduction (vm 1350, dual v143+v144, SQX idle,
+>   2026-08-03).** Launching the v144 engine took the guest's QEMU process to
+>   **764 % CPU**, node load 18, and the guest agent stopped answering — from a
+>   standing start with nothing else running. Confirmed, cleaned up, hook
+>   removed.
+> * On the same customer box a **`reg.exe` was found blocked for 24 minutes at
+>   0 s CPU**, mid-`reg add`, with the `Debugger` value left **empty**. That is
+>   the prime suspect: the guard's `reg delete` / `reg add` run through
+>   `shell.Run`, and if the *delete* has not landed before the relaunch, the
+>   IFEO re-triggers on itself — which is precisely a fork bomb.
+>
+> **A single-install box is NOT proof of safety.** A controlled launch test on
+> a single-install v144 box (vm 1985, 2026-08-02) passed cleanly — hook fired,
+> `Runtime args: -Djava.awt.headless=true` in SQX's own log, no recursion. Both
+> reproductions of the bomb were on **dual** v143+v144 installs, but the
+> mechanism is not established, so single-install is *unverified*, not safe.
+>
+> **`sqx_hook_launcher.vbs` (v143 `_nocheck`) is NOT implicated.** It has run
+> in production since July, it was left in place on all 119 boxes during the
+> rollback, and no fork bomb has ever been traced to it.
+>
+> **Before this can be reconsidered**, the acceptance test is behavioural, not
+> registry-deep: on a **dual-install** box, double-click launch must open SQX,
+> `wscript` must stay in single digits, and the `Debugger` value must be back
+> in place afterwards. Checking the registry alone would have passed every one
+> of these broken boxes.
+
+
 These VBS launchers are wired via the **Image File Execution Options** `Debugger`
 key so they intercept each target `.exe` and relaunch it with the right options:
 
 - `sqx_hook_launcher.vbs` — SQX **v142/v143** engine `StrategyQuantX_nocheck.exe` → injects `JAVA_TOOL_OPTIONS=-Djava.awt.headless=true` for the SQX process only, so SQX never binds to the volatile Remote-Desktop display and survives RDP/network blips (the `awt.dll`/`displayChanged` crash — agent doc §9.9.15b "Mode A").
-- `sqx144_hook_launcher.vbs` — SQX **v144** engine `StrategyQuantX.exe`. Byte-identical to the v143 launcher **except its recursion-guard IFEO key is `StrategyQuantX.exe`** (see the fork-bomb warning below). **v144-ONLY — see the gate below.**
+- `sqx144_hook_launcher.vbs` — SQX **v144** engine `StrategyQuantX.exe`. **🛑 WITHDRAWN 2026-08-03 — fork-bombs, see the banner at the top. Do not wire.** Kept in the repo only so the withdrawal is traceable.
 - `mt_hook_launcher.vbs` — MetaTrader `terminal64/metaeditor64/terminal/metaeditor.exe` → ensures `/portable` on non-shortcut launches (e.g. MT's self-update relaunch) so the terminal keeps using its portable data dir. **Portable-data boxes ONLY — see the gate below.**
 
 ## ⚠️ Hard gates learned the hard way
@@ -13,7 +55,10 @@ The 2026-07-16 fleet sweep applied steps 3+4 below unconditionally and caused
 two regressions (gates 1–2). A third gate (gate 3, 2026-07-17) is a scripting
 hazard in the install steps themselves. All three are now mandatory:
 
-1. **`StrategyQuantX.exe` → `sqx144_hook_launcher.vbs` ONLY on boxes with a real
+1. **SUPERSEDED 2026-08-03 — do not wire `StrategyQuantX.exe` at all** (see the
+   withdrawal banner at the top: it fork-bombs). Gate 1 as written below was
+   about *where* to wire it; the answer is now *nowhere*. Kept for context.
+   **`StrategyQuantX.exe` → `sqx144_hook_launcher.vbs` ONLY on boxes with a real
    v144 install** (a `C:\SQX*144*` / `StrategyQuant*144*` dir). On **v143**
    boxes `StrategyQuantX.exe` is the interactive launcher/checker, and hooking
    it makes every double-click **die silently** (cursor spins, no window, no
@@ -102,8 +147,10 @@ hazard in the install steps themselves. All three are now mandatory:
        if (-not (Test-Path (Join-Path $f.FullName 'StrategyQuantX_nocheck.exe'))) { $has144 = $true }
      }
    }
+   # 🛑 WITHDRAWN 2026-08-03: the $has144 branch below fork-bombs. Run ONLY the
+   # `else` action — remove the Debugger — until the launcher is fixed.
    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\StrategyQuantX.exe'
-   if ($has144) {
+   if ($false -and $has144) {
      if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
      Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\sqx144_hook_launcher.vbs"'
    } else {
