@@ -109,11 +109,21 @@ def main() -> int:
     except ImportError:
         q = db.collection("servers").where("status", "==", "running")
     running = {}  # vmid -> {docId, maintenance, rdpEnabled, sambaEnabled}
-    for snap in q.select(["proxmoxId", "maintenance", "firewall"]).stream():
+    for snap in q.select(["proxmoxId", "maintenance", "firewall",
+                          "provisioningStatus"]).stream():
         d = snap.to_dict() or {}
         try:
             vmid = int(d.get("proxmoxId"))
         except (TypeError, ValueError):
+            continue
+        # Una VM a MEDIO APROVISIONAR está legítimamente inalcanzable: el
+        # doc ya dice status=running (la VM arrancó) minutos antes de que el
+        # instalador le configure la IPv6. Sondearla genera una alerta que se
+        # resuelve sola (vms 1069/2008/2016 el 2026-08-03: la de 2016 se
+        # presentó a las 18:36 y el provisioning acabó a las 18:38). Solo se
+        # vigila lo YA ENTREGADO; los docs viejos sin el campo pasan.
+        prov = d.get("provisioningStatus")
+        if prov is not None and prov != "provisioned":
             continue
         fw = d.get("firewall") or {}
         running[vmid] = {
@@ -165,8 +175,11 @@ def main() -> int:
     for vmid, services in by_vm.items():
         snap = db.collection("servers").document(running[vmid]["docId"]).get()
         d = snap.to_dict() or {}
-        if (d.get("status") or "").strip().lower() != "running" or d.get("maintenance"):
-            continue  # cambió mientras sondeábamos (p.ej. arrancó una migración)
+        prov = d.get("provisioningStatus")
+        if ((d.get("status") or "").strip().lower() != "running"
+                or d.get("maintenance")
+                or (prov is not None and prov != "provisioned")):
+            continue  # cambió mientras sondeábamos (migración, o aún instalándose)
         fw = d.get("firewall") or {}
         keep = [s for s in services
                 if fw_enabled(fw, "rdpEnabled" if s == "rdp" else "sambaEnabled")]
