@@ -49,6 +49,18 @@ key so they intercept each target `.exe` and relaunch it with the right options:
 - `sqx144_hook_launcher.vbs` — SQX **v144** engine `StrategyQuantX.exe`. **🛑 WITHDRAWN 2026-08-03 — fork-bombs, see the banner at the top. Do not wire.** Kept in the repo only so the withdrawal is traceable.
 - `mt_hook_launcher.vbs` — MetaTrader `terminal64/metaeditor64/terminal/metaeditor.exe` → ensures `/portable` on non-shortcut launches (e.g. MT's self-update relaunch) so the terminal keeps using its portable data dir. **Portable-data boxes ONLY — see the gate below.**
 
+## Before any sweep: check the per-machine opt-out
+
+A sweep must read `C:\ProgramData\NeuraVPS\hook_optout.txt` and skip the hooks
+listed there **before** applying gates 1–4. The gates answer "does this
+machine's software shape call for the hook?"; they cannot answer "has a human
+already decided this machine must not have it?".
+
+That is not hypothetical: on 2026-08-02 a sweep re-applied the v144 hook to a
+box where it had been deliberately removed on 28 July, and the customer wrote
+in about the same fault for the second time. See [`optout.md`](optout.md) for
+the format and the snippet every sweep should paste.
+
 ## ⚠️ Hard gates learned the hard way
 
 The 2026-07-16 fleet sweep applied steps 3+4 below unconditionally and caused
