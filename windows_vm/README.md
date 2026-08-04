@@ -37,10 +37,18 @@
 - Uninstall unneeded apps and software
 - Install + configure OpenSSH Server (customer SSH access, 2026-08-04): run
   [install_openssh.ps1](install_openssh.ps1) inside the template. It installs
-  the Win32-OpenSSH MSI served from the BASES, sets
-  `DefaultShell = powershell.exe`, service to Automatic, and forces the
+  the Win32-OpenSSH MSI served from the BASES, sets `DefaultShell` to
+  PowerShell 7 when present (else 5.1), service to Automatic, forces the
   firewall rule to `-Profile Any` (the in-box capability's rule is
-  Private-only, which leaves port 22 filtered on Public networks).
+  Private-only, which leaves port 22 filtered on Public networks) and sets
+  `MaxAuthTries 20`.
+  - ⚠️ **Delete the host keys before sysprep** — `Stop-Service sshd` then
+    `Remove-Item C:\ProgramData\ssh\ssh_host_*`. They are NOT machine-specific
+    data to sysprep, so without this **every clone ships the same SSH host
+    fingerprint**. Verified 2026-08-04: sshd regenerates all three key pairs
+    by itself on the next service start, so the clone gets its own on first
+    boot and nothing else is needed. Also drop
+    `administrators_authorized_keys` if the box ever had one.
 
 ```powershell
 # Disable WindowsFeedbackHub installation for new users
@@ -48,11 +56,44 @@ Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "Microsoft.W
 ```
 
 - Install .NET framework legacy for myfxbook installed to work
-- Remove winget for sysprep to work — **user-level uninstall, done interactively by the operator**:
+- Remove winget for sysprep to work — **NO LONGER APPLICABLE on Server 2025 (verified 2026-08-04); leave it alone**:
 
 ```powershell
-Get-AppxPackage *winget* | Remove-AppxPackage
+Get-AppxPackage *winget* | Remove-AppxPackage   # ← NO-OP, see below
 ```
+
+  > **2026-08-04 — this step does nothing and does not need to be done.** Two
+  > separate findings from the template refresh:
+  >
+  > 1. **The command above matches no package.** `Get-AppxPackage` filters on
+  >    `Name`, and the package is `Microsoft.DesktopAppInstaller` — the string
+  >    "winget" appears nowhere in it. Every previous run of this line was a
+  >    silent no-op.
+  > 2. **Targeting it by its real name fails by design.** `Get-AppxPackage
+  >    Microsoft.DesktopAppInstaller | Remove-AppxPackage` returns
+  >    `0x80073CFA` / `0x80070032`: *"This app is part of Windows and cannot be
+  >    uninstalled on a per-user basis."* On Server 2025 winget is OS-serviced
+  >    and `NonRemovable=True`. Forcing it is the mistake that destroyed both
+  >    templates on 2026-07-06 (see the note below) — **do not**.
+  >
+  > **The image already syspreps in this state** (both templates sysprepped
+  > cleanly on 2026-08-04 with winget present). The reason the old
+  > "installed-for-user but not provisioned" check *looks* alarming is that it
+  > is wrong for **bundles**: a bundle is provisioned under its
+  > `…_neutral_~_…` name while what gets registered for the user is the
+  > architecture payload, so the two names never match. On a clean Server 2025
+  > image that check flags **41 packages**, all of them false positives. The
+  > only two that are not obviously system components — `DesktopAppInstaller`
+  > and `WindowsTerminal` — are both payloads of provisioned bundles:
+  >
+  > | registered for user | provisioned bundle |
+  > |---|---|
+  > | `Microsoft.DesktopAppInstaller_1.29.280.0_x64__8wekyb3d8bbwe` | `Microsoft.DesktopAppInstaller_2026.623.1704.0_neutral_~_8wekyb3d8bbwe` |
+  > | `Microsoft.WindowsTerminal_1.24.11911.0_x64__8wekyb3d8bbwe` | `Microsoft.WindowsTerminal_3001.24.11911.0_neutral_~_8wekyb3d8bbwe` |
+  >
+  > A correct blocker check must exclude `IsFramework`, `NonRemovable`, and
+  > anything whose family name matches a provisioned bundle. In practice: if
+  > sysprep succeeds, there was no blocker.
 
   > **Server 2025 (OS-serviced winget, clarified 2026-07-06):** the command above (run interactively as the admin user) removes the *full* app but Windows keeps the **stub** (`…_neutral_~_…` bundle, `NonRemovable=True`) registered for the user. That stub state is the **desired final state**: it syspreps fine (stubs are exempt from the appx installed-but-not-provisioned validation) and it keeps the on-demand mechanism — on a clone, just typing `winget` in PowerShell re-downloads the full app.
   >
@@ -124,8 +165,28 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 #Set-ItemProperty -Path $RegPath -Name "DefaultPassword" -Value "<new password>" -Type String
 ```
 
+  > The shipped templates leave `AutoAdminLogon` / `DefaultUserName` **unset** —
+  > `set_auto_login` (functions) writes all three per VM at provisioning time,
+  > together with `set_user_password`. If you need an interactive session inside
+  > the template (winget, `cleanmgr`, anything that refuses to run under QGA's
+  > session 0), set the three values, reboot, do the work, then **remove
+  > `AutoAdminLogon` and `DefaultUserName` again** before sysprep.
+  >
+  > ⚠️ **The `DefaultPassword` left in the template registry does not match the
+  > account** (found 2026-08-04: autologon silently did nothing until the
+  > account password was set to it). Validate before trusting it:
+  > `Add-Type -AssemblyName System.DirectoryServices.AccountManagement;` +
+  > `(New-Object …PrincipalContext('Machine')).ValidateCredentials($user,$pw)`.
+  > Setting the template's account password is safe — provisioning overwrites
+  > it per VM via `set_user_password`. Note the account name differs per
+  > template: **`Administrador` in windows-es, `Administrator` in windows-en**.
+
 - Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). [prepare.md](prepare.md) documents every step (DISM `/ResetBase`, NGEN, SoftwareDistribution, Delivery Optimization, winget caches, defrag/TRIM, SDelete zero-fill) and the remote-run procedure
 - From Linux, remove recovery partition
+- **Back up the current templates on the Storage Box before exporting** — the
+  remote copy is the ONLY copy, and `OVERWRITE=1` deletes the old streams.
+  One sftp rename is enough and is instant (no data moves):
+  `printf "rename /home/templates/windows-es /home/templates/windows-es.bak-<date>\n" | sftp -P 23 u560363@u560363.your-storagebox.de`
 - Sysprep with unattend_cleanup.xml
 
 ```powershell
