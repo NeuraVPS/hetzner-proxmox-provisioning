@@ -55,8 +55,14 @@ MAX_QUERIES_PER_CYCLE = 15
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
        "-o", "StrictHostKeyChecking=no"]
 
-FLOW_RE = re.compile(
-    r"ESTABLISHED src=(\S+) dst=\S+ sport=(\d+) dport=(\d+)")
+# Primera tupla de la línea = dirección ORIGINAL (dport pre-DNAT = 20000+vmid).
+TUPLE_RE = re.compile(r"src=(\S+) dst=\S+ sport=(\d+) dport=(\d+)")
+# Los flujos vivos aparecen como ESTABLISHED **o** [OFFLOAD] (la flowtable de
+# nftables se lleva el fast-path y esas entradas ni siquiera llevan estado —
+# medido en b0 2026-08-01; el binario `conntrack` NO está instalado en las
+# bases, de ahí leer /proc directamente). Estados de cierre/apertura fuera.
+BAD_STATES = ("TIME_WAIT", "CLOSE", "SYN_", "FIN_", "LAST_ACK", "UNREPLIED")
+CONNTRACK_PROC = "/proc/net/nf_conntrack"
 
 
 def log(msg):
@@ -64,22 +70,25 @@ def log(msg):
 
 
 def conntrack_flows():
-    """Set de (src, sport, dport) ESTABLISHED con dport en el rango RDP."""
+    """Set de (src, sport, dport) de flujos VIVOS con dport en el rango RDP."""
     flows = set()
-    for fam in ("ipv4", "ipv6"):
-        try:
-            out = subprocess.run(
-                ["conntrack", "-L", "-f", fam, "-p", "tcp"],
-                capture_output=True, text=True, timeout=20).stdout
-        except Exception:  # noqa: BLE001
-            continue
-        for line in out.splitlines():
-            m = FLOW_RE.search(line)
-            if not m:
-                continue
-            dport = int(m.group(3))
-            if PORT_MIN <= dport <= PORT_MAX:
-                flows.add((m.group(1), int(m.group(2)), dport))
+    try:
+        with open(CONNTRACK_PROC) as fh:
+            for line in fh:
+                if " tcp " not in line:
+                    continue
+                if "ESTABLISHED" not in line and "[OFFLOAD]" not in line:
+                    continue
+                if any(s in line for s in BAD_STATES):
+                    continue
+                m = TUPLE_RE.search(line)
+                if not m:
+                    continue
+                dport = int(m.group(3))
+                if PORT_MIN <= dport <= PORT_MAX:
+                    flows.add((m.group(1), int(m.group(2)), dport))
+    except OSError as e:
+        log(f"no puedo leer {CONNTRACK_PROC}: {e}")
     return flows
 
 
