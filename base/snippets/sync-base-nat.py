@@ -13,8 +13,8 @@ Commands:
       Single VM: read one server from Firestore and merge into local state,
       then reconcile managed dynamic DNAT rules.
 
-  sync-base-nat.py sync <proxmoxId> <publicVMIPv6> [rdp=0|1] [samba=0|1]
-      Single VM override without Firestore read. Optional rdp/samba
+  sync-base-nat.py sync <proxmoxId> <publicVMIPv6> [rdp=0|1] [samba=0|1] [ssh=0|1]
+      Single VM override without Firestore read. Optional rdp/samba/ssh
       flags force the matching service on/off; flags not passed are
       preserved from on-disk state (or default enabled for new VMs).
 
@@ -134,9 +134,11 @@ FIREBASE_CREDENTIALS = os.environ.get(
 
 SAMBA_PORT_BASE = int(os.environ.get("SAMBA_PORT_BASE", "10000"))
 RDP_PORT_BASE = int(os.environ.get("RDP_PORT_BASE", "20000"))
+SSH_PORT_BASE = int(os.environ.get("SSH_PORT_BASE", "30000"))
 VMID_MAX = int(os.environ.get("VMID_MAX", os.environ.get("PORT_MAX", "9999")))
 SAMBA_PORT_END = SAMBA_PORT_BASE + VMID_MAX
 RDP_PORT_END = RDP_PORT_BASE + VMID_MAX
+SSH_PORT_END = SSH_PORT_BASE + VMID_MAX
 INCLUDE_UDP_RDP = parse_bool_env("INCLUDE_UDP_RDP", True)
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", str(DEFAULT_STATE_FILE)))
@@ -186,16 +188,18 @@ def validate_config():
     if not MANAGED_RULE_COMMENT_PREFIX:
         logger.error("NFT_MANAGED_RULE_COMMENT_PREFIX cannot be empty")
         sys.exit(1)
-    if SAMBA_PORT_BASE < 1 or RDP_PORT_BASE < 1:
-        logger.error("SAMBA_PORT_BASE and RDP_PORT_BASE must be >= 1")
+    if SAMBA_PORT_BASE < 1 or RDP_PORT_BASE < 1 or SSH_PORT_BASE < 1:
+        logger.error("SAMBA_PORT_BASE, RDP_PORT_BASE and SSH_PORT_BASE must be >= 1")
         sys.exit(1)
-    if SAMBA_PORT_END > 65535 or RDP_PORT_END > 65535:
+    if SAMBA_PORT_END > 65535 or RDP_PORT_END > 65535 or SSH_PORT_END > 65535:
         logger.error(
-            "Port range overflow: SMB=%s-%s RDP=%s-%s",
+            "Port range overflow: SMB=%s-%s RDP=%s-%s SSH=%s-%s",
             SAMBA_PORT_BASE,
             SAMBA_PORT_END,
             RDP_PORT_BASE,
             RDP_PORT_END,
+            SSH_PORT_BASE,
+            SSH_PORT_END,
         )
         sys.exit(1)
 
@@ -241,9 +245,9 @@ def run(cmd: list[str], check: bool = True) -> str:
     return (result.stdout or "").strip()
 
 
-def vm_ports(vmid: int) -> tuple[int, int]:
+def vm_ports(vmid: int) -> tuple[int, int, int]:
     vmid = check_vmid(vmid)
-    return SAMBA_PORT_BASE + vmid, RDP_PORT_BASE + vmid
+    return SAMBA_PORT_BASE + vmid, RDP_PORT_BASE + vmid, SSH_PORT_BASE + vmid
 
 
 @contextlib.contextmanager
@@ -308,10 +312,12 @@ def write_state(state: dict):
 
 
 # Per-VM desired entry: ipv6 + which services BASE should redirect.
-# Defaults: rdp/samba enabled when the field is missing (back-compat with
-# pre-firewall-flag state files and Firestore docs).
-def _server_entry(ipv6: str, rdp: bool = True, samba: bool = True) -> dict:
-    return {"ipv6": ipv6, "rdp": bool(rdp), "samba": bool(samba)}
+# Defaults: rdp/samba/ssh enabled when the field is missing (back-compat
+# with pre-firewall-flag state files and Firestore docs).
+def _server_entry(
+    ipv6: str, rdp: bool = True, samba: bool = True, ssh: bool = True
+) -> dict:
+    return {"ipv6": ipv6, "rdp": bool(rdp), "samba": bool(samba), "ssh": bool(ssh)}
 
 
 def _firewall_flag(firewall: object, key: str, default: bool = True) -> bool:
@@ -353,10 +359,12 @@ def desired_from_state() -> dict[int, dict]:
             continue
         rdp_flag = d.get("rdpEnabled", True)
         samba_flag = d.get("sambaEnabled", True)
+        ssh_flag = d.get("sshEnabled", True)
         out[vmid] = _server_entry(
             s,
             rdp=bool(rdp_flag) if isinstance(rdp_flag, bool) else True,
             samba=bool(samba_flag) if isinstance(samba_flag, bool) else True,
+            ssh=bool(ssh_flag) if isinstance(ssh_flag, bool) else True,
         )
     return out
 
@@ -402,6 +410,7 @@ def firestore_list_configured_servers() -> dict[int, dict]:
             normalized,
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
             samba=_firewall_flag(firewall, "sambaEnabled", True),
+            ssh=_firewall_flag(firewall, "sshEnabled", True),
         )
     return out
 
@@ -432,18 +441,20 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
             normalized,
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
             samba=_firewall_flag(firewall, "sambaEnabled", True),
+            ssh=_firewall_flag(firewall, "sshEnabled", True),
         )
     return None
 
 
 # --- Dynamic DNAT via nftables maps -------------------------------------------
 #
-# The NAT chain contains three persistent rules declared in
+# The NAT chain contains four persistent rules declared in
 # /etc/nftables.conf (see base/docs/netns-jool-nat46-nat66-guide.md §7):
 #
 #   tcp dport @rdp_tcp_map dnat ip6 to tcp dport map @rdp_tcp_map
 #   udp dport @rdp_udp_map dnat ip6 to udp dport map @rdp_udp_map
 #   tcp dport @smb_tcp_map dnat ip6 to tcp dport map @smb_tcp_map
+#   tcp dport @ssh_tcp_map dnat ip6 to tcp dport map @ssh_tcp_map
 #
 # This script only populates the ELEMENTS of those maps; structure stays
 # in nftables.conf so it survives reboots and full rule reloads. Each
@@ -452,10 +463,12 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
 DNAT_MAP_RDP_TCP = "rdp_tcp_map"
 DNAT_MAP_RDP_UDP = "rdp_udp_map"
 DNAT_MAP_SMB_TCP = "smb_tcp_map"
-DNAT_MAPS = (DNAT_MAP_RDP_TCP, DNAT_MAP_RDP_UDP, DNAT_MAP_SMB_TCP)
+DNAT_MAP_SSH_TCP = "ssh_tcp_map"
+DNAT_MAPS = (DNAT_MAP_RDP_TCP, DNAT_MAP_RDP_UDP, DNAT_MAP_SMB_TCP, DNAT_MAP_SSH_TCP)
 
 RDP_TARGET_PORT = 3389
 SMB_TARGET_PORT = 445
+SSH_TARGET_PORT = 22
 
 
 def _build_desired_map_elements(
@@ -474,13 +487,15 @@ def _build_desired_map_elements(
         vmid = check_vmid(vmid)
         entry = desired[vmid]
         target_ipv6 = normalize_ipv6(entry["ipv6"])
-        samba_p, rdp_p = vm_ports(vmid)
+        samba_p, rdp_p, ssh_p = vm_ports(vmid)
         if entry.get("rdp", True):
             out[DNAT_MAP_RDP_TCP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
             if INCLUDE_UDP_RDP:
                 out[DNAT_MAP_RDP_UDP][rdp_p] = (target_ipv6, RDP_TARGET_PORT)
         if entry.get("samba", True):
             out[DNAT_MAP_SMB_TCP][samba_p] = (target_ipv6, SMB_TARGET_PORT)
+        if entry.get("ssh", True):
+            out[DNAT_MAP_SSH_TCP][ssh_p] = (target_ipv6, SSH_TARGET_PORT)
     return out
 
 
@@ -632,10 +647,11 @@ def reconcile_dynamic_dnat_rules(desired: dict[int, str]):
     _write_include_file(element_lines)
 
     logger.info(
-        "Dynamic DNAT reconcile (maps): rdp_tcp=%d rdp_udp=%d smb_tcp=%d",
+        "Dynamic DNAT reconcile (maps): rdp_tcp=%d rdp_udp=%d smb_tcp=%d ssh_tcp=%d",
         len(desired_by_map[DNAT_MAP_RDP_TCP]),
         len(desired_by_map[DNAT_MAP_RDP_UDP]),
         len(desired_by_map[DNAT_MAP_SMB_TCP]),
+        len(desired_by_map[DNAT_MAP_SSH_TCP]),
     )
 
 
@@ -646,8 +662,10 @@ def _state_payload(desired: dict[int, dict]) -> dict:
             "ipv6": desired[k]["ipv6"],
             "samba": SAMBA_PORT_BASE + k,
             "rdp": RDP_PORT_BASE + k,
+            "ssh": SSH_PORT_BASE + k,
             "rdpEnabled": bool(desired[k].get("rdp", True)),
             "sambaEnabled": bool(desired[k].get("samba", True)),
+            "sshEnabled": bool(desired[k].get("ssh", True)),
         }
         for k in sorted(desired.keys())
     }
@@ -718,16 +736,20 @@ def sync_single_vmid(
                 existing = desired.get(vmid)
                 rdp_default = bool(existing.get("rdp", True)) if existing else True
                 samba_default = bool(existing.get("samba", True)) if existing else True
+                ssh_default = bool(existing.get("ssh", True)) if existing else True
                 override = flags_override or {}
                 rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
                 samba_flag = bool(override["samba"]) if "samba" in override else samba_default
+                ssh_flag = bool(override["ssh"]) if "ssh" in override else ssh_default
             else:
                 rdp_flag = bool(server.get("rdp", True))
                 samba_flag = bool(server.get("samba", True))
+                ssh_flag = bool(server.get("ssh", True))
             desired[vmid] = _server_entry(
                 normalize_ipv6(server["ipv6"]),
                 rdp=rdp_flag,
                 samba=samba_flag,
+                ssh=ssh_flag,
             )
         else:
             desired.pop(vmid, None)
@@ -1283,8 +1305,8 @@ _FLAG_FALSE = {"0", "false", "no", "off"}
 def _parse_flag_args(extra: list[str]) -> dict:
     """Parse `key=value` args into a flag override dict.
 
-    Accepts `rdp` and `samba` keys with boolean-ish values. Unknown keys
-    or unparseable values are a hard error so a typo never silently
+    Accepts `rdp`, `samba` and `ssh` keys with boolean-ish values. Unknown
+    keys or unparseable values are a hard error so a typo never silently
     leaves DNAT in a wrong state.
     """
     out: dict = {}
@@ -1295,8 +1317,8 @@ def _parse_flag_args(extra: list[str]) -> dict:
         k, _, v = arg.partition("=")
         k = k.strip().lower()
         v = v.strip().lower()
-        if k not in ("rdp", "samba"):
-            logger.error("Unknown flag %r (allowed: rdp, samba)", k)
+        if k not in ("rdp", "samba", "ssh"):
+            logger.error("Unknown flag %r (allowed: rdp, samba, ssh)", k)
             sys.exit(2)
         if v in _FLAG_TRUE:
             out[k] = True
@@ -1313,7 +1335,7 @@ def main():
         print(
             "Usage: sync-base-nat.py sync\n"
             "       sync-base-nat.py sync <proxmoxId>\n"
-            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1]\n"
+            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
             "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,

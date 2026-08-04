@@ -72,8 +72,10 @@ FAILOVER_IPV6=2a01:4f8:fff2:95::2
 # Port contract:
 # SMB external port = SAMBA_PORT_BASE + proxmoxId -> VM 445 (TCP)
 # RDP external port = RDP_PORT_BASE + proxmoxId -> VM 3389 (TCP/UDP)
+# SSH external port = SSH_PORT_BASE + proxmoxId -> VM 22 (TCP)
 SAMBA_PORT_BASE=10000
 RDP_PORT_BASE=20000
+SSH_PORT_BASE=30000
 VMID_MAX=9999
 INCLUDE_UDP_RDP=1
 
