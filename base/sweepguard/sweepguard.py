@@ -76,16 +76,21 @@ DEFAULTS = {
 }
 NAT64 = ipaddress.ip_network("64:ff9b:1::/96")
 
-# La base reenvia DOS puertos por VM: RDP en 2xxxx y SMB (445) en 1xxxx, con el
-# MISMO sufijo — 10202 y 20202 son la misma maquina. Contar puertos a secas
-# duplicaria a cada cliente (7 servidores -> 14 puertos) y estrecharia el margen
-# de minPorts a la mitad. Se normaliza a "ranura de VM" para contar MAQUINAS.
-PORT_LO, PORT_HI = 10000, 29999
+# La base reenvia TRES puertos por VM: SMB (445) en 1xxxx, RDP en 2xxxx y SSH
+# (22) en 3xxxx, con el MISMO sufijo — 10202, 20202 y 30202 son la misma
+# maquina. Contar puertos a secas multiplicaria a cada cliente (7 servidores
+# -> 21 puertos) y estrecharia el margen de minPorts a un tercio. Se normaliza
+# a "ranura de VM" para contar MAQUINAS.
+PORT_LO, PORT_HI = 10000, 39999
 
 
 def vm_slot(port):
-    """Puerto reenviado -> identidad de VM (RDP y SMB de la misma maquina = 1)."""
-    return port - 10000 if port < 20000 else port - 20000
+    """Puerto reenviado -> identidad de VM (SMB, RDP y SSH de la misma maquina = 1)."""
+    if port < 20000:
+        return port - 10000
+    if port < 30000:
+        return port - 20000
+    return port - 30000
 
 
 def in_range(port):

@@ -209,9 +209,9 @@ table ip nat {
     chain prerouting {
         type nat hook prerouting priority dstnat;
         # Accept ingress on both main and failover IPv4.
-        ip daddr 37.27.135.250 tcp dport 10000-29999 dnat to 10.0.0.3
+        ip daddr 37.27.135.250 tcp dport 10000-39999 dnat to 10.0.0.3
         ip daddr 37.27.135.250 udp dport 20000-29999 dnat to 10.0.0.3
-        ip daddr 77.42.49.79 tcp dport 10000-29999 dnat to 10.0.0.3
+        ip daddr 77.42.49.79 tcp dport 10000-39999 dnat to 10.0.0.3
         ip daddr 77.42.49.79 udp dport 20000-29999 dnat to 10.0.0.3
     }
 
@@ -237,6 +237,9 @@ table ip6 nat {
     map smb_tcp_map {
         type inet_service : ipv6_addr . inet_service
     }
+    map ssh_tcp_map {
+        type inet_service : ipv6_addr . inet_service
+    }
 
     chain prerouting {
         type nat hook prerouting priority dstnat;
@@ -246,6 +249,7 @@ table ip6 nat {
         tcp dport @rdp_tcp_map dnat ip6 to tcp dport map @rdp_tcp_map
         udp dport @rdp_udp_map dnat ip6 to udp dport map @rdp_udp_map
         tcp dport @smb_tcp_map dnat ip6 to tcp dport map @smb_tcp_map
+        tcp dport @ssh_tcp_map dnat ip6 to tcp dport map @ssh_tcp_map
     }
 
     chain postrouting {
@@ -268,7 +272,7 @@ include "/etc/nftables.d/base-nat-elements.nft"
 # base/docs/INCIDENT_2026-07-16_b1_conntrack_flap.md):
 #
 #  (1) ip6 rdpguard — per-(source,port) rate limit on NEW RDP connections
-#      (TCP SYN to 20000-29999). filter prerouting at -150 runs BEFORE dstnat
+#      (TCP SYN to 10000-39999). filter prerouting at -150 runs BEFORE dstnat
 #      (-100). CAVEAT that drove the incident: at this hook a *v4* client is
 #      NOT visible as itself — v4 RDP is DNAT'd by `table ip nat` to 10.0.0.3
 #      and reaches here with saddr = the *VIP* (~all v4 traffic collapses to
@@ -297,7 +301,7 @@ table ip6 rdpguard {
     }
     chain pre {
         type filter hook prerouting priority -150; policy accept;
-        tcp dport 20000-29999 tcp flags & (syn|ack) == syn add @bf { ip6 saddr . tcp dport limit rate over 12/minute burst 6 packets } counter name bf_drops drop comment "drop excess new RDP conns per source+port"
+        tcp dport 20000-39999 tcp flags & (syn|ack) == syn add @bf { ip6 saddr . tcp dport limit rate over 12/minute burst 6 packets } counter name bf_drops drop comment "drop excess new RDP conns per source+port"
     }
 }
 
@@ -343,7 +347,7 @@ table ip rdpguard {
         type filter hook prerouting priority -300; policy accept;
         ip saddr @bf_allow accept comment "trusted infra/ops — exempt from RDP guard"
         ip saddr @bf_static counter name bf_v4_drops drop comment "confirmed RDP brute-force sources"
-        tcp dport 20000-29999 tcp flags & (syn|ack) == syn add @bf_src { ip saddr limit rate over 60/minute burst 30 packets } counter name bf_v4_drops drop comment "rate-limit excess new RDP conns per source (anti port-spray)"
+        tcp dport 10000-39999 tcp flags & (syn|ack) == syn add @bf_src { ip saddr limit rate over 60/minute burst 30 packets } counter name bf_v4_drops drop comment "rate-limit excess new RDP conns per source (anti port-spray)"
     }
 }
 
@@ -824,6 +828,7 @@ flows; only new connections re-enter the slow path.
 - `rdp_tcp_map` — external port `20000+VMID` → VM IPv6 `.` 3389
 - `rdp_udp_map` — same, UDP (only when `INCLUDE_UDP_RDP=1`)
 - `smb_tcp_map` — external port `10000+VMID` → VM IPv6 `.` 445
+- `ssh_tcp_map` — external port `30000+VMID` → VM IPv6 `.` 22
 
 Three static rules in `prerouting` turn new-connection lookup into an O(1)
 hash lookup regardless of VM count, and the whole reconcile is applied as
@@ -837,6 +842,7 @@ Inspect element counts:
 ```bash
 nft list map ip6 nat rdp_tcp_map | grep -c ':'
 nft list map ip6 nat smb_tcp_map | grep -c ':'
+nft list map ip6 nat ssh_tcp_map | grep -c ':'
 ```
 
 ---
