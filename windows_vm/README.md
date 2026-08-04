@@ -35,6 +35,12 @@
 
 - Apply Windows and Winget updates
 - Uninstall unneeded apps and software
+- Install + configure OpenSSH Server (customer SSH access, 2026-08-04): run
+  [install_openssh.ps1](install_openssh.ps1) inside the template. It installs
+  the Win32-OpenSSH MSI served from the BASES, sets
+  `DefaultShell = powershell.exe`, service to Automatic, and forces the
+  firewall rule to `-Profile Any` (the in-box capability's rule is
+  Private-only, which leaves port 22 filtered on Public networks).
 
 ```powershell
 # Disable WindowsFeedbackHub installation for new users
