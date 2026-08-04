@@ -183,9 +183,11 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 
 - Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). [prepare.md](prepare.md) documents every step (DISM `/ResetBase`, NGEN, SoftwareDistribution, Delivery Optimization, winget caches, defrag/TRIM, SDelete zero-fill) and the remote-run procedure
 - From Linux, remove recovery partition
-- **Back up the current templates on the Storage Box before exporting** — the
-  remote copy is the ONLY copy, and `OVERWRITE=1` deletes the old streams.
-  One sftp rename is enough and is instant (no data moves):
+- **Back up the current templates on the Storage Box before exporting** —
+  `OVERWRITE=1` deletes the old streams. The Storage Box does have its own
+  daily backups kept for 30 days, so this is a belt-and-braces step that makes
+  a rollback instant instead of a restore request. One sftp rename is enough
+  and moves no data:
   `printf "rename /home/templates/windows-es /home/templates/windows-es.bak-<date>\n" | sftp -P 23 u560363@u560363.your-storagebox.de`
 - Sysprep with unattend_cleanup.xml
 
