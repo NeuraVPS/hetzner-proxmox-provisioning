@@ -56,6 +56,24 @@ try {
       -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Profile Any `
       -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
   }
+  # MaxAuthTries 20: un cliente macOS/Linux con varias claves en el agent las
+  # ofrece TODAS antes del password y el default (6) corta la conexion con
+  # "Too many authentication failures" sin llegar a pedir contraseña
+  # (reproducido por el operador 2026-08-04). El anti-brute-force real vive
+  # en la BASE (rate-limits por origen y por puerto), no en este limite.
+  $cfg = 'C:\ProgramData\ssh\sshd_config'
+  if (Test-Path $cfg) {
+    $s = Get-Content $cfg -Raw
+    if ($s -notmatch '(?m)^MaxAuthTries 20\s*$') {
+      if ($s -match '(?m)^\s*#?\s*MaxAuthTries\b.*$') {
+        $s = $s -replace '(?m)^\s*#?\s*MaxAuthTries\b.*$', 'MaxAuthTries 20'
+      } else {
+        $s = "MaxAuthTries 20`r`n" + $s
+      }
+      Set-Content -Path $cfg -Value $s -Encoding ascii
+      Restart-Service sshd
+    }
+  }
   $sock = New-Object Net.Sockets.TcpClient
   $ok = $sock.ConnectAsync('127.0.0.1', 22).Wait(5000)
   $sock.Close()
