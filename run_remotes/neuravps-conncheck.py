@@ -81,6 +81,32 @@ def fw_enabled(firewall, key) -> bool:
     return True if v is None else bool(v)
 
 
+def resolution_for(vmid, confirmed_vmids, probed_vmids, running_vmids):
+    """Motivo para CERRAR un doc de distress abierto, o None para dejarlo.
+
+    Un doc de distress solo se cerraba antes cuando la CF lo arreglaba
+    (converge/auto-fix). Si la VM se recuperaba SOLA entre barridos (parpadeo
+    de RDP, la caja terminó de arrancar, el cliente rebooteó), el doc quedaba
+    abierto para siempre como `exhausted_alerted` — ensuciando la vista y tras
+    haber mandado ya un email. Este barrido, que acaba de re-sondear toda la
+    flota, es quien tiene la verdad para cerrarlo. SOLO se llama en un barrido
+    COMPLETO (el guard de abort ya nos habría sacado antes).
+      * en `confirmed`  -> sigue caída, se deja abierta.
+      * la sondeamos y NO está en `confirmed` -> responde -> `recovered`.
+      * ya no está entre las running/entregadas (parada, borrada, en
+        mantenimiento, reinstalando) -> el aviso dejó de aplicar.
+      * running pero no sondeada este ciclo (p.ej. el cliente deshabilitó el
+        servicio) -> conservador, se deja abierta.
+    """
+    if vmid in confirmed_vmids:
+        return None
+    if vmid in probed_vmids:
+        return "recovered"
+    if vmid not in running_vmids:
+        return "no_longer_applicable"
+    return None
+
+
 def main() -> int:
     hostname = socket.gethostname()
     peer = PEER_V4.get(hostname)
@@ -186,7 +212,8 @@ def main() -> int:
         if keep:
             confirmed[vmid] = {"services": sorted(keep), "ipv6": d.get("ipv6")}
 
-    probed_vms = len({j[0] for j in jobs})
+    probed_ids = {j[0] for j in jobs}
+    probed_vms = len(probed_ids)
     if len(confirmed) > ABORT_FAIL_MIN and probed_vms and \
             100.0 * len(confirmed) / probed_vms > ABORT_FAIL_PCT:
         log(f"ABORT: {len(confirmed)}/{probed_vms} VMs fallan — huele a ruta/base, "
@@ -196,7 +223,36 @@ def main() -> int:
     # --- presentar discrepancias ------------------------------------------
     now = datetime.now(timezone.utc)
     coll = db.collection("connectivity_distress")
-    filed = touched = 0
+    filed = touched = resolved = 0
+
+    # Cerrar los docs abiertos de VMs que ya se recuperaron (o dejaron de
+    # aplicar). Barrido completo => tenemos la verdad fresca. Sin esto, un
+    # parpadeo que se auto-cura deja el doc abierto para siempre (vms 1205,
+    # 2004, 2016, 337, 719 el 2026-08-05: accesibles pero con doc rancio).
+    confirmed_ids = set(confirmed)
+    running_ids = set(running)
+    if not dry:
+        try:
+            from google.cloud.firestore_v1 import FieldFilter
+            openq = coll.where(filter=FieldFilter("resolvedAt", "==", None))
+        except ImportError:
+            openq = coll.where("resolvedAt", "==", None)
+        for snap in openq.stream():
+            d = snap.to_dict() or {}
+            try:
+                vmid = int(d.get("vmid", snap.id))
+            except (TypeError, ValueError):
+                continue
+            reason = resolution_for(vmid, confirmed_ids, probed_ids, running_ids)
+            if reason is None:
+                continue
+            snap.reference.update({
+                "resolvedAt": firestore.SERVER_TIMESTAMP,
+                "resolvedBy": hostname,
+                "resolution": reason,
+            })
+            resolved += 1
+            log(f"resuelto: vm {vmid} ({reason})")
 
     def file_doc(vmid: int, kind: str, services, ipv6):
         nonlocal filed, touched
@@ -238,7 +294,7 @@ def main() -> int:
 
     log(f"fin: {probed_vms} VMs sondeadas, {len(missing)} sin entrada NAT, "
         f"{len(confirmed)} inalcanzables confirmadas, {filed} presentadas, "
-        f"{touched} ya en curso{' [DRY-RUN]' if dry else ''}")
+        f"{touched} ya en curso, {resolved} resueltas{' [DRY-RUN]' if dry else ''}")
     return 0
 
 
