@@ -42,10 +42,15 @@ try {
     if ($p.ExitCode -ne 0) { throw "msiexec exit $($p.ExitCode)" }
     Remove-Item $msi -Force -ErrorAction SilentlyContinue
   }
+  # DefaultShell: PowerShell 7 (pwsh) si esta instalado; si no, Windows
+  # PowerShell 5.1. Re-ejecutar este script tras instalar PS7 actualiza el
+  # shell por defecto (peticion del operador 2026-08-04).
+  $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+  $shell = if (Test-Path $pwsh) { $pwsh }
+           else { 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' }
   New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
   New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
-    -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-    -PropertyType String -Force | Out-Null
+    -Value $shell -PropertyType String -Force | Out-Null
   Set-Service sshd -StartupType Automatic
   if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
   $r = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
@@ -73,6 +78,36 @@ try {
       Set-Content -Path $cfg -Value $s -Encoding ascii
       Restart-Service sshd
     }
+  }
+  # Prioridad alta para sshd (fleet-wide, 2026-08-07). Bajo saturacion de CPU
+  # (cajas SQX/sqcli a tope, 20 cores pegados) el cliente SSH hace timeout
+  # mientras RDP no sufre (TermService es un servicio residente y ya calido; no
+  # crea proceso). CLAVE: OpenSSH 10 en Windows partio la arquitectura — el
+  # maestro es `sshd.exe` (solo escucha) pero CADA conexion la atiende un
+  # proceso NUEVO **`sshd-session.exe`**, y ES ESE el que manda el banner y hace
+  # el handshake. Bajo carga, crear/planificar ese sshd-session.exe a prioridad
+  # Normal se retrasa y el banner no llega antes del timeout del cliente.
+  # Verificado en vivo (vm 444, 2026-08-07): el hijo era sshd-session.exe en
+  # Normal; poner el IFEO solo en sshd.exe NO lo tocaba. Por eso el IFEO va en
+  # AMBOS, y lo que de verdad importa es sshd-session.exe.
+  # IFEO PerfOptions aplica al crear el proceso por NOMBRE de imagen y sobrevive
+  # reinicios. NO afecta al shell (pwsh.exe es otro ejecutable, no hereda) =>
+  # la carga del cliente sigue en Normal; priorizamos solo el MONTAJE.
+  # CpuPriorityClass: 3=High (1=Idle 2=Normal 4=RealTime 5=BelowNormal
+  # 6=AboveNormal). RealTime jamas. Guard Test-Path: New-Item -Force sobre una
+  # clave IFEO existente borra sus subclaves (leccion SQX 2026-07-06).
+  $ifeoBase = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+  foreach ($img in @('sshd.exe', 'sshd-session.exe')) {
+    $k = "$ifeoBase\$img"
+    if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
+    if (-not (Test-Path "$k\PerfOptions")) { New-Item -Path "$k\PerfOptions" -Force | Out-Null }
+    New-ItemProperty -Path "$k\PerfOptions" -Name 'CpuPriorityClass' -PropertyType DWord -Value 3 -Force | Out-Null
+  }
+  # Sube tambien los procesos sshd/sshd-session YA vivos en caliente (sin
+  # reiniciar el servicio => no corta sesiones). Los nuevos ya nacen High por el
+  # IFEO. -1 = no cambiar si ya son High.
+  Get-Process sshd, sshd-session -ErrorAction SilentlyContinue | ForEach-Object {
+    try { $_.PriorityClass = [Diagnostics.ProcessPriorityClass]::High } catch { }
   }
   $sock = New-Object Net.Sockets.TcpClient
   $ok = $sock.ConnectAsync('127.0.0.1', 22).Wait(5000)
