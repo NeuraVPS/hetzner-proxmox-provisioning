@@ -37,21 +37,38 @@ Select Case exeName
     WScript.Quit 4
 End Select
 
-Dim debuggerPath, debuggerValue, hasDebugger
-debuggerPath = ifeoKey & "\Debugger"
-hasDebugger = False
-
-On Error Resume Next
-debuggerValue = shell.RegRead(debuggerPath)
-If Err.Number = 0 Then hasDebugger = True
-Err.Clear
-On Error GoTo 0
-
 ' Serialize delete/launch/re-add of the shared IFEO Debugger key so that many
 ' MetaTrader terminals auto-starting at logon cannot race it (a race lets the
 ' re-added key re-intercept a concurrent relaunch -> wscript/reg fork-bomb).
 Dim gotLock
 gotLock = AcquireLock()
+
+' Read the value we are about to clear ONLY ONCE THE LOCK IS OURS.
+'
+' This used to be read before AcquireLock, and the re-add below was skipped
+' when the read came back empty. That lost the hook outright, with no crash
+' needed (real case 2026-08-09, canfret78 vm1455 and 74 boxes fleet-wide):
+'   A deletes -> B reads (already gone, so B "has no Debugger") -> A relaunches
+'   and re-adds -> B's ~14 s lock wait expires, B fails open, deletes again,
+'   launches, and skips the re-add. The Debugger value is gone for good.
+' terminal64.exe is launched far more often than metaeditor64.exe, so it loses
+' its value first and the box ends up ASYMMETRIC: the terminal starts
+' non-portable off its (flagless) shortcut while MetaEditor is still forced
+' /portable. The two then read different data folders, MT5 logs "MetaEditor
+' not found", and pasted EAs never show up in the terminal.
+Dim debuggerPath, debuggerValue
+debuggerPath = ifeoKey & "\Debugger"
+debuggerValue = ""
+
+On Error Resume Next
+debuggerValue = shell.RegRead(debuggerPath)
+Err.Clear
+On Error GoTo 0
+
+' A miss is no longer a reason to leave the key deleted. This script only runs
+' because Windows found OUR launcher in that Debugger value, so the correct
+' string is known from the way we were started - restore it either way.
+If Len(debuggerValue) = 0 Then debuggerValue = CanonicalDebugger()
 
 shell.Run "reg delete " & QuoteArg(ifeoKey) & " /v Debugger /f", 0, True
 
@@ -92,9 +109,9 @@ shell.CurrentDirectory = previousCwd
 Err.Clear
 On Error GoTo 0
 
-If hasDebugger Then
-  shell.Run "reg add " & QuoteArg(ifeoKey) & " /v Debugger /t REG_SZ /d " & QuoteArg(debuggerValue) & " /f", 0, True
-End If
+' Unconditional: see the note above the read. Two launchers both restoring the
+' same canonical string is harmless; one of them skipping it is not.
+shell.Run "reg add " & QuoteArg(ifeoKey) & " /v Debugger /t REG_SZ /d " & QuoteArg(debuggerValue) & " /f", 0, True
 
 If gotLock Then ReleaseLock()
 
@@ -131,6 +148,24 @@ End Sub
 
 Function QuoteArg(value)
   QuoteArg = """" & Replace(value, """", """""") & """"
+End Function
+
+' The Debugger string that starts this launcher, rebuilt from how we were
+' actually started rather than hardcoded:
+'   "C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\mt_hook_launcher.vbs"
+' Used only when the value could not be read back (a concurrent launcher had
+' already cleared it), so the key is never left deleted. The host filename is
+' forced to wscript.exe: under cscript we would otherwise write a Debugger
+' that opens a console window on every MetaTrader launch.
+Function CanonicalDebugger()
+  Dim hostDir
+  hostDir = ""
+  On Error Resume Next
+  hostDir = fso.GetParentFolderName(WScript.FullName)
+  Err.Clear
+  On Error GoTo 0
+  If Len(hostDir) = 0 Then hostDir = shell.ExpandEnvironmentStrings("%SystemRoot%") & "\System32"
+  CanonicalDebugger = """" & hostDir & "\wscript.exe"" """ & WScript.ScriptFullName & """"
 End Function
 
 ' How many processes with this image name are running right now. Returns -1 if

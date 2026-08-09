@@ -89,6 +89,34 @@ hazard in the install steps themselves. All three are now mandatory:
    hook. Remediation on a wrongly-hooked box: delete the 4 MT Debugger values —
    agent doc §9.9.28(a).
 
+2bis. **The MT hook is a backstop for `/portable`, never the only carrier of it**
+   (2026-08-09). The shortcut and the hook fail in opposite directions — an MT
+   self-update recreates the shortcut without the flag, and the hook can lose
+   its own `Debugger` value — so a portable install must have `/portable` in
+   **both** places. `install_mt_from_storagebox.ps1` now writes it onto the
+   desktop / Start Menu / Startup `.lnk`s, and `BuildForwardArgs` already
+   de-duplicates it. It had been hook-only, so one lost registry value flipped
+   a box to non-portable and its terminals opened blank.
+
+   The loss is not hypothetical and needs no crash: the launcher used to read
+   `Debugger` *before* taking the lock and re-add it only if that read
+   succeeded, so a concurrent launcher that had already deleted the value made
+   the second one skip the restore. Fixed in `mt_hook_launcher.vbs` — the read
+   moved inside the lock and the re-add is unconditional, falling back to
+   `CanonicalDebugger()`. Because `terminal64.exe` launches far more often than
+   `metaeditor64.exe`, the loss lands **asymmetrically**: the terminal goes
+   non-portable while MetaEditor stays forced portable, the two read different
+   data folders, MT5 logs `MetaEditor not found`, and EAs pasted in MetaEditor
+   never appear in the terminal. Read-only sweep 2026-08-09: **74 of 987**
+   reachable MT boxes split that way (63 terminal-loose / 11 editor-loose),
+   one of them provisioned three days earlier.
+
+   Fixing a split box: make MetaEditor agree with the terminal, never the
+   reverse. Where `terminal64` lost the hook, remove `metaeditor64`'s Debugger
+   (safe — the editor holds no accounts, and it takes effect on its next
+   launch). Where `metaeditor64` lost it, the terminal is genuinely portable,
+   so removing `terminal64`'s Debugger would be gate 2 all over again.
+
 3bis. **Detect a v144+ engine BY CONTENT, never by folder name** (gate 4,
    2026-08-02). The original gate-1 snippet tested
    `$_.Name -match 'SQX.*144|StrategyQuant.*144'`. A fleet sweep of 826 SQX
