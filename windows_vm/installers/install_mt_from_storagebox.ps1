@@ -423,16 +423,28 @@ try {
         $desktopLink = Join-Path -Path $PublicDesktop -ChildPath $label
         $startMenuLink = Join-Path -Path $StartMenuMt -ChildPath $label
 
+        # These installs are portable: their data lives next to the executable, not in
+        # %APPDATA%\MetaQuotes\Terminal\<hash>. Put the flag ON THE SHORTCUT as well as
+        # relying on the IFEO hook, because the two fail in opposite directions and
+        # neither is sufficient alone:
+        #   - an MT self-update recreates the shortcut WITHOUT /portable  -> the hook saves it
+        #   - the hook loses its IFEO Debugger value                      -> the shortcut saves it
+        # Until 2026-08-09 only the hook carried it, so one lost registry value silently
+        # flipped a box to non-portable and the customer's terminals opened blank
+        # (canfret78 vm1455; 74 boxes fleet-wide, one of them 3 days old).
+        # mt_hook_launcher.vbs already de-duplicates the flag when the shortcut has it.
+        $portableArg = '/portable'
+
         if (-not $NoDesktopShortcuts) {
-            New-MtShellShortcut -ShortcutPath $desktopLink -TargetPath $terminalExe -WorkingDirectory $folder
+            New-MtShellShortcut -ShortcutPath $desktopLink -TargetPath $terminalExe -WorkingDirectory $folder -Arguments $portableArg
         }
-        New-MtShellShortcut -ShortcutPath $startMenuLink -TargetPath $terminalExe -WorkingDirectory $folder
+        New-MtShellShortcut -ShortcutPath $startMenuLink -TargetPath $terminalExe -WorkingDirectory $folder -Arguments $portableArg
 
         if ($AddToStartup) {
             # MetaTrader restores its own saved window placement; WindowStyle 7 is a best-effort
             # hint - the durable minimised state comes from the config baked into the zip variant.
             $startupLink = Join-Path -Path $AllUsersStartup -ChildPath $label
-            New-MtShellShortcut -ShortcutPath $startupLink -TargetPath $terminalExe -WorkingDirectory $folder -WindowStyle 7
+            New-MtShellShortcut -ShortcutPath $startupLink -TargetPath $terminalExe -WorkingDirectory $folder -Arguments $portableArg -WindowStyle 7
         }
     }
 
