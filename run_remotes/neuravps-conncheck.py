@@ -18,6 +18,8 @@ ausente o enabled!=true = APAGADO (sistema nuevo, fallo cerrado).
 Exclusiones (spec del operador 2026-08-01):
   * VM con status != 'running' en Firestore (cliente puede apagarla).
   * maintenance == true (migración en curso).
+  * reinstalling == true (reset_vm en curso: la VM pasa parada casi todo el
+    rato y el guest se rehace, así que estar inalcanzable es lo ESPERADO).
   * firewall.rdpEnabled == false  -> no se sondea RDP (el cliente puede
     bloquearlo a propósito); ídem sambaEnabled para SMB. state.json refleja
     los flags, pero Firestore se re-consulta en los fallos como fuente de
@@ -136,11 +138,19 @@ def main() -> int:
         q = db.collection("servers").where("status", "==", "running")
     running = {}  # vmid -> {docId, maintenance, rdpEnabled, sambaEnabled}
     for snap in q.select(["proxmoxId", "maintenance", "firewall",
-                          "provisioningStatus"]).stream():
+                          "provisioningStatus", "reinstalling"]).stream():
         d = snap.to_dict() or {}
         try:
             vmid = int(d.get("proxmoxId"))
         except (TypeError, ValueError):
+            continue
+        # Una VM REINSTALÁNDOSE está parada casi todo el proceso y su guest se
+        # rehace entero (adiós IPv6 in-guest, adiós RDP/SMB). `reset_vm` deja
+        # `status` en 'running' y `provisioningStatus` en 'provisioned', así que
+        # sin este filtro se cuela (vm 2032 el 2026-08-11: reinstall 11:44→12:08
+        # UTC, doc presentado a las 12:06 y email a las 12:08:09, dos segundos
+        # después de que la VM volviera a arrancar).
+        if d.get("reinstalling") is True:
             continue
         # Una VM a MEDIO APROVISIONAR está legítimamente inalcanzable: el
         # doc ya dice status=running (la VM arrancó) minutos antes de que el
@@ -204,8 +214,9 @@ def main() -> int:
         prov = d.get("provisioningStatus")
         if ((d.get("status") or "").strip().lower() != "running"
                 or d.get("maintenance")
+                or d.get("reinstalling") is True
                 or (prov is not None and prov != "provisioned")):
-            continue  # cambió mientras sondeábamos (migración, o aún instalándose)
+            continue  # cambió mientras sondeábamos (migración, reinstall, o aún instalándose)
         fw = d.get("firewall") or {}
         keep = [s for s in services
                 if fw_enabled(fw, "rdpEnabled" if s == "rdp" else "sambaEnabled")]
