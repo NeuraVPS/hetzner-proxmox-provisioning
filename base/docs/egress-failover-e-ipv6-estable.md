@@ -673,6 +673,66 @@ De regalo se recuperan 8 bytes de MTU: de 1448 a **1456**.
 tiene `policy drop` y no contempla el protocolo 47 (`nft list chain inet filter
 input`). Sin ella no entra nada aunque el túnel esté perfecto.
 
+### 🏁 CADENA COMPLETA VALIDADA — vm 1096 sin dependencia del nodo (08-13)
+
+Estado final alcanzado sobre `0000228` + b0/b1:
+
+```
+gw=[fe80::1]  v6=[2a01:4f9:c01f:e::448]  v4=[10.64.4.72]
+salida6=2a01:4f8:2b03:18a9::448        ← traducida en la base al /64 de b0
+RDP 21096 y SSH 31096 ABIERTOS por las DOS VIPs
+```
+
+**La IPv6 del invitado ya no contiene el prefijo de su nodo.** Entra por las dos
+regiones y sale traducida. Es la prueba de que el modelo funciona.
+
+#### Los CINCO eslabones ocultos, en orden de aparición
+
+Ninguno estaba en el diseño y cada uno rompía la cadena entera en silencio:
+
+**1. GRE hay que permitirlo en LOS DOS extremos.** Se lo puse a las bases y no
+al nodo, cuyo `cluster.fw` tiene `policy_in: DROP`. Regla:
+`IN ACCEPT -source +dc/base -p gre`.
+⚠️ **El síntoma es direccional e intermitente**: un flujo iniciado por el NODO
+abre conntrack y la vuelta pasa, así que "a veces funciona". Base→nodo falla
+siempre hasta poner la regla.
+
+**2. Las direcciones de tránsito del túnel deben estar en el ipset `base`.**
+Tras el cambio la base alcanza al invitado desde su dirección **de túnel**, no
+desde su principal, y el firewall por-VM concede RDP/SMB/SSH a `+dc/base`. Sin
+esto el invitado descarta todo. Añadido `2a01:4f9:c01f:e:ffff::/112`.
+
+**3. La cadena `forward` de la base sólo deja salir por `enp6s0`.**
+`iifname "veth-host" oifname "enp6s0" accept` — el tráfico que sale hacia un
+**túnel** cae en el `policy drop`. Hace falta `oifname "tun-*"` (y el simétrico
+`tun-*` → `enp6s0` para la salida).
+
+**4. El SNAT de los flujos DNAT'd debe ser la dirección de TRÁNSITO, no la
+principal.** La regla global `ct status dnat snat to <principal>` hace que el
+invitado responda a la principal de la base; el nodo enruta esa dirección por su
+**uplink**, y Hetzner tira el paquete porque lleva un origen que no pertenece a
+ese servidor. Se inserta una regla **más específica y delante**, acotada al
+prefijo IDENT, y **la global se queda intacta** para las VMs del modelo viejo.
+
+**5. ⚠️ La regla de política del nodo debe acotarse por interfaz de entrada.**
+`ip -6 rule add from <IDENT>/64 lookup ident` parece correcto y crea un **bucle**:
+las direcciones de tránsito viven **dentro** del IDENT /64, así que el tráfico
+que llega **de la base** también casa y el nodo lo devuelve por el túnel en vez
+de entregarlo al invitado. El NDP resuelve bien y aun así **cero paquetes llegan
+al bridge**. Arreglo: `... iif vmbr0 lookup ident`.
+🔲 **Mejor a futuro**: sacar el tránsito FUERA del prefijo IDENT y el problema no
+existe. Con un solo /64 flotante se resolvió acotando por interfaz.
+
+#### Orden de operaciones que funciona
+
+1. Túneles a **las dos** bases + reglas GRE en los tres extremos.
+2. Rutas `/128` del IDENT en las dos bases → su túnel; y en el nodo → `vmbr0`.
+3. **Añadir** la IDENT al invitado (sin quitar la vieja).
+4. Cambiar `servers.ipv6` → la GCF empuja el mapa a las dos bases (medido:
+   ambas actualizadas en segundos).
+5. SNAT específico + reglas de forward en las bases; regla de política en el nodo.
+6. **Sólo entonces**, quitar la vieja del invitado — y **de los dos almacenes**.
+
 **Dos interfaces con nombre predecible, no un túnel multiplexado.** Un solo
 túnel con dos direcciones sería igual de funcional y más barato de montar, pero
 `iifname` es el discriminador que hace que las marcas de v1 sean seis líneas
