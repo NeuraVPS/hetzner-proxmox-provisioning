@@ -225,18 +225,53 @@ espacio ajeno.
 actual de cada par. Los vmid empiezan muy por encima, pero conviene dejar
 `::1–::ff` reservadas por convención.
 
-### 4.2 Nodo — puro transporte (sin nft, sin conntrack)
+### 4.2 Nodo — transporte (sin traducción, sin conntrack)
 
-**El nodo no traduce nada.** Toda su configuración de red para este diseño son
-tres cosas, estáticas e idénticas en los 235 nodos:
+**El nodo no traduce nada.** Su configuración de red para este diseño:
 
 1. **Dos túneles `ip6gre`** con nombre predecible (`tun-b0`, `tun-b1`), a la IP
    **principal** de cada base (§4.5).
 2. **Rutas**: `<dirección de b0> → tun-b0`, `<dirección de b1> → tun-b1`, y
    **por defecto → el túnel de su base local**.
 3. **MSS clamping** en los dos túneles.
+4. **Un watchdog de enlace** (§4.2bis). Esto sí es estado, y es obligatorio.
 
-Nada más. Ni tabla `nat`, ni NPTv6, ni marcas, ni conntrack IPv6.
+Ni tabla `nat`, ni NPTv6, ni marcas, ni conntrack IPv6.
+
+#### 4.2bis ⚠️ GRE es SIN ESTADO: el túnel no se cae cuando la base muere
+
+Detectado el 2026-08-13. `ip6gre` es pura encapsulación: no hay sesión, no hay
+negociación, y **Linux no implementa los keepalives de GRE** (los de estilo
+Cisco). Cuando la base peer se reinicia o cae:
+
+- La interfaz del túnel **sigue UP**.
+- La ruta por defecto **sigue apuntando ahí**.
+- El nodo sigue metiendo paquetes en un agujero negro.
+
+O sea que sin añadir nada, **no hay "delay": no hay recuperación**. El nodo se
+queda sin salida hasta que la base vuelve, con el otro túnel vivo al lado.
+
+**Solución: un temporizador que sondea las dos bases por sus túneles y ajusta la
+métrica de la ruta por defecto.** Sondeo cada 5 s, tres fallos para conmutar →
+recuperación en ~15 s. Es **por túnel, no por VM**: el mismo script en los 235
+nodos, sin nada que crezca con la flota.
+
+Descartado un demonio de enrutado (BGP/BFD con FRR): para dos vecinos fijos es
+desproporcionado, y añade una superficie operativa grande en 235 hipervisores.
+
+En **mantenimiento planificado** no hace falta esperar al watchdog: el drenaje
+conmuta la ruta a mano antes de reiniciar la base.
+
+#### ⚠️ Métricas DISTINTAS en las dos rutas por defecto — nunca iguales
+
+Con una sola ruta activa no hay duplicación de tráfico: el kernel elige un
+camino. **Pero si las dos quedan con la misma métrica, Linux hace ECMP y reparte
+por flujo.** Eso no duplica, **divide**: las conexiones salientes del cliente
+saldrían unas por la IP de una base y otras por la de la otra, alternando por
+conexión. Una prop firm vería la IP bailando dentro de la misma sesión.
+
+Fallo silencioso y facilísimo de diagnosticar mal. **Métricas explícitamente
+distintas**, y comprobado en la validación (§8).
 
 ⚠️ **Esto sustituye a la tabla `ip6 nvxlat` de la versión anterior**, que hacía
 NPTv6 en el nodo con `snat/dnat prefix to`. Se retira por tres motivos:
