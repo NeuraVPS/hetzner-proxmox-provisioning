@@ -12,6 +12,9 @@ derivarlas mañana. Nada de lo aquí descrito se ha aplicado.
   nodos comparten el mismo `10.0.0.0/16`, así que "SNAT en la base" no era
   implementable tal cual. Solución: **una IPv4 privada por VM, única en toda la
   flota, que viaja con la VM** (§4.4). Espejo exacto del direccionamiento IPv6.
+- **Fuera el DHCP**: IPv4 e IPv6 **estáticas in-guest**, puestas en la provisión
+  y en el `reset_vm` y nunca más. Es el modelo que el IPv6 ya usa hoy, y
+  **dnsmasq desaparece del nodo** (§4.4).
 - **Descartado NAT46 en el nodo (464XLAT)**: el kernel de PVE no admite Jool
   (§4.4bis). Al caerse, se cae también el Jool con estado en la base — y §3.2
   vuelve a ser válida tal como está escrita.
@@ -296,14 +299,43 @@ VM.** Espejo exacto de `<IDENT>::<vmid>`:
   familia donde vive el bróker (Dukascopy ni siquiera tiene IPv6 real). Eso
   reintroduciría por debajo el corte que este proyecto existe para quitar: las
   migraciones intra-región volverían a tirar la conexión del MT.
-- **Por DHCP con reserva estática por MAC**, no estática dentro de Windows.
-  `reset_vm` rehace el invitado entero cada vez que un cliente pulsa
-  "reinstalar", así que cualquier configuración in-guest se pierde; la MAC
-  sobrevive. 🔲 **Misma pregunta pendiente para `<IDENT>::<vmid>`**: confirmar
-  que el instalador la vuelve a poner tras un reinstall.
+- **Estática dentro de Windows, y se ELIMINA el DHCP.** Es el modelo que el
+  IPv6 ya usa hoy: `first_boot.sh:110-114` — *"IPv6: NOTHING. No RA, no DHCPv6.
+  Each VM is configured in-guest with a static `<prefix>::<vmid_hex>` + manual
+  default route + manual DNS via the legacy netsh `store=persistent` path.
+  Both DHCPv6 client and RouterDiscovery are persistently DISABLED"*. Se pone
+  en la provisión y en el `reset_vm` (que vuelve a correr el instalador), y no
+  se toca nunca más. Como **dnsmasq en el nodo no hace nada más que DHCP
+  IPv4**, desaparece entero: un servicio menos por nodo. El `dhcp-option=3`
+  (gateway) y el `dhcp-option=6` (resolvers `185.12.64.1/.2`) pasan al
+  invitado, donde el IPv6 ya los tiene.
+  ⚠️ **Descartada la reserva DHCP por MAC** (decisión del 08-13 revisada el
+  mismo día): con direccionamiento por VM, una reserva es **estado por-VM en el
+  nodo** — al migrar habría que escribirla en el dnsmasq del destino y recargar
+  el servicio, que es justo el estado por-nodo que el diseño elimina, y más
+  frágil que actualizar una ruta. La configuración estática pone la identidad
+  donde corresponde: con la VM.
 - **Puerta de enlace `10.0.0.1` idéntica en todos los nodos**, con máscara
   ancha y `proxy_arp` en el bridge, para que el invitado no necesite saber en
   qué nodo está y no haya que tocarlo nunca.
+
+**Lo que hay que atender al quitar el DHCP:**
+
+1. **La provisión pasa a ser sensible al orden.** Hoy el DHCP da IPv4 en el
+   arranque, así que el instalador puede descargar (`install_openssh.ps1` tira
+   de `files-fsn`/`files-hel`) antes o después de tocar la red. Con todo
+   estático, **lo primero** que hace el instalador es configurar las
+   direcciones — y con la regla de oro: **el éxito se MIDE, no se supone**
+   (`BOUND:` devuelto Y el puerto contestando). Ver el caso vm 1023 del
+   2026-08-02: un exec devolvió exit 0 sin aplicar nada.
+2. **Una inyección fallida deja la caja sin red ninguna**, no a medias. No nos
+   deja fuera: el guest agent habla por virtio-serial, no por red, y queda la
+   consola VNC. Pero conviene tenerlo escrito antes de que pase.
+3. **Se pierde el autocurado del DHCP** (cliente que hace `netsh int ip reset`,
+   reinstala el adaptador o restaura una copia). 🔲 **Arreglo: extender a IPv4
+   la detección de deriva y el auto-fix de conncheck**, que ya existe y está
+   validado E2E para IPv6 (vm 1985, 21 s de detección a reparación). Queda
+   mejor que el DHCP porque conncheck **verifica** que ha funcionado.
 - **La base guarda una ruta `/32` por VM** hacia el túnel del nodo que la
   aloja — mismo objeto y mismo momento que la `/128` de §4.3.
 - **SNAT normal de netfilter en la base** hacia la IPv4 failover. Sin
@@ -456,7 +488,7 @@ sola VIP que reenvíe entre regiones* funciona pero fija +25 ms a media flota.
 | **La región es DESEMPATE en el relief** | No es criterio de colocación: si el mejor destino está en la otra región, va igual. Sólo desempata entre destinos equivalentes, y convierte parte de los cortes diurnos en transparentes. Coste cero. |
 | **Identidad en /64 global, NO ULA** | RFC 6724 en Windows (§4.1). |
 | **IPv4 privada por VM, no por nodo** (08-13) | Un rango por nodo cambiaría la IPv4 del invitado en cada migración, y el IPv4 es donde vive el bróker → reintroduce el corte que el proyecto quita (§4.4). |
-| **IPv4 del invitado por DHCP con reserva por MAC** (08-13) | `reset_vm` rehace el invitado a petición del cliente y se lleva cualquier configuración in-guest; la MAC sobrevive (§4.4). |
+| **IPv4 del invitado ESTÁTICA in-guest; se elimina el DHCP** (08-13) | Es el modelo que el IPv6 ya usa. Una reserva DHCP sería estado por-VM en el nodo que habría que mover en cada migración — justo lo que el diseño elimina. Y dnsmasq desaparece del nodo (§4.4). |
 | **Sin NAT46 en el nodo** (08-13) | El kernel de PVE no admite Jool, y el techo de puertos de un NAT64 sería global en vez de por destino (§4.4bis). |
 | **Túnel a la IP principal de cada base, no a la VIP** (08-13) | Terminarlo en la VIP dejaría a la base peer sin camino al nodo y rompería la entrada por las dos VIPs (§4.5). |
 | **La IPv4 de salida se deduce del túnel de entrada** (08-13) | Una línea estática puede apuntar a una VIP que esa base ya no posee → fallo silencioso. Por túnel, la regla es correcta antes y después de una conmutación, sin consultar a Robot (§4.5). |
@@ -523,10 +555,28 @@ la toquemos. Un doc de `servers` sin `orderId` es inofensivo para facturación.
 
 - `install.sh:620` — dirección de vmbr, hoy `10.0.0.1/16`.
 - `install.sh:625/627` — MASQUERADE `-s 10.0.0.0/16` (se queda como rollback).
-- `first_boot.sh:103-104` — rango de dnsmasq + `dhcp-option=3`; duplicado en
-  `run_remotes/migrate_to_deterministic_ipv6.sh:212-213`. **Los dos a la vez.**
+- **Eliminar dnsmasq del nodo.** Su única función es el DHCP IPv4
+  (`first_boot.sh:89-117`, "dnsmasq for IPv4 DHCP only"); el bloque está
+  duplicado en `run_remotes/migrate_to_deterministic_ipv6.sh:212-213` —
+  **los dos a la vez**.
 - `proxy_arp` en el bridge.
-- Reserva estática por MAC para cada VM del nodo.
+
+### Instalador de invitado
+
+- Configurar IPv4 **estática** (dirección, máscara, gateway `10.0.0.1`) junto a
+  la IPv6, por el mismo camino `netsh … store=persistent` que ya se usa.
+- Los resolvers que hoy reparte `dhcp-option=6` (`185.12.64.1/.2`) pasan a
+  ponerse in-guest, donde el IPv6 ya los pone.
+- **Primero la red, después todo lo demás** — hoy el DHCP hacía el orden
+  irrelevante (§4.4).
+- Deshabilitar el cliente DHCP de IPv4 en el adaptador, igual que ya se hace
+  con DHCPv6 y RouterDiscovery, para que no compita con la configuración
+  manual.
+
+### `conncheck`
+
+- 🔲 **Extender a IPv4** la detección de deriva in-guest y el auto-fix, que hoy
+  sólo cubren IPv6. Es lo que sustituye al autocurado que daba el DHCP (§4.4).
 
 ### Aprovisionamiento
 
@@ -694,7 +744,8 @@ Dentro del invitado:
 - [ ] Tiene su IPv4 privada única, y **es la misma tras migrar** (§4.4)
 - [ ] **No se ha tocado nada** tras la migración (misma config que antes)
 - [ ] Sobrevive a un `reset_vm`: tras reinstalar, IPv6 e IPv4 vuelven a ser las
-      mismas (la reserva DHCP por MAC debe bastar)
+      mismas (las pone el instalador; verificar que **las dos** se aplican)
+- [ ] Sin cliente DHCP activo en el adaptador, en ninguna de las dos familias
 - [ ] MTU/PMTUD: descarga de un fichero grande por HTTPS sin cortes
 
 En el nodo y la base:
@@ -737,7 +788,9 @@ Migración:
 | 9 | **`nf_conntrack_tcp_loose` y descarte de `INVALID` en el nodo.** El NPTv6 va sobre conntrack (§4.2); si un flujo a media conversación no se recoge en el nodo destino, la migración corta las conexiones establecidas — lo contrario del objetivo. | 🔲 verificar en fase 1 |
 | 10 | **Reconciliar la regla de SNAT tras una conmutación.** Con el reparto por túnel (§4.5) la regla es correcta sola, pero hay que **probarlo** en el simulacro, no darlo por hecho. Un fallo aquí es del tipo peor: *timeouts* al bróker con la infraestructura aparentemente sana. | 🔲 incluir en 0.E |
 | 11 | **Windows ante el renumerado IPv4** (NAK-y-rebind de dnsmasq) y `proxy_arp` sobre el bridge de PVE. | 🔲 validar en la VM de pruebas antes de tocar flota |
-| 12 | **Que la identidad sobreviva a `reset_vm`.** El cliente puede reinstalar desde el panel y eso rehace el invitado entero. La reserva DHCP por MAC cubre el IPv4; hay que confirmar que el instalador vuelve a poner `<IDENT>::<vmid>`. | 🔲 |
+| 12 | **Que la identidad sobreviva a `reset_vm`.** El cliente puede reinstalar desde el panel y eso rehace el invitado entero. Sin DHCP, **las dos familias** dependen de que el instalador las vuelva a poner — y de que se verifique que lo hizo, no de que devuelva exit 0 (vm 1023, 08-02). | 🔲 |
+| 14 | **Sin DHCP se pierde el autocurado**: un cliente que haga `netsh int ip reset`, reinstale el adaptador o restaure una copia se queda sin red y ya no vuelve solo. Lo sustituye el auto-fix de conncheck, que **hay que extender a IPv4** (hoy sólo mira IPv6). | 🔲 antes de la fase 3 |
+| 15 | **Provisión sensible al orden**: el instalador debe configurar la red antes de nada que necesite red. Hoy el DHCP hacía ese orden irrelevante. | 🔲 |
 | 13 | ~~El kernel de PVE no admite Jool~~ → **deja de ser un riesgo**: el diseño ya no necesita Jool en el nodo (§4.4bis). El spike se mantiene como información, no como bloqueo. | ✅ cerrado 08-13 |
 
 ---
