@@ -631,9 +631,47 @@ diferencia entre dos comandos `ip link` y gestionar 470 pares de claves con su
 rotación lo decide todo. El cifrado compra poco: es tráfico entre dos máquinas
 nuestras dentro de la red de Hetzner, y el del cliente ya va cifrado por encima.
 
-🔲 **Prueba del día 0**: confirmar que Hetzner deja pasar GRE entre servidores.
-Debería, pero algunos proveedores filtran lo que no es TCP/UDP. Si no pasa:
-`ip6tnl mode any`, y si tampoco, WireGuard sobre UDP, que pasa siempre.
+✅ **Prueba del día 0 — HECHA 2026-08-13: Hetzner SÍ pasa GRE.** Túnel
+`ip6gre` entre el nodo `0000228` y b0, **0 % de pérdida y 0,51 ms de RTT**.
+
+#### ⚠️ TRAMPA: `ip6gre` mete una cabecera DSTOPT y rompe el firewall
+
+La trampa que casi hace descartar GRE por un motivo falso. Por defecto `ip6gre`
+añade una cabecera de extensión **Destination Options** con el límite de
+encapsulación, así que el `nexthdr` de la cabecera IPv6 fija es **60, no 47**:
+
+```
+2a01:4f8:2240:201f::2 > 2a01:4f8:2b03:18a9::2: DSTOPT GREv0, length 108
+```
+
+Una regla `ip6 nexthdr gre accept` **no casa** (contador medido: 0 paquetes) y
+todo el túnel muere en el `policy drop` de la base. **Y el cuadro de síntomas es
+engañosísimo:**
+
+| se ve | realidad |
+|---|---|
+| túnel `UP,LOWER_UP` en los dos extremos | ✅ correcto |
+| `local`/`remote` bien puestos | ✅ correcto |
+| contador TX del nodo **sube** con cada ping | ✅ el nodo transmite |
+| `tcpdump` en la base **ve los paquetes en el cable** | ✅ Hetzner los entrega |
+| contador **RX del túnel en la base: 0** | ❌ el firewall los tira antes |
+
+Todo verde por los dos lados y ni un paquete atravesando. Sin bajar al `tcpdump`
+lo natural habría sido concluir "Hetzner bloquea GRE" y tirar el diseño.
+
+**Arreglo: `encaplimit none`.** ⚠️ Y no se puede cambiar en caliente —
+`ip -6 tunnel change ... encaplimit none` **lo acepta sin error y NO lo aplica**.
+Hay que **borrar y recrear** la interfaz:
+
+```bash
+ip link add name tun-b0 type ip6gre local <nodo> remote <base> encaplimit none
+```
+
+De regalo se recuperan 8 bytes de MTU: de 1448 a **1456**.
+
+⚠️ **La base necesita además una regla de entrada para GRE**: su cadena `input`
+tiene `policy drop` y no contempla el protocolo 47 (`nft list chain inet filter
+input`). Sin ella no entra nada aunque el túnel esté perfecto.
 
 **Dos interfaces con nombre predecible, no un túnel multiplexado.** Un solo
 túnel con dos direcciones sería igual de funcional y más barato de montar, pero
