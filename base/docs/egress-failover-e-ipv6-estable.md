@@ -1573,7 +1573,7 @@ de certeza, y **uno de los pasos de la receta NO es seguro**:
 | `ip addr add 10.64.255.1/16` | **No.** Segunda dirección; el `10.0.0.1/16` sigue ahí | medido |
 | MASQUERADE `-s 10.64.0.0/16` | **No.** Regla añadida al final; la de `10.0.0.0/16` sigue primera y sigue casando | medido |
 | `ip -6 addr add fe80::1/64` | **No.** Los viejos usan `<nodo>::1`, que no se toca | medido |
-| `proxy_arp = 1` | **Casi seguro que no** — Linux no responde por proxy cuando la ruta al destino sale por la MISMA interfaz por la que llegó la petición, así que el ARP invitado↔invitado del bridge no cambia | ⚠️ **razonado, NO medido**: los nodos de prueba no tienen invitados del modelo viejo |
+| `proxy_arp = 1` | **No** — Linux no responde por proxy cuando la ruta al destino sale por la MISMA interfaz por la que llegó la petición, así que el ARP invitado↔invitado del bridge no cambia | ✅ **MEDIDO** (ver abajo) |
 | **Parar `dnasmasq`** | **SÍ ROMPE.** Los invitados viejos obtienen su IPv4 por DHCP: al no renovar, acaban sin dirección | medido (en 0000228 no había ninguno, por eso fue inocuo) |
 
 **Restricción de orden para el despliegue, que se deriva de la última fila:**
@@ -1582,9 +1582,28 @@ de certeza, y **uno de los pasos de la receta NO es seguro**:
 > estén convertidos a IP estática**. Sólo entonces se retira. Convertir el nodo
 > y convertir sus VMs son dos pasos distintos y en ese orden.
 
-🔲 **Pre-vuelo obligatorio en el primer nodo con clientes**: confirmar el
-comportamiento de `proxy_arp` con invitados del modelo viejo antes de darlo por
-bueno en flota. Es la única casilla de esta tabla que no está medida.
+#### ✅ Medido: invitado del modelo VIEJO sobre nodo YA CONVERTIDO
+
+Es la situación exacta en la que estará **cada nodo durante el despliegue** —
+convertido, pero con invitados que todavía no lo están — así que valida bastante
+más que `proxy_arp`. Hecho el 2026-08-13 devolviendo la vm 1097 al modelo viejo
+(IPv4 por DHCP + puerta de enlace v6 derivada del nodo) sobre `0000238`, que ya
+tenía las dos direcciones nuevas, la regla de MASQUERADE y `proxy_arp=1`:
+
+```
+v4=[10.0.115.210] dhcp=Enabled gw4=10.0.0.1 gw6=[2a01:4f9:3100:4b08::1]
+salida4=65.109.148.185  salida6=2a01:4f9:3100:4b08::449  dns=OK
+RDP 21097 / SSH 31097: ABIERTOS
+```
+
+Cogió su concesión del rango antiguo, usó la puerta de enlace vieja en las dos
+familias, salió a Internet por ambas y siguió alcanzable. **Un nodo convertido
+sirve a sus invitados del modelo viejo exactamente igual que antes.** Después se
+devolvió al modelo nuevo y volvió a `10.64.4.73` / `fe80::1` sin incidencias.
+
+Queda así demostrado el punto que sostiene todo el despliegue secuencial: la
+conversión del nodo es **aditiva de verdad**, y convertir el nodo y convertir sus
+VMs son dos pasos independientes que pueden separarse en el tiempo.
 
 ## 12. Siguiente sesión (actualizado 2026-08-13)
 
