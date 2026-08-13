@@ -319,6 +319,16 @@ VM.** Espejo exacto de `<IDENT>::<vmid>`:
   ancha y `proxy_arp` en el bridge, para que el invitado no necesite saber en
   qué nodo está y no haya que tocarlo nunca.
 
+- **La base guarda una ruta `/32` por VM** hacia el túnel del nodo que la
+  aloja — mismo objeto y mismo momento que la `/128` de §4.3.
+- **SNAT normal de netfilter en la base** hacia la IPv4 failover. Sin
+  traducción entre familias, así que el techo de puertos de §3.2 sigue siendo
+  **por destino** y el arreglo `time_wait 120 → 30` sigue aplicando tal cual.
+- `nf_conntrack_tcp_timeout_time_wait` = **30 s**.
+- **`insert_failed` monitorizado** (§3.3).
+- El MASQUERADE del nodo **se queda presente pero inactivo**, como ruta de
+  rollback por nodo con un solo flip.
+
 **Lo que hay que atender al quitar el DHCP:**
 
 1. **La provisión pasa a ser sensible al orden.** Hoy el DHCP da IPv4 en el
@@ -336,20 +346,11 @@ VM.** Espejo exacto de `<IDENT>::<vmid>`:
    la detección de deriva y el auto-fix de conncheck**, que ya existe y está
    validado E2E para IPv6 (vm 1985, 21 s de detección a reparación). Queda
    mejor que el DHCP porque conncheck **verifica** que ha funcionado.
-- **La base guarda una ruta `/32` por VM** hacia el túnel del nodo que la
-  aloja — mismo objeto y mismo momento que la `/128` de §4.3.
-- **SNAT normal de netfilter en la base** hacia la IPv4 failover. Sin
-  traducción entre familias, así que el techo de puertos de §3.2 sigue siendo
-  **por destino** y el arreglo `time_wait 120 → 30` sigue aplicando tal cual.
-- `nf_conntrack_tcp_timeout_time_wait` = **30 s**.
-- **`insert_failed` monitorizado** (§3.3).
-- El MASQUERADE del nodo **se queda presente pero inactivo**, como ruta de
-  rollback por nodo con un solo flip.
 
-**Superficie de cambio (verificada 2026-08-13):** sólo **tres sitios** fijan
-ese rango en los dos repos — `install.sh:620` (dirección de vmbr),
-`install.sh:625/627` (MASQUERADE `-s 10.0.0.0/16`) y el bloque de dnsmasq de
-`first_boot.sh:103-104`, duplicado en
+**Superficie de cambio (verificada 2026-08-13):** sólo **tres sitios** tocan
+esto en los dos repos — `install.sh:620` (dirección de vmbr),
+`install.sh:625/627` (MASQUERADE `-s 10.0.0.0/16`) y el bloque entero de
+dnsmasq de `first_boot.sh:89-117`, duplicado en
 `run_remotes/migrate_to_deterministic_ipv6.sh:212-213`. Nada más en ninguno de
 los dos repos.
 
@@ -842,8 +843,10 @@ Por orden. Lo de arriba no depende de decisiones pendientes; lo de abajo sí.
 2. **Bajar SOA `minimum` y TTL a 60 s** (§4.6). Independiente, riesgo cero, y
    es lo que más tarda en surtir efecto — cuanto antes, mejor.
 3. **Línea base de `insert_failed`** en las dos bases (§7, 0.D).
-4. **Renumerado del espacio privado** (§4.4), empezando por los dos nodos de
-   prueba. No-op hoy, prerrequisito de todo.
+4. **Renumerado del espacio privado + fuera dnsmasq** (§4.4), empezando por los
+   dos nodos de prueba. No-op hoy, prerrequisito de todo.
+   ⚠️ Antes de tocar flota: validar en la VM de pruebas que el instalador deja
+   IPv4 **e** IPv6 estáticas y verificadas, y que sobreviven a un `reset_vm`.
 5. **Decidir**: ¿se pide la failover IPv4 de pruebas para cronometrar la
    conmutación, o se instrumenta el próximo drenaje de mantenimiento? (§7, 0.E)
    — **gatea todo el proyecto**.
