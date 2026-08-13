@@ -782,6 +782,47 @@ como no está persistido, un reinicio del nodo vuelve solo al camino seguro.
 🔲 Para la baja real: llevar la ruta por defecto y el túnel a `install.sh`, y
 **no** quitar el MASQUERADE hasta tener recorrido.
 
+### Nodo de Helsinki preparado — 4 túneles en pie (08-13)
+
+`0000238` queda con la misma configuración que `0000228`: túneles a **las dos**
+bases, reglas GRE en los tres extremos, tránsito en el ipset `base`, y enrutado
+por política para IDENT (v6) y `10.64.0.0/16` (v4).
+
+⚠️ **`/etc/iproute2/rt_tables` no existe en todos los nodos.** En `0000228` sí y
+en `0000238` no, así que `ip route ... table ident` falla en silencio (sin
+`set -e` el script sigue y parece que funcionó). **Usar identificadores
+NUMÉRICOS** (`table 100`) en cualquier script de flota, que no dependen de ese
+fichero.
+
+⚠️ **`ping` a un NODO no sirve como prueba de túnel.** El firewall de PVE no
+acepta ICMPv6 echo entrante, así que el nodo nunca contesta aunque el túnel esté
+perfecto — y da 100 % de pérdida en las dos direcciones tras el primer intento.
+Se pierde media hora persiguiendo un túnel sano. **La prueba válida es alcanzar
+un servicio real del invitado** (`nc -6 -s <transito> -z <IDENT> 3389`).
+
+### 🔲 SIGUIENTE: la migración en caliente — requiere TOCAR `migrate_vm.sh`
+
+No es "lanzar el script y mirar". `migrate_vm.sh:1235-1240` calcula:
+
+```bash
+EXPECTED_VM_IPV6="<prefijo_del_nodo_destino><vmid>"
+DST_GATEWAY="${EXPECTED_VM_IPV6%::*}::1"
+```
+
+y después **entra en el invitado por el guest agent a reescribir esa dirección y
+esa puerta de enlace**. Sobre una VM del modelo nuevo eso le **machacaría** su
+IDENT y su `fe80::1`, dejándola con una dirección derivada del nodo — justo lo
+contrario de lo que persigue el proyecto, y con el cliente dentro.
+
+Así que la migración exige antes el cambio de código de §6: que `migrate_vm.sh`
+detecte que la VM está en el modelo nuevo y **se salte** todo el bloque del
+guest agent, sustituyéndolo por **mover las rutas `/128` y `/32` en las dos
+bases**. Eso es una modificación del script más crítico de la flota y merece su
+propia sesión con pruebas, no una improvisación.
+
+**Lo que ya está listo para esa sesión**: los cuatro túneles, las dos VMs, los
+dos nodos preparados y el camino de datos validado de punta a punta.
+
 **Dos interfaces con nombre predecible, no un túnel multiplexado.** Un solo
 túnel con dos direcciones sería igual de funcional y más barato de montar, pero
 `iifname` es el discriminador que hace que las marcas de v1 sean seis líneas
