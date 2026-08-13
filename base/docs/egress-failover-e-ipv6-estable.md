@@ -1476,6 +1476,59 @@ diagnóstico.
   auto-fix de conncheck, la futura migración a `<IDENT>`— tiene que contemplarlo
   y **verificar el resultado en el almacén activo**, no fiarse del `exitcode`.
 
+### ⚠️ La puerta de enlace del invitado TAMBIÉN depende del nodo
+
+Descubierto el 2026-08-13 al preguntar el operador si bastaba con actualizar
+Firestore. **No basta, y no sólo por el transporte.**
+
+```
+migrate_vm.sh:1240:  DST_GATEWAY="${EXPECTED_VM_IPV6%::*}::1"
+```
+
+La ruta por defecto del invitado apunta hoy a `<prefijo_del_nodo>::1`
+(verificado en la vm 1096: `::/0 via 2a01:4f8:2240:201f::1`, y esa dirección
+está puesta en el bridge del nodo). Así que **darle a la VM una IPv6 estable no
+basta**: al migrar sobreviviría la dirección pero **la puerta de enlace dejaría
+de existir**, y habría que volver a entrar en Windows. Se perdería justo lo que
+el proyecto persigue, con un síntoma especialmente traicionero — *"la dirección
+es correcta pero no hay salida"*.
+
+**Para que el invitado sea de verdad independiente del nodo hay que uniformar
+TRES cosas, no una:**
+
+| | hoy | debe ser |
+|---|---|---|
+| dirección v6 | `<prefijo_nodo>::<vmid>` | `<IDENT>::<vmid>` **como /128** |
+| **puerta de enlace v6** | `<prefijo_nodo>::1` | **`fe80::1`, igual en todos los nodos** |
+| DNS v6 | `2a01:4ff:ff00::add:1/2` | igual (ya es uniforme) |
+
+⚠️ La dirección va como **`/128`**, no `/64`: con `/64` el nodo trataría todo el
+`<IDENT>` como on-link y haría NDP para VMs remotas que nunca contestarán.
+
+### `fe80::1` como puerta de enlace — PROBADO 2026-08-13 (vm 1096)
+
+**Duda del operador**: *"¿no dijiste que Windows no prioriza IPv6 si usamos
+fe80?"*. No — aquello era sobre **ULA (`fc00::/7`) como DIRECCIÓN del invitado**,
+que la RFC 6724 pone por debajo de IPv4 (§4.1). El `fe80::1` es el **siguiente
+salto de la ruta**, y la selección de origen no mira el next-hop. De hecho en
+cualquier red IPv6 normal el next-hop por defecto de Windows **es** una
+link-local, porque es lo que anuncian los RA; el caso raro es el nuestro, con un
+next-hop global, forzado por tener los RA desactivados.
+
+Probado en vez de asumido. Con `fe80::1` como puerta de enlace:
+
+| | resultado |
+|---|---|
+| `::/0` next-hop | `fe80::1` |
+| `api64.ipify.org` | `2a01:4f8:2240:201f::448` → **sigue prefiriendo IPv6** sobre IPv4 |
+| origen elegido hacia un destino v6 | la global, no la link-local |
+| RDP `21096` / SSH `31096` | abiertos |
+| **tras reiniciar la VM** | **todo idéntico** — gw, v6, v4 y salida |
+
+🔲 **Pendiente**: `fe80::1` se añadió **en vivo** al bridge del nodo. Hay que
+llevarlo a `install.sh` para que persista — si el nodo reinicia, el invitado se
+queda sin salida IPv6.
+
 ## 12. Siguiente sesión (actualizado 2026-08-13)
 
 Por orden. Lo de arriba no depende de decisiones pendientes; lo de abajo sí.
