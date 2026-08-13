@@ -1431,6 +1431,51 @@ prescindir de dnsmasq**, que era su única función.
 `policy_in: DROP` y no acepta ICMP, así que se descarta la respuesta del eco. El
 enrutado funciona — no perseguir este falso síntoma.
 
+### Experimento: quitar la IPv6 del invitado (2026-08-13, vm 1096)
+
+Hecho a propósito sobre la VM de prueba, y restaurado después. Dos resultados.
+
+**1 — El camino base→VM es IPv6 PURO.** Con la IPv6 fuera:
+
+| | resultado |
+|---|---|
+| Internet IPv4 desde dentro | ✅ `188.40.145.216` |
+| DNS | ✅ resuelve |
+| `api64.ipify.org` | devuelve la **IPv4** — Windows cae a v4 solo |
+| **RDP `21096` desde fuera** | ❌ **CERRADO** |
+| **SSH `31096` desde fuera** | ❌ **CERRADO** |
+
+Es decir: **la VM sigue viva y con Internet, pero nadie puede entrar.** Es el
+`MIGRATION_DEGRADED` reproducido deliberadamente, y explica por qué el síntoma
+que ve conncheck es "mapas NAT OK + invitado cerrado" (§4.3 de
+`neuravps-conncheck`): la VM no está caída, está sin dirección.
+
+Corolario para el diseño: mientras el `<IDENT>` no esté puesto y enrutado, **no
+se puede quitar la IPv6 vieja** — el corte es total e inmediato. La sustitución
+tiene que ser add-then-delete, nunca delete-then-add.
+
+**2 — ⚠️ TRAMPA: `netsh … delete address … store=persistent` NO borra la
+dirección viva.** Sólo quita la entrada del almacén persistente; la dirección
+**sigue enlazada y funcionando** hasta el siguiente reinicio. Medido:
+
+```
+persistente: (vacío)
+activo     : 2a01:4f8:2240:201f::448      ← sigue ahí, y RDP sigue abierto
+```
+
+Eso deja la VM en un **estado partido**: funciona hoy, y se queda a oscuras al
+reiniciar — días o semanas después, sin ninguna relación aparente con el cambio
+que lo causó. Es la clase de bomba de relojería que luego cuesta una tarde de
+diagnóstico.
+
+- Para borrar de verdad hacen falta **los dos almacenes** (`store=active` y
+  `store=persistent`).
+- `add address … store=persistent` sí aplica a los dos a la vez (el activo lo
+  recogió al instante). **La asimetría está en el borrado, no en el alta.**
+- Cualquier script que sustituya la IPv6 del invitado —el instalador, el
+  auto-fix de conncheck, la futura migración a `<IDENT>`— tiene que contemplarlo
+  y **verificar el resultado en el almacén activo**, no fiarse del `exitcode`.
+
 ## 12. Siguiente sesión (actualizado 2026-08-13)
 
 Por orden. Lo de arriba no depende de decisiones pendientes; lo de abajo sí.
