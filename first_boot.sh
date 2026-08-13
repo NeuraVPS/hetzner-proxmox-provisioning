@@ -624,12 +624,17 @@ policy_forward: DROP
 
 [IPSET base]
 
-2a01:4f9:3090:2488::/64 # BASE 0 IPv6
+2a01:4f8:2b03:18a9::/64 # BASE 0 GERMANY (b0) IPv6
 2a01:4f9:3070:3984::/64 # BASE 1 IPv6
+2a01:4f9:c01f:e:ffff::/112 # transito de los tuneles base<->nodo
 
 [IPSET hosts-ipv6]
 
 2a01:4f9:6a:44eb::/64 # 0000002-AX162-R
+
+[IPSET vm-ident]
+
+2a01:4f9:c01f:e::/64 # identidad interna de las VMs (SOLO SMB, ver abajo)
 
 [RULES]
 
@@ -637,6 +642,7 @@ IN PMG(ACCEPT) -source +dc/base -log nolog
 IN PMG(ACCEPT) -source +dc/hosts-ipv6 -log nolog
 IN SSH(ACCEPT) -source +dc/base -log nolog
 IN SSH(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN ACCEPT -source +dc/base -p gre -log nolog
 IN DHCPfwd(ACCEPT) -i vmbr0 -log nolog
 
 [group vm-default]
@@ -646,6 +652,7 @@ IN RDP(ACCEPT) -source +dc/base -log nolog
 IN ACCEPT -source +dc/base -p udp -dport 3389 -log nolog
 IN SMB(ACCEPT) -source +dc/base -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN SMB(ACCEPT) -source +dc/vm-ident -log nolog
 
 [group vm-no-internet]
 
@@ -654,6 +661,7 @@ IN RDP(ACCEPT) -source +dc/base -log nolog
 IN ACCEPT -source +dc/base -p udp -dport 3389 -log nolog
 IN SMB(ACCEPT) -source +dc/base -log nolog
 IN SMB(ACCEPT) -source +dc/hosts-ipv6 -log nolog
+IN SMB(ACCEPT) -source +dc/vm-ident -log nolog
 IN DROP -log nolog
 OUT DROP -log nolog
 
