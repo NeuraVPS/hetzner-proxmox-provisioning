@@ -1334,6 +1334,103 @@ diarios `logs\*.log` de la flota MT).
 
 ---
 
+## 11bis. Receta de IPs estáticas — VALIDADA EN PRODUCCIÓN 2026-08-13
+
+Probada de punta a punta en las VMs de prueba **1096** (`0000228`, FSN) y
+**1097** (`0000238`, HEL). Todo lo de aquí está **medido, no supuesto**.
+
+### El esquema de direccionamiento IPv4
+
+```
+  IPv4 de la VM = 10.64.<vmid_hi>.<vmid_lo>/16      (vmid = hi*256 + lo)
+  Puerta enlace = 10.64.255.1                        (igual en TODOS los nodos)
+  DNS           = 185.12.64.1, 185.12.64.2           (los de dhcp-option=6)
+```
+
+| vmid | dirección |
+|---|---|
+| 100 (el más bajo en uso) | `10.64.0.100` |
+| 1096 / 1097 (las de prueba) | `10.64.4.72` / `10.64.4.73` |
+| 2072 (el más alto en uso) | `10.64.8.24` |
+| 9999 (`VMID_MAX`) | `10.64.39.15` |
+
+**Por qué así:**
+
+- **Los dos últimos octetos SON el vmid** en big-endian, así que de un paquete
+  se lee de quién es sin consultar nada.
+- **Vive fuera de `10.0.0.0/16`**, donde está hoy toda la flota → durante un
+  despliegue **secuencial nodo a nodo no puede haber colisión** con los que aún
+  usen el esquema viejo. Los dos esquemas conviven sin tocarse.
+- También fuera de `10.0.0.0/24`, que es el `veth-host` del netns de Jool en las
+  bases (§4.4).
+- Como `VMID_MAX = 9999`, el tercer octeto **nunca pasa de 39**, así que
+  `10.64.40.0`–`10.64.255.255` queda libre para siempre y la puerta de enlace en
+  `.255.1` no puede colisionar jamás con una VM.
+- Es **determinista desde el vmid**: no hace falta asignador ni registro.
+  Aun así se **guarda** en `servers.ipv4` (§6) — la fuente de verdad es el campo,
+  no el cálculo.
+
+### Prerrequisito por nodo (ADITIVO — no toca nada existente)
+
+```bash
+ip addr add 10.64.255.1/16 dev vmbr0
+iptables -t nat -A POSTROUTING -s 10.64.0.0/16 -o <uplink> -j MASQUERADE
+sysctl -w net.ipv4.conf.vmbr0.proxy_arp=1
+```
+
+Se **añade** una dirección al bridge y una regla de MASQUERADE; el `10.0.0.1/16`
+y su regla se quedan intactos sirviendo a los invitados que aún estén en el
+esquema viejo. Por eso un nodo se puede convertir sin tocar a sus VMs.
+
+🔲 **Pendiente**: llevar esto a `install.sh` para que sea persistente. En los
+nodos de prueba está aplicado **en vivo**, así que un reinicio del NODO lo
+pierde (el reinicio de la VM no, ver abajo).
+
+### Receta en el invitado
+
+```powershell
+netsh interface ipv4 set address   name="Ethernet" static 10.64.4.72 255.255.0.0 10.64.255.1
+netsh interface ipv4 set dnsserver name="Ethernet" static 185.12.64.1 primary validate=no
+netsh interface ipv4 add dnsserver name="Ethernet" 185.12.64.2 index=2 validate=no
+```
+
+Vía `pvesh create /nodes/<nodo>/qemu/<vmid>/agent/exec` con `powershell.exe
+-EncodedCommand` (UTF-16LE + base64), el mismo camino que
+`migrate_to_deterministic_ipv6.sh`. ⚠️ `qm agent exec` directo da `400 too many
+arguments`; hay que usar `pvesh` con `--command` repetido.
+
+**`set address … static` desactiva el cliente DHCP del adaptador por sí solo** —
+no hace falta un paso aparte. Verificado: `dhcp=Disabled`.
+
+**El éxito se MIDE**: la PowerShell termina devolviendo una línea
+
+```
+BOUND:10.64.4.72/16 origin=Manual gw=10.64.255.1 dns=185.12.64.1,185.12.64.2 dhcp=Disabled
+```
+
+y no se da por buena hasta comprobar además salida real (`api.ipify.org`),
+resolución DNS y que la IPv6 sigue igual. Regla de oro de la vm 1023 (08-02):
+un `exitcode: 0` no prueba que se haya aplicado nada.
+
+### Qué quedó demostrado
+
+| prueba | resultado |
+|---|---|
+| IPv4 estática aplicada | `10.64.4.72/16`, `origin=Manual`, `dhcp=Disabled` |
+| Salida IPv4 real | `188.40.145.216` (la del nodo, vía el MASQUERADE nuevo) |
+| Salida IPv6 | `2a01:4f8:2240:201f::448` — **intacta**, sin tocarla |
+| DNS | resuelve con los dos servidores estáticos |
+| **Persistencia tras reiniciar la VM** | **idéntico** — sobrevive |
+| Una sola dirección v4 | sí, sin restos de la concesión DHCP |
+| **Con `dnsmasq` PARADO en el nodo** | **todo sigue funcionando** |
+
+Ese último punto es el que valida la decisión de §4.4: **el nodo puede
+prescindir de dnsmasq**, que era su única función.
+
+⚠️ **`ping` a la puerta de enlace falla, y es NORMAL**: el firewall por-VM tiene
+`policy_in: DROP` y no acepta ICMP, así que se descarta la respuesta del eco. El
+enrutado funciona — no perseguir este falso síntoma.
+
 ## 12. Siguiente sesión (actualizado 2026-08-13)
 
 Por orden. Lo de arriba no depende de decisiones pendientes; lo de abajo sí.
