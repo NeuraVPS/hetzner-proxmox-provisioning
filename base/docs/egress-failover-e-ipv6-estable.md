@@ -1553,13 +1553,38 @@ net.ipv4.conf.vmbr0.proxy_arp = 1
 | Invitado: gw, v6, v4, salida por ambas | ✅ idéntico |
 | RDP `21096` / SSH `31096` | ✅ abiertos |
 
-⚠️ **Hallazgo colateral: la VM NO arrancó sola tras el reinicio del nodo.** No
-hay `onboot` en `/etc/pve/qemu-server/<vmid>.conf`; de levantarlas se encarga
-`node_boot_reconcile` (citado en `node_liveness.py:845`). La VM de prueba tiene
-`maintenance: true`, que es el candidato obvio a que el reconciliador la salte —
-🔲 conviene confirmarlo, porque si el flag también frena el arranque tras un
-reboot no planificado, una VM en mantenimiento se quedaría abajo sin que nadie
-lo note.
+Repetido en **0000238 (Helsinki)** con idéntico resultado: las dos direcciones
+v4, `fe80::1`, la regla de MASQUERADE, `proxy_arp`, y la vm 1097 con
+`gw=fe80::1`, `10.64.4.73`, salida por ambas familias y RDP/SSH abiertos.
+
+ℹ️ **La VM no arranca sola tras un reinicio PLANIFICADO, y es correcto**: el
+apagado ordenado para las VMs antes de reiniciar, así que quedan paradas a
+propósito y `node_boot_reconcile` no debe levantarlas. Tras un reinicio **no
+planificado** sí las levanta solo (`node_liveness.py:845`). No es un fallo.
+
+### ⚠️ ¿Pierde conexión alguien del modelo antiguo? — análisis por cambio
+
+La pregunta que hay que responder antes de tocar el primer nodo CON clientes.
+Los cuatro cambios del nodo son **aditivos**, pero no todos con el mismo grado
+de certeza, y **uno de los pasos de la receta NO es seguro**:
+
+| cambio | ¿afecta a un invitado del modelo viejo? | evidencia |
+|---|---|---|
+| `ip addr add 10.64.255.1/16` | **No.** Segunda dirección; el `10.0.0.1/16` sigue ahí | medido |
+| MASQUERADE `-s 10.64.0.0/16` | **No.** Regla añadida al final; la de `10.0.0.0/16` sigue primera y sigue casando | medido |
+| `ip -6 addr add fe80::1/64` | **No.** Los viejos usan `<nodo>::1`, que no se toca | medido |
+| `proxy_arp = 1` | **Casi seguro que no** — Linux no responde por proxy cuando la ruta al destino sale por la MISMA interfaz por la que llegó la petición, así que el ARP invitado↔invitado del bridge no cambia | ⚠️ **razonado, NO medido**: los nodos de prueba no tienen invitados del modelo viejo |
+| **Parar `dnasmasq`** | **SÍ ROMPE.** Los invitados viejos obtienen su IPv4 por DHCP: al no renovar, acaban sin dirección | medido (en 0000228 no había ninguno, por eso fue inocuo) |
+
+**Restricción de orden para el despliegue, que se deriva de la última fila:**
+
+> En un nodo con clientes, **`dnsmasq` se queda hasta que TODOS sus invitados
+> estén convertidos a IP estática**. Sólo entonces se retira. Convertir el nodo
+> y convertir sus VMs son dos pasos distintos y en ese orden.
+
+🔲 **Pre-vuelo obligatorio en el primer nodo con clientes**: confirmar el
+comportamiento de `proxy_arp` con invitados del modelo viejo antes de darlo por
+bueno en flota. Es la única casilla de esta tabla que no está medida.
 
 ## 12. Siguiente sesión (actualizado 2026-08-13)
 
