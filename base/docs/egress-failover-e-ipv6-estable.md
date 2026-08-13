@@ -733,6 +733,55 @@ existe. Con un solo /64 flotante se resolvió acotando por interfaz.
 5. SNAT específico + reglas de forward en las bases; regla de política en el nodo.
 6. **Sólo entonces**, quitar la vieja del invitado — y **de los dos almacenes**.
 
+### 🏁 Salida IPv4 por la base — invitado Y host del nodo (08-13)
+
+**Invitado.** `salida4` de la vm 1096 pasa de `188.40.145.216` (la del nodo) a
+**`188.40.153.120`** (la de b0). Piezas:
+
+- Nodo: `ip rule from 10.64.0.0/16 iif vmbr0 lookup ident4` → `default dev tun-b0`.
+- Base: ruta `/32` de vuelta + `ip saddr 10.64.0.0/16 iifname "tun-*" oifname
+  "enp6s0" snat to <ipv4 de la base>`, **añadida al final** de la cadena.
+- El MASQUERADE del nodo **no estorba**: casa por `-o <uplink>`, y este tráfico
+  sale por el túnel. Se queda como rollback de un solo comando.
+
+**Aislamiento verificado**: la regla de la base está **doblemente acotada** —
+origen `10.64.0.0/16` **y** entrada por `tun-*`. Ningún cliente cumple ninguna
+de las dos (los suyos son `10.0.x.x` y entran por `enp6s0`), y va detrás de las
+reglas existentes sin tocarlas.
+
+**Host del nodo** — necesario antes de dar de baja la IPv4 en Hetzner, o `apt`
+y los instaladores dejan de funcionar (riesgo #5).
+
+⚠️ **El host NO puede salir con `10.64.255.1`**: esa es la puerta de enlace de
+los invitados, **idéntica en todos los nodos**, así que la base no podría saber
+a qué túnel devolver el retorno. Es la misma colisión que el `10.0.0.0/16`.
+
+**Esquema para nodos: `10.65.<node_hi>.<node_lo>`** — un `/16` aparte del de las
+VMs, mismo criterio de legibilidad. Nodo 228 → `10.65.0.228`.
+
+```bash
+ip addr replace 10.65.0.228/32 dev lo
+ip route replace default dev tun-b0 src 10.65.0.228 table host4
+ip rule add from 10.65.0.228 lookup host4 priority 102
+```
+
+**Simulada la baja de la IPv4** poniendo la ruta por defecto del nodo en el
+túnel:
+
+| prueba | resultado |
+|---|---|
+| `curl https://api.ipify.org` desde el host | **`188.40.153.120`** (la de b0) |
+| `raw.githubusercontent.com` | HTTP 200 |
+| **`apt-get update`** | **OK** |
+| RDP de la VM por las dos VIPs | abiertos |
+
+**La IPv4 pública del nodo ya no la necesita nadie.** Después se devolvió la
+ruta por defecto al uplink: el estado validado se alcanza con **un comando**, y
+como no está persistido, un reinicio del nodo vuelve solo al camino seguro.
+
+🔲 Para la baja real: llevar la ruta por defecto y el túnel a `install.sh`, y
+**no** quitar el MASQUERADE hasta tener recorrido.
+
 **Dos interfaces con nombre predecible, no un túnel multiplexado.** Un solo
 túnel con dos direcciones sería igual de funcional y más barato de montar, pero
 `iifname` es el discriminador que hace que las marcas de v1 sean seis líneas
