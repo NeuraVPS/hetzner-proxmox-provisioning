@@ -1525,9 +1525,41 @@ Probado en vez de asumido. Con `fe80::1` como puerta de enlace:
 | RDP `21096` / SSH `31096` | abiertos |
 | **tras reiniciar la VM** | **todo idéntico** — gw, v6, v4 y salida |
 
-🔲 **Pendiente**: `fe80::1` se añadió **en vivo** al bridge del nodo. Hay que
-llevarlo a `install.sh` para que persista — si el nodo reinicia, el invitado se
-queda sin salida IPv6.
+### Persistencia en el NODO — hecha y validada con reinicio real
+
+`install.sh` genera ahora la configuración nueva para **nodos nuevos**, y los dos
+de prueba se han actualizado a mano (sólo afecta a la sección de `vmbr0`, nunca
+a la del enlace físico, así que el nodo vuelve accesible pase lo que pase):
+
+```
+# en la stanza inet de vmbr0
+post-up   ip addr add 10.64.255.1/16 dev vmbr0 || true
+post-up   iptables -t nat -A POSTROUTING -s '10.64.0.0/16' -o <uplink> -j MASQUERADE
+post-down iptables -t nat -D POSTROUTING -s '10.64.0.0/16' -o <uplink> -j MASQUERADE
+# en la stanza inet6 de vmbr0
+post-up   ip -6 addr add fe80::1/64 dev vmbr0 || true
+# y en sysctl.d
+net.ipv4.conf.vmbr0.proxy_arp = 1
+```
+
+**Reinicio real del nodo 0000228 (2026-08-13)** — todo volvió solo:
+
+| | tras el reinicio |
+|---|---|
+| `10.0.0.1/16` + `10.64.255.1/16` | ✅ las dos |
+| `<nodo>::1/64` + `fe80::1/64` | ✅ las dos |
+| MASQUERADE `10.0.0.0/16` + `10.64.0.0/16` | ✅ las dos |
+| `proxy_arp` | ✅ `1` |
+| Invitado: gw, v6, v4, salida por ambas | ✅ idéntico |
+| RDP `21096` / SSH `31096` | ✅ abiertos |
+
+⚠️ **Hallazgo colateral: la VM NO arrancó sola tras el reinicio del nodo.** No
+hay `onboot` en `/etc/pve/qemu-server/<vmid>.conf`; de levantarlas se encarga
+`node_boot_reconcile` (citado en `node_liveness.py:845`). La VM de prueba tiene
+`maintenance: true`, que es el candidato obvio a que el reconciliador la salte —
+🔲 conviene confirmarlo, porque si el flag también frena el arranque tras un
+reboot no planificado, una VM en mantenimiento se quedaría abajo sin que nadie
+lo note.
 
 ## 12. Siguiente sesión (actualizado 2026-08-13)
 

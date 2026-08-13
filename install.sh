@@ -626,10 +626,32 @@ fi
   echo "    post-up   iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1"
   echo "    post-down iptables -t nat -D POSTROUTING -s '10.0.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo "    post-down iptables -t raw -D PREROUTING -i fwbr+ -j CT --zone 1"
+  # --- Esquema de direccionamiento por-VM (2026-08-13) ---------------------
+  # La IPv4 del invitado pasa a ser 10.64.<vmid_hi>.<vmid_lo>/16 con puerta de
+  # enlace 10.64.255.1, IDÉNTICA en todos los nodos, para que la dirección
+  # VIAJE CON LA VM y deje de derivarse del nodo. Ver
+  # base/docs/egress-failover-e-ipv6-estable.md §11bis.
+  #
+  # Es ADITIVO a propósito: el 10.0.0.1/16 y su MASQUERADE se quedan sirviendo
+  # a los invitados que aún estén en el esquema viejo, así que un nodo se puede
+  # convertir sin tocar a ninguna de sus VMs y la flota se migra en secuencia
+  # sin ventana de colisión (10.64.0.0/16 no solapa con 10.0.0.0/16).
+  echo "    post-up   ip addr add 10.64.255.1/16 dev vmbr0"
+  echo "    post-up   iptables -t nat -A POSTROUTING -s '10.64.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
+  echo "    post-down iptables -t nat -D POSTROUTING -s '10.64.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo ""
   echo "iface vmbr0 inet6 static"
   echo "    address ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
   echo "    post-up   echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"
+  # Puerta de enlace IPv6 UNIFORME para el invitado. Hoy migrate_vm.sh calcula
+  # DST_GATEWAY="<prefijo_del_nodo>::1", así que la ruta por defecto del
+  # invitado depende del nodo y hay que reescribirla dentro de Windows en cada
+  # migración — justo lo que el proyecto elimina. Con fe80::1 en el bridge de
+  # TODOS los nodos, la puerta de enlace deja de cambiar.
+  #
+  # No colisiona con el fe80::1 del uplink (Hetzner usa esa misma dirección
+  # como gateway v6 del nodo): las link-local tienen ámbito por interfaz.
+  echo "    post-up   ip -6 addr add fe80::1/64 dev vmbr0 || true"
 } >> /mnt/etc/network/interfaces
 fi
 
@@ -639,6 +661,11 @@ mkdir -p /mnt/etc/sysctl.d
 cat > /mnt/etc/sysctl.d/99-neuravps-forwarding.conf <<'SYSCTL'
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
+# proxy_arp en el bridge: con el esquema 10.64.<vmid>/16 la puerta de enlace
+# (10.64.255.1) es la misma en todos los nodos, así que el invitado considera
+# on-link todo 10.64.0.0/16 — incluidas VMs de OTROS nodos, que nunca
+# contestarían al ARP. Con proxy_arp el nodo responde por lo que sepa enrutar.
+net.ipv4.conf.vmbr0.proxy_arp = 1
 SYSCTL
 
 log "Successfully generated /etc/network/interfaces ($(wc -l < /mnt/etc/network/interfaces) lines)"
