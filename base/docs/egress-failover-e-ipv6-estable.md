@@ -823,6 +823,87 @@ propia sesión con pruebas, no una improvisación.
 **Lo que ya está listo para esa sesión**: los cuatro túneles, las dos VMs, los
 dos nodos preparados y el camino de datos validado de punta a punta.
 
+---
+
+## 13. ESTADO ALCANZADO — los dos nodos de prueba en el modelo FINAL
+
+Cerrado el 2026-08-14 de madrugada. `0000228` (FSN) y `0000238` (HEL) están
+**exactamente como quedará la flota**, y ambos **sin IPv4 pública**.
+
+| | 0000228 (FSN) | 0000238 (HEL) |
+|---|---|---|
+| IPv4 pública del nodo | **ninguna** | **ninguna** |
+| Salida IPv4 del host (`apt`, GitHub) | `188.40.153.120` (b0) | `37.27.135.250` (b1) |
+| VM | 1096 | 1097 |
+| IPv6 del invitado | `2a01:4f9:c01f:e::448` | `2a01:4f9:c01f:e::449` |
+| IPv4 del invitado | `10.64.4.72` | `10.64.4.73` |
+| Puerta de enlace | `fe80::1` | `fe80::1` |
+| Salida IPv6 | `2a01:4f8:2b03:18a9::448` | `2a01:4f9:3070:3984::449` |
+| Salida IPv4 | `188.40.153.120` | `37.27.135.250` |
+| **RDP por las DOS VIPs** | ✅ | ✅ |
+
+**Ninguna dirección del invitado depende del nodo.** Todo persiste a reinicios
+de VM y de nodo vía `neuravps-tunnels.service` + `/etc/default/neuravps-tunnels`.
+
+### Piezas del diseño que sólo aparecieron al montarlo
+
+**Una sola dirección de SNAT por BASE, no una por túnel.** La base pone SIEMPRE
+la suya como origen del tráfico DNAT'd, así que **cada nodo debe enrutar las dos
+direcciones canónicas** (`::` de b0, `::2` de b1) por su túnel correspondiente.
+Con `/127` por túnel, el nodo sólo conocía los suyos y devolvía por el equivocado
+→ **la entrada cruzada fallaba**. Síntoma: RDP OK por la VIP local y cerrado por
+la otra.
+
+**El `/64` de identidad se enruta ENTERO a `vmbr0`**, no una `/128` por VM. Quita
+todo el estado por-VM del nodo, y no interfiere con el tráfico saliente del
+invitado porque de eso se encarga la regla de política (`from IDENT iif vmbr0`).
+
+**`snat ip6 prefix to` funciona en la base** — una sola regla traduce
+`<IDENT>::<vmid>` → `<base>::<vmid>` conservando el sufijo, en vez de una regla
+por VM. Verificado en producción.
+
+**Direccionamiento de los nodos: `10.65.<node_hi>.<node_lo>`.** El host NO puede
+salir con `10.64.255.1` (la puerta de enlace de los invitados, idéntica en todos
+los nodos): la base no sabría a qué túnel devolver el retorno. Es la misma
+colisión que el `10.0.0.0/16`, repetida en otro sitio.
+
+### Trampas operativas que costaron tiempo
+
+- **`fwd` es palabra reservada de nftables** (el statement `fwd to <dev>`). Una
+  cadena llamada `fwd` da errores de sintaxis en las líneas SIGUIENTES, no en la
+  suya. Renombrada a `clamp`.
+- **Un `exit 0` al final de un script deja fuera todo lo que se le añada
+  después.** Silencioso.
+- **Esperar a que el SSH conteste NO prueba que un nodo haya reiniciado**: sigue
+  contestando mientras se apaga. Verificar contra un **uptime pequeño**, o se
+  comprueba el arranque viejo y se dan por buenas cosas que no se han aplicado
+  (y por rotas otras que están bien).
+- **Estos AX162 tardan varios minutos en volver** (import de ZFS). "No responde"
+  no es "caído".
+- `/etc/iproute2/rt_tables` no existe en todos los nodos → **tablas numéricas**.
+
+## 14. Firewall de flota — DESPLEGADO 2026-08-14
+
+`sync-base-nat.py sync nodes sync-firewall`: **234 nodos, 0 avisos, 0 fallos**,
+~8 min secuenciales. Canario de 6 clientes reales (3 por región) **6/6 en todas
+las rondas, cero fallos**. Verificado después en 5 nodos al azar: los tres
+cambios presentes y aplicados en `ip6tables`.
+
+Los tres cambios, **todos aditivos y compatibles con los dos modelos**:
+
+| cambio | para qué | modelo viejo |
+|---|---|---|
+| `2a01:4f9:c01f:e:ffff::/112` en `[IPSET base]` | la base alcanza al invitado desde su dirección de túnel, no la principal | intacto |
+| `[IPSET vm-ident]` + `IN SMB(ACCEPT) -source +dc/vm-ident` en los dos grupos | VM↔VM del cliente (MT→SQX) con el tráfico pasando por la base | intacto |
+| `IN ACCEPT -source +dc/base -p gre` | los túneles; sin ella el nodo tira el GRE por `policy_in: DROP` | intacto |
+
+⚠️ **`vm-ident` concede SOLO SMB**, nunca RDP — igual que `hosts-ipv6` hoy.
+Concederle RDP reabriría la regresión de aislamiento (§4.3bis).
+
+Procedimiento seguido, por si hay que repetirlo: canario primero → transformar
+la canónica **con asserts** → `diff` → **validar compilando en un nodo real con
+vuelta atrás** → subir al Storage Box → verificar idéntica → push → muestra.
+
 **Dos interfaces con nombre predecible, no un túnel multiplexado.** Un solo
 túnel con dos direcciones sería igual de funcional y más barato de montar, pero
 `iifname` es el discriminador que hace que las marcas de v1 sean seis líneas
