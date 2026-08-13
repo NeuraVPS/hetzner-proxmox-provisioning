@@ -39,6 +39,21 @@ ha **simplificado mucho** respecto a la versión del 08-11.
   por la base, un cliente podría abrir RDP contra la VM de otro. Regla en la
   base desde v0.
 - **Criterio de diseño explícito** (§4.6) y hoja de ruta v0 / v1 / v1.1.
+
+**Ronda 3 — anclaje del túnel, y ejecución arrancada:**
+
+- **Los túneles se anclan a las DOS VIPs, no a las IPs principales** (§4.5). Con
+  eso la salida sigue a la VIP sola cuando se mueve, apagar una base es sólo
+  mover las VIPs, y **el sondeo en el nodo pasa de obligatorio a opcional**.
+- **`ip6gre` es sin estado y Linux no implementa sus keepalives** (§4.2bis): con
+  anclaje a IP principal el túnel apuntaría a una caja muerta para siempre.
+- ⚠️ **Métricas distintas en las dos rutas por defecto** — si quedan iguales,
+  Linux hace ECMP y la IP de salida del cliente baila por conexión (§4.2bis).
+- **Los dos nodos de prueba están CONGELADOS** (§7). Cambia el de Falkenstein:
+  0000227 se llenó de clientes por no haber congelado a tiempo.
+- **Criterio de aborto fijado** (§7, 0.H) y **`<IDENT>` elegido** (§7, 0.F).
+- **Dos cambios independientes** que se aplican en el mismo viaje (§7, fase
+  0bis): el `cluster.fw` desfasado y cerrar el DNAT de la IP principal.
 - Corregido: `snat/dnat prefix to` **no es sin estado** (§4.2, ya sin uso).
 - **Riesgo #6 CERRADO**: el operador confirma que Hetzner permite renunciar a la
   IPv4 de un dedicado ya contratado (€1,70/mes cada una, el /64 se queda).
@@ -251,16 +266,27 @@ Cisco). Cuando la base peer se reinicia o cae:
 O sea que sin añadir nada, **no hay "delay": no hay recuperación**. El nodo se
 queda sin salida hasta que la base vuelve, con el otro túnel vivo al lado.
 
-**Solución: un temporizador que sondea las dos bases por sus túneles y ajusta la
-métrica de la ruta por defecto.** Sondeo cada 5 s, tres fallos para conmutar →
-recuperación en ~15 s. Es **por túnel, no por VM**: el mismo script en los 235
-nodos, sin nada que crezca con la flota.
+**Esto lo resuelve el anclaje a las VIPs** (§4.5, decisión de la ronda 3): al
+moverse la VIP, el túnel la sigue y el tráfico aterriza en la superviviente sin
+que el nodo haga nada. Suelo de recuperación: la cadena de failover completa,
+~5-6 min (detección 6×30 s + árbitro + 2-3 min de propagación de Hetzner).
+
+**Mejora opcional, para después**: un temporizador que sondea las dos bases por
+sus túneles y ajusta la métrica de la ruta por defecto. Baja los 5-6 min a
+~15 s, porque en operación normal cada túnel termina en una base distinta y el
+nodo puede irse al de la otra región sin esperar a la VIP. Es **por túnel, no
+por VM**: el mismo script en los 235 nodos, sin nada que crezca con la flota, y
+**aditivo** — se puede montar más adelante sin rediseñar nada.
 
 Descartado un demonio de enrutado (BGP/BFD con FRR): para dos vecinos fijos es
 desproporcionado, y añade una superficie operativa grande en 235 hipervisores.
 
-En **mantenimiento planificado** no hace falta esperar al watchdog: el drenaje
-conmuta la ruta a mano antes de reiniciar la base.
+⚠️ **Caso que el anclaje a VIP NO cubre: base viva pero degradada.** Es lo del
+2026-07-16 — la base con el conntrack lleno tirando paquetes mientras seguía
+contestando. El watchdog no mueve la VIP porque la base está viva, así que la
+salida no se recupera. El sondeo del nodo *podría* pillarlo, pero tampoco está
+garantizado: si la base descarta tráfico de cliente pero contesta al sondeo, se
+le escapa igual.
 
 #### ⚠️ Métricas DISTINTAS en las dos rutas por defecto — nunca iguales
 
@@ -545,16 +571,50 @@ IPv6-only. Ya no bloquea nada.
 
 ### 4.5 Túnel base↔nodo y elección de la IPv4 de salida
 
-**Dos túneles por nodo, terminados en la IP PRINCIPAL de cada base.** Ambos
-siempre arriba, así que las dos bases alcanzan siempre todos los nodos.
+**Dos túneles por nodo, anclados a las DOS VIPs de failover** (no a las IPs
+principales). `tun-hel` → VIP de Helsinki, `tun-fsn` → VIP de Falkenstein.
+Ambos siempre arriba.
 
-⚠️ **Por qué NO terminarlos en la VIP de failover.** Es tentador: los paquetes
-llegarían solos a la base que en ese momento posee la IP, y una conmutación
-arrastraría el túnel gratis sin tocar el nodo. Pero entonces **sólo la base que
-posee la VIP alcanza ese nodo**, y eso rompe la entrada cruzada que §2 tiene
-verificada — el puerto `20959` de una VM de Helsinki responde por las **dos**
-VIPs. Es justo lo que hace que la URL guardada del cliente no se rompa al
-migrar de región, y lo que piden las dos reglas de `pre` de §4.2.
+**El emparejamiento nodo↔base es por VIP, no por máquina**, y eso es lo que hace
+que se resuelva solo: cada base lleva **un único juego** de túneles, sourced de
+la VIP que posee (b1 con `local = VIP de Helsinki`, b0 con `local = VIP de
+Falkenstein`). Cuando una VIP se mueve, los túneles de los nodos la siguen sin
+tocar nada, y **la base superviviente no reconfigura nada**: sigue usando su
+propio juego, que alcanza todos los nodos igual.
+
+⚠️ **UN SOLO túnel a la VIP de su región NO vale** (se evaluó y se descartó):
+entonces sólo la base que posee esa VIP alcanza ese nodo, y eso rompe la entrada
+cruzada que §2 tiene verificada — el puerto `20959` de una VM de Helsinki
+responde por las **dos** VIPs — además de dejar sin camino al sondeo cruzado de
+conncheck (§4.3). Con **dos** túneles, uno por VIP, cada base alcanza todos los
+nodos por el túnel de la VIP que posee y las dos propiedades se conservan.
+
+**Por qué a las VIPs y no a las IPs principales** (decisión de la ronda 3, tras
+comparar las dos):
+
+| | anclado a IP principal | anclado a failover ✅ |
+|---|---|---|
+| **sin** sondeo en el nodo | **nunca se recupera** — el túnel apunta a una caja muerta para siempre | se recupera al moverse la VIP (~5-6 min) |
+| **con** sondeo en el nodo | 15 s | 15 s |
+| apagar una base | drenaje que flipea métricas + mover VIPs | **sólo mover las VIPs** |
+
+El anclaje a la failover es **estrictamente mejor**: funciona sin sondeo, y el
+sondeo pasa a ser una **mejora opcional** en vez de un requisito. Con las IPs
+principales el sondeo es obligatorio porque sin él no hay recuperación de
+ninguna clase.
+
+**El sondeo es ORTOGONAL al anclaje.** Incluso anclando a las VIPs, en operación
+normal cada túnel termina en una base distinta, así que un nodo que vea su túnel
+muerto puede irse al de la otra región —que llega a la superviviente— y
+recuperar en ~15 s sin esperar a que la VIP se mueva. **Se arranca sin sondeo**,
+con los 5-6 min como suelo, y se añade después si la primera caída real duele.
+Es aditivo y no cambia el diseño.
+
+⚠️ **Asimetría a saber**: tras una conmutación las dos VIPs viven en la misma
+caja, así que los dos túneles del nodo terminan en el mismo sitio y el sondeo se
+queda sin alternativa independiente. Sólo importa si la superviviente también
+cae —escenario sin salida de todas formas— pero no hay que creerse que queda
+redundancia donde ya no la hay.
 
 **Tecnología: `ip6gre`.**
 
@@ -872,8 +932,19 @@ Hay **12 AX162-2-LTD vacíos** (0 VMs), instalados el 2026-07-29, 96 cores /
 251 GB, `nodeType: SQX`, sincronizando a diario y térmicamente sanos:
 Falkenstein 0000227/228/229; Helsinki 0000230/231/233/234/235/236/237/238/239.
 
-- **Fase 1 → `0000227-AX162-2-LTD`** (Falkenstein, `2a01:4f8:2240:201e::2`) + **b0**.
-- **Fase 2 → `0000238-AX162-2-LTD`** (Helsinki, `2a01:4f9:3100:4b08::2`) + b1.
+- **Fase 1 → `0000228-AX162-2-LTD`** (Falkenstein, `2a01:4f8:2240:201f::2`,
+  v4 `188.40.145.216`) + **b0**. 🧊 **Congelado el 2026-08-13.**
+- **Fase 2 → `0000238-AX162-2-LTD`** (Helsinki, `2a01:4f9:3100:4b08::2`,
+  v4 `65.109.148.185`) + b1. 🧊 **Congelado el 2026-08-13.**
+
+⚠️ **Por qué NO es 0000227, y la lección.** El plan del 08-13 por la mañana
+eligió 0000227, pero **el paso 0.A (congelar) no se ejecutó** — y en menos de 24
+horas el nodo recibió **3 VMs de clientes**, dos creadas esa misma mañana
+(08:59 y 10:04 UTC). En el mismo periodo la reserva de AX162 vacíos pasó de
+**12 a 8** (se llenaron 227, 230, 231 y 233), dejando Falkenstein con sólo dos.
+
+Lección, y por eso 0.A es el paso uno y no el cuatro: **la reserva de vacíos se
+consume a ~4 nodos/día**. Congelar no es una precaución, es una carrera.
 
 ⚠️ **b0 va PRIMERO** (cambio del 08-13, antes era al revés). b0 sirve las 522
 VMs de Falkenstein; b1 sirve las 1.343 de Helsinki. El paso con riesgo real en
@@ -973,13 +1044,34 @@ cross-check gratis, instrumentar el próximo drenaje de mantenimiento.
 qué número de segundos convierte esto en un "no seguimos". Es mucho más fácil
 ahora que con la cifra delante.
 
-**0.F — Elegir el `<IDENT>` /64.** Requisito: global unicast, nuestro, no
-anunciado. No tenemos espacio PI, así que lo práctico es **pedir a Hetzner un
-/64 adicional asignado a una de las bases**. Vuelta de tuerca: dejarlo enrutado
-a esa base con una regla que lo **cuente y lo tire**. Si alguna vez falla una
-traducción NPTv6 y un paquete se escapa con origen IDENT, el retorno muere en
-nuestra propia base, en un contador que podemos mirar, en vez de en el vacío.
-Detector de fugas gratis y fallo cerrado.
+**0.F — El `<IDENT>` /64: pedir uno adicional en Robot, asignado a b0.**
+Elegido el 2026-08-13. Requisito: global unicast, nuestro, no anunciado. No
+tenemos espacio PI, así que la vía es **un /64 adicional de Hetzner**. Razones
+de la elección, por orden:
+
+1. Es global y sin ambigüedad **nuestro**, así que ninguna VM se queda sin poder
+   alcanzar un destino legítimo por colisión de prefijo.
+2. Enrutado a b0, un paquete que se escape por un fallo de traducción tiene el
+   retorno muriendo en máquina nuestra, donde lo podemos **contar y tirar**:
+   fallo cerrado con detector de fugas gratis.
+3. No depende de ningún nodo ni de los bloques failover, así que ni una baja de
+   hierro ni una conmutación de VIP lo tocan.
+
+❌ **Descartado reusar el /64 de un AX162 vacío**: funcionaría hoy y sería una
+bomba de relojería el día que ese nodo entre en servicio o se dé de baja.
+🔲 Confirmar que Hetzner lo entrega **enrutado**, no atado a MAC.
+
+**0.H — Criterio de aborto (fijado por el operador, 2026-08-13).**
+
+> Si en cualquier momento una de las bases deja de responder a conexiones
+> entrantes de RDP: **mover el failover a la otra base, parar, y
+> revertir/evaluar.**
+
+Para que sea operativo hace falta detectarlo **en segundos**, y ninguna de las
+sondas actuales sirve: conncheck es **horario**, y el failover watchdog mira
+liveness de base (ICMP + TCP 22/443 desde el árbitro), no RDP. Así que durante
+cada ventana de trabajo hay que levantar un **sondeo continuo de RDP contra una
+VM conocida de cada base**, y dejarlo corriendo mientras dure la sesión.
 
 **0.G — Túnel base↔nodo en el nodo de pruebas (§4.5), con MSS clamping.** Va
 después de 0.A y 0.B. ⚠️ El nodo usa `iptables` (`install.sh:625`) y la base
@@ -989,8 +1081,61 @@ nueva va en su propio include desde el principio, no como `nft add table` a
 mano. Verificar antes de que exista ninguna VM: PMTUD en los dos sentidos,
 ICMPv6 incrustado (§9.4), y que `pve-firewall` no pisa la tabla nueva.
 
+### Fase 0bis — dos cambios INDEPENDIENTES que aprovechan el viaje
+
+Ninguno de los dos necesita nada de este proyecto, pero los dos tocan las
+mismas piezas, así que se aplican en la misma ventana.
+
+**1. Arreglar el `cluster.fw` desfasado (riesgo #17). Son TRES pasos, no uno:**
+
+- Corregir la plantilla inline de `first_boot.sh:617` — cubre sólo
+  **instalaciones nuevas**, porque `first_boot.sh` únicamente corre al instalar.
+- Corregir la **copia canónica del Storage Box** (`/home/firewall/cluster.fw`),
+  que es la que se sirve a los 235 nodos existentes.
+- Empujarla con `sync-base-nat.py sync nodes sync-firewall` y **verificar**.
+
+**2. Cerrar el DNAT de la IP PRINCIPAL al público.**
+
+Hoy `table ip nat prerouting` acepta el rango `10000-39999` en **las dos**
+direcciones — la failover y la principal:
+
+```nft
+ip daddr 37.27.135.250 tcp dport 10000-39999 dnat to 10.0.0.3   # ← principal
+ip daddr 77.42.49.79   tcp dport 10000-39999 dnat to 10.0.0.3   # ← failover
+```
+
+**Ningún cliente usa la principal.** Verificado el 2026-08-13 resolviendo los
+nombres que genera `get_connection_url` / `_rdp_host`: `sqx-hel`, `trading-hel`,
+`sqx` y `trading` → `77.42.49.79`; `sqx-fsn` y `trading-fsn` → `94.130.3.118`.
+Todos VIPs. Así que la IP de gestión de cada base —la que sirve SSH, nginx y las
+sondas del árbitro— está publicando el rango de RDP a todo Internet sin que
+nadie legítimo entre por ahí.
+
+⚠️ **NO se puede quitar: hay que restringirla.** `neuravps-conncheck.py:53-55`
+sondea las ~1.850 VMs **a través de la IP principal de la base peer**, y es
+deliberado — las dos bases tienen la VIP enlazada, así que una conexión a la VIP
+se entregaría **localmente** y probaría la caja equivocada. Quitar el DNAT de la
+principal deja a conncheck reportando la flota entera como inalcanzable.
+
+**Arreglo: añadir `ip saddr <principal de la peer>` a esas dos líneas.** La IP
+de gestión deja de ser superficie pública de RDP y conncheck sigue igual. El
+patrón ya existe: `bf_allow` de `ip rdpguard` ya lleva las dos principales como
+infraestructura de confianza.
+
+⚠️ **Es NO aditivo** — toca una cadena existente. `nft -c -f` antes, una base
+cada vez empezando por b0, y con el canario de RDP encendido.
+🔲 Antes de aplicarlo: verificar la **IP de origen real** de las sondas (podrían
+salir por otra dirección de la que asumimos) y desde dónde se ejecuta
+`scripts/check_rdp_smb_connectivity.sh`, que lleva `37.27.135.250` cableado.
+
+**Corrección de premisa**: esto NO libera puertos de salida. El DNAT de entrada
+y el SNAT de salida son tuplas de conntrack distintas, y netfilter no reserva
+puertos por tener un DNAT apuntando a ellos. El techo real sigue siendo el de
+§3.2, por destino, y no cambia ni un puerto. **El motivo es superficie, no
+capacidad.**
+
 ### Fase 1 — un nodo, una VM de prueba, una base
-- Nodo de Falkenstein (**0000227**) + b0. VM de prueba **nuestra**, no de cliente.
+- Nodo de Falkenstein (**0000228**) + b0. VM de prueba **nuestra**, no de cliente.
 - Aplicar: identidad en el invitado, par de reglas nft en el nodo, ruta `/128`
   en las **dos** bases, entrada NAT46 estática.
 - **Validar** (§8) y **medir** antes/después.
@@ -1193,17 +1338,22 @@ diarios `logs\*.log` de la flota MT).
 
 Por orden. Lo de arriba no depende de decisiones pendientes; lo de abajo sí.
 
-1. **Congelar 0000238 y 0000227** (§7, 0.A). Un toggle en admin/nodos.
-2. **Bajar SOA `minimum` y TTL a 60 s** (§4.7). Independiente, riesgo cero, y
+1. ✅ **Congelar los dos nodos** (§7, 0.A) — HECHO 2026-08-13: `0000228` (FSN) y
+   `0000238` (HEL), los dos a 0 VMs y `frozen: true`.
+2. **Levantar el canario de RDP** antes de tocar ninguna base: netcat continuo
+   contra el puerto RDP de **2-3 clientes reales** de la base que se toca. Si
+   dejan de responder → **avisar de inmediato y mover el failover a la otra
+   base** (§7, 0.H). Esto va ANTES que cualquier cambio, no en paralelo.
+3. **Bajar SOA `minimum` y TTL a 60 s** (§4.7). Independiente, riesgo cero, y
    es lo que más tarda en surtir efecto — cuanto antes, mejor.
-3. **Línea base de `insert_failed`** en las dos bases (§7, 0.D).
-4. **Renumerado del espacio privado + fuera dnsmasq** (§4.4), empezando por los
-   dos nodos de prueba. No-op hoy, prerrequisito de todo.
-   ⚠️ Antes de tocar flota: validar en la VM de pruebas que el instalador deja
-   IPv4 **e** IPv6 estáticas y verificadas, y que sobreviven a un `reset_vm`.
-5. **Decidir** el `<IDENT>` /64 (§7, 0.F): pedir un /64 adicional a Hetzner.
-6. Crear las VMs de prueba con doc en `servers` + `maintenance: true` (§6).
-7. Montar el túnel `ip6gre` en 0000227 y **verificar que Hetzner pasa GRE**.
+4. **Línea base de `insert_failed`** en las dos bases (§7, 0.D).
+5. **Pedir el `/64` adicional para `<IDENT>`** en Robot, asignado a b0 (0.F).
+6. Crear la VM de prueba en `0000228` desde `/admin/servers` — el formulario
+   pide `nodeId` explícito, y `frozen` sólo gatea la colocación **automática**,
+   así que se puede forzar un nodo congelado. Luego ponerle `maintenance: true`
+   en su doc de `servers` (§6).
+7. Montar el túnel `ip6gre` en `0000228` y **verificar que Hetzner pasa GRE**.
+8. **Fase 0bis**: `cluster.fw` (3 pasos) y cerrar el DNAT de la IP principal.
 
 **Lo que ya NO gatea la fase 0**: cronometrar la conmutación de failover. Eso
 gatea la **fase 4**, no el arranque — durante las fases 0 a 2 los únicos que
