@@ -140,6 +140,32 @@ CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — RDP listener 
 POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
+# ----- NEW_IPS: direccionamiento independiente del nodo -------------------------
+# NEW_IPS=1  ->  la VM lleva su propia identidad de red, que NO se deriva del
+#                nodo: IPv6 `<IDENT>::<vmid>` y puerta de enlace `fe80::1`,
+#                iguales en toda la flota. Al migrar NO hay que tocar el
+#                invitado: lo único que se mueve son las rutas en las bases.
+#                Ver base/docs/egress-failover-e-ipv6-estable.md §11bis.
+#
+# Con NEW_IPS=1 se OMITE todo el bloque que entra en Windows por el guest agent
+# a reescribir la dirección. Eso es obligatorio, no una optimización: ese bloque
+# calcula la dirección desde el prefijo del nodo DESTINO, así que sobre una VM
+# del modelo nuevo le MACHACARÍA su IDENT dejándola atada al nodo — justo lo
+# contrario de lo que se persigue, y con el cliente dentro.
+#
+# Default 0 = comportamiento de siempre, para no romper las VMs del modelo
+# viejo mientras convive con ellas.
+#
+# 🔲 CUANDO TODA LA FLOTA ESTÉ MIGRADA: borrar los bloques `NEW_IPS != 1` y
+#    quedarse sólo con el camino nuevo. El script adelgaza mucho — se van
+#    `_wait_agent_dst`, `_verify_dest_ipv6`, `PS_RECONFIG`, `DST_GATEWAY` y el
+#    flag `MIGRATION_DEGRADED` por esta causa.
+NEW_IPS="${NEW_IPS:-0}"
+case "${NEW_IPS,,}" in
+  1|true|yes|on) NEW_IPS=1 ;;
+  *)             NEW_IPS=0 ;;
+esac
+
 # ----- Logging helpers ---------------------------------------------------------
 # All warnings + errors are mirrored to $ERROR_LOG with a timestamp + VMID for
 # post-run review. Failures during file writes are silently ignored — logging
@@ -283,11 +309,23 @@ if (( SRC_EQ_DST == 0 )); then
   [[ -n "$RESOLVED" ]] || _die "Resolver produced empty output."
   read -r SRC_NODE SRC_IPV6 DST_NODE DST_IPV6 EXPECTED_VM_IPV6 OLD_VM_IPV6 <<< "$RESOLVED"
   RDP_PORT=$((RDP_BASE_PORT + VMID))
+  # NEW_IPS: la dirección del invitado NO cambia al migrar. El resolver la
+  # calcula desde el prefijo del nodo destino porque es lo que hace el modelo
+  # viejo; aquí se descarta ese cálculo y se conserva la que ya tiene, de modo
+  # que todo lo que viene después (NAT local, sonda RDP, Firestore) apunte a la
+  # dirección real y no a una derivada del nodo.
+  if (( NEW_IPS == 1 )); then
+    EXPECTED_VM_IPV6="$OLD_VM_IPV6"
+  fi
   _info "VMID:           ${VMID}"
   _info "Source node:    ${SRC_NODE} (${SRC_IPV6})"
   _info "Dest node:      ${DST_NODE} (${DST_IPV6})"
-  _info "Old VM IPv6:    ${OLD_VM_IPV6}"
-  _info "New VM IPv6:    ${EXPECTED_VM_IPV6}"
+  if (( NEW_IPS == 1 )); then
+    _info "VM IPv6:        ${OLD_VM_IPV6}  (NEW_IPS=1 — NO cambia al migrar)"
+  else
+    _info "Old VM IPv6:    ${OLD_VM_IPV6}"
+    _info "New VM IPv6:    ${EXPECTED_VM_IPV6}"
+  fi
   _info "Public RDP port: ${RDP_PORT}"
 fi
 
@@ -504,7 +542,19 @@ PY
   if [[ -n "$RECONCILE" ]]; then
     read -r RC_DST_NODE RC_EXPECTED_IPV6 <<< "$RECONCILE"
     _info "Source equals destination (${RC_DST_NODE}); reconciling Firestore in case a prior run was interrupted…"
-    if _firestore_update_servers --vmid "$VMID" --node-id "$RC_DST_NODE" --ipv6 "$RC_EXPECTED_IPV6" --maintenance false 2>/dev/null; then
+    # NEW_IPS: NO tocar `ipv6` aquí. Este resolver la calcula desde el prefijo
+    # del nodo destino, y como el script es idempotente y se re-ejecuta a
+    # propósito tras un fallo parcial, escribirla machacaría la IDENT de una VM
+    # del modelo nuevo — y la Cloud Function lo propagaría a las DOS bases,
+    # dejando al cliente inalcanzable. Se reconcilian nodo y maintenance, que
+    # sí cambian; la dirección no cambia nunca al migrar.
+    _rc_fs_args=(--vmid "$VMID" --node-id "$RC_DST_NODE" --maintenance false)
+    if (( NEW_IPS == 0 )); then
+      _rc_fs_args+=(--ipv6 "$RC_EXPECTED_IPV6")
+    else
+      _info "NEW_IPS=1 — se reconcilia nodeId pero NO ipv6 (la dirección no depende del nodo)."
+    fi
+    if _firestore_update_servers "${_rc_fs_args[@]}" 2>/dev/null; then
       _ok "Firestore reconciled (or was already up-to-date)."
     else
       _warn "Firestore reconcile failed; check /etc/firebase-credentials.json."
@@ -1274,7 +1324,17 @@ if [[ "$_vm_name" == E-* ]]; then
   fi
 fi
 
-if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
+if (( NEW_IPS == 1 )); then
+  # ---- Camino NUEVO: el invitado NO se toca -----------------------------------
+  # Su IPv6 es <IDENT>::<vmid> y su puerta de enlace fe80::1, las dos iguales en
+  # toda la flota, así que la migración no cambia nada dentro de Windows. Se
+  # omite entero el bloque del guest agent (PS_RECONFIG, _wait_agent_dst,
+  # _verify_dest_ipv6) — que es lo que hoy causa el MIGRATION_DEGRADED.
+  _ok "NEW_IPS=1 — el invitado conserva ${EXPECTED_VM_IPV6}; NO se toca su configuración de red."
+  _warn "NEW_IPS=1: mover las rutas de la VM en LAS DOS bases hacia el túnel del nodo destino (${DST_NODE}) — todavía NO lo hace este script:"
+  _warn "    ip -6 route replace ${EXPECTED_VM_IPV6}/128 dev <tunel-del-destino>"
+  _warn "    ip    route replace <ipv4-privada-de-la-vm>/32 dev <tunel-del-destino>"
+elif [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
   _info "Reconfiguring static IPv6 in guest: addr=${EXPECTED_VM_IPV6}/64 gw=${DST_GATEWAY}…"
 
   PS_RECONFIG=$(cat <<PSEOF
