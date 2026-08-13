@@ -315,9 +315,187 @@ def write_state(state: dict):
 # Defaults: rdp/samba/ssh enabled when the field is missing (back-compat
 # with pre-firewall-flag state files and Firestore docs).
 def _server_entry(
-    ipv6: str, rdp: bool = True, samba: bool = True, ssh: bool = True
+    ipv6: str,
+    rdp: bool = True,
+    samba: bool = True,
+    ssh: bool = True,
+    node_id: str = "",
+    ipv4: str = "",
 ) -> dict:
-    return {"ipv6": ipv6, "rdp": bool(rdp), "samba": bool(samba), "ssh": bool(ssh)}
+    return {
+        "ipv6": ipv6,
+        "rdp": bool(rdp),
+        "samba": bool(samba),
+        "ssh": bool(ssh),
+        # Modelo nuevo (IDENT): la dirección del invitado ya no se deriva del
+        # nodo, así que hace falta saber DÓNDE está para enrutar el /128 al
+        # túnel correcto. En el modelo viejo estos campos se ignoran.
+        "nodeId": str(node_id or ""),
+        "ipv4": str(ipv4 or ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rutas por VM del modelo nuevo (IDENT)
+# ---------------------------------------------------------------------------
+# Con el direccionamiento independiente del nodo, la dirección del invitado NO
+# dice dónde está; lo dice `nodeId`. Así que además del mapa de puertos, la base
+# mantiene una ruta por VM hacia el túnel del nodo que la aloja. Eso es lo único
+# que se mueve en una migración, y es lo que sustituye a entrar en Windows.
+#
+# IDENT_PREFIX vacío = función DESACTIVADA: nada cambia para el modelo viejo.
+# Ver base/docs/egress-failover-e-ipv6-estable.md §4.3 / §13.
+IDENT_PREFIX = (os.environ.get("IDENT_PREFIX") or "").strip()
+TUNNEL_IFACE_PREFIX = os.environ.get("TUNNEL_IFACE_PREFIX", "tun-")
+# Trozo del /64 de identidad reservado al tránsito de los túneles. NO son VMs y
+# este script NUNCA debe tocar sus rutas (ver _managed_route_dst).
+TRANSIT_PREFIX = os.environ.get("TRANSIT_PREFIX", "2a01:4f9:c01f:e:ffff::/112")
+# Rango de las IPv4 privadas de las VMs. El de los nodos (10.65/16) es aparte y
+# no se gestiona desde aquí.
+VM_V4_PREFIX = os.environ.get("VM_V4_PREFIX", "10.64.0.0/16")
+
+
+def _ident_network():
+    """La red IDENT como objeto, o None si la función está desactivada."""
+    if not IDENT_PREFIX:
+        return None
+    try:
+        return ipaddress.IPv6Network(IDENT_PREFIX, strict=False)
+    except ValueError:
+        logger.error("IDENT_PREFIX inválido: %r — rutas por VM DESACTIVADAS", IDENT_PREFIX)
+        return None
+
+
+def _is_ident(ipv6: str) -> bool:
+    net = _ident_network()
+    if net is None:
+        return False
+    try:
+        return ipaddress.IPv6Address(str(ipv6).strip()) in net
+    except ValueError:
+        return False
+
+
+def tunnel_iface_for_node(node_id: str) -> str | None:
+    """`0000228-AX162-2-LTD` -> `tun-p228`. None si no se puede derivar."""
+    alias = node_short_alias(node_id or "")
+    return f"{TUNNEL_IFACE_PREFIX}{alias}" if alias else None
+
+
+def _iface_exists(iface: str) -> bool:
+    return Path(f"/sys/class/net/{iface}").exists()
+
+
+def reconcile_vm_routes(desired: dict[int, dict]) -> None:
+    """Rutas /128 (y /32 de la IPv4 privada) hacia el túnel del nodo de cada VM.
+
+    Sólo actúa sobre VMs cuya IPv6 cae dentro de IDENT_PREFIX, así que durante
+    el despliegue las del modelo viejo pasan intactas: su dirección vive en el
+    /64 del nodo y se enruta nativamente, sin ruta ni túnel.
+
+    Reconcilia de verdad — instala lo que falta y RETIRA lo que sobra — para que
+    una migración deje de apuntar al túnel del nodo anterior.
+    """
+    if _ident_network() is None:
+        return
+
+    quieren: dict[str, str] = {}   # destino -> interfaz
+    sin_tunel: list[int] = []
+    for vmid, ent in desired.items():
+        ipv6 = (ent.get("ipv6") or "").strip()
+        if not _is_ident(ipv6):
+            continue
+        iface = tunnel_iface_for_node(ent.get("nodeId") or "")
+        if not iface or not _iface_exists(iface):
+            sin_tunel.append(vmid)
+            continue
+        quieren[f"{ipv6}/128"] = iface
+        ipv4 = (ent.get("ipv4") or "").strip()
+        if ipv4:
+            quieren[f"{ipv4}/32"] = iface
+
+    if sin_tunel:
+        # No es fatal: la VM sigue alcanzable por el camino viejo si lo tiene.
+        # Pero es exactamente lo que hay que mirar si una VM del modelo nuevo
+        # deja de responder tras una migración.
+        logger.warning(
+            "rutas: %d VM(s) del modelo nuevo sin túnel en esta base (nodo sin "
+            "preparar o interfaz ausente): %s",
+            len(sin_tunel), sorted(sin_tunel)[:20],
+        )
+
+    for familia, flag in (("-6", "inet6"), ("-4", "inet")):
+        # Sólo se tocan rutas cuyo destino cae en los prefijos gestionados y
+        # cuya salida es un túnel: cualquier otra cosa de la tabla es ajena.
+        try:
+            actuales_raw = run(["ip", familia, "route", "show"], check=False)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("rutas: no se pudo leer la tabla %s", flag)
+            continue
+        actuales: dict[str, str] = {}
+        for line in actuales_raw.splitlines():
+            parts = line.split()
+            if len(parts) < 3 or "dev" not in parts:
+                continue
+            dst = parts[0]
+            iface = parts[parts.index("dev") + 1]
+            if not iface.startswith(TUNNEL_IFACE_PREFIX):
+                continue
+            if "/" not in dst:
+                dst = f"{dst}/128" if familia == "-6" else f"{dst}/32"
+            actuales[dst] = iface
+
+        esperadas = {d: i for d, i in quieren.items()
+                     if (":" in d) == (familia == "-6")}
+
+        for dst, iface in sorted(esperadas.items()):
+            if actuales.get(dst) != iface:
+                run(["ip", familia, "route", "replace", dst, "dev", iface], check=False)
+                logger.info("ruta %s -> %s", dst, iface)
+        for dst, iface in sorted(actuales.items()):
+            if dst in esperadas:
+                continue
+            # Sólo se retira lo que está DENTRO de los prefijos gestionados: el
+            # tránsito de los túneles y las rutas del propio nodo no se tocan.
+            if not _managed_route_dst(dst):
+                continue
+            run(["ip", familia, "route", "del", dst, "dev", iface], check=False)
+            logger.info("ruta RETIRADA %s (estaba en %s)", dst, iface)
+
+
+def _transit_network():
+    """Rango de tránsito de los túneles. Vive DENTRO del /64 de identidad."""
+    try:
+        return ipaddress.IPv6Network(TRANSIT_PREFIX, strict=False)
+    except ValueError:
+        return None
+
+
+def _managed_route_dst(dst: str) -> bool:
+    """True si el destino es una VM del modelo nuevo (y por tanto retirable).
+
+    ⚠️ El tránsito de los túneles vive DENTRO del /64 de identidad, así que sin
+    excluirlo explícitamente este reconciliador BORRARÍA las rutas de los
+    propios túneles y dejaría la base sin camino a ningún nodo. Misma trampa que
+    la regla de política del nodo (§13): el prefijo de identidad no es
+    homogéneo, tiene un trozo reservado para infraestructura.
+    """
+    addr = dst.split("/", 1)[0]
+    if ":" in addr:
+        if not _is_ident(addr):
+            return False
+        tnet = _transit_network()
+        try:
+            if tnet is not None and ipaddress.IPv6Address(addr) in tnet:
+                return False        # tránsito: NUNCA se toca
+        except ValueError:
+            return False
+        return True
+    try:
+        # Sólo el rango de VMs. El de los nodos (10.65/16) no se gestiona aquí.
+        return ipaddress.IPv4Address(addr) in ipaddress.IPv4Network(VM_V4_PREFIX)
+    except ValueError:
+        return False
 
 
 def _firewall_flag(firewall: object, key: str, default: bool = True) -> bool:
@@ -365,6 +543,8 @@ def desired_from_state() -> dict[int, dict]:
             rdp=bool(rdp_flag) if isinstance(rdp_flag, bool) else True,
             samba=bool(samba_flag) if isinstance(samba_flag, bool) else True,
             ssh=bool(ssh_flag) if isinstance(ssh_flag, bool) else True,
+            node_id=d.get("nodeId") or "",
+            ipv4=d.get("ipv4") or "",
         )
     return out
 
@@ -411,6 +591,8 @@ def firestore_list_configured_servers() -> dict[int, dict]:
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
             samba=_firewall_flag(firewall, "sambaEnabled", True),
             ssh=_firewall_flag(firewall, "sshEnabled", True),
+            node_id=d.get("nodeId") or "",
+            ipv4=d.get("ipv4") or "",
         )
     return out
 
@@ -666,6 +848,8 @@ def _state_payload(desired: dict[int, dict]) -> dict:
             "rdpEnabled": bool(desired[k].get("rdp", True)),
             "sambaEnabled": bool(desired[k].get("samba", True)),
             "sshEnabled": bool(desired[k].get("ssh", True)),
+            "nodeId": desired[k].get("nodeId", ""),
+            "ipv4": desired[k].get("ipv4", ""),
         }
         for k in sorted(desired.keys())
     }
@@ -678,6 +862,7 @@ def sync_full():
     desired = firestore_list_configured_servers()
     with state_lock():
         reconcile_dynamic_dnat_rules(desired)
+        reconcile_vm_routes(desired)
         write_state(_state_payload(desired))
     logger.info("Full sync done (%d servers)", len(desired))
 
