@@ -140,31 +140,40 @@ CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — RDP listener 
 POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
-# ----- NEW_IPS: direccionamiento independiente del nodo -------------------------
-# NEW_IPS=1  ->  la VM lleva su propia identidad de red, que NO se deriva del
-#                nodo: IPv6 `<IDENT>::<vmid>` y puerta de enlace `fe80::1`,
-#                iguales en toda la flota. Al migrar NO hay que tocar el
-#                invitado: lo único que se mueve son las rutas en las bases.
-#                Ver base/docs/egress-failover-e-ipv6-estable.md §11bis.
+# ----- Modelo de direccionamiento: se DEDUCE, no se pasa por parametro --------
+# Una VM del modelo nuevo lleva su propia identidad de red, que NO se deriva del
+# nodo: IPv6 `<IDENT>::<vmid>` y puerta de enlace `fe80::1`, iguales en toda la
+# flota. Al migrar NO hay que tocar el invitado: lo unico que se mueve son las
+# rutas en las bases.  Ver base/docs/egress-failover-e-ipv6-estable.md §11bis.
 #
-# Con NEW_IPS=1 se OMITE todo el bloque que entra en Windows por el guest agent
-# a reescribir la dirección. Eso es obligatorio, no una optimización: ese bloque
-# calcula la dirección desde el prefijo del nodo DESTINO, así que sobre una VM
-# del modelo nuevo le MACHACARÍA su IDENT dejándola atada al nodo — justo lo
-# contrario de lo que se persigue, y con el cliente dentro.
+# Antes esto era un flag NEW_IPS=0/1 que habia que acordarse de pasar. Durante
+# una migracion de flota larga eso es una bomba en las dos direcciones:
+#   - olvidarlo en una VM YA migrada -> el bloque de reconfiguracion le calcula
+#     la direccion desde el prefijo del nodo DESTINO y le MACHACA su IDENT,
+#     dejandola atada al nodo y al cliente fuera;
+#   - ponerlo de mas sobre una VM del modelo VIEJO -> se queda sin reconfigurar
+#     y pierde la red al aterrizar.
 #
-# Default 0 = comportamiento de siempre, para no romper las VMs del modelo
-# viejo mientras convive con ellas.
+# Ahora se decide mirando la direccion que la VM tiene DE VERDAD: si cae dentro
+# del /64 de identidad, es del modelo nuevo. La fuente es state.json, la misma
+# que usa el resolver, asi que no puede desincronizarse de lo que ve el script.
 #
-# 🔲 CUANDO TODA LA FLOTA ESTÉ MIGRADA: borrar los bloques `NEW_IPS != 1` y
-#    quedarse sólo con el camino nuevo. El script adelgaza mucho — se van
+# 🔲 CUANDO TODA LA FLOTA ESTE MIGRADA: borrar los bloques `NEW_IPS != 1` y
+#    quedarse solo con el camino nuevo. El script adelgaza mucho — se van
 #    `_wait_agent_dst`, `_verify_dest_ipv6`, `PS_RECONFIG`, `DST_GATEWAY` y el
 #    flag `MIGRATION_DEGRADED` por esta causa.
-NEW_IPS="${NEW_IPS:-0}"
-case "${NEW_IPS,,}" in
-  1|true|yes|on) NEW_IPS=1 ;;
-  *)             NEW_IPS=0 ;;
-esac
+IDENT_PREFIX="${IDENT_PREFIX:-2a01:4f9:c01f:e::/64}"
+
+_is_ident() {   # rc 0 si $1 cae dentro de $IDENT_PREFIX
+  [[ -n "${1:-}" ]] || return 1
+  python3 -c '
+import ipaddress, sys
+try:
+    sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_network(sys.argv[2]) else 1)
+except Exception:
+    sys.exit(1)
+' "$1" "$IDENT_PREFIX" 2>/dev/null
+}
 
 # ----- Logging helpers ---------------------------------------------------------
 # All warnings + errors are mirrored to $ERROR_LOG with a timestamp + VMID for
@@ -214,6 +223,29 @@ TOKEN_NAME="${TOKEN_NAME:-${TOKEN_NAME_PREFIX}-${VMID}}"
 for cmd in python3 ssh iconv base64; do
   command -v "$cmd" >/dev/null || _die "$cmd is required."
 done
+
+# La direccion ACTUAL de la VM decide el modelo. state.json es la misma fuente
+# que usa el resolver, asi que ambos ven exactamente lo mismo. Se calcula aqui,
+# antes de bifurcar, para que valga tanto en la migracion normal como en la
+# reconciliacion SRC_EQ_DST.
+CUR_VM_IPV6=$(VMID="$VMID" STATE_FILE="$STATE_FILE" python3 -c '
+import json, os, sys
+try:
+    s = json.load(open(os.environ["STATE_FILE"]))
+    sys.stdout.write(((s.get(os.environ["VMID"]) or {}).get("ipv6") or "").strip())
+except Exception:
+    pass
+' 2>/dev/null || true)
+
+NEW_IPS=0
+if _is_ident "$CUR_VM_IPV6"; then
+  NEW_IPS=1
+  _info "Modelo NUEVO (${CUR_VM_IPV6} dentro de ${IDENT_PREFIX}): el invitado NO se toca."
+elif [[ -n "$CUR_VM_IPV6" ]]; then
+  _info "Modelo viejo (${CUR_VM_IPV6} fuera de ${IDENT_PREFIX}): se reconfigurara la red del invitado."
+else
+  _warn "No pude leer la IPv6 de la VM ${VMID} en ${STATE_FILE}; asumo modelo viejo."
+fi
 
 # Per-VMID lock so two BASE operators can't migrate the same VM in parallel.
 LOCKFILE="/run/migrate_vm.${VMID}.lock"
@@ -321,7 +353,7 @@ if (( SRC_EQ_DST == 0 )); then
   _info "Source node:    ${SRC_NODE} (${SRC_IPV6})"
   _info "Dest node:      ${DST_NODE} (${DST_IPV6})"
   if (( NEW_IPS == 1 )); then
-    _info "VM IPv6:        ${OLD_VM_IPV6}  (NEW_IPS=1 — NO cambia al migrar)"
+    _info "VM IPv6:        ${OLD_VM_IPV6}  (modelo nuevo — NO cambia al migrar)"
   else
     _info "Old VM IPv6:    ${OLD_VM_IPV6}"
     _info "New VM IPv6:    ${EXPECTED_VM_IPV6}"
@@ -552,7 +584,7 @@ PY
     if (( NEW_IPS == 0 )); then
       _rc_fs_args+=(--ipv6 "$RC_EXPECTED_IPV6")
     else
-      _info "NEW_IPS=1 — se reconcilia nodeId pero NO ipv6 (la dirección no depende del nodo)."
+      _info "Modelo nuevo — se reconcilia nodeId pero NO ipv6 (la dirección no depende del nodo)."
     fi
     if _firestore_update_servers "${_rc_fs_args[@]}" 2>/dev/null; then
       _ok "Firestore reconciled (or was already up-to-date)."
@@ -1330,8 +1362,8 @@ if (( NEW_IPS == 1 )); then
   # toda la flota, así que la migración no cambia nada dentro de Windows. Se
   # omite entero el bloque del guest agent (PS_RECONFIG, _wait_agent_dst,
   # _verify_dest_ipv6) — que es lo que hoy causa el MIGRATION_DEGRADED.
-  _ok "NEW_IPS=1 — el invitado conserva ${EXPECTED_VM_IPV6}; NO se toca su configuración de red."
-  _warn "NEW_IPS=1: mover las rutas de la VM en LAS DOS bases hacia el túnel del nodo destino (${DST_NODE}) — todavía NO lo hace este script:"
+  _ok "Modelo nuevo — el invitado conserva ${EXPECTED_VM_IPV6}; NO se toca su configuración de red."
+  _warn "Modelo nuevo: mover las rutas de la VM en LAS DOS bases hacia el túnel del nodo destino (${DST_NODE}) — todavía NO lo hace este script:"
   _warn "    ip -6 route replace ${EXPECTED_VM_IPV6}/128 dev <tunel-del-destino>"
   _warn "    ip    route replace <ipv4-privada-de-la-vm>/32 dev <tunel-del-destino>"
 elif [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
