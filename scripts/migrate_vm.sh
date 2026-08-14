@@ -256,7 +256,7 @@ command -v flock >/dev/null && { flock -n 9 || _die "Another migration is alread
 # Single python call: looks up dest by host_num, source by /64-prefix match
 # against the VM's current IPv6 in state.json. Prints space-separated:
 #   SRC_NODE SRC_IPV6 DST_NODE DST_IPV6 EXPECTED_VM_IPV6 OLD_VM_IPV6
-RESOLVED=$(VMID="$VMID" NEW_NODE_NUM="$NEW_NODE_NUM" \
+RESOLVED=$(VMID="$VMID" NEW_NODE_NUM="$NEW_NODE_NUM" IDENT_PREFIX="$IDENT_PREFIX" \
            PVE_NODES_FILE="$PVE_NODES_FILE" STATE_FILE="$STATE_FILE" \
            python3 - <<'PY'
 import ipaddress, json, os, sys
@@ -303,16 +303,39 @@ try:
 except ValueError:
     fail(f"VMID {vmid} ipv6 in state.json is not a valid IPv6: {old_vm_ipv6!r}")
 
-src = None
-for h, ip in nodes.items():
+# El modelo NUEVO rompe el truco del /64: la direccion de la VM ya NO deriva
+# del nodo — ese es justamente el objetivo del proyecto — asi que ningun nodo
+# comparte /64 con ella y el emparejamiento no puede funcionar. El nodo de
+# origen lo dice `nodeId`, que sync-base-nat.py escribe en state.json desde
+# Firestore y que migrate_vm actualiza al terminar cada migracion.
+ident_prefix = (os.environ.get("IDENT_PREFIX") or "").strip()
+es_modelo_nuevo = False
+if ident_prefix:
     try:
-        if prefix64(ip) == src_net:
-            src = (h, ip)
-            break
+        es_modelo_nuevo = ipaddress.ip_address(old_vm_ipv6) in ipaddress.ip_network(ident_prefix)
     except ValueError:
-        continue
-if not src:
-    fail(f"No node in pve_nodes shares /64 ({src_net}) with VM {vmid} ipv6 {old_vm_ipv6}")
+        pass
+
+src = None
+if es_modelo_nuevo:
+    node_id = (vm.get("nodeId") or "").strip()
+    if not node_id:
+        fail(f"VM {vmid} es del modelo nuevo ({old_vm_ipv6}) pero no tiene nodeId en "
+             f"{os.environ['STATE_FILE']} — corre `sync-base-nat.py sync` y reintenta")
+    if node_id not in nodes:
+        fail(f"VM {vmid} dice estar en {node_id}, que no esta en "
+             f"{os.environ['PVE_NODES_FILE']} — corre `sync-base-nat.py sync nodes`")
+    src = (node_id, nodes[node_id])
+else:
+    for h, ip in nodes.items():
+        try:
+            if prefix64(ip) == src_net:
+                src = (h, ip)
+                break
+        except ValueError:
+            continue
+    if not src:
+        fail(f"No node in pve_nodes shares /64 ({src_net}) with VM {vmid} ipv6 {old_vm_ipv6}")
 src_node, src_ipv6 = src
 
 if src_node == dst_node:
