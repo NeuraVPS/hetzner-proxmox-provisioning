@@ -182,8 +182,11 @@ VIP_FSN=2a01:4f8:fff2:95::2
 VIP_HEL=2a01:4f9:fff1:5f::2
 NODES_FILE=/etc/neuravps/tunnel-nodes.conf
 EOF
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/tunnel-nodes.conf.example \
-  -o /etc/neuravps/tunnel-nodes.conf
+# La tabla de nodos NO se siembra aqui: la genera sync-base-nat.py desde
+# Firestore en cada `sync nodes`, y relanza esta unidad cuando cambia. En el
+# primer arranque el script no encuentra el fichero, sale limpio sin hacer nada,
+# y base-nat-boot lo crea acto seguido con la flota entera. Ver
+# snippets/tunnel-nodes.conf.example para el formato.
 
 # TUNNEL_IFACE_PREFIX le dice a sync-base-nat.py por que tunel colgar las rutas
 # por VM: tun-f en la base de Falkenstein, tun-h en la de Helsinki.

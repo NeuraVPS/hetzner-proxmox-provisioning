@@ -354,6 +354,21 @@ TRANSIT_PREFIX = os.environ.get("TRANSIT_PREFIX", "2a01:4f9:c01f:e:ffff::/112")
 # no se gestiona desde aquí.
 VM_V4_PREFIX = os.environ.get("VM_V4_PREFIX", "10.64.0.0/16")
 
+# --- tuneles base<->nodo: tabla de nodos generada -----------------------------
+# El lado BASE de los tuneles (neuravps-base-tunnels.sh) lee esta tabla. Se
+# genera aqui y NO se toca a mano: mantenerla en las dos bases era el ultimo
+# paso manual para convertir un nodo, y un fichero copiado a mano en dos sitios
+# diverge tarde o temprano.
+TUNNEL_NODES_FILE = Path(
+    os.environ.get("TUNNEL_NODES_FILE", "/etc/neuravps/tunnel-nodes.conf")
+)
+TUNNEL_UNIT = os.environ.get("TUNNEL_UNIT", "neuravps-base-tunnels.service")
+# El /112 de transito da 4096 huecos de 16 direcciones; el hueco 0 esta
+# RESERVADO para las direcciones canonicas de las bases.
+TUNNEL_SLOT_MIN, TUNNEL_SLOT_MAX = 1, 4095
+
+
+
 
 def _ident_network():
     """La red IDENT como objeto, o None si la función está desactivada."""
@@ -1258,9 +1273,121 @@ def write_hosts_block(nodes: dict[str, str], bases: dict[str, str]):
         logger.warning("hosts: write %s failed: %s", HOSTS_FILE, e)
 
 
+TUNNEL_NODES_HEADER = """# generado por sync-base-nat.py - NO editar a mano
+#
+# Tabla de nodos del lado BASE de los tuneles ip6gre. Cada linea:
+#
+#   <id>  <ipv6 principal del nodo>  <slot>
+#
+# El slot reserva un hueco de 16 direcciones dentro del /112 de transito:
+# +0/+1 = par FSN, +2/+3 = par HEL. slot = id, determinista y sin registro.
+# El hueco 0 esta RESERVADO para las canonicas de las bases (::0 FSN, ::2 HEL).
+#
+# Estan TODOS los nodos, tambien los que aun no se han convertido: el lado base
+# de un tunel cuyo nodo no lo tiene montado es inerte (nada enruta hacia el), y
+# tenerlo ya creado convierte la conversion de un nodo en una operacion de UNA
+# sola maquina y permite que una VM migre a cualquier nodo ya convertido.
+"""
+
+
+def render_tunnel_nodes(nodes: dict[str, str]) -> str | None:
+    """Texto del fichero, o None si el estado no es de fiar.
+
+    Devolver None (y no un fichero corto) es deliberado: quien llama deja el
+    fichero anterior intacto. Un fichero vacio borraria de golpe el camino de
+    TODA la flota.
+    """
+    if not nodes:
+        logger.warning("tunnel-nodes: estado de nodos vacio; no toco el fichero")
+        return None
+
+    lines, vistos = [], {}
+    for node_id, ipv6 in sorted(nodes.items()):
+        m = _NODE_NUM_RE.match(node_id)
+        if not m:
+            logger.warning("tunnel-nodes: %s sin numero al principio; lo salto", node_id)
+            continue
+        num = int(m.group(1))
+        if not (TUNNEL_SLOT_MIN <= num <= TUNNEL_SLOT_MAX):
+            logger.warning(
+                "tunnel-nodes: %s tiene id %d fuera de %d-%d; lo salto (el hueco 0 es "
+                "de las canonicas de las bases y por arriba no cabe en el /112)",
+                node_id, num, TUNNEL_SLOT_MIN, TUNNEL_SLOT_MAX,
+            )
+            continue
+        if num in vistos:
+            # Dos nodos con el mismo numero compartirian direcciones de
+            # transito: el segundo se llevaria el trafico del primero.
+            logger.error(
+                "tunnel-nodes: %s y %s comparten el id %d; me quedo con el primero "
+                "y SALTO el segundo — corrige el nombre en Firestore",
+                vistos[num], node_id, num,
+            )
+            continue
+        vistos[num] = node_id
+        lines.append(f"{num:<5} {ipv6:<28} {num}")
+
+    if not lines:
+        logger.warning("tunnel-nodes: ninguna linea valida; no toco el fichero")
+        return None
+    return TUNNEL_NODES_HEADER + "\n".join(lines) + "\n"
+
+
+def write_tunnel_nodes(nodes: dict[str, str]) -> None:
+    """Escribe la tabla y, SOLO si ha cambiado, relanza la unidad de tuneles.
+
+    Nunca puede tumbar el sync: cualquier fallo aqui es un aviso. Y el disparo
+    va condicionado al cambio a proposito — recorrer los ~470 tuneles cuesta
+    ~15 s, y el sync se ejecuta muchas veces al dia.
+    """
+    try:
+        nuevo = render_tunnel_nodes(nodes)
+        if nuevo is None:
+            return
+        viejo = TUNNEL_NODES_FILE.read_text() if TUNNEL_NODES_FILE.is_file() else ""
+        if nuevo == viejo:
+            return
+
+        antes = len([l for l in viejo.splitlines() if l and not l.startswith("#")])
+        ahora = len([l for l in nuevo.splitlines() if l and not l.startswith("#")])
+        TUNNEL_NODES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TUNNEL_NODES_FILE.with_suffix(".tmp")
+        tmp.write_text(nuevo)
+        tmp.replace(TUNNEL_NODES_FILE)      # atomico: nunca un fichero a medias
+        logger.info("tunnel-nodes: %s actualizado (%d -> %d nodos)",
+                    TUNNEL_NODES_FILE, antes, ahora)
+
+        # Un nodo que desaparece de Firestore deja su tunel en pie. Es inerte
+        # (nada enruta hacia el), asi que se AVISA y no se borra: un borrado
+        # automatico sobre un estado mal leido se llevaria por delante el camino
+        # de nodos vivos.
+        if ahora < antes:
+            logger.warning(
+                "tunnel-nodes: %d nodo(s) menos que antes — sus tuneles siguen en pie "
+                "(inertes). Borralos a mano si la baja es definitiva.", antes - ahora,
+            )
+
+        # Comprobacion canonica de "systemd esta al mando": evita importar
+        # shutil solo para esto y no depende del PATH.
+        if not Path("/run/systemd/system").is_dir():
+            return
+        r = subprocess.run(["systemctl", "restart", TUNNEL_UNIT],
+                           capture_output=True, text=True, check=False)
+        if r.returncode == 0:
+            logger.info("tunnel-nodes: %s relanzada", TUNNEL_UNIT)
+        else:
+            logger.warning("tunnel-nodes: no pude relanzar %s: %s",
+                           TUNNEL_UNIT, (r.stderr or r.stdout or "").strip()[:200])
+    except Exception as e:                        # nunca romper el sync
+        logger.warning("tunnel-nodes: fallo generando la tabla: %s", e)
+
+
 def sync_nodes_apply_state(nodes: dict[str, str], reload_nginx: bool = True):
     write_pve_nodes_state(nodes)
     write_pve_nginx_map(nodes)
+    # Hereda gratis la guardia anti-lectura-parcial: sync_nodes_full aborta
+    # ANTES de llegar aqui si Firestore devuelve de menos.
+    write_tunnel_nodes(nodes)
     write_hosts_block(nodes, parse_base_hosts())
     if reload_nginx:
         nginx_test_and_reload()
