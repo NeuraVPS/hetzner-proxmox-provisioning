@@ -2358,3 +2358,20 @@ dos reglas y protege a una VM que mañana se cree sin firewall.
 Verificado tras el cambio: SMB (445) **abierto** en los cuatro caminos —mismo
 nodo, misma región y cruzando región— y RDP (3389), SSH (22) y PVE (8006)
 **cerrados** entre VMs.
+
+### ⚠️ El resync de enlaces SMB va POR USUARIO y con retraso de una VM
+
+`setup_smb_symlinks_trigger` reconstruye los enlaces de **todo el usuario**
+leyendo Firestore, y se dispara con cada cambio de `ipv6`. Al convertir VMs en
+serie, el resync que corre dentro de la VM N lee Firestore cuando la VM N+1
+todavía tiene su dirección vieja — así que **el enlace hacia la ÚLTIMA VM
+convertida se queda obsoleto en todas las demás**.
+
+Se vio con `VM2055 - MetaTrader+`: en la vm 1986 todos los enlaces apuntaban ya
+al literal nuevo menos ése. El puerto 445 respondía perfectamente en los dos
+sentidos; lo que estaba mal era el destino del enlace, no la red.
+
+**Hay que disparar un resync más, UNA VEZ POR USUARIO, cuando ya están
+convertidas TODAS sus VMs** (`base/snippets/resync-enlaces-smb.py`, toca
+`lastStarted`, que está entre los campos vigilados y es inocuo). El resync es
+*fire-and-forget* por el agente, así que tarda y no es instantáneo en todas.
