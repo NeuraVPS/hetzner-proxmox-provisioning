@@ -10,7 +10,7 @@ if [ "$KIND" = nodo ]; then
   ok "neuravps-tunnel-probe.timer" "$(systemctl is-enabled neuravps-tunnel-probe.timer 2>&1)/$(systemctl is-active neuravps-tunnel-probe.timer 2>&1)"
   for f in /usr/local/sbin/neuravps-tunnels.sh /usr/local/sbin/neuravps-tunnel-select.sh \
            /usr/local/sbin/neuravps-tunnel-probe.sh /etc/default/neuravps-tunnels \
-           /etc/sysctl.d/99-neuravps-rpfilter.conf; do
+           /etc/sysctl.d/zz-neuravps-rpfilter.conf; do
     ok "$(basename "$f")" "$([ -s "$f" ] && echo presente || echo "❌ FALTA")"
   done
   ok "HOME_REGION" "$(. /etc/default/neuravps-tunnels; echo "$HOME_REGION (slot $SLOT)")"
@@ -23,7 +23,7 @@ if [ "$KIND" = nodo ]; then
 else
   ok "neuravps-base-tunnels.service" "$(systemctl is-enabled neuravps-base-tunnels.service 2>&1)/$(systemctl is-active neuravps-base-tunnels.service 2>&1)"
   for f in /usr/local/sbin/neuravps-base-tunnels.sh /etc/default/neuravps-base-tunnels \
-           /etc/neuravps/tunnel-nodes.conf /etc/sysctl.d/99-neuravps-rpfilter.conf; do
+           /etc/neuravps/tunnel-nodes.conf /etc/sysctl.d/zz-neuravps-rpfilter.conf; do
     ok "$(basename "$f")" "$([ -s "$f" ] && echo presente || echo "❌ FALTA")"
   done
   ok "HOME_REGION" "$(. /etc/default/neuravps-base-tunnels; echo "$HOME_REGION")"
