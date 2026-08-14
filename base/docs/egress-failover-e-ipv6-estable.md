@@ -2311,3 +2311,50 @@ mirar esto primero.**
 ⚠️ Entre 1 y 2 el invitado **no tiene salida**: la base aún no tiene ruta de
 vuelta hacia su `/32` privada. Es esperado y dura segundos; no confundirlo con
 un fallo de la configuración.
+
+---
+
+## 21. SMB entre VMs — la base no lo reenviaba (2026-08-14)
+
+Los enlaces SMB entre las VMs de un mismo cliente (`\\<ipv6-literal>\c$`, la
+función de cuentas enlazadas) **dejaron de funcionar** al convertir sus VMs.
+
+**Antes**, dos VMs se hablaban **nodo a nodo directamente**: sus direcciones
+salían del `/64` del nodo y se enrutaban de forma nativa. **Ahora** ese tráfico
+cruza la base, y la cadena `forward` de la base tiene `policy drop` con reglas
+sólo para `tun-* → uplink` y `veth-host → tun-*`. **No había ninguna regla
+`tun-* → tun-*`**, así que el enlace moría en la base sin dejar rastro.
+
+El lado del nodo estaba bien desde §14: `[IPSET vm-ident]` con el `/64` de
+identidad y `IN SMB(ACCEPT) -source +dc/vm-ident` en los dos grupos.
+
+### ⚠️ Entre regiones el camino VM↔VM es ASIMÉTRICO
+
+La primera versión de la regla casaba sólo el **puerto destino**. Funcionó para
+pares de la misma región y **falló** para el par Falkenstein↔Helsinki. Motivo:
+
+- ida: VM(FSN) → su nodo → túnel de **su** región → **b0** → nodo destino
+- vuelta: VM(HEL) → su nodo → túnel de **su** región → **b1** → nodo origen
+
+**Ninguna base ve los dos sentidos**, así que `ct state established` no casa
+nunca y el `SYN-ACK` llega con destino un **puerto efímero**. Hace falta casar
+también por **puerto de origen**:
+
+```
+iifname "tun-*" oifname "tun-*" meta l4proto {tcp,udp} th dport {135,137,138,139,445} accept
+iifname "tun-*" oifname "tun-*" meta l4proto {tcp,udp} th sport {135,137,138,139,445} accept
+```
+
+Esta asimetría es una propiedad del diseño, no un fallo: cada nodo sale por la
+base de **su** región. Cualquier regla con estado en las bases que dependa de ver
+los dos sentidos de una conversación VM↔VM entre regiones **no va a funcionar**.
+
+### Por qué sólo los puertos de SMB y no `tun-* → tun-*` abierto
+
+El nodo destino ya limita a SMB con `vm-ident`, y hoy **las 1877 VMs llevan el
+firewall de PVE activo** (medido). Pero duplicar la restricción en la base cuesta
+dos reglas y protege a una VM que mañana se cree sin firewall.
+
+Verificado tras el cambio: SMB (445) **abierto** en los cuatro caminos —mismo
+nodo, misma región y cruzando región— y RDP (3389), SSH (22) y PVE (8006)
+**cerrados** entre VMs.
