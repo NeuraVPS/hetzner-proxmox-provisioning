@@ -168,9 +168,9 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
 chmod 755 /usr/local/sbin/neuravps-base-tunnels.sh
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-base-tunnels.service \
   -o /etc/systemd/system/neuravps-base-tunnels.service
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/99-neuravps-rpfilter.conf \
-  -o /etc/sysctl.d/99-neuravps-rpfilter.conf
-sysctl -p /etc/sysctl.d/99-neuravps-rpfilter.conf
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/zz-neuravps-rpfilter.conf \
+  -o /etc/sysctl.d/zz-neuravps-rpfilter.conf
+sysctl -p /etc/sysctl.d/zz-neuravps-rpfilter.conf
 
 # HOME_REGION = la region cuya VIP posee esta base en operacion normal.
 # ⚠️ Es lo unico que distingue una base de la otra aqui: fsn en b0, hel en b1.

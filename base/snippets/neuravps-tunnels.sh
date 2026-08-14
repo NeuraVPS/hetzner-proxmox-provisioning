@@ -54,6 +54,10 @@ mk() { # iface remoto direccion_local/127
   # IPv4 no. El modo laxo (2) NO basta: tiene que ser 0.
   # Riesgo acotado: estos enlaces solo llevan GRE entre maquinas nuestras, ya
   # filtrado por [IPSET base]; la uplink conserva su rp_filter.
+  # `all` tambien: el kernel usa el MAXIMO de all y de la interfaz, y PVE deja
+  # all=2 desde /usr/lib/sysctl.d/pve-firewall.conf. Con all=2 no hay forma de
+  # bajar de laxo, que ya medimos que NO basta.
+  sysctl -qw "net.ipv4.conf.all.rp_filter=0" 2>/dev/null
   sysctl -qw "net.ipv4.conf.$1.rp_filter=0" 2>/dev/null
 }
 

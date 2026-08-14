@@ -2200,3 +2200,58 @@ en las interfaces que miran al cliente.
   convertidos — si no, convertir un nodo exige editar un fichero en las dos
   bases.
 - **La migración en caliente**, único punto del plan sin probar.
+
+---
+
+## 19. Los 234 nodos en las bases, y la trampa del orden de `sysctl.d`
+
+### Por qué añadir TODOS los nodos ya, antes de tocar ninguna VM
+
+El lado base de un túnel cuyo nodo aún no lo tiene montado es **inerte**: nada
+enruta hacia él, el nodo no manda nada, y la entrada en `gre_peers` sólo dice
+"aceptaría GRE de esta máquina" — que no lo envía. No hay riesgo, y a cambio:
+
+- **convertir un nodo pasa a ser una operación de UNA sola máquina**, sin tener
+  que editar nada en las dos bases y sin ventana en la que un lado esté hecho y
+  el otro no;
+- **una VM puede migrar a cualquier nodo ya convertido** desde el primer día,
+  porque las bases ya tienen su camino montado.
+
+Medido en producción: 234 nodos → **468 túneles por base**, 234 `gre_peers`, 234
+rutas de host. Crear todo desde cero cuesta **~16 s** (ese es el coste de
+arranque, con `base-nat-boot` esperando detrás por el `Before=`), y una
+reejecución es no-op. Los clientes: 12/12 por cada base durante todo el proceso
+y el canario en 480 rondas sin un fallo.
+
+⚠️ Para que ese tiempo no se disparase hubo que cambiar la comprobación de
+existencia: un `ip -6 tunnel show <iface>` por túnel son **~1400 procesos** en
+cada arranque. Ahora se vuelca la lista **una vez** y se busca en ella.
+
+### 🔴 La trampa: `sysctl.d` ordena por NOMBRE DE FICHERO
+
+El reinicio del nodo 0000228 destapó que `net.ipv4.conf.all.rp_filter` volvía a
+**2** con todo lo demás correcto. Causa: PVE trae
+`/usr/lib/sysctl.d/pve-firewall.conf` con `all.rp_filter = 2`, y
+**systemd-sysctl ordena por nombre de fichero, no por directorio**. Como
+`'p' > '9'`, un `99-neuravps-rpfilter.conf` **pierde** contra el de PVE y el
+ajuste se evapora en el siguiente arranque.
+
+El fichero se llama ahora **`zz-neuravps-rpfilter.conf`**. El nombre es
+load-bearing y está documentado dentro del propio fichero. `pve-firewall` NO lo
+reaplica en caliente (comprobado con `pve-firewall restart` y
+`systemctl restart pve-firewall`), así que sólo era el orden de arranque; aun
+así los scripts de túnel lo fijan también en caliente, por si alguien lanza
+`sysctl --system` a mano.
+
+**Por qué esto no se habría visto sin reiniciar:** el valor estaba correcto en
+memoria desde que lo apliqué, y la auditoría estática decía "presente". Sólo el
+reinicio real lo destapó — y con las VIPs en geo-split el camino es simétrico,
+así que ni siquiera daba síntoma. Habría mordido en la primera conmutación.
+
+### Nota al margen: las VMs no usan `onboot`
+
+Tras reiniciar el nodo, la vm 1096 no arrancó sola. **No es una regresión**: las
+VMs de cliente tampoco llevan `onboot` (comprobado en `0000029-EX44`: 0/1) — las
+levanta el reconciliador de arranque desde el estado deseado de Firestore. La
+1096 está marcada `maintenance` para que `conncheck` la ignore, y por eso se
+quedó parada. Al planificar el reinicio de un nodo, contar con eso.

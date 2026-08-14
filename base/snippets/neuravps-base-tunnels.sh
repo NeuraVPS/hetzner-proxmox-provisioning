@@ -38,11 +38,16 @@ ip -6 addr replace "${CANON_HEL}/128" dev lo
 rc=0
 peers=""
 
+# Un unico volcado de todos los tuneles en vez de un `ip` por tunel: a escala de
+# flota son 2 tuneles x 234 nodos = 468, y preguntar uno a uno cuesta ~1400
+# procesos en cada arranque, con base-nat-boot esperando detras (Before=).
+TUNNELS_NOW="$(ip -6 tunnel show 2>/dev/null)"
+
 mk() { # iface local_vip remoto direccion/127
-  local show cur
-  show="$(ip -6 tunnel show "$1" 2>/dev/null)"
-  cur="$(printf '%s' "$show" | sed -n 's/.*remote \([0-9a-f:]*\) .*/\1/p')"
-  if [ "$cur" != "$3" ] || ! printf '%s' "$show" | grep -q 'encaplimit none'; then
+  local linea cur
+  linea="$(printf '%s\n' "$TUNNELS_NOW" | grep -m1 "^$1:")"
+  cur="$(printf '%s' "$linea" | sed -n 's/.*remote \([0-9a-f:]*\) .*/\1/p')"
+  if [ "$cur" != "$3" ] || ! printf '%s' "$linea" | grep -q 'encaplimit none'; then
     ip link del "$1" 2>/dev/null
     # `encaplimit none` OBLIGATORIO, ver §4.5: sin el, nexthdr 60 en vez de 47 y
     # el firewall deja de casar GRE. Muere en silencio.
@@ -54,6 +59,10 @@ mk() { # iface local_vip remoto direccion/127
   # por el tunel de la VIP que poseemos, sale por el de casa). El filtro de ruta
   # inversa lo tira como "martian source", y el sintoma enganya: IPv6 pasa
   # (Linux no tiene rp_filter v6) y IPv4 no. El modo laxo (2) NO basta.
+  # `all` tambien: el kernel usa el MAXIMO de all y de la interfaz, y PVE deja
+  # all=2 desde /usr/lib/sysctl.d/pve-firewall.conf. Con all=2 no hay forma de
+  # bajar de laxo, que ya medimos que NO basta.
+  sysctl -qw "net.ipv4.conf.all.rp_filter=0" 2>/dev/null
   sysctl -qw "net.ipv4.conf.$1.rp_filter=0" 2>/dev/null
 }
 

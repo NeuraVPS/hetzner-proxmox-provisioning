@@ -945,7 +945,7 @@ VIP_HEL=2a01:4f9:fff1:5f::2
 DEFAULT_V4_VIA_TUNNEL=0
 NVXEOF
 
-cat > /mnt/etc/sysctl.d/99-neuravps-rpfilter.conf <<'NVXEOF'
+cat > /mnt/etc/sysctl.d/zz-neuravps-rpfilter.conf <<'NVXEOF'
 # Filtro de ruta inversa: los tuneles base<->nodo lo necesitan a 0.
 #
 # Con los tuneles anclados a las VIPs de failover el camino es ASIMETRICO A
