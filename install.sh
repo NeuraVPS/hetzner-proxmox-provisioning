@@ -668,6 +668,312 @@ net.ipv6.conf.all.forwarding = 1
 net.ipv4.conf.vmbr0.proxy_arp = 1
 SYSCTL
 
+# --- tuneles base<->nodo anclados a las VIPs (egress-failover §4.5) ---
+
+# El nodo ya no depende de su IPv4 publica: sale por un tunel ip6gre hacia la
+# VIP de failover de su region, y la base hace el SNAT. Anclar a la VIP y no a
+# la IP principal de la base es lo que hace que un mantenimiento de base sea
+# invisible: al moverse la VIP el tunel la sigue hasta la superviviente.
+# Ver base/docs/egress-failover-e-ipv6-estable.md §4.5, §15, §17.
+mkdir -p /mnt/usr/local/sbin /mnt/etc/systemd/system /mnt/etc/default
+NODE_NUM=$((10#$(echo "$NAME" | cut -d- -f1)))
+
+cat > /mnt/usr/local/sbin/neuravps-tunnels.sh <<'NVXEOF'
+#!/usr/bin/env bash
+# Lado NODO de los tuneles base<->nodo. Idempotente.
+# Ver base/docs/egress-failover-e-ipv6-estable.md §4.5.
+#
+# v2 (2026-08-14): ANCLADO A LAS VIPs DE FAILOVER, no a las IPs principales de
+# las bases. El tunel deja de apuntar a una MAQUINA y apunta a un SERVICIO: al
+# moverse una VIP, el tunel la sigue sin tocar nada y termina en la
+# superviviente. Es lo que hace invisible el mantenimiento de una base.
+set -u
+
+. /etc/default/neuravps-tunnels
+
+: "${NODE_ID:?falta NODE_ID}"
+SLOT="${SLOT:-$NODE_ID}"
+TRANSIT_BASE="${TRANSIT_BASE:-2a01:4f9:c01f:e:ffff::}"
+VIP_FSN="${VIP_FSN:-2a01:4f8:fff2:95::2}"
+VIP_HEL="${VIP_HEL:-2a01:4f9:fff1:5f::2}"
+IDENT6="${IDENT6:-2a01:4f9:c01f:e::/64}"
+HOME_REGION="${HOME_REGION:-fsn}"
+
+# El /112 da 4096 huecos de 16 direcciones. El hueco 0 esta RESERVADO para las
+# direcciones canonicas de las bases, asi que un nodo nunca puede ocuparlo.
+[ "$SLOT" -ge 1 ] && [ "$SLOT" -le 4095 ] || { echo "SLOT $SLOT fuera de rango 1-4095" >&2; exit 1; }
+
+transit() { printf '%s%x' "$TRANSIT_BASE" $(( $1 * 16 + $2 )); }
+
+NODE_V6="$(ip -6 addr show scope global | sed -n 's#.*inet6 \([0-9a-f:]*\)/128.*#\1#p' | head -1)"
+[ -n "$NODE_V6" ] || NODE_V6="$(ip -6 addr show dev "$(ip -6 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)" scope global | sed -n 's#.*inet6 \([0-9a-f:]*\)/.*#\1#p' | head -1)"
+NODE_V4="10.65.$(( NODE_ID / 256 )).$(( NODE_ID % 256 ))"
+
+# Direcciones canonicas: son DE LA VIP, no de la maquina. Por eso el nodo puede
+# enrutarlas siempre por el mismo tunel aunque la base de detras cambie.
+CANON_FSN="$(transit 0 0)"
+CANON_HEL="$(transit 0 2)"
+
+mk() { # iface remoto direccion_local/127
+  local show cur
+  show="$(ip -6 tunnel show "$1" 2>/dev/null)"
+  cur="$(printf '%s' "$show" | sed -n 's/.*remote \([0-9a-f:]*\) .*/\1/p')"
+  if [ "$cur" != "$2" ] || ! printf '%s' "$show" | grep -q 'encaplimit none'; then
+    ip link del "$1" 2>/dev/null
+    # `encaplimit none` es OBLIGATORIO: por defecto ip6gre mete una cabecera
+    # DSTOPT, el nexthdr pasa a 60 en vez de 47 y las reglas de firewall que
+    # casan GRE dejan de casar. El tunel muere EN SILENCIO: UP en los dos
+    # extremos, TX subiendo, RX clavado a 0.
+    ip link add name "$1" type ip6gre local "$NODE_V6" remote "$2" encaplimit none || return 1
+  fi
+  ip link set "$1" mtu 1456 up
+  ip -6 addr replace "$3" dev "$1"
+  # rp_filter=0 en los tuneles. Con anclaje a VIP el camino es asimetrico A
+  # PROPOSITO: el trafico entra por el tunel de la VIP que la base posee y sale
+  # por el de casa. El filtro de ruta inversa lo tira como "martian source" y el
+  # sintoma es desconcertante — IPv6 pasa (Linux no tiene rp_filter para v6) y
+  # IPv4 no. El modo laxo (2) NO basta: tiene que ser 0.
+  # Riesgo acotado: estos enlaces solo llevan GRE entre maquinas nuestras, ya
+  # filtrado por [IPSET base]; la uplink conserva su rp_filter.
+  sysctl -qw "net.ipv4.conf.$1.rp_filter=0" 2>/dev/null
+}
+
+[ -x /usr/local/sbin/nvx-mss.sh ] && /usr/local/sbin/nvx-mss.sh >/dev/null 2>&1
+
+mk tun-fsn "$VIP_FSN" "$(transit "$SLOT" 1)/127"
+mk tun-hel "$VIP_HEL" "$(transit "$SLOT" 3)/127"
+
+# Direccion propia del nodo para su trafico saliente. NO 10.64.255.1: esa es la
+# puerta de enlace de los invitados y es identica en todos los nodos, asi que la
+# base no sabria a que tunel devolver el retorno.
+ip addr replace "${NODE_V4}/32" dev lo
+
+ip -6 route replace "$IDENT6" dev vmbr0
+
+# Cada canonica por SU tunel. Esto es lo que hace que el retorno acabe siempre
+# en la base que emitio, sea cual sea.
+#
+# Y los DOS /127 de transito de este nodo, cada uno por su tunel. Son
+# imprescindibles en la tabla 100: el transito vive DENTRO del /64 de identidad,
+# asi que una respuesta del invitado hacia la direccion de transito de una base
+# casa la regla de politica y cae en la tabla 100. Sin estas rutas solo encuentra
+# la ruta por defecto y sale por el tunel de CASA — de modo que todo lo que
+# origine la base REMOTA (sondeo cruzado de conncheck, file-bridge) se pierde.
+for T in main 100; do
+  ip -6 route replace "${CANON_FSN}/128" dev tun-fsn table $T
+  ip -6 route replace "${CANON_HEL}/128" dev tun-hel table $T
+  ip -6 route replace "$(transit "$SLOT" 0)/127" dev tun-fsn table $T
+  ip -6 route replace "$(transit "$SLOT" 2)/127" dev tun-hel table $T
+done
+
+# Tablas de politica. Identificadores NUMERICOS a proposito: /etc/iproute2/
+# rt_tables no existe en todos los nodos y con nombre falla en silencio.
+# `iif vmbr0` es OBLIGATORIO: las direcciones de transito viven DENTRO del /64
+# de identidad, asi que sin acotar por interfaz el trafico que llega DE la base
+# tambien casaria y el nodo lo devolveria por el tunel: bucle.
+ip -6 rule del from "$IDENT6" iif vmbr0 lookup 100 2>/dev/null
+ip -6 rule add from "$IDENT6" iif vmbr0 lookup 100 priority 100
+ip rule del from 10.64.0.0/16 iif vmbr0 lookup 101 2>/dev/null
+ip rule add from 10.64.0.0/16 iif vmbr0 lookup 101 priority 101
+ip rule del from "$NODE_V4" lookup 102 2>/dev/null
+ip rule add from "$NODE_V4" lookup 102 priority 102
+
+# --- region de casa ----------------------------------------------------------
+# `auto` = la mas cercana, medida. Es el criterio correcto (el trafico del
+# cliente debe salir por la base LOCAL) y ademas evita que install.sh tenga que
+# averiguar en que centro de datos esta el nodo: la separacion es de ~1 ms
+# contra ~20 ms, asi que no hay ambiguedad posible.
+if [ "$HOME_REGION" = auto ]; then
+  best=""; bestms=999999
+  for r in fsn hel; do
+    c=$([ "$r" = fsn ] && echo "$CANON_FSN" || echo "$CANON_HEL")
+    t0=$(date +%s%N)
+    if timeout 3 bash -c "</dev/tcp/$c/443" 2>/dev/null; then
+      ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+      [ "$ms" -lt "$bestms" ] && { bestms=$ms; best=$r; }
+    fi
+  done
+  HOME_REGION="${best:-fsn}"
+  logger -t neuravps-tunnels "region de casa detectada: $HOME_REGION (${bestms} ms)"
+  # Cachearla: si en el proximo arranque la base local esta caida, la medicion
+  # elegiria la remota y el nodo se quedaria ahi para siempre.
+  sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+fi
+
+# Rutas por defecto hacia el tunel de casa. El sondeo
+# (neuravps-tunnel-probe.sh) las reapunta al otro si esta base deja de contestar.
+/usr/local/sbin/neuravps-tunnel-select.sh "$HOME_REGION"
+
+exit 0
+NVXEOF
+
+cat > /mnt/usr/local/sbin/neuravps-tunnel-select.sh <<'NVXEOF'
+#!/usr/bin/env bash
+# Apunta las rutas por defecto del nodo (las suyas y las de sus invitados) al
+# tunel de una region. Idempotente y sin efecto si ya esta apuntando ahi.
+# Uso: neuravps-tunnel-select.sh <fsn|hel>
+set -u
+. /etc/default/neuravps-tunnels
+REGION="$1"
+TUN="tun-$REGION"
+NODE_V4="10.65.$(( NODE_ID / 256 )).$(( NODE_ID % 256 ))"
+
+ip link show "$TUN" >/dev/null 2>&1 || { echo "$TUN no existe" >&2; exit 1; }
+
+# Si ya estamos ahi, no tocar nada: reescribir la ruta por defecto tira las
+# conexiones en curso de los invitados.
+cur="$(ip -4 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+[ "$cur" = "$TUN" ] && exit 0
+
+ip -6 route replace default dev "$TUN" table 100
+ip route    replace default dev "$TUN" table 101
+ip route    replace default dev "$TUN" src "$NODE_V4" table 102
+
+# El nodo ya no tiene IPv4 publica: TODA su salida v4 va por el tunel y la base
+# hace el SNAT. El `src` es obligatorio: sin direccion de origen el kernel no
+# puede elegir una y la conexion ni sale.
+if [ "${DEFAULT_V4_VIA_TUNNEL:-0}" = "1" ]; then
+  ip route replace default dev "$TUN" src "$NODE_V4"
+fi
+
+logger -t neuravps-tunnels "salida por defecto -> $TUN"
+echo "salida por defecto -> $TUN"
+NVXEOF
+
+cat > /mnt/usr/local/sbin/neuravps-tunnel-probe.sh <<'NVXEOF'
+#!/usr/bin/env bash
+# Sondeo del tunel activo. GRE es SIN ESTADO: el tunel NO se cae cuando la base
+# muere, sigue UP para siempre apuntando a una caja muerta. Sin esto, la unica
+# recuperacion posible es que alguien mueva la VIP (~5-6 min en una caida no
+# planificada). Con esto, el nodo se pasa al otro tunel en ~30 s.
+#
+# El anclado a VIPs y el sondeo son ORTOGONALES y cubren casos distintos:
+#   - mantenimiento PLANIFICADO: movemos la VIP antes -> 0 s, sin sondeo.
+#   - muerte NO planificada     : el sondeo salta a la otra region -> ~30 s.
+set -u
+. /etc/default/neuravps-tunnels
+
+TRANSIT_BASE="${TRANSIT_BASE:-2a01:4f9:c01f:e:ffff::}"
+HOME_REGION="${HOME_REGION:-fsn}"
+OTHER_REGION=$([ "$HOME_REGION" = fsn ] && echo hel || echo fsn)
+STATE=/run/neuravps-tunnel-probe.state
+FAILS_TO_SWITCH=2      # ~30 s con el timer a 15 s
+OKS_TO_RETURN=4        # volver a casa cuesta mas: evita el ping-pong
+
+canon() { [ "$1" = fsn ] && printf '%s0' "$TRANSIT_BASE" || printf '%s2' "$TRANSIT_BASE"; }
+
+# La base contesta 443 (nginx) por su direccion canonica. Un TCP completo prueba
+# ida Y vuelta; el ping NO sirve: PVE tira el eco ICMPv6 y da falso negativo.
+alive() { timeout 4 bash -c "</dev/tcp/$(canon "$1")/443" 2>/dev/null; }
+
+cur="$(ip -4 route show default | sed -n 's/.*dev tun-\([a-z]*\).*/\1/p' | head -1)"
+[ -n "$cur" ] || exit 0
+
+read -r st n < "$STATE" 2>/dev/null || { st=""; n=0; }
+[ "$st" = "$cur" ] || n=0
+
+if [ "$cur" = "$HOME_REGION" ]; then
+  if alive "$HOME_REGION"; then n=0; else
+    n=$((n+1))
+    if [ "$n" -ge "$FAILS_TO_SWITCH" ] && alive "$OTHER_REGION"; then
+      logger -t neuravps-tunnel-probe "casa ($HOME_REGION) no responde x$n -> me paso a $OTHER_REGION"
+      /usr/local/sbin/neuravps-tunnel-select.sh "$OTHER_REGION" && { echo "$OTHER_REGION 0" > "$STATE"; exit 0; }
+    fi
+  fi
+else
+  # Estamos fuera de casa: volver solo cuando casa lleve un rato estable.
+  if alive "$HOME_REGION"; then
+    n=$((n+1))
+    if [ "$n" -ge "$OKS_TO_RETURN" ]; then
+      logger -t neuravps-tunnel-probe "casa ($HOME_REGION) estable x$n -> vuelvo"
+      /usr/local/sbin/neuravps-tunnel-select.sh "$HOME_REGION" && { echo "$HOME_REGION 0" > "$STATE"; exit 0; }
+    fi
+  else n=0; fi
+fi
+
+echo "$cur $n" > "$STATE"
+NVXEOF
+
+chmod 755 /mnt/usr/local/sbin/neuravps-tunnel*.sh
+
+cat > /mnt/etc/systemd/system/neuravps-tunnels.service <<'NVXEOF'
+[Unit]
+Description=NeuraVPS: tuneles base<->nodo + direccionamiento propio
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/neuravps-tunnels.sh
+[Install]
+WantedBy=multi-user.target
+NVXEOF
+
+cat > /mnt/etc/systemd/system/neuravps-tunnel-probe.service <<'NVXEOF'
+[Unit]
+Description=NeuraVPS: sondeo del tunel activo del nodo
+After=neuravps-tunnels.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuravps-tunnel-probe.sh
+NVXEOF
+
+cat > /mnt/etc/systemd/system/neuravps-tunnel-probe.timer <<'NVXEOF'
+[Unit]
+Description=NeuraVPS: sondeo del tunel activo cada 15 s
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=15
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
+NVXEOF
+
+
+# HOME_REGION=auto: el nodo mide a que base llega antes y se queda con ella,
+# cacheando el resultado en este mismo fichero. Asi install.sh no necesita saber
+# en que centro de datos esta la maquina (la separacion es ~1 ms contra ~20 ms).
+cat > /mnt/etc/default/neuravps-tunnels <<NVXEOF
+# Parametros de ESTE nodo. Ver docs/egress-failover-e-ipv6-estable.md §4.5.
+NODE_ID=${NODE_NUM}
+SLOT=${NODE_NUM}
+HOME_REGION=auto
+IDENT6=2a01:4f9:c01f:e::/64
+TRANSIT_BASE=2a01:4f9:c01f:e:ffff::
+VIP_FSN=2a01:4f8:fff2:95::2
+VIP_HEL=2a01:4f9:fff1:5f::2
+DEFAULT_V4_VIA_TUNNEL=0
+NVXEOF
+
+cat > /mnt/etc/sysctl.d/99-neuravps-rpfilter.conf <<'NVXEOF'
+# Filtro de ruta inversa: los tuneles base<->nodo lo necesitan a 0.
+#
+# Con los tuneles anclados a las VIPs de failover el camino es ASIMETRICO A
+# PROPOSITO: el trafico entra por el tunel de la VIP que la base posee y sale por
+# el de casa. rp_filter lo tira como "martian source", y el sintoma engana
+# muchisimo porque Linux NO tiene rp_filter para IPv6: v6 pasa y v4 no, con
+# tcpdump viendo el paquete en LOS DOS extremos y cero conntrack.
+# El modo laxo (2) NO basta. Tiene que ser 0.
+#
+# El kernel usa el MAXIMO de conf.all y conf.<iface>, asi que poner `all` a 0 no
+# afloja nada por si solo: cada interfaz conserva el suyo. Las que miran al
+# cliente (vmbr0 en el nodo, enp6s0 en la base) siguen con el valor que tenian, y
+# `default` se queda en 2 para que toda interfaz nueva nazca filtrada. El 0 lo
+# pone explicitamente neuravps-tunnels.sh / neuravps-base-tunnels.sh sobre cada
+# tunel, y solo sobre ellos: solo llevan GRE entre maquinas nuestras, ya filtrado
+# por gre_peers y por el [IPSET base] del nodo.
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 2
+NVXEOF
+
+
+# Los enlaces se activan al arrancar; el sondeo cada 15 s reapunta la salida a
+# la otra region si la base de casa deja de contestar (GRE es SIN ESTADO: el
+# tunel no se cae solo cuando la base muere).
+chroot /mnt systemctl enable neuravps-tunnels.service >/dev/null 2>&1 || true
+chroot /mnt systemctl enable neuravps-tunnel-probe.timer >/dev/null 2>&1 || true
+log "Tuneles anclados a VIP + sondeo instalados (nodo ${NODE_NUM}, region auto)"
+
 log "Successfully generated /etc/network/interfaces ($(wc -l < /mnt/etc/network/interfaces) lines)"
 
 # Configure DNS resolvers in /etc/resolv.conf

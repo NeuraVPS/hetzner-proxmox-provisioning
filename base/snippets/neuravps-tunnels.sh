@@ -97,6 +97,28 @@ ip rule add from 10.64.0.0/16 iif vmbr0 lookup 101 priority 101
 ip rule del from "$NODE_V4" lookup 102 2>/dev/null
 ip rule add from "$NODE_V4" lookup 102 priority 102
 
+# --- region de casa ----------------------------------------------------------
+# `auto` = la mas cercana, medida. Es el criterio correcto (el trafico del
+# cliente debe salir por la base LOCAL) y ademas evita que install.sh tenga que
+# averiguar en que centro de datos esta el nodo: la separacion es de ~1 ms
+# contra ~20 ms, asi que no hay ambiguedad posible.
+if [ "$HOME_REGION" = auto ]; then
+  best=""; bestms=999999
+  for r in fsn hel; do
+    c=$([ "$r" = fsn ] && echo "$CANON_FSN" || echo "$CANON_HEL")
+    t0=$(date +%s%N)
+    if timeout 3 bash -c "</dev/tcp/$c/443" 2>/dev/null; then
+      ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+      [ "$ms" -lt "$bestms" ] && { bestms=$ms; best=$r; }
+    fi
+  done
+  HOME_REGION="${best:-fsn}"
+  logger -t neuravps-tunnels "region de casa detectada: $HOME_REGION (${bestms} ms)"
+  # Cachearla: si en el proximo arranque la base local esta caida, la medicion
+  # elegiria la remota y el nodo se quedaria ahi para siempre.
+  sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+fi
+
 # Rutas por defecto hacia el tunel de casa. El sondeo
 # (neuravps-tunnel-probe.sh) las reapunta al otro si esta base deja de contestar.
 /usr/local/sbin/neuravps-tunnel-select.sh "$HOME_REGION"

@@ -156,6 +156,44 @@ systemctl enable --now veth-host.service
 systemctl restart nftables.service
 systemctl enable --now base-nat-boot.service
 
+# 5bis) Tuneles base<->nodo anclados a las VIPs de failover.
+# Cada base levanta DOS tuneles por nodo, uno por VIP, los dos siempre en pie.
+# Solo lleva trafico el de la VIP que esta base posee de verdad; el otro esta de
+# reserva y se activa SOLO cuando la VIP se mueve, sin reconfigurar nada. Un
+# unico juego NO vale: al moverse la VIP los paquetes llegan dirigidos a una VIP
+# para la que no hay tunel con ese par (local, remoto) y se caen.
+# Ver docs/egress-failover-e-ipv6-estable.md §15 y §17.
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-base-tunnels.sh \
+  -o /usr/local/sbin/neuravps-base-tunnels.sh
+chmod 755 /usr/local/sbin/neuravps-base-tunnels.sh
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-base-tunnels.service \
+  -o /etc/systemd/system/neuravps-base-tunnels.service
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/99-neuravps-rpfilter.conf \
+  -o /etc/sysctl.d/99-neuravps-rpfilter.conf
+sysctl -p /etc/sysctl.d/99-neuravps-rpfilter.conf
+
+# HOME_REGION = la region cuya VIP posee esta base en operacion normal.
+# ⚠️ Es lo unico que distingue una base de la otra aqui: fsn en b0, hel en b1.
+mkdir -p /etc/neuravps
+cat > /etc/default/neuravps-base-tunnels <<'EOF'
+HOME_REGION=fsn
+TRANSIT_BASE=2a01:4f9:c01f:e:ffff::
+VIP_FSN=2a01:4f8:fff2:95::2
+VIP_HEL=2a01:4f9:fff1:5f::2
+NODES_FILE=/etc/neuravps/tunnel-nodes.conf
+EOF
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/tunnel-nodes.conf.example \
+  -o /etc/neuravps/tunnel-nodes.conf
+
+# TUNNEL_IFACE_PREFIX le dice a sync-base-nat.py por que tunel colgar las rutas
+# por VM: tun-f en la base de Falkenstein, tun-h en la de Helsinki.
+grep -q '^TUNNEL_IFACE_PREFIX=' /etc/default/base-nat \
+  || echo 'TUNNEL_IFACE_PREFIX=tun-f' >> /etc/default/base-nat
+
+# Antes que base-nat-boot: sus rutas por VM apuntan a estas interfaces.
+systemctl daemon-reload
+systemctl enable --now neuravps-base-tunnels.service
+
 # 6) Validation.
 systemctl status --no-pager jool-nat46.service
 systemctl status --no-pager base-nat-boot.service
