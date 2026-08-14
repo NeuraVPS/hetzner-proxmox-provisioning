@@ -2255,3 +2255,59 @@ VMs de cliente tampoco llevan `onboot` (comprobado en `0000029-EX44`: 0/1) — l
 levanta el reconciliador de arranque desde el estado deseado de Firestore. La
 1096 está marcada `maintenance` para que `conncheck` la ignore, y por eso se
 quedó parada. Al planificar el reinicio de un nodo, contar con eso.
+
+---
+
+## 20. Conversión del invitado — la trampa del `/128` (2026-08-14)
+
+Primera VM real convertida (la 201, del operador). Salió a la primera **la
+configuración** y falló **la entrada**, con un síntoma que no cuadraba: salida a
+Internet perfecta por v4 y v6, DNS resolviendo, y RDP muerto por las dos VIPs.
+
+### `netsh interface ipv6 add address` pone `/64` por defecto
+
+Y con `/64` el invitado cree que las direcciones de **tránsito de las bases**
+están en su mismo enlace — viven dentro del `/64` de identidad — así que las
+busca por NDP en lugar de mandarlas a `fe80::1`. La captura en el nodo lo enseña
+sin lugar a dudas:
+
+```
+tun-fsn  In  2a01:4f9:c01f:e:ffff::c30.35332 > 2a01:4f9:c01f:e::c9.3389: [S]
+tap201i0 Out 2a01:4f9:c01f:e:ffff::c30.35332 > 2a01:4f9:c01f:e::c9.3389: [S]
+tap201i0 M   2a01:4f9:c01f:e::c9 > ff02::1:ff00:c30: neighbor solicitation,
+             who has 2a01:4f9:c01f:e:ffff::c30
+```
+
+El SYN llega hasta la VM. La VM contesta preguntando por el vecino. Nadie
+responde —la base no está en ese segmento— y la respuesta jamás sale.
+
+**La dirección del invitado va con `/128`.** Así nada es on-link y TODO sale por
+`fe80::1`. Es lo que tenían las vm 1096/1097 desde el principio; se perdió al
+reescribir la receta porque el `/128` no estaba explícito en la doc.
+
+Es la MISMA trampa de siempre —el tránsito vive dentro del IDENT— por tercera
+vez: primero en la regla de política del nodo, luego en la tabla 100, ahora en
+el prefijo del invitado. **Si algo del modelo nuevo falla sólo en una dirección,
+mirar esto primero.**
+
+### Otras dos cosas que salieron
+
+- **`-NoProfile` es obligatorio.** El perfil de PowerShell de los invitados
+  ejecuta el desplegador de enlaces SMB y su salida se cuela por delante de la
+  del comando, rompiendo cualquier verificación.
+- **La conversión SÓLO puede ir por el agente**, nunca por SSH: al cambiar la IP
+  se cortaría la propia sesión a mitad del script y no habría forma de medir cómo
+  quedó. El agente va por virtio-serial, así que sobrevive a una red rota — es la
+  red de seguridad que hace todo esto reversible.
+
+### Orden que funciona
+
+1. Agente: aplicar v6 `/128` + ruta `fe80::1` + v4 estática (que desactiva el
+   DHCP sola) y **medir** dentro (`BOUND:`).
+2. Firestore `ipv6`+`ipv4` → la Cloud Function mueve DNAT y rutas en las dos
+   bases (~15 s) y de paso regenera los enlaces SMB del usuario.
+3. Verificar entrada por las dos VIPs y salida real.
+
+⚠️ Entre 1 y 2 el invitado **no tiene salida**: la base aún no tiene ruta de
+vuelta hacia su `/32` privada. Es esperado y dura segundos; no confundirlo con
+un fallo de la configuración.
