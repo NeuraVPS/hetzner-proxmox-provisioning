@@ -2375,3 +2375,34 @@ sentidos; lo que estaba mal era el destino del enlace, no la red.
 convertidas TODAS sus VMs** (`base/snippets/resync-enlaces-smb.py`, toca
 `lastStarted`, que está entre los campos vigilados y es inocuo). El resync es
 *fire-and-forget* por el agente, así que tarda y no es instantáneo en todas.
+
+---
+
+## 22. 🔲 Panel — qué se le enseña al cliente (decisión del operador 2026-08-14)
+
+⚠️ **Pendiente, y bloquea cerrar la fase de VMs.** Hoy el panel lee
+`nodeServerIpv4 ?? publicIpv4` (`PanelContent.tsx:3374`), y **las dos son la IP
+del NODO**. Con el modelo nuevo la salida real es la de la **base**, así que el
+campo "Acceso a Internet" muestra una IP que ya no es la del cliente — y es
+justo la que copia en la lista blanca de su bróker.
+
+Medido tras convertir: vm 981 muestra `65.108.46.209` y sale por
+`37.27.135.250`; vm 201 muestra `46.4.231.56` y sale por `188.40.153.120`.
+
+**Lo que hay que enseñar** (literal del operador):
+
+- Mantener el "tu servidor está en la región X".
+- Explicar que **los movemos entre Helsinki y Alemania por optimización de
+  recursos**.
+- Mostrar **las cuatro IPs**.
+- Decir que la que el servidor ve **en cada momento** es la de su región…
+- …que **podemos cambiarla sin previo aviso**…
+- …y que **nunca verá ninguna otra que esas dos**.
+
+Eso encaja con la promesa de §1: no es "tu IP no cambia nunca", es "tus IPs son
+estas, y te las decimos desde el primer día". Es lo que convierte una conmutación
+de base en un no-evento en vez de en una incidencia.
+
+**Dónde tocar**: `functions/proxmox_handlers.py:8490` (deja de espejar la IP del
+nodo en `publicIpv4` para las VMs del modelo nuevo) y
+`website/app/panel/PanelContent.tsx:3374` + `hooks/useNodeServerIpv4.ts`.
