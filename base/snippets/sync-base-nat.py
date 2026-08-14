@@ -639,6 +639,11 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
             samba=_firewall_flag(firewall, "sambaEnabled", True),
             ssh=_firewall_flag(firewall, "sshEnabled", True),
+            # Sin estos dos, una VM del modelo nuevo sincronizada de una en una
+            # se queda sin nodo conocido y su ruta /128 no se puede mover. El
+            # cargador masivo si los pasaba; este se habia quedado atras.
+            node_id=d.get("nodeId") or "",
+            ipv4=d.get("ipv4") or "",
         )
     return None
 
@@ -955,7 +960,27 @@ def sync_single_vmid(
             desired.pop(vmid, None)
             logger.info("proxmoxId=%s not in Firestore; removed from desired map", vmid)
 
+        # Modelo nuevo: la ruta /128 (y la /32 privada) cuelgan del tunel del
+        # NODO, asi que una migracion obliga a moverlas. La Cloud Function que
+        # reacciona a un cambio de nodo entra POR AQUI, no por el sync completo,
+        # y esta via nunca reconciliaba rutas: tras migrar, las dos bases seguian
+        # apuntando al tunel del nodo anterior y la VM quedaba inalcanzable
+        # aunque su DNAT estuviera perfecto. Medido con la vm 1096 el 2026-08-14.
+        ent = desired.get(vmid)
+        if ent and _is_ident(ent.get("ipv6") or ""):
+            if ipv6_override or not ent.get("nodeId"):
+                # El camino de override salta Firestore a proposito (es el
+                # rapido), pero sin el nodo no hay ruta que calcular. Se lee
+                # SOLO para las VMs del rango de identidad: las unicas con ruta.
+                fresco = firestore_server_for_vmid(vmid)
+                if fresco:
+                    if fresco.get("nodeId"):
+                        ent["nodeId"] = fresco["nodeId"]
+                    if fresco.get("ipv4"):
+                        ent["ipv4"] = fresco["ipv4"]
+
         reconcile_dynamic_dnat_rules(desired)
+        reconcile_vm_routes(desired)
         write_state(_state_payload(desired))
     logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
