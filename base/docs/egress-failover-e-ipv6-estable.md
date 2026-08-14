@@ -2153,3 +2153,50 @@ canónicas de las bases, lo que de paso resuelve la sobrecarga que señalaba el
   modelos, pero sin él un nodo convertido tira el GRE de la VIP.
 - **`install.sh`**: túneles, `rp_filter` de los túneles y el sondeo, para que un
   nodo nuevo nazca ya así.
+
+---
+
+## 18. Persistencia completa y convivencia de los dos modelos — 2026-08-14
+
+Todo lo de §15/§17 vivía en cuatro máquinas puestas a mano. Ya no: un nodo
+reinstalado o una base nueva nacen en el modelo nuevo, y los 234 nodos de la
+flota aceptan ya el GRE de las VIPs sin haber cambiado de modelo.
+
+### Lo que hace posible la convivencia
+
+| pieza | modelo viejo | modelo nuevo |
+|---|---|---|
+| `[IPSET base]` con las 2 VIPs | **intacto** (aditivo) | necesario para el GRE |
+| `DEFAULT_V4_VIA_TUNNEL=0` de serie | el nodo sale por su IPv4 pública | los invitados `10.64/16` por el túnel |
+| tabla de política 101 (`from 10.64.0.0/16`) | no la toca: sus invitados son `10.0.0.0/16` | los enruta al túnel |
+| `10.64.255.1` + `fe80::1` en `vmbr0` | añadidos, `10.0.0.1` sigue | puerta de enlace de los nuevos |
+
+Un nodo puede tener invitados de los **dos** esquemas a la vez y ninguno se
+entera del otro. Verificado en `0000029-EX44` tras el empuje: conserva su IPv4
+pública, su `10.0.0.1`, cero túneles, y ya lleva las VIPs en su `cluster.fw`.
+
+### `HOME_REGION=auto`
+
+El nodo mide a qué base llega antes y **cachea el resultado en su propio
+`/etc/default`**. Sin cachear, un arranque con la base local caída elegiría la
+remota y el nodo se quedaría allí para siempre. Evita que `install.sh` tenga que
+averiguar el centro de datos, y el criterio es además el correcto: el tráfico
+del cliente debe salir por la base **local**. La separación es ~1 ms contra
+~20 ms, así que no hay ambigüedad posible.
+
+### `rp_filter` sin aflojar nada de cara al cliente
+
+El kernel usa el **máximo** de `conf.all` y `conf.<iface>`. Por eso `all=0` no
+afloja nada por sí solo: `vmbr0` y `enp6s0` conservan su `2`, y `default` se
+queda en `2` para que toda interfaz nueva nazca filtrada. El `0` lo pone el
+script sobre **cada túnel y sólo sobre ellos**. Medido antes y después: idéntico
+en las interfaces que miran al cliente.
+
+### 🔲 Lo que falta para la fase 3
+
+- **`tunnel-nodes.conf` de las bases se mantiene a mano.** Hoy lista los dos
+  nodos convertidos. Para la flota tiene que generarlo `sync-base-nat.py` desde
+  Firestore, con un campo en `proxmox_nodes` que diga qué nodos están
+  convertidos — si no, convertir un nodo exige editar un fichero en las dos
+  bases.
+- **La migración en caliente**, único punto del plan sin probar.
