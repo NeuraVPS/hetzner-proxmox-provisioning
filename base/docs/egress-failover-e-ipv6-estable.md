@@ -1981,3 +1981,76 @@ Después, reinicio real de las dos bases (§16): **10/10 piezas reaplicadas sola
   Con dos VMs de prueba es anecdótico; **a escala de flota es media flota sin
   salida durante cada mantenimiento de base**, cuando hoy un mantenimiento es
   invisible. Hay que cerrarlo **antes de la fase 3**.
+
+---
+
+## 16. Ciclo de reinicio de las dos BASES — 2026-08-14
+
+Kernel **6.12.100 → 6.12.101**, una base cada vez, según
+[[neuravps-base-maintenance-reboot-cycle]]. Objetivo doble: cargar el kernel y
+**comprobar que el modelo nuevo se reaplica solo**.
+
+| | b1 (HEL) | b0 (FSN) |
+|---|---|---|
+| vuelta (cambio de `boot_id`) | **70 s** | **71 s** |
+| kernel | 6.12.101 ✅ | 6.12.101 ✅ |
+| `systemd is-system-running` | `running`, 0 fallidas | `running`, 0 fallidas |
+| piezas del modelo nuevo | **10/10** | **10/10** |
+| mapas NAT | 1873×4 + 209 | 1873×4 + 209 |
+| clientes reales por su IP principal, aislada | **12/12** | **12/12** |
+
+**Canario: 140 rondas × 6 clientes reales, CERO fallos** — ni un cliente notó
+nada, ni durante los cuatro traslados de VIP ni durante los dos reinicios.
+
+### Método que hizo esto seguro
+
+- **Recargar `nftables` ANTES de reiniciar, con la base ya drenada** y un hombre
+  muerto (`systemd-run --on-active=90` que restaura la copia). Si el fichero
+  persistido estuviera mal, se ve en 2 s y se arregla en 5, en vez de
+  descubrirlo en un arranque a ciegas. Las dos bases cargaron a la primera.
+- **Probar la base recién reiniciada AISLADA por su IP principal**, antes de
+  devolverle VIPs: el DNAT v4 casa también la IP principal, así que se cazaría
+  una base rota sin clientes encima.
+- **Gate diferencial**: lo que falla por la base bajo prueba se reintenta por la
+  otra. Responde en la otra = fallo real; muerto en las dos = VM apagada.
+
+### Lo que el ciclo DEMOSTRÓ del modelo nuevo
+
+1. **La persistencia funciona.** Las 10 piezas volvieron solas en las dos bases.
+2. **Los invitados no se tocan.** Las dos VMs conservaron su IPv6 de identidad,
+   su IPv4 privada y su puerta de enlace, y recuperaron salida v4 **y** v6 con
+   la identidad correcta (`…::448` por b0, `…::449` por b1) sin entrar en ellas.
+3. **La entrada cruzada aguanta el mantenimiento.** Con las 4 VIPs en una sola
+   base, las dos VMs de prueba siguieron respondiendo RDP y SSH por las dos.
+4. **`base-nat-boot` reconcilia las rutas por VM al arrancar**, y el orden
+   `Before=` hace que encuentre los túneles ya en pie.
+
+### Lo que el ciclo DESTAPÓ
+
+⚠️ **Reiniciar una base deja sin salida IPv4 a los nodos cuyo `LOCAL_TUN` apunta
+a ella.** Durante la ventana de b1, el nodo 238 y su VM se quedaron sin v4
+(entrada por b0 intacta); durante la de b0, lo mismo con el 228. Es consecuencia
+directa de que los túneles estén anclados a las **IPs principales** en vez de a
+las **VIPs**, en contra de §4.5.
+
+Hoy es anecdótico —dos VMs de prueba, sin clientes—. **A escala de flota deja a
+media flota sin salida v4 en cada mantenimiento de base**, cuando hoy un
+mantenimiento de base es completamente invisible para el cliente. Anclar a las
+VIPs lo elimina: al moverse la VIP, el túnel del nodo la sigue y termina en la
+superviviente sin tocar nada. **Bloqueante de la fase 3.**
+
+### Hallazgos laterales
+
+- **`certbot.service` falla en las dos bases** desde hace tiempo: intenta
+  renovar `pve.neuravps.com`, un certificado **DNS-01 manual sin hooks**.
+  Caduca el **2026-08-31**. En b0 es un residuo (nginx sólo sirve
+  `neuravps-dual` y `file-bridge`), pero **b1 todavía lo referencia en nginx**.
+  Es exactamente lo que anticipaba [[neuravps-dual-region-bases]]. Arreglo:
+  pasar b1 a `neuravps-dual` (12 SANs, DNS-01 automático) y borrar los
+  `renewal` huérfanos.
+- **`guest-exec` del agente qemu deja de funcionar en los invitados**
+  (`Failed to execute child process (Permission denied)`) mientras el resto del
+  agente sigue perfecto (ping, `network-get-interfaces`, `get-osinfo`). Apareció
+  tras varias llamadas seguidas. **Alternativa fiable: SSH al invitado por su
+  IPv6 de identidad** con las credenciales de Firestore (`serverUser` /
+  `serverPassword`) — no depende del agente y prueba de paso el camino de red.
