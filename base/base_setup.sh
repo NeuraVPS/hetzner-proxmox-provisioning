@@ -227,6 +227,13 @@ curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisionin
   -o /etc/nginx/conf.d/pve-proxy-map.conf
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-proxy-backends.map.conf.example \
   -o /etc/nginx/conf.d/pve-proxy-backends.map.conf
+# Host desconocido -> neuravps.com. SIN esto nginx usa el PRIMER bloque como
+# predeterminado, y cualquiera que entrase por la IP de la base --la que los
+# invitados ven como su salida-- se encontraba el navegador de archivos.
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/nginx-00-catchall.conf \
+  -o /etc/nginx/sites-available/00-catchall.conf
+ln -sf /etc/nginx/sites-available/00-catchall.conf /etc/nginx/sites-enabled/00-catchall.conf
+
 curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-redirects.conf \
   -o /etc/nginx/sites-available/neuravps-redirects.conf
 
