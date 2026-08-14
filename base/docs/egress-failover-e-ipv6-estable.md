@@ -2054,3 +2054,102 @@ superviviente sin tocar nada. **Bloqueante de la fase 3.**
   tras varias llamadas seguidas. **Alternativa fiable: SSH al invitado por su
   IPv6 de identidad** con las credenciales de Firestore (`serverUser` /
   `serverPassword`) — no depende del agente y prueba de paso el camino de red.
+
+---
+
+## 17. Anclaje a las VIPs + sondeo — HECHO Y VALIDADO 2026-08-14
+
+Cierra el bloqueante del §16. Los túneles dejan de apuntar a una **máquina** y
+apuntan a un **servicio**: al moverse una VIP, el túnel del nodo la sigue y
+termina en la superviviente sin tocar nada en ningún lado.
+
+### ⚠️ §4.5 estaba incompleto: UN juego por base NO basta
+
+El diseño decía «cada base lleva un único juego de túneles, sourced de la VIP
+que posee». **Medido: no sobrevive a un traslado de VIP.** Cuando la VIP de
+Helsinki se mueve a b0, los paquetes del nodo llegan a b0 dirigidos a esa VIP, y
+b0 no tiene ningún túnel con ese par `(local, remoto)`: se caen.
+
+**Cada base crea DOS túneles por nodo, uno por VIP, los dos siempre en pie.** En
+cada momento sólo lleva tráfico el de la VIP que la base posee de verdad; el otro
+está de reserva y se activa **solo** cuando la VIP se mueve. A escala de flota
+son ~470 interfaces por base: de kernel, sin estado y sin coste apreciable.
+
+### La dirección canónica de SNAT es de la VIP, no de la máquina
+
+Antes había una por base, y el nodo enrutaba esa `/128` por un túnel fijo — así
+que al moverse la VIP la base de detrás cambiaba y el retorno se perdía. Ahora
+son dos, elegidas por el **túnel de salida**:
+
+```
+oifname "tun-fp*" ip6 daddr <IDENT> ct status dnat snat to 2a01:4f9:c01f:e:ffff::
+oifname "tun-hp*" ip6 daddr <IDENT> ct status dnat snat to 2a01:4f9:c01f:e:ffff::2
+```
+
+Lo que sale por un túnel anclado a la VIP FSN lleva la canónica FSN, y el nodo la
+devuelve por su `tun-fsn`, que termina en quien posea esa VIP. **Correcto por
+construcción**, esté donde esté cada VIP. Los valores no cambian; cambia lo que
+significan.
+
+### 🔴 LA TRAMPA CARA: `rp_filter` — v6 pasa y v4 no
+
+Con anclaje a VIP el camino es **asimétrico a propósito**: el tráfico entra por
+el túnel de la VIP que la base posee y sale por el de casa. El filtro de ruta
+inversa lo tira como `martian source`.
+
+El síntoma engaña muchísimo: **IPv6 funciona perfectamente y IPv4 no**, porque
+**Linux no tiene `rp_filter` para IPv6**. Se ve tráfico en `tcpdump` en los dos
+extremos, contadores subiendo, y aun así cero entradas de `conntrack` y cero en
+los contadores de `forward`: el paquete muere entre el dispositivo y netfilter.
+
+**El modo laxo (`2`) NO basta — tiene que ser `0`**, y en `all` *y* en la
+interfaz (el kernel usa el máximo de los dos). Se fija en los dos extremos, sólo
+en las interfaces de túnel: sólo llevan GRE entre máquinas nuestras, ya filtrado
+por `gre_peers` y `[IPSET base]`; la uplink conserva el suyo.
+
+Para diagnosticarlo: `sysctl -w net.ipv4.conf.all.log_martians=1` y `dmesg`.
+
+### Sondeo en el nodo — ortogonal al anclaje
+
+GRE es **sin estado**: el túnel no se cae cuando la base muere, se queda UP para
+siempre apuntando a una caja muerta. Anclaje y sondeo cubren casos distintos:
+
+| | mantenimiento PLANIFICADO | muerte NO planificada |
+|---|---|---|
+| **anclaje a VIP** | **0 s** (movemos la VIP antes) | espera a que el watchdog mueva la VIP (~5-6 min) |
+| **+ sondeo** | igual | **~30 s** (el nodo salta a la otra región) |
+
+El sondeo abre un TCP a la canónica de su región (`:443` de nginx). **`ping` no
+vale: PVE tira el eco ICMPv6 y da falso negativo** — el túnel bueno también da
+100 % de pérdida al ping mientras mueve tráfico real. Histéresis asimétrica: 2
+fallos para irse, 4 aciertos para volver.
+
+### Validación — traslado real de VIP, 2026-08-14
+
+Con las VIPs de Helsinki movidas a b0 y **sin tocar nada en el nodo 238**:
+
+| | antes | con HEL en b0 | tras devolverla |
+|---|---|---|---|
+| nodo 238, salida v4 | `37.27.135.250` | **`188.40.153.120`** | `37.27.135.250` |
+| vm 1097, salida v6 | `…3070:3984::449` | **`…2b03:18a9::449`** | `…3070:3984::449` |
+| sondeo | `hel 0` | `hel 0` | `hel 0` |
+
+El sufijo (`::449` = vmid) se conserva en las tres columnas. RDP y SSH de las dos
+VMs respondieron por **las cuatro vías** durante todo el ejercicio, la flota se
+mantuvo 12/12 por cada base y el canario acumuló **340 rondas × 6 clientes reales
+sin un solo fallo**.
+
+### Renumerado del tránsito
+
+`slot = id` (determinista, sin registro). **El hueco 0 queda RESERVADO** para las
+canónicas de las bases, lo que de paso resuelve la sobrecarga que señalaba el
+§15: el nodo 228 pasa del slot 0 al 228 (`…ffff::e40`) y el 238 al 238
+(`…ffff::ee0`). Dentro de cada hueco de 16: `+0/+1` par FSN, `+2/+3` par HEL.
+
+### 🔲 Pendiente antes de la flota
+
+- **Las VIPs en el `[IPSET base]` de los 234 nodos.** Hoy sólo en los dos de
+  prueba (`nodo-ipset-base-vips.py`). Es aditivo y compatible con los dos
+  modelos, pero sin él un nodo convertido tira el GRE de la VIP.
+- **`install.sh`**: túneles, `rp_filter` de los túneles y el sondeo, para que un
+  nodo nuevo nazca ya así.

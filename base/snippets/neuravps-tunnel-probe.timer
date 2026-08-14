@@ -1,0 +1,8 @@
+[Unit]
+Description=NeuraVPS: sondeo del tunel activo cada 15 s
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=15
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=NeuraVPS: sondeo del tunel activo del nodo
+After=neuravps-tunnels.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuravps-tunnel-probe.sh
