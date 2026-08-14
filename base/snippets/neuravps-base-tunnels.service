@@ -1,0 +1,21 @@
+[Unit]
+Description=NeuraVPS: lado BASE de los tuneles base<->nodo
+Wants=network-online.target
+After=network-online.target nftables.service
+# Las rutas por VM de sync-base-nat.py apuntan a estas interfaces: si no
+# existen todavia, `ip route add ... dev tun-pXXX` falla y la base arranca sin
+# camino a los invitados del esquema nuevo.
+Before=base-nat-boot.service
+# Un `systemctl restart nftables` vacia el set gre_peers; PartOf hace que se
+# vuelva a poblar solo.
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/neuravps-base-tunnels.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

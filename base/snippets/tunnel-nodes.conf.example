@@ -1,0 +1,11 @@
+# Nodos con tunel ip6gre hacia las bases. Fuente de verdad UNICA de
+# neuravps-base-tunnels.sh: tuneles, ruta al host del nodo y set gre_peers.
+#
+#   <id>  <ipv6 principal del nodo>   <slot>
+#
+# El slot reserva un hueco de 16 direcciones dentro de
+# 2a01:4f9:c01f:e:ffff::/112; dentro del hueco b0 usa +0/+1 y b1 +2/+3.
+# Por defecto slot = id (determinista, sin registro). Los dos nodos de prueba
+# llevan slots historicos 0 y 1 -> ver PENDIENTE en la doc §4.5.
+228  2a01:4f8:2240:201f::2  0
+238  2a01:4f9:3100:4b08::2  1

@@ -1908,3 +1908,76 @@ entonces).
 Pendiente de escribir antes de la fase 3, y **antes de conocer la cifra**: el
 **criterio de aborto** — cuántos segundos de hueco convierten esto en un "no
 seguimos".
+
+---
+
+## 15. Persistencia en las BASES — HECHO 2026-08-14
+
+Todo lo que se construyó a mano en las bases durante los días 13 y 14 vivía
+**sólo en memoria**. Un reinicio de una base lo habría borrado entero, dejando
+a los dos nodos convertidos —que ya no tienen IPv4 pública— **sin salida v4
+ninguna** y sin camino de vuelta para sus invitados.
+
+Se descubrió al preparar el ciclo de reinicio de las bases, antes de tocarlas.
+Es el mismo error que el 🔲 pendiente del §11bis para los nodos, repetido en el
+otro extremo del túnel.
+
+### Lo que NO sobrevivía a un reinicio
+
+| pieza | dónde vivía |
+|---|---|
+| los 2 `ip6gre` + sus `/127` + MTU 1456 | memoria |
+| rutas `10.65.<hi>.<lo>` al host de cada nodo | memoria |
+| `ip nat`: SNAT de `10.64/16` y `10.65/16` | memoria |
+| `ip6 nat`: SNAT canónica + `snat prefix to` | memoria |
+| `inet filter input`: aceptar GRE | memoria |
+| `inet filter forward`: `veth-host↔tun-*`, `tun-*→uplink` | memoria |
+| rutas `/128` y `/32` **por VM** | ✅ ya las reconciliaba `base-nat-boot` |
+
+### Lo que se construyó
+
+`base/snippets/neuravps-base-tunnels.{sh,service}` + `tunnel-nodes.conf`:
+una unidad `oneshot` que levanta el lado BASE de los túneles desde una tabla de
+nodos. Tres decisiones que importan:
+
+- **`Before=base-nat-boot.service`** — las rutas por VM apuntan a estas
+  interfaces. Si no existen todavía, `ip route add ... dev tun-pXXX` falla y la
+  base arranca sin camino a los invitados del modelo nuevo.
+- **`PartOf=nftables.service`** — el set `gre_peers` se vacía con cada recarga
+  del firewall; así se vuelve a poblar solo.
+- **Sólo recrea un túnel si sus parámetros han cambiado.** Un `ip link del`
+  gratuito tira el tráfico de ese nodo ~1 s en cada arranque del servicio.
+
+El firewall pasa a `/etc/nftables.conf` con `base/snippets/persist-egress-nft.py`,
+que inserta seis bloques con anclas exactas, **aborta si un ancla no aparece
+exactamente una vez**, valida con `nft -c -f` y deja copia en
+`/etc/nftables.conf.pre-egress`.
+
+Las direcciones GRE autorizadas dejan de ser una lista literal y pasan a un set
+`gre_peers` que puebla la misma unidad desde el mismo fichero de nodos: **set y
+túneles no pueden divergir**, y la regla es una sola línea para toda la flota.
+
+### Validación
+
+El script se ejecutó primero **en caliente** contra el estado hecho a mano:
+`diff` vacío en b0 y, en b1, exactamente la única ruta que faltaba
+(`10.65.0.228 dev tun-p228` — asimetría que llevaba ahí desde el día 13). Que el
+estado calculado coincida byte a byte con el estado a mano es la prueba de que
+la tabla de nodos describe bien la realidad.
+
+Después, reinicio real de las dos bases (§16): **10/10 piezas reaplicadas solas**.
+
+### 🔲 Pendientes que esto deja abiertos
+
+- **El slot 0 está sobrecargado.** La dirección canónica de SNAT de cada base
+  (`…ffff::` y `…ffff::2`) es *a la vez* el extremo del túnel del nodo 228.
+  Funciona por casualidad —la base acepta su propia dirección venga por donde
+  venga— pero es una trampa. Al pasar a slots deterministas (`slot = id`, que es
+  lo que hace el script por defecto), **reservar el slot 0 para las bases** y
+  renumerar el 228.
+- **Los túneles siguen anclados a las IPs PRINCIPALES de las bases, no a las
+  VIPs**, en contra de lo que decide §4.5. Consecuencia medida en §16: reiniciar
+  una base deja sin salida v4 a todos los nodos cuyo `LOCAL_TUN` apunta a ella.
+  Con dos VMs de prueba es anecdótico; **a escala de flota es media flota sin
+  salida durante cada mantenimiento de base**, cuando hoy un mantenimiento es
+  invisible. Hay que cerrarlo **antes de la fase 3**.
