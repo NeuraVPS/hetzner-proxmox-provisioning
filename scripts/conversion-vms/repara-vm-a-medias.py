@@ -26,6 +26,15 @@ netsh interface ipv6 add address $if {V6}/128 store=persistent | Out-Null
 netsh interface ipv6 add route ::/0 $if fe80::1 store=persistent | Out-Null
 {DELGW}
 
+# Retirar CUALQUIER IPv6 global que no sea la esperada. La vm 1854 se quedo con
+# las dos --la nueva y la del nodo-- y eso ensucia la seleccion de origen: el
+# invitado puede salir con la vieja, que ya no le enruta nadie.
+foreach ($store in 'PersistentStore','ActiveStore') {{
+  Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv6 -PolicyStore $store -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.IPAddress -notlike 'fe80*' -and $_.IPAddress -ne '{V6}' }} |
+    ForEach-Object {{ Remove-NetIPAddress -InterfaceAlias $if -IPAddress $_.IPAddress -PolicyStore $store -Confirm:$false -ErrorAction SilentlyContinue }}
+}}
+
 # IPv4 estatica del modelo nuevo (`set address ... static` desactiva el DHCP).
 netsh interface ipv4 set address   name=$if static {V4} 255.255.0.0 10.64.255.1 | Out-Null
 netsh interface ipv4 set dnsserver name=$if static 185.12.64.1 primary validate=no | Out-Null

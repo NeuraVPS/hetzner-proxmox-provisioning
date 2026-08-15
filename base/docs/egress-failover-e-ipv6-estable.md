@@ -2450,3 +2450,30 @@ suponer: `scripts/conversion-vms/repara-vm-a-medias.py`. Las dos recuperadas.
 🔲 **Mejora pendiente del despliegue**: verificar el `BOUND:` contra los valores
 esperados (prefijo `/128`, IPv4 `10.64.x.y`, puertas) en vez de confiar en que
 la VM siga respondiendo — que es lo que dejó pasar estos dos casos.
+
+### Auditoría de las 1.809 convertidas — 3 casos reales
+
+`audita-convertidas.py` compara el estado REAL del invitado contra lo esperado.
+De 1.809: **1.783 correctas**, 3 casos reales, y el resto **falsos positivos**
+del propio barrido (lectura fallida con 24 hilos; releídas una a una, perfectas).
+
+⚠️ **Un fallo de lectura NO es un fallo de configuración.** Si todos los campos
+salen a `None`, es que no se pudo leer — releer antes de "reparar", o se aplica
+la conversión a ciegas sobre una VM que estaba bien.
+
+Los tres reales, y ninguno lo habría cazado el RDP:
+
+| vm | qué le pasaba | por qué el RDP no lo detecta |
+|---|---|---|
+| 1378 | IPv4 y puerta VIEJAS | entra por IPv6, que sí estaba bien |
+| 1854 | conservaba **las dos** IPv6 | funciona, pero sale por la vieja |
+| 1692 | igual, y con el **WMI/CIM roto** | idem; además los cmdlets no leen |
+
+**El patrón que importa**: quedarse con las dos IPv6 significa que el invitado
+**sigue saliendo por la del nodo** — exactamente la dependencia que el proyecto
+elimina. Por eso `repara-vm-a-medias.py` ahora retira **cualquier** IPv6 global
+que no sea la esperada.
+
+⚠️ **En un invitado con el WMI roto sólo funciona `netsh`** — `Get-NetIPAddress`
+y `Remove-NetIPAddress` fallan con `Cannot connect to CIM server`. La reparación
+por netsh sirve igual.
