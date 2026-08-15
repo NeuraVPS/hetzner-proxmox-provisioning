@@ -77,11 +77,31 @@ El nombre del ejecutable principal de StrategyQuantX **cambió de versión**:
 | SQX **<= 143** | `StrategyQuantX_nocheck.exe` | `sqx_hook_launcher.vbs` |
 | SQX **>= 144** | `StrategyQuantX.exe` | `sqx144_hook_launcher.vbs` |
 
-Hoy la plantilla solo cablea el de v143. **Y de momento así se queda:** el hook
-de v144 se retiró el 2026-08-03 por fork-bomb (ver la corrección al principio),
-así que los clientes de v144 se quedan sin esa protección a sabiendas — es el
-mal menor frente a que la aplicación no abra. **Cablea solo
-`StrategyQuantX_nocheck.exe`.**
+### 🟢 ANTES DE NADA (2026-08-15): ejecuta `hooks/set_java_headless.ps1`
+
+Añade `option -Djava.awt.headless=true` al `.config` de SQX (el mismo fichero
+donde vive el `-Xmx`). Eso **ya da la protección headless**, en cualquier
+versión, sin interceptar ningún proceso. Con eso, **los hooks de SQX dejan de
+ser necesarios** y el cliente de v144 deja de quedarse sin protección.
+
+Probado en vm1096 (2026-08-15) y desplegado en 732 VMs de la flota. Verificado
+en el log de la propia SQX: `SQApp - Runtime args: -Djava.awt.headless=true`.
+
+**No uses una variable de entorno de máquina** aunque funcione: afecta a todo
+Java y **QuantAnalyzer4** tiene interfaz Java propia, así que headless global
+se la puede dejar sin abrir. Detalle y las dos trampas medidas (esa, y los
+configs sin salto de línea final que rompen el `-Xmx`) en `hooks/README.md`.
+
+**El hook de v143 puede seguir cableado** mientras dure la transición —
+conviven y la variable no se duplica (validado en vm1097). Pero en una
+plantilla nueva **no hace falta cablear ningún hook de SQX**.
+
+Hoy la plantilla solo cablea el de v143. El hook de v144 se retiró el
+2026-08-03 por fork-bomb, y el 2026-08-15 quedó establecido que es
+**inarreglable por diseño en cajas duales**: IFEO va por *nombre* de imagen, y
+el `StrategyQuantX.exe` de **v143 se re-ejecuta a sí mismo**, así que la
+entrada de v144 lo atrapa y re-entra en cada generación. **No lo cablees
+nunca.** Si cableas alguno, que sea solo `StrategyQuantX_nocheck.exe`.
 
 **Los dos VBS ya existen** en `windows_vm/hooks/`. Son idénticos salvo la
 clave IFEO de su guarda anti-recursión. **No los fusiones ni los reescribas**:

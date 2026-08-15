@@ -1,5 +1,42 @@
 # NeuraVPS launch hooks (IFEO)
 
+> # ✅ 2026-08-15: PARA EL HEADLESS DE SQX YA NO HACE FALTA NINGÚN HOOK
+>
+> Usa **`set_java_headless.ps1`**: añade `option -Djava.awt.headless=true` al
+> `.config` de cada instalación de SQX — el mismo fichero donde ya vive el
+> `-Xmx`, que es de donde el lanzador nativo lee sus argumentos de JVM.
+>
+> Probado en vm1096 (2026-08-15). Tres arranques el mismo día, los tres con
+> el flag: **18:34** vía hook IFEO, **19:36** vía variable de máquina, **19:47**
+> **solo con el .config, sin hook y sin variable**. Confirmado en el log de la
+> propia SQX: `SQApp - Runtime args: -Djava.awt.headless=true`.
+>
+> Es estrictamente mejor: imposible fork-bombear porque no hay nada que
+> interceptar, no hay `.vbs` que derive de versión o se quede a 0 bytes, y
+> vale para v142/v143/v144 y lo que venga, porque no depende del nombre del exe.
+>
+> **Surte efecto en el siguiente arranque de SQX** — sin reiniciar Windows y
+> sin cerrar la sesión del cliente. Por eso se puede aplicar en caliente.
+>
+> **Desplegado en la flota el 2026-08-15: 732 de 794 VMs SQX** (50 no tenían
+> SQX instalado; 5 con el agente mudo quedaron fuera, ver abajo).
+>
+> ### Dos trampas medidas, que están resueltas en el script
+>
+> 1. **La variable de entorno de máquina NO vale**, aunque funcione.
+>    `JAVA_TOOL_OPTIONS` a nivel de máquina afecta a **todo** Java, y
+>    **QuantAnalyzer4 es Java con interfaz propia** (no lleva Electron, como sí
+>    lleva SQX) — headless global se la puede dejar sin abrir. El `.config` es
+>    por aplicación y no tiene ese efecto colateral.
+> 2. **Hay configs que no terminan en salto de línea.** Un `Add-Content` a
+>    secas produce `option -Xmx16goption -Djava.awt.headless=true` y **rompe el
+>    `-Xmx`**. Pasó en la vm1309. El script reescribe el fichero entero con
+>    `Set-Content` y verifica que el `-Xmx` sale intacto; si no, repone el
+>    respaldo.
+>
+> Los hooks de MetaTrader siguen siendo necesarios: hacen otra cosa
+> (`/portable`), no headless.
+
 > # 🛑 `sqx144_hook_launcher.vbs` IS WITHDRAWN — DO NOT WIRE IT (2026-08-03)
 >
 > **Wiring `StrategyQuantX.exe` to this launcher fork-bombs.** Not "can" —
@@ -25,11 +62,43 @@
 >   `shell.Run`, and if the *delete* has not landed before the relaunch, the
 >   IFEO re-triggers on itself — which is precisely a fork bomb.
 >
-> **A single-install box is NOT proof of safety.** A controlled launch test on
-> a single-install v144 box (vm 1985, 2026-08-02) passed cleanly — hook fired,
-> `Runtime args: -Djava.awt.headless=true` in SQX's own log, no recursion. Both
-> reproductions of the bomb were on **dual** v143+v144 installs, but the
-> mechanism is not established, so single-install is *unverified*, not safe.
+> **MECHANISM ESTABLISHED 2026-08-15 — it is the dual install, and here is why.**
+> Process trees measured on vm1097 (v143) and vm2063 (v144), no hook in play:
+>
+> ```
+> v143:  StrategyQuantX.exe  pid=5748
+>        StrategyQuantX.exe  pid=3388  parent=5748   <-- RE-EXECS ITSELF, same image name
+>
+> v143:  StrategyQuantX_nocheck.exe -> StrategyQuantX_ui.exe x4   <-- different name
+> v144:  StrategyQuantX.exe         -> StrategyQuantX_ui.exe x6   <-- different name
+> ```
+>
+> A hook is safe exactly when the intercepted process spawns children with a
+> **different image name** — then it can never fire on its own descendants.
+> That holds for v143 `_nocheck.exe` and for v144's own `StrategyQuantX.exe`.
+>
+> It does **not** hold for **v143's** `StrategyQuantX.exe`, which re-execs
+> itself. And IFEO keys on the image **name**, not the path — so on a
+> **dual** box the v144 entry also catches `C:\SQX_143\StrategyQuantX.exe`
+> and re-enters on every generation. That is the bomb, and it explains why
+> both incidents were dual boxes and why single installs (vm 1985, vm 2063)
+> ran clean: they were never unsafe, the wiring just could not reach a
+> self-relaunching binary.
+>
+> **No launcher version fixes it.** Measured on vm1097 with the v144 entry
+> wired: deployed launcher (2 386 B) -> SQX never starts; repo launcher with
+> `WaitForNewProcess` (4 207 B) -> SQX **still** never starts. The fix closes
+> the race between *our* re-add and the *first* child; the self-relaunch
+> happens later, from inside SQX, with the `Debugger` already legitimately
+> back. It is not a race, it is the design.
+>
+> Also ruled out by measurement: headless is not the culprit — a 2x2 of
+> {`StrategyQuantX.exe`, `_nocheck.exe`} x {headless, normal} has
+> `StrategyQuantX.exe` surviving 2/2/2/2/2 either way.
+>
+> **Practical upshot:** none of this matters any more for headless, because
+> `set_java_headless.ps1` does the job with no interception at all. Do not
+> re-wire `StrategyQuantX.exe`.
 >
 > **`sqx_hook_launcher.vbs` (v143 `_nocheck`) is NOT implicated.** It has run
 > in production since July, it was left in place on all 119 boxes during the
