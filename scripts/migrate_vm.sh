@@ -560,7 +560,19 @@ if args.node_id is not None:
             # D2 (2026-07-07): the node's egress IPv4 is mirrored on the
             # server doc (panel "Acceso a Internet" / broker allowlists) —
             # refresh it IMMEDIATELY on migration, same rule as nodeId/ipv6.
-            if ndata.get("server_ipv4"):
+            # ⚠️ Solo para el modelo VIEJO. Una VM del esquema nuevo NO sale por
+            # la IP de su nodo sino por la de su BASE, asi que espejar la del
+            # nodo aqui le enseñaria al cliente en el panel una IP que no es la
+            # suya — y es la que copia en la lista blanca de su broker.
+            _ip6_vm = (args.ipv6 or (docs[0].to_dict() or {}).get("ipv6") or "")
+            _es_nuevo = str(_ip6_vm).strip().lower().startswith("2a01:4f9:c01f:e:")
+            if _es_nuevo:
+                _base = {"falkenstein": "188.40.153.120",
+                         "helsinki": "37.27.135.250"}.get(
+                    str(ndata.get("location") or "").strip().lower())
+                if _base:
+                    patch["publicIpv4"] = _base
+            elif ndata.get("server_ipv4"):
                 patch["publicIpv4"] = ndata["server_ipv4"]
     except Exception:
         pass
