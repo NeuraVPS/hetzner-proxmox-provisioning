@@ -2406,3 +2406,47 @@ de base en un no-evento en vez de en una incidencia.
 **Dónde tocar**: `functions/proxmox_handlers.py:8490` (deja de espejar la IP del
 nodo en `publicIpv4` para las VMs del modelo nuevo) y
 `website/app/panel/PanelContent.tsx:3374` + `hooks/useNodeServerIpv4.ts`.
+
+---
+
+## 23. Cierre de la conversión de VMs — 1.809 en el modelo nuevo (2026-08-15)
+
+| | |
+|---|---|
+| VMs en el modelo nuevo | **1.809** — 1.808 responden |
+| La única que no | **409**, apagada por su cliente, conversión coherente |
+| Lista manual | **32**, todas intactas en el modelo viejo |
+
+### Reanimar el agente por SSH recupera la mitad
+
+El motivo de la lista manual es siempre el mismo: **`guest-exec` mudo** en VMs por
+lo demás sanas (encendidas, en el NAT y respondiendo por sus puertos públicos).
+
+La conversión **no puede ir por SSH** —al cambiar la IP se cortaría la propia
+sesión—, pero SSH sí sirve para **reiniciar el servicio del agente** y devolver
+el canal bueno. Con eso la lista bajó **88 → 64 → 45 → 32** en tres vueltas, y
+en la cuarta ya no recuperó ninguna: ahí converge.
+
+`scripts/conversion-vms/revive-agente-por-ssh.py`.
+
+### ⚠️ Dos VMs quedaron A MEDIAS — cómo se reconoce
+
+Las vm 460 y 1754 acabaron con la **IPv6 nueva pero con `/64`**, y la IPv4 y las
+puertas **viejas**:
+
+```
+v6=2a01:4f9:c01f:e::1cc/64   v4=10.0.38.215/16   gw6=2a01:4f9:3090:1bda::1
+```
+
+Firestore y las rutas de las bases ya apuntaban al modelo nuevo, así que las dos
+quedaron **incomunicadas por fuera aunque por dentro parecieran vivas** — y el
+despliegue no lo cazó porque su comprobación pasó mientras el DNAT viejo aún
+funcionaba.
+
+**Señal para reconocerlo**: IPv6 del rango nuevo **con `/64`** + IPv4 `10.0.x.y`.
+Se repara leyendo el estado real del invitado y aplicando lo que falte, sin
+suponer: `scripts/conversion-vms/repara-vm-a-medias.py`. Las dos recuperadas.
+
+🔲 **Mejora pendiente del despliegue**: verificar el `BOUND:` contra los valores
+esperados (prefijo `/128`, IPv4 `10.64.x.y`, puertas) en vez de confiar en que
+la VM siga respondiendo — que es lo que dejó pasar estos dos casos.
