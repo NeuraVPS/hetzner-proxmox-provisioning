@@ -14,6 +14,8 @@ ANTES_RPF=$(sysctl -n net.ipv4.conf.vmbr0.rp_filter)
 install -m755 neuravps-tunnels.sh        /usr/local/sbin/neuravps-tunnels.sh
 install -m755 neuravps-tunnel-select.sh  /usr/local/sbin/neuravps-tunnel-select.sh
 install -m755 neuravps-tunnel-probe.sh   /usr/local/sbin/neuravps-tunnel-probe.sh
+# El clamp de MSS: sin el, el invitado anuncia 1460 sobre un camino de 1456.
+install -m755 nvx-mss.sh                 /usr/local/sbin/nvx-mss.sh
 install -m644 neuravps-tunnels.service   /etc/systemd/system/
 install -m644 neuravps-tunnel-probe.service /etc/systemd/system/
 install -m644 neuravps-tunnel-probe.timer   /etc/systemd/system/

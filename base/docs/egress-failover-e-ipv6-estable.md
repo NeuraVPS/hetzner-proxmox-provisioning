@@ -2477,3 +2477,55 @@ que no sea la esperada.
 ⚠️ **En un invitado con el WMI roto sólo funciona `netsh`** — `Get-NetIPAddress`
 y `Remove-NetIPAddress` fallan con `Cannot connect to CIM server`. La reparación
 por netsh sirve igual.
+
+---
+
+## 24. 🔴 El clamp de MSS — el fallo que rompió clientes (2026-08-15)
+
+**Cinco clientes en 13 h con "Program cannot connect to internet".** Causa: el
+invitado tiene la interfaz a **MTU 1500** y anuncia **MSS 1460**, pero su camino
+real pasa por un `ip6gre` de **1456** (1500 − 40 IPv6 − 4 GRE). Sin clamp, los
+paquetes grandes **se pierden en silencio**: el TCP conecta y luego el handshake
+TLS se cuelga con retransmisiones a 3,2 s y 6,5 s (backoff 1+2 y 1+2+4).
+
+### Por qué despista tanto
+
+**StrategyQuant sale sólo por IPv4** (`-Djava.net.preferIPv4Stack=true`), así que
+se lo come entero — mientras el **navegador del mismo servidor va por IPv6 y
+funciona**. IPv6 tiene PMTUD que sí funciona; el de IPv4 lo rompen los cortafuegos
+que tiran el ICMP. Y `www.strategyquant.com` responde con cualquier MTU;
+`api.strategyquant.com`, que es el que verifica la licencia, no.
+
+### La causa raíz no era el diseño, era el despliegue
+
+El clamp estaba **diseñado y funcionando** en los dos nodos de prueba desde el
+principio. `neuravps-tunnels.sh` lo invoca con `[ -x nvx-mss.sh ] && …`, y
+**ese fichero nunca entró en el paquete de conversión de la flota**. Los 234
+nodos convertidos se quedaron sin él y nadie lo notó: la condición `[ -x ]` falla
+en silencio, que es exactamente lo que una guarda no debe hacer.
+
+Prueba controlada, con el **mismo MTU 1500 en el invitado**:
+
+| | `api.strategyquant.com` |
+|---|---|
+| nodo **con** clamp | **200 en 0,24 s** |
+| nodo **sin** clamp | **000 tras 25,1 s** |
+
+### ⚠️ Los dos sentidos NO se arreglan igual
+
+La opción MSS es **por sentido**: la del SYN le dice al **servidor** cuánto puede
+mandar; la del SYN-ACK se lo dice al **invitado**. Hacen falta las dos, y `rt mtu`
+sólo vale para una:
+
+| sentido | ruta de salida | `rt mtu` | qué hay que hacer |
+|---|---|---|---|
+| invitado → internet | túnel (tabla de política) | **1456** ✅ | `size set rt mtu` |
+| internet → invitado | `vmbr0` | **1500** ❌ | valor explícito `mtu − 40` |
+
+Un clamp genérico evaluado contra la ruta principal daría 1500 → MSS 1460 y sería
+un **no-op**. Y bajar el MTU invitado por invitado sólo arregla la dirección de
+salida, y **las VMs nuevas nacen rotas**.
+
+Desplegado a los **234 nodos**; los 5 clientes que fallaban pasaron a 200 en
+<0,25 s **sin tocar su MTU**, y el parche temporal de MTU 1440 en cuatro VMs
+quedó revertido a 1500.
