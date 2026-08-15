@@ -32,7 +32,8 @@ Start-Sleep -Seconds 3
 # --- MEDIR. Un exitcode 0 no prueba nada (regla de oro de la vm 1023) -------
 $i  = Get-NetAdapter -InterfaceAlias $if
 $a6 = (Get-NetIPAddress -AddressFamily IPv6 -InterfaceIndex $i.ifIndex |
-       Where-Object {{$_.IPAddress -notlike "fe80*"}} | ForEach-Object {{$_.IPAddress}}) -join ","
+       Where-Object {{$_.IPAddress -notlike "fe80*"}} |
+       ForEach-Object {{$_.IPAddress+"/"+$_.PrefixLength}}) -join ","
 $a4 = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $i.ifIndex |
        ForEach-Object {{$_.IPAddress}}) -join ","
 $g6 = (Get-NetRoute -DestinationPrefix "::/0" -InterfaceIndex $i.ifIndex |
