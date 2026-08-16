@@ -73,7 +73,7 @@ State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
 
 --dry-run flag: plan + journal (as dryRun) but never execute, without
 touching the config/defrag kill-switch the hourly timers read.
-#NDFVER=9
+#NDFVER=10
 """
 import fcntl
 import json
@@ -88,14 +88,16 @@ os.environ.setdefault("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.js
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# FLOOR must match the reconciler's FLOOR_BUDGET_PCT (80 since 2026-07-29;
-# was 70 for one day, 60 before that). It is the ceiling floors ACTUALLY grow to on a node, so it is
+# FLOOR must match the reconciler's FLOOR_BUDGET_PCT (90 since 2026-08-16 —
+# justified by the live sweep: 40% of physical RAM idle, KSM ~73 GB/node,
+# PSI 0.00 fleet-wide; 80 from 2026-07-29, 70 for one day, 60 before that).
+# It is the ceiling floors ACTUALLY grow to on a node, so it is
 # what "does this destination have room" has to be measured against. Leaving it
 # at 0.60 while reconcilers filled to 0.70 made every node look over-budget and
 # relief escalated "no destination" on a fleet that had plenty — caught live on
 # 0000056 minutes after the rollout.
 # FLOOR_SALES mirrors auto_provision.SQX_FLOOR_BUDGET_FACTOR
-# (config/capacityGates.json, 0.70 since 2026-07-29), which answers a
+# (config/capacityGates.json, 0.80 since 2026-08-16; 0.70 before), which answers a
 # DIFFERENT question: "could a sale still land here". Phase 2 (crumb
 # recovery) exists to recover SELLABLE capacity, so its arithmetic has to use
 # the sales budget: measured against FLOOR (0.80) it would call the ~30 nodes
@@ -103,16 +105,17 @@ from firebase_admin import credentials, firestore
 # freeze a customer per node per day chasing holes no sale can ever fill
 # (audit 2026-07-31). Destination margins and over-gate corrections keep
 # using FLOOR: existing VMs are deliberately packed tighter than we sell.
-COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.80, 0.70
+COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.90, 0.80
 # Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
 # max(ram_min, ram_min_observed), the same number auto_provision reserves).
 # vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
 # nominal floors (5.7-18.0) that understate the measured settle points 1.66x,
 # so fits_any_plan() under-estimated what a destination must reserve.
 # RE-MEASURE together with pricingPlans.json ram_min_observed.
-PLAN_SIZES = [19, 23, 31, 35, 48]          # SQX sellable GB sizes (vps-a..e)
+PLAN_SIZES = [19, 23, 31, 33, 48]          # SQX sellable GB sizes (vps-a..e;
+                                           # vps-d is 33 GB since 2026-08-16)
 PLANS = [("vps-a", 19, 9.7), ("vps-b", 23, 11.9), ("vps-c", 31, 15.5),
-         ("vps-d", 35, 25.2), ("vps-e", 48, 52.2)]
+         ("vps-d", 33, 23.8), ("vps-e", 48, 52.2)]
 
 # Floor a guest of each plan ACTUALLY settles at — pricingPlans.json
 # max(ram_min, ram_min_observed), measured 2026-07-29 over 657 live guests.
@@ -124,6 +127,9 @@ PLANS = [("vps-a", 19, 9.7), ("vps-b", 23, 11.9), ("vps-c", 31, 15.5),
 # reconciler's LIVE floors_sum_mb) would happily pick it as a destination.
 # Real case 2026-07-30: four vps-e created outside auto_provision had no
 # ramFloorGb and hid 180.8 GB of floor on 0000185-AX162-2-LTD.
+# vps-d stays 25.2 here (not the 23.8 of the new 33 GB generation): this
+# table charges docs with NO ramFloorGb, and a floor-less D is more likely
+# a legacy 35/45 GB box — charge the conservative generation.
 EXPECTED_FLOOR = {"mt": 2.0, "mt-plus": 4.0, "vps-a": 9.7, "vps-b": 11.9,
                   "vps-c": 15.5, "vps-d": 25.2, "vps-e": 52.2}
 WORST_FLOOR = max(EXPECTED_FLOOR.values())
