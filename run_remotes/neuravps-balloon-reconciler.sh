@@ -82,7 +82,17 @@ IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
 IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-30}  # idle CREDIT (leaky) before lowering
 LOWER_COOLDOWN_RUNS=${LOWER_COOLDOWN_RUNS:-5}  # calm runs to re-earn between -4G steps
 STEP_MB=${STEP_MB:-4096}
-FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-80}  # sum(floors) cap as % of node RAM
+FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-90}  # sum(floors) cap as % of node RAM
+# 90 since 2026-08-16. The 07-29 note below called 80 "the last notch", but that
+# was PAPER saturation, not physical: the 08-16 live sweep (86 AX162, 0 fails)
+# measured 40% of physical RAM idle (8.6 TB avail, median 85 GB/node), KSM
+# deduplicating 6.25 TB (~73 GB/node), zswap at 2.25x and memory PSI 0.00
+# fleet-wide; nodes 186/190/193 have run for months at 1.31-1.39x floors over
+# physical RAM without pressure. Floors are balloon targets, not consumption —
+# the real guard is HOST_FREE_MIN_MB (unchanged). Rolled to all 86 AX162 via
+# /etc/default on 2026-08-16, together with defrag FLOOR 0.90 and the sales
+# gate capacityGates 0.80.
+# History below kept for the shape of previous raises:
 # 80 since 2026-07-29 (60 -> 70 on the 28th, 70 -> 80 the next day). At 60 the cap was refusing customers RAM they
 # already pay for on nodes with ~50 GB of physically FREE memory: 5 of 56 SQX
 # nodes were budget-blocked with 251 GB idle between them, and the hourly relief
@@ -105,9 +115,8 @@ FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-80}  # sum(floors) cap as % of node RAM
 # contracted RAM, 0000054 vm492). Simulated before applying: if every floor grew
 # to the new 80% ceiling — a worst case that cannot actually happen — only 3 of
 # 56 nodes would approach HOST_FREE_MIN_MB, and that guard is what stops them.
-# THIS IS THE LAST NOTCH. If the fleet fills again there is no knob left to
-# turn; it needs hardware.
-# NOTE: this is NOT auto_provision's SQX_FLOOR_BUDGET_FACTOR (still 0.60), which
+# NOTE: this is NOT auto_provision's SQX_FLOOR_BUDGET_FACTOR (0.80 since
+# 2026-08-16), which
 # gates how many VMs are SOLD per node. Two knobs on purpose — raising the sales
 # gate would spend this headroom on new VMs and bring the thrashing back.
 # And defrag.py's FLOOR must move WITH this one: it measures destination room
