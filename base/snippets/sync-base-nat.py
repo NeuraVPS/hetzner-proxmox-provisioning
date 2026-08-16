@@ -14,7 +14,8 @@ Commands:
       then reconcile managed dynamic DNAT rules.
 
   sync-base-nat.py sync <proxmoxId> <publicVMIPv6> [rdp=0|1] [samba=0|1] [ssh=0|1]
-      Single VM override without Firestore read. Optional rdp/samba/ssh
+                                                  [internet=0|1]
+      Single VM override without Firestore read. Optional rdp/samba/ssh/internet
       flags force the matching service on/off; flags not passed are
       preserved from on-disk state (or default enabled for new VMs).
 
@@ -321,12 +322,17 @@ def _server_entry(
     ssh: bool = True,
     node_id: str = "",
     ipv4: str = "",
+    internet: bool = True,
 ) -> dict:
     return {
         "ipv6": ipv6,
         "rdp": bool(rdp),
         "samba": bool(samba),
         "ssh": bool(ssh),
+        # `internet` False = la VM no sale a Internet. Antes lo hacía el grupo
+        # `vm-no-internet` del firewall POR VM del nodo; ahora lo hace la base,
+        # que es la única pieza que sigue en pie con el nodo caído.
+        "internet": bool(internet),
         # Modelo nuevo (IDENT): la dirección del invitado ya no se deriva del
         # nodo, así que hace falta saber DÓNDE está para enrutar el /128 al
         # túnel correcto. En el modelo viejo estos campos se ignoran.
@@ -553,6 +559,7 @@ def desired_from_state() -> dict[int, dict]:
         rdp_flag = d.get("rdpEnabled", True)
         samba_flag = d.get("sambaEnabled", True)
         ssh_flag = d.get("sshEnabled", True)
+        net_flag = d.get("internetEnabled", True)
         out[vmid] = _server_entry(
             s,
             rdp=bool(rdp_flag) if isinstance(rdp_flag, bool) else True,
@@ -560,6 +567,10 @@ def desired_from_state() -> dict[int, dict]:
             ssh=bool(ssh_flag) if isinstance(ssh_flag, bool) else True,
             node_id=d.get("nodeId") or "",
             ipv4=d.get("ipv4") or "",
+            # Un fichero de estado viejo no trae el campo. Por defecto CON
+            # Internet: equivocarse hacia "abierto" deja a un cliente con red
+            # de más; hacia "cerrado" lo deja sin ella y sin saber por qué.
+            internet=bool(net_flag) if isinstance(net_flag, bool) else True,
         )
     return out
 
@@ -606,6 +617,7 @@ def firestore_list_configured_servers() -> dict[int, dict]:
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
             samba=_firewall_flag(firewall, "sambaEnabled", True),
             ssh=_firewall_flag(firewall, "sshEnabled", True),
+            internet=_firewall_flag(firewall, "internetEnabled", True),
             node_id=d.get("nodeId") or "",
             ipv4=d.get("ipv4") or "",
         )
@@ -639,6 +651,7 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
             samba=_firewall_flag(firewall, "sambaEnabled", True),
             ssh=_firewall_flag(firewall, "sshEnabled", True),
+            internet=_firewall_flag(firewall, "internetEnabled", True),
             # Sin estos dos, una VM del modelo nuevo sincronizada de una en una
             # se queda sin nodo conocido y su ruta /128 no se puede mover. El
             # cargador masivo si los pasaba; este se habia quedado atras.
@@ -857,6 +870,145 @@ def reconcile_dynamic_dnat_rules(desired: dict[int, str]):
     )
 
 
+# --- vm-no-internet servido desde la BASE -------------------------------------
+#
+# Antes esto vivía en el firewall POR VM del nodo (grupo `vm-no-internet` de
+# cluster.fw). Traerlo aquí no es orden: es que el interruptor sigue
+# funcionando CON EL NODO CAÍDO. Antes, con el nodo apagado no había forma de
+# cortarle Internet a una VM, y al volver arrancaba con Internet antes de que
+# nadie pudiera reaccionar — justo el caso malo si dentro hay un robot.
+#
+# Las reglas que consumen estos sets están en /etc/nftables.conf, al principio
+# de `chain forward`, y distinguen la salida de la VM (ct direction original,
+# se corta) de la respuesta a un RDP entrante (reply, se deja pasar).
+NFT_FILTER_FAMILY = os.environ.get("NFT_FILTER_FAMILY", "inet")
+NFT_FILTER_TABLE = os.environ.get("NFT_FILTER_TABLE", "filter")
+SET_SIN_INET6 = "sin_internet6"
+SET_SIN_INET4 = "sin_internet4"
+# Fichero aparte del de los mapas DNAT a propósito: aquél se incluye ANTES de
+# que `table inet filter` esté declarada, y un `add element` sobre una tabla que
+# aún no existe rompe la recarga entera.
+NFT_SIN_INET_FILE = Path(
+    os.environ.get("NFT_SIN_INET_FILE", "/etc/nftables.d/base-nat-sin-internet.nft")
+)
+
+
+def _nft_set_exists(nombre: str) -> bool:
+    return subprocess.run(
+        ["nft", "list", "set", NFT_FILTER_FAMILY, NFT_FILTER_TABLE, nombre],
+        capture_output=True, text=True, check=False,
+    ).returncode == 0
+
+
+def _nft_set_members(nombre: str) -> set[str]:
+    r = subprocess.run(
+        ["nft", "-j", "list", "set", NFT_FILTER_FAMILY, NFT_FILTER_TABLE, nombre],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return set()
+    try:
+        datos = json.loads(r.stdout)
+    except ValueError:
+        return set()
+    fuera: set[str] = set()
+    for obj in datos.get("nftables", []):
+        for elem in (obj.get("set", {}) or {}).get("elem", []) or []:
+            if isinstance(elem, str):
+                fuera.add(elem)
+    return fuera
+
+
+def _corta_conexiones(direcciones: list[str]) -> int:
+    """Mata las conexiones ya abiertas de esas direcciones.
+
+    Sin esto la regla nueva no se nota: un flujo ya establecido está descargado
+    en el flowtable y sus paquetes se saltan la cadena entera, así que el robot
+    de dentro seguiría hablando con su bróker durante horas. Es el equivalente
+    del `reset_conntrack` que hacía el disparador cuando esto vivía en el nodo.
+    """
+    if not direcciones:
+        return 0
+    n = 0
+    for addr in direcciones:
+        for sentido in ("--src", "--dst"):
+            r = subprocess.run(
+                ["conntrack", "-D", sentido, addr],
+                capture_output=True, text=True, check=False,
+            )
+            # rc=1 = no había ninguna. Solo es un fallo si falta el binario.
+            if r.returncode not in (0, 1):
+                logger.warning("conntrack -D %s %s: %s", sentido, addr,
+                               (r.stderr or "").strip()[:120])
+            else:
+                n += (r.stderr or "").count("deleted")
+    return n
+
+
+def reconcile_sin_internet(desired: dict[int, dict]) -> None:
+    """Repuebla los sets de VMs sin Internet y corta lo que ya estaba abierto."""
+    if not _nft_set_exists(SET_SIN_INET6):
+        # Base sin la parte de nftables instalada todavía. No es un error: el
+        # resto de la sincronización tiene que seguir funcionando igual.
+        logger.info("sin_internet: sets no declarados en nftables; omito")
+        return
+
+    v6: list[str] = []
+    v4: list[str] = []
+    for vmid in sorted(desired):
+        entrada = desired[vmid]
+        if entrada.get("internet", True):
+            continue
+        try:
+            v6.append(normalize_ipv6(entrada["ipv6"]))
+        except (KeyError, ValueError):
+            logger.warning("sin_internet: vm %s con ipv6 ilegible; omito", vmid)
+            continue
+        bruta4 = str(entrada.get("ipv4") or "").strip()
+        if bruta4:
+            try:
+                v4.append(normalize_ipv4(bruta4))
+            except ValueError:
+                logger.warning("sin_internet: vm %s con ipv4 ilegible: %s", vmid, bruta4)
+
+    antes6 = _nft_set_members(SET_SIN_INET6)
+    antes4 = _nft_set_members(SET_SIN_INET4)
+
+    lineas = [
+        f"flush set {NFT_FILTER_FAMILY} {NFT_FILTER_TABLE} {SET_SIN_INET6}",
+        f"flush set {NFT_FILTER_FAMILY} {NFT_FILTER_TABLE} {SET_SIN_INET4}",
+    ]
+    elementos = [
+        f"add element {NFT_FILTER_FAMILY} {NFT_FILTER_TABLE} {SET_SIN_INET6} {{ {a} }}"
+        for a in v6
+    ] + [
+        f"add element {NFT_FILTER_FAMILY} {NFT_FILTER_TABLE} {SET_SIN_INET4} {{ {a} }}"
+        for a in v4
+    ]
+    _apply_nft_transaction(lineas + elementos)
+
+    try:
+        NFT_SIN_INET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cuerpo = "# generado por sync-base-nat.py - no editar a mano\n"
+        cuerpo += "\n".join(elementos) + ("\n" if elementos else "")
+        tmp = NFT_SIN_INET_FILE.with_suffix(NFT_SIN_INET_FILE.suffix + ".tmp")
+        tmp.write_text(cuerpo)
+        os.replace(tmp, NFT_SIN_INET_FILE)
+    except OSError as e:
+        logger.warning("sin_internet: no pude escribir %s: %s", NFT_SIN_INET_FILE, e)
+
+    # Solo las que ACABAN de perder Internet: cortar las de las demás sería
+    # tirarle la sesión a quien no ha cambiado nada.
+    nuevas = [a for a in v6 if a not in antes6] + [a for a in v4 if a not in antes4]
+    matadas = _corta_conexiones(nuevas)
+
+    logger.info(
+        "sin_internet reconcile: %d VM(s) sin Internet (v6=%d v4=%d), "
+        "%d dirección(es) recién cortada(s), %d conexión(es) matada(s)",
+        len(v6), len(v6), len(v4), len(nuevas), matadas,
+    )
+
+
 def _state_payload(desired: dict[int, dict]) -> dict:
     """Serializable view of the desired map for STATE_FILE."""
     return {
@@ -868,6 +1020,7 @@ def _state_payload(desired: dict[int, dict]) -> dict:
             "rdpEnabled": bool(desired[k].get("rdp", True)),
             "sambaEnabled": bool(desired[k].get("samba", True)),
             "sshEnabled": bool(desired[k].get("ssh", True)),
+            "internetEnabled": bool(desired[k].get("internet", True)),
             "nodeId": desired[k].get("nodeId", ""),
             "ipv4": desired[k].get("ipv4", ""),
         }
@@ -883,6 +1036,7 @@ def sync_full():
     with state_lock():
         reconcile_dynamic_dnat_rules(desired)
         reconcile_vm_routes(desired)
+        reconcile_sin_internet(desired)
         write_state(_state_payload(desired))
     logger.info("Full sync done (%d servers)", len(desired))
 
@@ -942,19 +1096,30 @@ def sync_single_vmid(
                 rdp_default = bool(existing.get("rdp", True)) if existing else True
                 samba_default = bool(existing.get("samba", True)) if existing else True
                 ssh_default = bool(existing.get("ssh", True)) if existing else True
+                net_default = bool(existing.get("internet", True)) if existing else True
                 override = flags_override or {}
                 rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
                 samba_flag = bool(override["samba"]) if "samba" in override else samba_default
                 ssh_flag = bool(override["ssh"]) if "ssh" in override else ssh_default
+                net_flag = bool(override["internet"]) if "internet" in override else net_default
+                # La IPv4 privada NO viene por esta via (el que llama solo pasa
+                # la IPv6), y sin ella el corte de Internet quedaria a medias:
+                # se cerraria la salida v6 y la v4 seguiria abierta. Se recupera
+                # del estado en disco, que lo dejo el ultimo sync completo.
+                ipv4_flag = str((existing or {}).get("ipv4") or "")
             else:
                 rdp_flag = bool(server.get("rdp", True))
                 samba_flag = bool(server.get("samba", True))
                 ssh_flag = bool(server.get("ssh", True))
+                net_flag = bool(server.get("internet", True))
+                ipv4_flag = str(server.get("ipv4") or "")
             desired[vmid] = _server_entry(
                 normalize_ipv6(server["ipv6"]),
                 rdp=rdp_flag,
                 samba=samba_flag,
                 ssh=ssh_flag,
+                internet=net_flag,
+                ipv4=ipv4_flag,
             )
         else:
             desired.pop(vmid, None)
@@ -978,9 +1143,17 @@ def sync_single_vmid(
                         ent["nodeId"] = fresco["nodeId"]
                     if fresco.get("ipv4"):
                         ent["ipv4"] = fresco["ipv4"]
+                    # `internet` tambien, y por el mismo motivo que `ipv4`: el
+                    # estado en disco puede ser de antes del cambio. Firestore
+                    # es la fuente de verdad porque el disparador escribe ALLI
+                    # primero y por eso se ejecuta esto. Si quien llama lo paso
+                    # explicitamente, manda quien llama.
+                    if "internet" not in (flags_override or {}):
+                        ent["internet"] = bool(fresco.get("internet", True))
 
         reconcile_dynamic_dnat_rules(desired)
         reconcile_vm_routes(desired)
+        reconcile_sin_internet(desired)
         write_state(_state_payload(desired))
     logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
@@ -1654,8 +1827,8 @@ def _parse_flag_args(extra: list[str]) -> dict:
         k, _, v = arg.partition("=")
         k = k.strip().lower()
         v = v.strip().lower()
-        if k not in ("rdp", "samba", "ssh"):
-            logger.error("Unknown flag %r (allowed: rdp, samba, ssh)", k)
+        if k not in ("rdp", "samba", "ssh", "internet"):
+            logger.error("Unknown flag %r (allowed: rdp, samba, ssh, internet)", k)
             sys.exit(2)
         if v in _FLAG_TRUE:
             out[k] = True
@@ -1672,7 +1845,7 @@ def main():
         print(
             "Usage: sync-base-nat.py sync\n"
             "       sync-base-nat.py sync <proxmoxId>\n"
-            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1]\n"
+            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1] [internet=0|1]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
             "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,
