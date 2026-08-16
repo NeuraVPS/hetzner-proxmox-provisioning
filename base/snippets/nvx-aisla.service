@@ -1,0 +1,22 @@
+[Unit]
+Description=NeuraVPS: aislamiento VM<->VM en el puente vmbr0
+# ⚠️ DESPUES de nftables, por el mismo motivo que nvx-mss: `/etc/nftables.conf`
+# empieza por `flush ruleset`, asi que si esta tabla se pusiera antes, nftables
+# la borraria al cargar. El clamp de MSS ya se perdio asi en 10 nodos el
+# 16-08-2026 y no se noto hasta que 9 clientes se quedaron sin licencia de SQX.
+# Aqui el fallo seria peor de detectar: nada se rompe, solo deja de haber
+# aislamiento — y eso no da sintomas hasta que alguien lo aprovecha.
+After=nftables.service network-online.target
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nvx-aisla.sh
+# Idempotente: reconstruye su propia tabla, reintentar es seguro.
+Restart=on-failure
+RestartSec=15s
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target
