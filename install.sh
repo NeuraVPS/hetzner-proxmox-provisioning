@@ -971,6 +971,31 @@ ExecStart=/usr/local/sbin/neuravps-tunnels.sh
 WantedBy=multi-user.target
 NVXEOF
 
+# ⚠️ El clamp NECESITA su propia unidad, no basta con que lo llame el script de
+# tuneles. `/etc/nftables.conf` empieza por `flush ruleset`, asi que cuando
+# nftables carga BORRA la tabla del clamp que los tuneles acababan de poner. En
+# un nodo recien arrancado el resultado es 0 reglas maxseg y los invitados con
+# agujero negro de PMTU: TCP conecta y luego se cuelga. Medido el 16-08-2026 en
+# 10 nodos reiniciados ese dia, con 9 VMs de clientes afectadas — y el sintoma
+# despista porque el navegador (IPv6) va bien y solo falla lo que sale por IPv4.
+# Por eso esta unidad va DESPUES de nftables, no solo despues de los tuneles.
+cat > /mnt/etc/systemd/system/nvx-mss.service <<'NVXEOF'
+[Unit]
+Description=NeuraVPS: clamp de MSS del trafico de invitados por el tunel
+After=neuravps-tunnels.service nftables.service network-online.target
+Wants=neuravps-tunnels.service
+Requires=nftables.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nvx-mss.sh
+Restart=on-failure
+RestartSec=15s
+StartLimitBurst=10
+[Install]
+WantedBy=multi-user.target
+NVXEOF
+
 cat > /mnt/etc/systemd/system/neuravps-tunnel-probe.service <<'NVXEOF'
 [Unit]
 Description=NeuraVPS: sondeo del tunel activo del nodo
@@ -1034,6 +1059,7 @@ NVXEOF
 # tunel no se cae solo cuando la base muere).
 chroot /mnt systemctl enable neuravps-tunnels.service >/dev/null 2>&1 || true
 chroot /mnt systemctl enable neuravps-tunnel-probe.timer >/dev/null 2>&1 || true
+chroot /mnt systemctl enable nvx-mss.service >/dev/null 2>&1 || true
 log "Tuneles anclados a VIP + sondeo instalados (nodo ${NODE_NUM}, region auto)"
 
 log "Successfully generated /etc/network/interfaces ($(wc -l < /mnt/etc/network/interfaces) lines)"

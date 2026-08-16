@@ -1,0 +1,24 @@
+[Unit]
+Description=NeuraVPS: clamp de MSS del trafico de invitados por el tunel
+# ⚠️ Va DESPUES de nftables, no solo de los tuneles. `/etc/nftables.conf`
+# empieza por `flush ruleset`: cuando nftables carga BORRA la tabla del clamp
+# que el script de tuneles acaba de poner. Ese es el motivo real de que el
+# clamp no sobreviviera a un reinicio (medido el 16-08-2026: 10 nodos
+# reiniciados ese dia, 0 reglas maxseg, 9 VMs de clientes con agujero negro de
+# PMTU). Despista mucho porque el navegador del invitado sale por IPv6 y va
+# bien; solo se cuelga lo que sale por IPv4, como la licencia de SQX.
+After=neuravps-tunnels.service nftables.service network-online.target
+Wants=neuravps-tunnels.service
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nvx-mss.sh
+# Idempotente: reconstruye su propia tabla, reintentar es seguro.
+Restart=on-failure
+RestartSec=15s
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target
