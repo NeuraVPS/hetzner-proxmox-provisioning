@@ -133,8 +133,6 @@ MIGRATE_DOWNTIME_INITIAL="${MIGRATE_DOWNTIME_INITIAL:-15}"  # STARTING cutover b
 DOWNTIME_ESCALATE_HARD_S="${DOWNTIME_ESCALATE_HARD_S:-600}"  # RAM-phase seconds after which the escalator jumps straight to the MIGRATE_DOWNTIME ceiling — bounds the RAM pre-copy time (the efidisk0-reap window, failure mode (a)) to roughly what the flat 90s produced. Counted from the first poll that shows RAM stats, NOT from launch: the preceding disk mirror legitimately runs 10-25+ min and must not burn this budget.
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
-DNS6_PRIMARY="${DNS6_PRIMARY:-2a01:4ff:ff00::add:1}"
-DNS6_SECONDARY="${DNS6_SECONDARY:-2a01:4ff:ff00::add:2}"
 RDP_GUEST_PORT="${RDP_GUEST_PORT:-3389}"
 CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — RDP listener can take a moment after the in-guest IPv6 rebind
 POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
@@ -146,7 +144,7 @@ ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 # flota. Al migrar NO hay que tocar el invitado: lo unico que se mueve son las
 # rutas en las bases.  Ver base/docs/egress-failover-e-ipv6-estable.md §11bis.
 #
-# Antes esto era un flag NEW_IPS=0/1 que habia que acordarse de pasar. Durante
+# Esto fue un flag NEW_IPS=0/1 que habia que acordarse de pasar. Durante
 # una migracion de flota larga eso es una bomba en las dos direcciones:
 #   - olvidarlo en una VM YA migrada -> el bloque de reconfiguracion le calcula
 #     la direccion desde el prefijo del nodo DESTINO y le MACHACA su IDENT,
@@ -158,10 +156,7 @@ ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 # del /64 de identidad, es del modelo nuevo. La fuente es state.json, la misma
 # que usa el resolver, asi que no puede desincronizarse de lo que ve el script.
 #
-# 🔲 CUANDO TODA LA FLOTA ESTE MIGRADA: borrar los bloques `NEW_IPS != 1` y
-#    quedarse solo con el camino nuevo. El script adelgaza mucho — se van
-#    `_wait_agent_dst`, `_verify_dest_ipv6`, `PS_RECONFIG`, `DST_GATEWAY` y el
-#    flag `MIGRATION_DEGRADED` por esta causa.
+# (Hecho el 16-08-2026: eliminados los caminos del modelo viejo.)
 IDENT_PREFIX="${IDENT_PREFIX:-2a01:4f9:c01f:e::/64}"
 
 _is_ident() {   # rc 0 si $1 cae dentro de $IDENT_PREFIX
@@ -237,15 +232,14 @@ except Exception:
     pass
 ' 2>/dev/null || true)
 
-NEW_IPS=0
-if _is_ident "$CUR_VM_IPV6"; then
-  NEW_IPS=1
-  _info "Modelo NUEVO (${CUR_VM_IPV6} dentro de ${IDENT_PREFIX}): el invitado NO se toca."
-elif [[ -n "$CUR_VM_IPV6" ]]; then
-  _info "Modelo viejo (${CUR_VM_IPV6} fuera de ${IDENT_PREFIX}): se reconfigurara la red del invitado."
-else
-  _warn "No pude leer la IPv6 de la VM ${VMID} en ${STATE_FILE}; asumo modelo viejo."
+# Toda la flota vive en <IDENT>::<vmid> desde el 16-08-2026. Si apareciera una
+# VM fuera de ese prefijo seria un dato corrupto o una VM que nunca se convirtio:
+# en cualquier caso, este script ya no sabe reconfigurar invitados y seguir seria
+# peor que parar.
+if ! _is_ident "$CUR_VM_IPV6"; then
+  _die "la VM ${VMID} tiene ${CUR_VM_IPV6:-(sin ipv6)}, fuera de ${IDENT_PREFIX}. Este script solo migra VMs del modelo actual."
 fi
+_info "IPv6 del invitado: ${CUR_VM_IPV6} — no se toca al migrar."
 
 # Per-VMID lock so two BASE operators can't migrate the same VM in parallel.
 LOCKFILE="/run/migrate_vm.${VMID}.lock"
@@ -364,23 +358,16 @@ if (( SRC_EQ_DST == 0 )); then
   [[ -n "$RESOLVED" ]] || _die "Resolver produced empty output."
   read -r SRC_NODE SRC_IPV6 DST_NODE DST_IPV6 EXPECTED_VM_IPV6 OLD_VM_IPV6 <<< "$RESOLVED"
   RDP_PORT=$((RDP_BASE_PORT + VMID))
-  # NEW_IPS: la dirección del invitado NO cambia al migrar. El resolver la
-  # calcula desde el prefijo del nodo destino porque es lo que hace el modelo
-  # viejo; aquí se descarta ese cálculo y se conserva la que ya tiene, de modo
-  # que todo lo que viene después (NAT local, sonda RDP, Firestore) apunte a la
-  # dirección real y no a una derivada del nodo.
-  if (( NEW_IPS == 1 )); then
-    EXPECTED_VM_IPV6="$OLD_VM_IPV6"
-  fi
+  # La dirección del invitado NO cambia al migrar. El resolver aún la calcula
+  # desde el prefijo del nodo destino (herencia del modelo viejo); aquí se
+  # descarta ese cálculo y se conserva la que ya tiene, de modo que todo lo que
+  # viene después —NAT local, sonda RDP, Firestore— apunte a la dirección real
+  # y no a una derivada del nodo.
+  EXPECTED_VM_IPV6="$OLD_VM_IPV6"
   _info "VMID:           ${VMID}"
   _info "Source node:    ${SRC_NODE} (${SRC_IPV6})"
   _info "Dest node:      ${DST_NODE} (${DST_IPV6})"
-  if (( NEW_IPS == 1 )); then
-    _info "VM IPv6:        ${OLD_VM_IPV6}  (modelo nuevo — NO cambia al migrar)"
-  else
-    _info "Old VM IPv6:    ${OLD_VM_IPV6}"
-    _info "New VM IPv6:    ${EXPECTED_VM_IPV6}"
-  fi
+  _info "VM IPv6:        ${OLD_VM_IPV6}  (no cambia al migrar)"
   _info "Public RDP port: ${RDP_PORT}"
 fi
 
@@ -609,18 +596,14 @@ PY
   if [[ -n "$RECONCILE" ]]; then
     read -r RC_DST_NODE RC_EXPECTED_IPV6 <<< "$RECONCILE"
     _info "Source equals destination (${RC_DST_NODE}); reconciling Firestore in case a prior run was interrupted…"
-    # NEW_IPS: NO tocar `ipv6` aquí. Este resolver la calcula desde el prefijo
+    # NO tocar `ipv6` aquí. Este resolver la calcula desde el prefijo
     # del nodo destino, y como el script es idempotente y se re-ejecuta a
     # propósito tras un fallo parcial, escribirla machacaría la IDENT de una VM
     # del modelo nuevo — y la Cloud Function lo propagaría a las DOS bases,
     # dejando al cliente inalcanzable. Se reconcilian nodo y maintenance, que
     # sí cambian; la dirección no cambia nunca al migrar.
     _rc_fs_args=(--vmid "$VMID" --node-id "$RC_DST_NODE" --maintenance false)
-    if (( NEW_IPS == 0 )); then
-      _rc_fs_args+=(--ipv6 "$RC_EXPECTED_IPV6")
-    else
-      _info "Modelo nuevo — se reconcilia nodeId pero NO ipv6 (la dirección no depende del nodo)."
-    fi
+    _info "Se reconcilia nodeId pero NO ipv6: la dirección no depende del nodo."
     if _firestore_update_servers "${_rc_fs_args[@]}" 2>/dev/null; then
       _ok "Firestore reconciled (or was already up-to-date)."
     else
@@ -675,14 +658,6 @@ _dst_run_ps() {
   return 1
 }
 
-_wait_agent_dst() {
-  local timeout="${1:-300}" elapsed=0
-  while (( elapsed < timeout )); do
-    if dst_ssh "qm guest cmd '${VMID}' ping" >/dev/null 2>&1; then return 0; fi
-    sleep 3; (( elapsed += 3 ))
-  done
-  return 1
-}
 
 _wait_status_dst() {
   local want="$1" timeout="${2:-60}" elapsed=0 cur
@@ -726,40 +701,6 @@ _ensure_running_dst() {
   return 1
 }
 
-_verify_dest_ipv6() {
-  local timeout="${1:-60}" elapsed=0 ifaces
-  while (( elapsed < timeout )); do
-    ifaces=$(dst_ssh "pvesh get /nodes/${DST_NODE}/qemu/${VMID}/agent/network-get-interfaces --output-format json" 2>/dev/null | tr -d '\r' || true)
-    if [[ -n "$ifaces" ]] \
-       && EXPECTED="$EXPECTED_VM_IPV6" JSON="$ifaces" python3 - <<'PY' >/dev/null 2>&1; then
-import ipaddress, json, os, sys
-try:
-    target = ipaddress.IPv6Address(os.environ["EXPECTED"])
-except ValueError:
-    sys.exit(2)
-try:
-    data = json.loads(os.environ["JSON"])
-except Exception:
-    sys.exit(1)
-ifaces = data.get("result", data) if isinstance(data, dict) else data
-for iface in (ifaces or []):
-    if not isinstance(iface, dict): continue
-    for addr in (iface.get("ip-addresses") or []):
-        if not isinstance(addr, dict): continue
-        ip = (addr.get("ip-address") or "").strip().split("%")[0]
-        if not ip: continue
-        try:
-            if ipaddress.IPv6Address(ip) == target: sys.exit(0)
-        except ValueError:
-            continue
-sys.exit(1)
-PY
-      return 0
-    fi
-    sleep 3; (( elapsed += 3 ))
-  done
-  return 1
-}
 
 # ----- Cleanup / rollback state machine ----------------------------------------
 TOKEN_CREATED=0
@@ -1306,41 +1247,17 @@ _enroll_efi_dst() {
 
 # If we migrated a stopped VM (offline), start it on dest so the guest agent
 # is reachable for the in-guest IPv6 reconfig. We restore "stopped" at the end.
+# El invitado ya no se reconfigura al migrar (su IP no depende del nodo), asi
+# que una VM parada YA NO SE ENCIENDE: antes habia que arrancarla en destino
+# solo para hablarle por el guest agent, con todo el aparato de forzar
+# `vm-no-internet` para que ningun MetaTrader abriera operaciones en esa
+# ventana. Al desaparecer el motivo, desaparece el riesgo: la VM llega parada y
+# se queda parada.
+#
+# `qm enroll-efi-keys` SI se hace, y precisamente requiere la VM parada.
 if (( WAS_STOPPED == 1 )); then
   _enroll_efi_dst
-  # --- Operator procedure (2026-07-13): the temporary power-on of a STOPPED
-  # trading VM must not let MetaTrader/EAs reach the internet (an auto-started
-  # terminal could open trades). Save the VM's original firewall config, force
-  # the datacenter-wide `vm-no-internet` security group ON (+ NIC firewall=1),
-  # start -> in-guest IPv6 reconfig -> shutdown, then restore EXACTLY the
-  # original firewall state (file content and net0 string).
-  NOINT_FW="/etc/pve/firewall/${VMID}.fw"
-  NOINT_ORIG_B64=$(dst_ssh "[ -f '${NOINT_FW}' ] && base64 -w0 '${NOINT_FW}' || true" 2>/dev/null)
-  NOINT_NET0_ORIG=$(dst_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^net0: //p' | tr -d '\r')
-  NOINT_NET0_MODIFIED=0
-  dst_ssh "grep -q '^\[group vm-no-internet\]' /etc/pve/firewall/cluster.fw 2>/dev/null" \
-    || _warn "cluster.fw has no [group vm-no-internet] on dest — the guard rule will be a no-op."
-  if [[ -n "$NOINT_NET0_ORIG" && "$NOINT_NET0_ORIG" != *firewall=1* ]]; then
-    if dst_ssh "qm set '${VMID}' --net0 '${NOINT_NET0_ORIG},firewall=1'" >/dev/null 2>&1; then
-      NOINT_NET0_MODIFIED=1
-    else
-      _warn "could not set firewall=1 on net0 — no_internet guard may not filter."
-    fi
-  fi
-  dst_ssh "printf '[OPTIONS]\nenable: 1\n\n[RULES]\nGROUP vm-no-internet\n' > '${NOINT_FW}'" >/dev/null 2>&1 \
-    && _ok "Firewall vm-no-internet ON for the temporary power-on." \
-    || _warn "could not write ${NOINT_FW} — proceeding without the internet guard."
-  _info "Starting VM ${VMID} on dest to apply in-guest reconfig (was stopped pre-migration)…"
-  if dst_ssh "qm start '${VMID}'" >/dev/null 2>&1; then
-    _ok "qm start issued."
-    if _wait_agent_dst 300; then
-      _ok "Guest agent is responding on dest."
-    else
-      _warn "Guest agent did not respond within 5m — in-guest reconfig will likely fail; continuing."
-    fi
-  else
-    _warn "qm start failed on dest; in-guest reconfig will be skipped — VM will remain stopped."
-  fi
+  _info "La VM llego parada: se queda parada (ya no hace falta encenderla)."
 fi
 
 DST_STATUS=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
@@ -1354,7 +1271,6 @@ _info "Dest VM: status=${DST_STATUS:-unknown} ostype=${OSTYPE:-unknown}"
 # NOT the gateway VMs should use. The PS script is idempotent: Test-Configured
 # short-circuits the rewrite, but DHCPv4 is always renewed because the node
 # changed and the old lease comes from a different dnsmasq.
-DST_GATEWAY="${EXPECTED_VM_IPV6%::*}::1"
 
 # If the memory pre-check auto-aligned the config to the running value, re-apply
 # the ORIGINAL (intended) config value on the dest as a pending change — the VM
@@ -1391,111 +1307,19 @@ if [[ "$_vm_name" == E-* ]]; then
   fi
 fi
 
-if (( NEW_IPS == 1 )); then
-  # ---- Camino NUEVO: el invitado NO se toca -----------------------------------
-  # Su IPv6 es <IDENT>::<vmid> y su puerta de enlace fe80::1, las dos iguales en
-  # toda la flota, así que la migración no cambia nada dentro de Windows. Se
-  # omite entero el bloque del guest agent (PS_RECONFIG, _wait_agent_dst,
-  # _verify_dest_ipv6) — que es lo que hoy causa el MIGRATION_DEGRADED.
-  _ok "Modelo nuevo — el invitado conserva ${EXPECTED_VM_IPV6}; NO se toca su configuración de red."
-  _warn "Modelo nuevo: mover las rutas de la VM en LAS DOS bases hacia el túnel del nodo destino (${DST_NODE}) — todavía NO lo hace este script:"
-  _warn "    ip -6 route replace ${EXPECTED_VM_IPV6}/128 dev <tunel-del-destino>"
-  _warn "    ip    route replace <ipv4-privada-de-la-vm>/32 dev <tunel-del-destino>"
-elif [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
-  _info "Reconfiguring static IPv6 in guest: addr=${EXPECTED_VM_IPV6}/64 gw=${DST_GATEWAY}…"
-
-  PS_RECONFIG=$(cat <<PSEOF
-\$ErrorActionPreference = 'SilentlyContinue'
-\$ProgressPreference   = 'SilentlyContinue'
-\$exp  = '${EXPECTED_VM_IPV6}'
-\$gw   = '${DST_GATEWAY}'
-\$dns1 = '${DNS6_PRIMARY}'
-\$dns2 = '${DNS6_SECONDARY}'
-
-\$a = Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1
-if (-not \$a) { [Console]::Error.WriteLine('no active physical adapter'); exit 1 }
-\$idx   = \$a.ifIndex
-\$alias = \$a.InterfaceAlias
-
-function Test-Configured {
-  \$pp = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore PersistentStore -ErrorAction SilentlyContinue
-  if (-not (\$pp -and \$pp.PrefixOrigin -eq 'Manual')) { return \$false }
-  \$ac = Get-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PolicyStore ActiveStore -ErrorAction SilentlyContinue
-  if (-not (\$ac -and \$ac.PrefixOrigin -eq 'Manual')) { return \$false }
-  \$rc = Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object { \$_.NextHop -eq \$gw }
-  if (-not \$rc) { return \$false }
-  \$d = (Get-DnsClientServerAddress -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue).ServerAddresses
-  if (-not \$d -or -not (\$d -contains \$dns1)) { return \$false }
-  return \$true
-}
-
-if (-not (Test-Configured)) {
-  foreach (\$store in 'PersistentStore', 'ActiveStore') {
-    Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -RouterDiscovery Disabled -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
-    Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv6 -Dhcp Disabled -PolicyStore \$store -ErrorAction SilentlyContinue | Out-Null
-  }
-  foreach (\$store in 'PersistentStore', 'ActiveStore') {
-    Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -PolicyStore \$store -ErrorAction SilentlyContinue |
-      Where-Object { \$_.PrefixOrigin -ne 'WellKnown' -and \$_.IPAddress -notlike 'fe80*' } |
-      ForEach-Object {
-        Remove-NetIPAddress -InterfaceIndex \$idx -IPAddress \$_.IPAddress -PolicyStore \$store -Confirm:\$false -ErrorAction SilentlyContinue
-      }
-  }
-  Get-NetRoute -InterfaceIndex \$idx -AddressFamily IPv6 -ErrorAction SilentlyContinue |
-    Where-Object { \$_.DestinationPrefix -eq '::/0' } |
-    ForEach-Object { Remove-NetRoute -InterfaceIndex \$idx -DestinationPrefix '::/0' -Confirm:\$false -ErrorAction SilentlyContinue }
-  try { New-NetIPAddress -InterfaceIndex \$idx -IPAddress \$exp -PrefixLength 64 -AddressFamily IPv6 -ErrorAction Stop | Out-Null } catch { [Console]::Error.WriteLine("New-NetIPAddress: \$(\$_.Exception.Message)") }
-  try { New-NetRoute     -InterfaceIndex \$idx -DestinationPrefix '::/0' -NextHop \$gw -AddressFamily IPv6 -ErrorAction Stop | Out-Null } catch { [Console]::Error.WriteLine("New-NetRoute: \$(\$_.Exception.Message)") }
-  & netsh interface ipv6 set dnsserver "\$alias" static \$dns1 primary validate=no 2>&1 | Out-Null
-  & netsh interface ipv6 add dnsserver "\$alias" \$dns2 index=2 validate=no 2>&1 | Out-Null
-}
-
-# Always refresh DHCPv4 — we changed nodes, so the lease must be reissued by
-# the new dnsmasq (same /16 pool, but a different lease database).
-& ipconfig /release 2>&1 | Out-Null
-& ipconfig /renew   2>&1 | Out-Null
-
-if (Test-Configured) { exit 0 } else { exit 2 }
-PSEOF
-)
-  # Slow cutovers leave the guest agent down for minutes; a single reconfig
-  # attempt then fails (qga exec timeout) and the guest keeps the SOURCE-prefix
-  # IP → customer unreachable while everything else reports success (VMs
-  # 1777/1841/1084/702/1257, 2026-07-03). Wait for the agent, then retry the
-  # idempotent reconfig until the expected IPv6 is actually bound. Worst case
-  # ~12 min before giving up loudly.
-  RECONFIG_OK=0
-  _wait_agent_dst 180 \
-    || _info "Guest agent not answering after 180s — attempting reconfig anyway…"
-  for _try in 1 2 3 4; do
-    if (( _try > 1 )); then
-      _info "In-guest IPv6 not confirmed yet; waiting for agent and retrying (${_try}/4)…"
-      sleep 10
-      _wait_agent_dst 120 || true
-    fi
-    _ps_rc=0
-    _dst_run_ps "$PS_RECONFIG" 120 || _ps_rc=$?
-    if (( _ps_rc != 0 )); then
-      _info "Reconfig attempt ${_try}/4 failed (rc=${_ps_rc})."
-      continue
-    fi
-    if _verify_dest_ipv6 30; then
-      RECONFIG_OK=1
-      break
-    fi
-  done
-  if (( RECONFIG_OK == 1 )); then
-    _ok "In-guest IPv6 reconfigured + verified: ${EXPECTED_VM_IPV6} bound on dest VM (attempt ${_try})."
-  else
-    MIGRATION_DEGRADED=1
-    DEGRADED_REASON="in-guest IPv6 reconfig NOT verified (guest may still hold the source-prefix IP)"
-    _warn "In-guest IPv6 reconfig NOT verified after 4 attempts — the guest may still hold the source-prefix IP (customer unreachable via connectionUrl AND direct RDP). Fix: re-run this script (idempotent) or apply the PS_RECONFIG netsh block via 'qm guest exec ${VMID}'. Continuing — NAT/Firestore will still point at ${EXPECTED_VM_IPV6}."
-  fi
-elif [[ "${OSTYPE:-}" != win* ]]; then
-  _info "ostype=${OSTYPE:-unknown} (not Windows); skipping in-guest reconfig."
-else
-  _info "Dest VM not running (status=${DST_STATUS:-unknown}); skipping in-guest reconfig."
-fi
+# ---- El invitado NO se toca ------------------------------------------------
+# Su IPv6 es <IDENT>::<vmid> y su puerta de enlace fe80::1, iguales en TODA la
+# flota, asi que una migracion no cambia nada dentro de Windows. Ese era el
+# objetivo del proyecto y desde el 16-08-2026 no queda ninguna VM del modelo
+# viejo, de modo que el bloque de reconfiguracion por el guest agent
+# (PS_RECONFIG, _wait_agent_dst, _verify_dest_ipv6) se ha eliminado: era la
+# causa habitual del MIGRATION_DEGRADED y ya no reconfiguraba nada real.
+#
+# Las rutas de la VM en las DOS bases las mueve solo el disparador de Firestore
+# al escribirse `nodeId` mas abajo. Comprobado en la vm1188 (16-08): aparecieron
+# en tun-fp235 y tun-hp235 sin intervencion. El aviso que pedia hacerlo a mano
+# se ha quitado porque mandaba al operador a repetir algo ya hecho.
+_ok "El invitado conserva ${EXPECTED_VM_IPV6}; su red no se toca."
 
 # Hookscript on dest — idempotent (qm set is repeatable).
 _info "Attaching hookscript on dest…"
@@ -1600,29 +1424,9 @@ fi
 # Restore original power state: if we started this VM ourselves to apply
 # in-guest config, gracefully shut it back down. The hookscript on dest will
 # fire post-stop and update Firestore status accordingly.
-if (( WAS_STOPPED == 1 )); then
-  _info "Restoring original power state — gracefully shutting down VM ${VMID}…"
-  dst_ssh "qm shutdown '${VMID}' --timeout 300" >/dev/null 2>&1 \
-    || _warn "qm shutdown returned non-zero; will still poll for stopped state."
-  if _wait_status_dst stopped 60; then
-    _ok "VM gracefully shut down on dest."
-  else
-    _warn "VM ${VMID} still running after shutdown timeout — left running for triage."
-  fi
-  # Restore the ORIGINAL firewall state (the guard was only for the temporary
-  # power-on). File first, then the net0 string if we added firewall=1.
-  if [[ -n "${NOINT_ORIG_B64}" ]]; then
-    dst_ssh "echo '${NOINT_ORIG_B64}' | base64 -d > '${NOINT_FW}'" >/dev/null 2>&1 \
-      || _warn "could not restore original ${NOINT_FW} — review manually."
-  else
-    dst_ssh "rm -f '${NOINT_FW}'" >/dev/null 2>&1 || true
-  fi
-  if (( NOINT_NET0_MODIFIED == 1 )); then
-    dst_ssh "qm set '${VMID}' --net0 '${NOINT_NET0_ORIG}'" >/dev/null 2>&1 \
-      || _warn "could not restore original net0 (firewall=1 left on — harmless but review)."
-  fi
-  _ok "Firewall state restored to original."
-fi
+# (Ya no hay nada que restaurar: la VM parada nunca se enciende, asi que no se
+# le fuerza ningun cortafuegos ni hay que apagarla luego. El bloque que hacia
+# `qm shutdown` + restaurar `vm-no-internet` se elimino con el encendido.)
 
 if (( MIGRATION_DEGRADED == 1 )); then
   # MIGRATION_DONE is already 1, so the EXIT trap only closes SSH — nothing is
