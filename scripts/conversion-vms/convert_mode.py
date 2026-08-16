@@ -23,7 +23,15 @@ netsh interface ipv6 add route ::/0 $if {GW6} store=persistent | Out-Null
 {DEL6}
 
 # --- IPv4: `set address ... static` desactiva el DHCP el solo ---------------
-netsh interface ipv4 set address   name=$if static {NEW4} 255.255.0.0 {GW4} | Out-Null
+# /32, no /16 (2026-08-16). Con /16 el invitado veia a TODOS los de su nodo
+# como vecinos on-link y llegaba a su RDP por nivel 2, sin pasar por el
+# encaminamiento del nodo ni por la base. Con /32 no queda nada on-link.
+# Las tres ordenes van en ESTE orden: con /32 la puerta tampoco queda on-link,
+# asi que primero se le abre una ruta de host, luego la direccion, y solo
+# despues la ruta por defecto. Al reves Windows rechaza la puerta.
+netsh interface ipv4 add route {GW4}/32 $if 0.0.0.0 store=persistent | Out-Null
+netsh interface ipv4 set address   name=$if static {NEW4} 255.255.255.255 | Out-Null
+netsh interface ipv4 add route 0.0.0.0/0 $if {GW4} store=persistent | Out-Null
 netsh interface ipv4 set dnsserver name=$if static 185.12.64.1 primary validate=no | Out-Null
 netsh interface ipv4 add dnsserver name=$if 185.12.64.2 index=2 validate=no | Out-Null
 
