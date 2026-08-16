@@ -351,12 +351,33 @@ table ip rdpguard {
     }
 }
 
+<!-- ⚠️ ESTE BLOQUE ES LA FUENTE DE VERDAD PARA RECONSTRUIR UNA BASE.
+     `base_setup.sh` NO genera /etc/nftables.conf: lo da por hecho y lo saca de
+     aqui. Auditado el 16-08-2026 contra b1 y estaba DESFASADO — le faltaban el
+     set `gre_peers`, la aceptacion de GRE y TODO el bloque de forward del
+     egress-failover. Una base reconstruida desde el documento habria arrancado
+     con los tuneles muertos y los invitados sin salida.
+     Si tocas el cortafuegos de una base, actualiza esto EN EL MISMO cambio. -->
+
 table inet filter {
-    # Firestore-driven allowlist of every node's IPv6 /64 (populated + refreshed
-    # by netconsole-fleet-allow.timer); gates the netconsole collector below so
-    # UDP 6666 is only reachable from our own nodes, never the public internet.
+# --- egress-failover (modelo nuevo)
+    # Nodos con tunel ip6gre hacia esta base. Lo puebla
+    # neuravps-base-tunnels.sh desde /etc/neuravps/tunnel-nodes.conf, que es
+    # la unica fuente de verdad: set y tuneles no pueden divergir.
+    set gre_peers {
+        type ipv6_addr
+    }
+
     set nc_fleet_v6 { type ipv6_addr; flags interval; auto-merge; }
 
+    # --- vm-no-internet servido desde la BASE --------------------------------
+    # Antes vivia en el firewall POR VM del nodo (grupo vm-no-internet de
+    # cluster.fw). Aqui el interruptor funciona aunque el NODO este caido, que
+    # es justo cuando mas falta hace: al volver, la VM arrancaria con Internet
+    # antes de que nadie pueda reaccionar.
+    # Los pueblan sync-base-nat.py (elementos) y el include de abajo.
+    set sin_internet6 { type ipv6_addr; }
+    set sin_internet4 { type ipv4_addr; }
     # Fast-path: kernel flowtable for offloading established flows.
     # Once a connection is added to @ft, subsequent packets bypass the full
     # netfilter hook traversal (including NAT), cutting per-packet latency
@@ -377,14 +398,24 @@ table inet filter {
         # Required if nginx terminates TLS / handles HTTP redirects or ACME.
         tcp dport 80 accept
         tcp dport 443 accept
-        # netconsole from fleet nodes over IPv6 (kernel-console freeze capture,
-        # UDP 6666 -> netconsole-collector.service), restricted to our nodes' /64s
-        # via @nc_fleet_v6. See docs/INCIDENT_2026-07-08_node0000008_freeze.md.
-        udp dport 6666 ip6 saddr @nc_fleet_v6 accept
+# --- egress-failover (modelo nuevo)
+        # GRE de los nodos convertidos. nexthdr 47 (no 60) porque los tuneles
+        # se crean con `encaplimit none`; ver §4.5 de la doc.
+        ip6 nexthdr gre ip6 saddr @gre_peers accept
+        udp dport 6666 ip6 saddr @nc_fleet_v6 accept        # netconsole from fleet nodes (freeze capture)
     }
 
     chain forward {
         type filter hook forward priority filter; policy drop;
+        # Corta la salida a Internet de las VMs marcadas, pero deja pasar las
+        # respuestas de lo que entro por DNAT (RDP/SMB/SSH) — la semantica
+        # exacta del grupo vm-no-internet: el cliente sigue entrando por
+        # escritorio remoto, la VM no sale. `ct direction original` distingue
+        # las dos cosas sin necesidad de mirar puertos.
+        # Van ANTES del `flow add @ft` a proposito: un flujo ya descargado en
+        # el flowtable se salta la cadena entera.
+        iifname "tun-*" oifname "enp6s0" ct direction original ip6 saddr @sin_internet6 drop
+        iifname "tun-*" oifname "enp6s0" ct direction original ip saddr @sin_internet4 drop
         # Offload established flows to the flowtable fast path.
         ip protocol { tcp, udp } ct state established flow add @ft
         ip6 nexthdr { tcp, udp } ct state established flow add @ft
@@ -392,8 +423,20 @@ table inet filter {
         # Allow any flow that was explicitly DNAT'ed in prerouting.
         iifname "enp6s0" ct status dnat accept
         iifname "veth-host" oifname "enp6s0" accept
+# --- egress-failover (modelo nuevo)
+        # Trafico ya traducido por Jool hacia un invitado del esquema nuevo,
+        # y salida a Internet de lo que llega por los tuneles.
+        iifname "veth-host" oifname "tun-*" accept
+        iifname "tun-*" oifname "enp6s0" accept
+        # SMB entre VMs del mismo cliente: con el modelo nuevo ese trafico
+        # cruza la base en vez de ir nodo a nodo. Solo los puertos de SMB —
+        # el nodo destino ya limita con el ipset vm-ident, pero duplicarlo
+        # aqui protege a una VM que manana se cree sin firewall.
+        iifname "tun-*" oifname "tun-*" meta l4proto { tcp, udp } th dport { 135, 137, 138, 139, 445 } accept
+        iifname "tun-*" oifname "tun-*" meta l4proto { tcp, udp } th sport { 135, 137, 138, 139, 445 } accept
     }
 }
+
 
 # netconsole /64 allowlist elements (maintained by netconsole-fleet-allow.py +
 # timer; see run_remotes/setup_netconsole_base.sh). Reloads the fleet /64s at

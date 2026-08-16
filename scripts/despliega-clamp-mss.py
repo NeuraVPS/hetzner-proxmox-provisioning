@@ -13,7 +13,11 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-DIR = Path(__file__).resolve().parent
+# El fichero vive en base/snippets/, no junto a este script. Apuntaba mal y
+# reventaba con FileNotFoundError — descubierto el 16-08-2026 mientras se
+# reponia el clamp de urgencia en la flota, que es justo cuando no quieres
+# que la herramienta falle.
+DIR = Path(__file__).resolve().parent.parent / "base" / "snippets"
 B64 = base64.b64encode((DIR / "nvx-mss.sh").read_bytes()).decode()
 CMD = (f"echo {B64} | base64 -d > /usr/local/sbin/nvx-mss.sh && "
        "chmod 755 /usr/local/sbin/nvx-mss.sh && /usr/local/sbin/nvx-mss.sh && "

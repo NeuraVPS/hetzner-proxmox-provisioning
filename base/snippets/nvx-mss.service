@@ -7,9 +7,20 @@ Description=NeuraVPS: clamp de MSS del trafico de invitados por el tunel
 # reiniciados ese dia, 0 reglas maxseg, 9 VMs de clientes con agujero negro de
 # PMTU). Despista mucho porque el navegador del invitado sale por IPv6 y va
 # bien; solo se cuelga lo que sale por IPv4, como la licencia de SQX.
+# ⚠️ NI `Requires=` NI `Wants=` sobre nftables.service. El 16-08-2026 esta
+# unidad llevaba `Requires=` y un `systemctl enable --now` ARRANCO nftables
+# —que estaba INACTIVO en los nodos— en los 227 a la vez. Al cargar
+# `/etc/nftables.conf`, que empieza por `flush ruleset`, se llevo por delante
+# la tabla del clamp MSS en toda la flota. Con `After=` a secas se conserva el
+# orden sin poder provocar ese arranque.
+#
+# `PartOf=` es la otra mitad: si alguien reinicia nftables, systemd reinicia
+# tambien esta unidad DESPUES, y la tabla se repone sola. Sin eso, cualquier
+# recarga de nftables dejaba la regla borrada en silencio y para siempre —que
+# es como se perdio el clamp la primera vez, esa misma manana.
 After=neuravps-tunnels.service nftables.service network-online.target
 Wants=neuravps-tunnels.service
-Requires=nftables.service
+PartOf=nftables.service
 
 [Service]
 Type=oneshot

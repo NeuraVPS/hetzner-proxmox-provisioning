@@ -47,7 +47,7 @@
 
 # 1) Install runtime dependencies.
 apt update && apt upgrade -y
-apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool sshpass smbclient netcat-openbsd freerdp3-x11 xvfb imagemagick
+apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool sshpass smbclient netcat-openbsd freerdp3-x11 xvfb imagemagick conntrack
 # Debian 13: the dpkg-owned `requests` blocks the dependency upgrade
 # (uninstall-no-record-file) — --ignore-installed installs the tree into
 # /usr/local without touching dpkg files.
@@ -127,6 +127,13 @@ chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
 # atomically on every reconcile.
 mkdir -p /etc/nftables.d
 [ -f /etc/nftables.d/base-nat-elements.nft ] || : > /etc/nftables.d/base-nat-elements.nft
+# Igual para los elementos del corte de Internet por VM (`sin_internet*`, que
+# puebla sync-base-nat desde `firewall.internetEnabled`). Va en fichero APARTE
+# del anterior porque aquel se incluye ANTES de que `table inet filter` exista,
+# y un `add element` sobre una tabla inexistente rompe la recarga entera.
+# ⚠️ Si el fichero falta y el include esta en nftables.conf, nftables NO CARGA
+# NADA: la base arrancaria sin cortafuegos y sin DNAT.
+[ -f /etc/nftables.d/base-nat-sin-internet.nft ] || : > /etc/nftables.d/base-nat-sin-internet.nft
 
 # 4b) veth-host.service: tiny early-boot oneshot that creates the
 # `veth-host` netdev pair before nftables.service loads. The flowtable
