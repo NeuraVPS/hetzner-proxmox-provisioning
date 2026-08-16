@@ -86,35 +86,17 @@ fi
 
 
 ############################################
-# dnsmasq for IPv4 DHCP only
-############################################
-log "Installing and configuring dnsmasq"
-apt-get install -y dnsmasq
-
-cat > /etc/dnsmasq.d/vmbr0.conf <<EOF
-interface=vmbr0
-# bind-dynamic (NOT bind-interfaces): bind-interfaces breaks RS/NS multicast on
-# Proxmox where fwbr<vmid> bridges come and go.
-bind-dynamic
-dhcp-authoritative
-dhcp-rapid-commit
-
-# IPv4 DHCP pool for guests.
-dhcp-range=10.0.0.100,10.0.255.254,255.255.0.0,12h
-dhcp-option=3,10.0.0.1
-dhcp-option=6,185.12.64.1,185.12.64.2
-
-# IPv6: NOTHING. No RA, no DHCPv6. Each VM is configured in-guest with a
-# static <prefix>::<vmid_hex> + manual default route + manual DNS via the
-# legacy netsh "store=persistent" path (run_remotes/migrate_to_deterministic_ipv6.sh).
-# Both DHCPv6 client and RouterDiscovery are persistently DISABLED on the
-# adapter, so Windows has zero auto-config to compete with the manual IPv6.
-EOF
-
-# Clean up leftovers from previous models (stateful DHCPv6 pin files).
-rm -f /etc/dnsmasq-vm-pins.hosts /etc/dnsmasq.d/vm-pins.conf
-
-systemctl restart dnsmasq
+# dnsmasq RETIRADO (2026-08-16). Servia IPv4 por DHCP en 10.0.0.0/16, el
+# direccionamiento del modelo viejo. Ya no queda ninguna VM ahi: las 1876 usan
+# la IPv4 de identidad `10.64.<vmid>/32`, fija, puesta por el aprovisionamiento
+# y verificada. Se desinstalo de los 227 nodos y la flota lleva dias sin el
+# (comprobado: `inactive` en toda la muestra), asi que un nodo nuevo tampoco
+# debe traerlo — si lo trajera, volveria a repartir direcciones del esquema que
+# acabamos de retirar.
+#
+# El invitado no necesita DHCP en ningun momento: su IPv4 la escribe
+# `_apply_static_ipv6_in_guest` por el agente, que va por canal serie y no
+# depende de la red.
 
 ############################################
 # Raw swap: one partition per rpool disk, filling the free space install.sh

@@ -6,8 +6,19 @@ Description=NeuraVPS: aislamiento VM<->VM en el puente vmbr0
 # 16-08-2026 y no se noto hasta que 9 clientes se quedaron sin licencia de SQX.
 # Aqui el fallo seria peor de detectar: nada se rompe, solo deja de haber
 # aislamiento — y eso no da sintomas hasta que alguien lo aprovecha.
+# ⚠️ NI `Requires=` NI `Wants=` sobre nftables.service. El 16-08-2026 esta
+# unidad llevaba `Requires=` y un `systemctl enable --now` ARRANCO nftables
+# —que estaba INACTIVO en los nodos— en los 227 a la vez. Al cargar
+# `/etc/nftables.conf`, que empieza por `flush ruleset`, se llevo por delante
+# la tabla del clamp MSS en toda la flota. Con `After=` a secas se conserva el
+# orden sin poder provocar ese arranque.
+#
+# `PartOf=` es la otra mitad: si alguien reinicia nftables, systemd reinicia
+# tambien esta unidad DESPUES, y la tabla se repone sola. Sin eso, cualquier
+# recarga de nftables dejaba la regla borrada en silencio y para siempre —que
+# es como se perdio el clamp la primera vez, esa misma manana.
 After=nftables.service network-online.target
-Requires=nftables.service
+PartOf=nftables.service
 
 [Service]
 Type=oneshot

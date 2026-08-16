@@ -617,14 +617,19 @@ fi
   echo ""
   echo "auto vmbr0"
   echo "iface vmbr0 inet static"
+  # ⚠️ El MASQUERADE de estos dos rangos se retiro el 16-08-2026. Salia por
+  # ${UPLINK_IF}, que ya NO tiene IPv4 (bajas de Hetzner de ese dia), asi que
+  # no podia funcionar. Medido antes de quitarlo: contadores a cero y 0
+  # paquetes en 150 s en un nodo con 40 VMs. La salida IPv4 del invitado va por
+  # el tunel a la base, no por el nodo.
+  # La 10.0.0.1/16 se queda: no cuesta nada y da puerta de enlace a cualquier
+  # invitado viejo que apareciera; el rango ya no lo usa ninguna VM.
   echo "    address 10.0.0.1/16"
   echo "    bridge-ports none"
   echo "    bridge-stp off"
   echo "    bridge-fd 0"
   echo "    post-up   echo 1 > /proc/sys/net/ipv4/ip_forward"
-  echo "    post-up   iptables -t nat -A POSTROUTING -s '10.0.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo "    post-up   iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1"
-  echo "    post-down iptables -t nat -D POSTROUTING -s '10.0.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo "    post-down iptables -t raw -D PREROUTING -i fwbr+ -j CT --zone 1"
   # --- Esquema de direccionamiento por-VM (2026-08-13) ---------------------
   # La IPv4 del invitado pasa a ser 10.64.<vmid_hi>.<vmid_lo>/16 con puerta de
@@ -637,8 +642,6 @@ fi
   # convertir sin tocar a ninguna de sus VMs y la flota se migra en secuencia
   # sin ventana de colisión (10.64.0.0/16 no solapa con 10.0.0.0/16).
   echo "    post-up   ip addr add 10.64.255.1/16 dev vmbr0"
-  echo "    post-up   iptables -t nat -A POSTROUTING -s '10.64.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
-  echo "    post-down iptables -t nat -D POSTROUTING -s '10.64.0.0/16' -o ${UPLINK_IF} -j MASQUERADE"
   echo ""
   echo "iface vmbr0 inet6 static"
   echo "    address ${VM_V6_GATEWAY}/${VM_V6_PREFIXLEN}"
@@ -982,9 +985,13 @@ NVXEOF
 cat > /mnt/etc/systemd/system/nvx-mss.service <<'NVXEOF'
 [Unit]
 Description=NeuraVPS: clamp de MSS del trafico de invitados por el tunel
+# ⚠️ NI Requires= NI Wants= sobre nftables.service: el 16-08-2026 un
+# `enable --now` con Requires= arranco nftables —inactivo en los nodos— en los
+# 227 a la vez, y su `flush ruleset` borro el clamp MSS de toda la flota.
+# PartOf= repone la tabla si alguien reinicia nftables.
 After=neuravps-tunnels.service nftables.service network-online.target
 Wants=neuravps-tunnels.service
-Requires=nftables.service
+PartOf=nftables.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -1079,8 +1086,12 @@ chmod 755 /mnt/usr/local/sbin/nvx-aisla.sh
 cat > /mnt/etc/systemd/system/nvx-aisla.service <<'NVXEOF'
 [Unit]
 Description=NeuraVPS: aislamiento VM<->VM en el puente vmbr0
+# ⚠️ NI Requires= NI Wants= sobre nftables.service: el 16-08-2026 un
+# `enable --now` con Requires= arranco nftables —inactivo en los nodos— en los
+# 227 a la vez, y su `flush ruleset` borro el clamp MSS de toda la flota.
+# PartOf= repone la tabla si alguien reinicia nftables.
 After=nftables.service network-online.target
-Requires=nftables.service
+PartOf=nftables.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
