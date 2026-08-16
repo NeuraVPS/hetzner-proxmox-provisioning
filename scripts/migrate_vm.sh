@@ -600,9 +600,9 @@ PY
     # del nodo destino, y como el script es idempotente y se re-ejecuta a
     # propósito tras un fallo parcial, escribirla machacaría la IDENT de una VM
     # del modelo nuevo — y la Cloud Function lo propagaría a las DOS bases,
-    # dejando al cliente inalcanzable. Se reconcilian nodo y maintenance, que
+    # dejando al cliente inalcanzable. Se reconcilia el nodo, que
     # sí cambian; la dirección no cambia nunca al migrar.
-    _rc_fs_args=(--vmid "$VMID" --node-id "$RC_DST_NODE" --maintenance false)
+    _rc_fs_args=(--vmid "$VMID" --node-id "$RC_DST_NODE")
     _info "Se reconcilia nodeId pero NO ipv6: la dirección no depende del nodo."
     if _firestore_update_servers "${_rc_fs_args[@]}" 2>/dev/null; then
       _ok "Firestore reconciled (or was already up-to-date)."
@@ -615,48 +615,6 @@ PY
   exit 0
 fi
 
-# ----- Guest-agent helpers (run PowerShell on dest VM) -------------------------
-# Returns: PS process exit code (0 success, anything else = failure / signal).
-# 1 if the guest agent never came up.
-_dst_run_ps() {
-  local ps="$1" timeout="${2:-120}"
-  local b64; b64=$(printf '%s' "$ps" | iconv -t UTF-16LE | base64 -w0)
-  [[ -n "$b64" ]] || { _warn "iconv/base64 failed for PS"; return 1; }
-
-  local exec_out pid attempt=0 max_attempts=30
-  while (( attempt < max_attempts )); do
-    exec_out=$(dst_ssh "pvesh create /nodes/${DST_NODE}/qemu/${VMID}/agent/exec --output-format json \
-                          --command powershell.exe \
-                          --command -NoProfile \
-                          --command -NonInteractive \
-                          --command -EncodedCommand \
-                          --command '${b64}' 2>&1") || true
-    pid=$(printf '%s' "$exec_out" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
-    if [[ -n "$pid" && "$pid" -gt 0 ]]; then break; fi
-    if printf '%s' "$exec_out" | grep -qi 'guest agent is not running\|agent.*not running\|not connected'; then
-      sleep 3; (( attempt++ )); continue
-    fi
-    _info "agent exec failed (recoverable, caller retries): ${exec_out:0:200}"
-    return 1
-  done
-  if [[ -z "$pid" || "$pid" -le 0 ]]; then
-    _info "guest agent never came up after $((max_attempts * 3))s (recoverable, caller retries)"
-    return 1
-  fi
-
-  local elapsed=0 status_out exitcode
-  while (( elapsed < timeout )); do
-    status_out=$(dst_ssh "pvesh get /nodes/${DST_NODE}/qemu/${VMID}/agent/exec-status --output-format json --pid '${pid}'" 2>/dev/null || true)
-    if printf '%s' "$status_out" | grep -qE '"exited"\s*:\s*1'; then
-      exitcode=$(printf '%s' "$status_out" | sed -n 's/.*"exitcode"[[:space:]]*:[[:space:]]*\([-0-9][0-9]*\).*/\1/p' | head -1)
-      [[ -z "$exitcode" ]] && exitcode=0
-      return "$exitcode"
-    fi
-    sleep 3; (( elapsed += 3 ))
-  done
-  _info "PS exec timed out after ${timeout}s (recoverable, caller retries)"
-  return 1
-}
 
 
 _wait_status_dst() {
@@ -705,7 +663,6 @@ _ensure_running_dst() {
 # ----- Cleanup / rollback state machine ----------------------------------------
 TOKEN_CREATED=0
 HOOKSCRIPT_DETACHED=0
-MAINTENANCE_SET=0
 MIGRATION_DONE=0
 WAS_STOPPED=0  # 1 if the source VM was stopped pre-migration (we started it temporarily on dest)
 # 1 when the migration COMMITTED but left the VM in a state the customer cannot
@@ -735,10 +692,6 @@ _rollback() {
   if (( TOKEN_CREATED == 1 )); then
     _info "Removing migration token on dest…"
     dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 || true
-  fi
-  if (( MAINTENANCE_SET == 1 )); then
-    _info "Clearing Firestore maintenance flag…"
-    _firestore_update_servers --vmid "$VMID" --maintenance false >/dev/null 2>&1 || true
   fi
   # A failed/aborted migration can leave the BASEs' NAT entry for this VM
   # missing or stale (e.g. the aborted dest stub's stop event clobbers it via
@@ -843,32 +796,17 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     fi
   fi
 
-  # 0c) Guest-agent pre-check — ONLINE Windows migrations only. The post-move
-  # in-guest IPv6 reconfig NEEDS the agent; with a dead one the migration
-  # "succeeds" into the worst failure mode there is: VM running on dest,
-  # CUSTOMER UNREACHABLE (vms 854/1023, 2026-08-01 — caught hours later by
-  # conncheck). Probe BEFORE any expensive work, with retries: a busy agent
-  # answers late (1023's did at ~45s) while a dead one never does.
-  # MIGRATE_SKIP_AGENT_CHECK=1 overrides for moves that deliberately need no
-  # reconfig (e.g. rolling a VM BACK to the node whose prefix its guest still
-  # holds — the 854 recovery).
-  if [[ -n "$ONLINE_FLAG" && "${MIGRATE_SKIP_AGENT_CHECK:-0}" != "1" ]]; then
-    _src_ostype=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^ostype:[[:space:]]*//p' | tr -d '\r' || true)
-    if [[ "${_src_ostype:-win}" == win* ]]; then
-      _agent_ok=0
-      for _t in 1 2 3; do
-        if src_ssh "timeout 20 qm agent '${VMID}' ping" >/dev/null 2>&1; then
-          _agent_ok=1; break
-        fi
-        (( _t < 3 )) && _info "Guest agent not answering (try ${_t}/3) — retrying…"
-      done
-      if (( _agent_ok == 1 )); then
-        _ok "Guest agent answers — the in-guest IPv6 reconfig will be possible on dest."
-      else
-        _die "Guest agent DEAD on VM ${VMID} (3 pings over ~60s). A live migration would complete but leave the guest holding the source-prefix IP: VM running, CUSTOMER UNREACHABLE (the 854/1023 mode). Fix the agent first (or power-cycle the VM), or set MIGRATE_SKIP_AGENT_CHECK=1 if this move deliberately needs no reconfig. Aborting before any data is copied."
-      fi
-    fi
-  fi
+  # (Aqui habia una comprobacion previa del guest agent que ABORTABA la
+  # migracion si no respondia. Existia porque despues habia que reconfigurar la
+  # red DENTRO del invitado: con el agente muerto la VM llegaba al destino con
+  # la IP del prefijo del nodo de origen y el cliente se quedaba inalcanzable
+  # (vms 854/1023, 01-08).
+  #
+  # Desde el 16-08-2026 el invitado NO se toca al migrar: su IPv6 es
+  # <IDENT>::<vmid> y su puerta fe80::1, iguales en toda la flota. Sin
+  # reconfiguracion no hace falta el agente, asi que exigirlo solo servia para
+  # bloquear migraciones perfectamente validas — y son justo las cajas mas
+  # cargadas, donde el agente se cae, las que mas falta tienen de moverse.)
 
   # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
   # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
@@ -1009,13 +947,12 @@ PY
     fi
   fi
 
-  # 1) Firestore: set maintenance=true (advisory; non-fatal)
-  if _firestore_update_servers --vmid "$VMID" --maintenance true 2>/dev/null; then
-    MAINTENANCE_SET=1
-    _ok "Firestore maintenance=true"
-  else
-    _warn "Firestore maintenance=true failed (no creds or no doc); continuing."
-  fi
+  # 1) NO se marca `maintenance`. Una migracion en caliente ya no interrumpe al
+  # cliente: no se toca el invitado, no se pide el guest agent y el corte de
+  # cutover son segundos. Marcarla solo servia para ensuciar el panel con un
+  # estado que el usuario no llega a notar. El flag sigue existiendo para uso
+  # MANUAL del operador (--maintenance en el ayudante de Firestore), pero este
+  # script no lo escribe.
 
   # 2) Detach hookscript on source — otherwise sync-dnat fires on remote_migrate's
   # implicit post-stop and clobbers Firestore status mid-migration.
@@ -1168,7 +1105,7 @@ PY
   # VM present on dest and gone from source. If that does not hold, the VM was
   # kept on source — _die here (BEFORE MIGRATION_DONE=1) so the existing
   # _rollback re-attaches the hookscript on source and leaves Firestore routing
-  # (nodeId/ipv6) untouched; only the advisory maintenance flag is reverted.
+  # (nodeId/ipv6) untouched.
   _post_on_dst=0; _post_on_src=0
   dst_ssh "qm config '${VMID}' >/dev/null 2>&1" && _post_on_dst=1 || _post_on_dst=0
   src_ssh "qm config '${VMID}' >/dev/null 2>&1" && _post_on_src=1 || _post_on_src=0
@@ -1396,16 +1333,15 @@ if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/
   fi
 fi
 
-# Firestore: nodeId + ipv6 + maintenance=false (LAST step). Gated on NAT_OK so
+# Firestore: nodeId + ipv6 (LAST step). Gated on NAT_OK so
 # we don't claim the VM lives on the new node until NAT actually points there.
-# If we skip, the doc keeps the old nodeId + maintenance=true, signalling
+# If we skip, the doc keeps the old nodeId, signalling
 # "in-flux" so a re-run can reconcile.
 if (( NAT_OK == 1 )); then
   _info "Updating Firestore servers/{${VMID}}: nodeId=${DST_NODE}, ipv6=${EXPECTED_VM_IPV6}…"
-  fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6" --maintenance false)
+  fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6")
   if _firestore_update_servers "${fs_args[@]}"; then
     _ok "Firestore updated."
-    MAINTENANCE_SET=0  # cleared by the update itself, no rollback needed
   else
     _warn "Firestore update failed. Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} to retry."
   fi
