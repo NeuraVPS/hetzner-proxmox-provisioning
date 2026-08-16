@@ -181,7 +181,11 @@ floor_target() {  # $1 = max MB, $2 = orig MB -> echoes target MB
     31744) t=15872 ;;   # vps-c 31G  -> 15.5G
     33792) t=24371 ;;   # vps-d 33G  -> 23.8G (gen 2026-08-16)
     35840) t=25805 ;;   # vps-d 35G  -> 25.2G
-    46080) t=41574 ;;   # vps-d 45G  -> 40.6G (legacy 16c gen, measured mean)
+    46080) t=44134 ;;   # 45G: vps-e (gen 2026-08-17) -> 43.1G, AND the legacy
+                        # 16c vps-d 45G whose measured mean is 40.6G. The
+                        # lookup only sees the size, so take the HIGHER of the
+                        # two: under-decaying a vps-d costs a little paper
+                        # budget, over-decaying a vps-e is the v5 failure.
     49152) t=47104 ;;   # vps-e 48G  -> 46G
     61440) t=53453 ;;   # vps-e 60G  -> 52.2G (grandfathered gen)
     *)     t=$(( mx * FLOOR_TARGET_FALLBACK_PCT / 100 )) ;;

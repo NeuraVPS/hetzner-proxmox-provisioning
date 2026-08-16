@@ -112,10 +112,10 @@ COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.90, 0.80
 # nominal floors (5.7-18.0) that understate the measured settle points 1.66x,
 # so fits_any_plan() under-estimated what a destination must reserve.
 # RE-MEASURE together with pricingPlans.json ram_min_observed.
-PLAN_SIZES = [16, 19, 31, 33, 48]          # SQX sellable GB sizes (vps-a..e;
+PLAN_SIZES = [16, 19, 31, 33, 45]          # SQX sellable GB sizes (vps-a..e;
                                            # catalogue-wide respec 2026-08-16)
 PLANS = [("vps-a", 16, 8.2), ("vps-b", 19, 9.7), ("vps-c", 31, 15.5),
-         ("vps-d", 33, 23.8), ("vps-e", 48, 46.3)]
+         ("vps-d", 33, 23.8), ("vps-e", 45, 43.1)]
 
 # Floor a guest of each plan ACTUALLY settles at — pricingPlans.json
 # max(ram_min, ram_min_observed), measured 2026-07-29 over 657 live guests.
