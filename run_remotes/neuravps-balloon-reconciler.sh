@@ -175,7 +175,8 @@ touch "$SAMPLES"
 floor_target() {  # $1 = max MB, $2 = orig MB -> echoes target MB
   local mx=$1 orig=$2 t
   case "$mx" in
-    19456) t=9932  ;;   # vps-a 19G  -> 9.7G
+    16384) t=8397  ;;   # vps-a 16G  -> 8.2G (gen 2026-08-16)
+    19456) t=9932  ;;   # vps-a 19G / vps-b 19G (gen 2026-08-16) -> 9.7G
     23552) t=12186 ;;   # vps-b 23G  -> 11.9G
     31744) t=15872 ;;   # vps-c 31G  -> 15.5G
     33792) t=24371 ;;   # vps-d 33G  -> 23.8G (gen 2026-08-16)
