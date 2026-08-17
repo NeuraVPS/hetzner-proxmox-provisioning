@@ -80,6 +80,29 @@
 #     login (~30 s) and the boot RAM guard covers restarts, so decay's cost
 #     when we get it wrong is minutes of sluggishness, self-corrected by the
 #     ~1-min RAISE path plus a bounce block.
+#
+#     v8 (2026-08-17) after one day of v7 canary. v7 was correct but it only
+#     REACHED 7 of 86 AX162, and it left the ratchet's source untouched:
+#       * RUNS EVERYWHERE NOW. The old blanket early exit ended the run on any
+#         node with committed <= 1.05x RAM — 68 of 86 — so their floors could
+#         only ever go up. Those are the SAFEST nodes to walk back: an
+#         unsqueezed guest sits at actual==max whatever its floor says, because
+#         a floor is a minimum, not an allocation. Measured on 0000015 (oc 0.79,
+#         all six guests at actual==max): 189 GB of floors, four guests pinned
+#         at 100 % of RAM, ~67 GB of sales budget recoverable there without
+#         taking a byte from anyone. Over-commitment now only decides whether
+#         the RAISE path can mean anything, which it does on its own.
+#       * RAISE ONLY WHAT IS SQUEEZED. A guest already holding ~all its RAM and
+#         still faulting is paging INSIDE itself (-Xmx over plan, oversized
+#         databank); a bigger floor cannot give it anything. Raising anyway is
+#         precisely how floors reached 100 % on nodes that were never
+#         over-committed. Now gated on actual < 98 % of max, which also aligns
+#         the mechanism with the entitlement policy support already applies.
+#       * Bounce accounting fixed: ONE bounce per lower->raise episode. Each
+#         +4G recovery step used to re-count, so vm 1502's single bad probe
+#         scored four bounces and a 336h block instead of 48h.
+#       * First-lower credit 12h -> 24h: canary guests resumed 4.5-5.7 h after
+#         being lowered, one at 1258 faults/s for a few minutes.
 # Original floors persist in /var/lib/neuravps-balloon/floors.json. A VM that
 # arrives already-bumped (migrated in) with no record: original is estimated as
 # min(current_floor, 30% of max) — observed plan floors are ~30% of max.
@@ -96,7 +119,7 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=7
+#NBRVER=8
 set -u
 # v7 (2026-08-16): the walk-back exists again (see header) but stays OFF BY
 # DEFAULT until the 2-node canary (0000008/0000054) proves it converges.
@@ -106,9 +129,17 @@ set -u
 LOWER_ENABLED=${LOWER_ENABLED:-0}
 RAISE_FAULTS_PS=${RAISE_FAULTS_PS:-100}   # sustained faults/s to trigger a raise
 IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
-IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-720}  # idle CREDIT (leaky) before the FIRST
-# lower: 12h of NET idle. v5's 30 min was inside the normal gap between SQX
+IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-1440}  # idle CREDIT (leaky) before the FIRST
+# lower: 24h of NET idle. v5's 30 min was inside the normal gap between SQX
 # backtests, so it kept probing working sets that were coming right back.
+# 12h was still too short, measured on the canary 2026-08-17: three guests
+# earned the full credit and then resumed 4.5-5.7 HOURS after being lowered
+# (vm 1502 at 68 min, vm 1385 at 277, vm 1616 at 337) — one of them thrashing
+# at 1258 faults/s for a few minutes before the raise path caught it, which is
+# a customer feeling something. The population this exists for is idle for
+# DAYS (the back-from-vacation guest), so 24h costs almost none of the prize
+# and moves the probe clear of a working pause. Total decay of a fully idle
+# guest is still ~1 day thanks to the 1h step pacing below.
 LOWER_COOLDOWN_RUNS=${LOWER_COOLDOWN_RUNS:-60}  # calm runs to re-earn between -4G steps (1h)
 REBOUND_WINDOW_S=${REBOUND_WINDOW_S:-86400}   # RAISE within this of our LOWER = bounce
 BACKOFF_BASE_S=${BACKOFF_BASE_S:-172800}      # lower-block after 1st bounce (48h), x2 each
@@ -232,9 +263,9 @@ write_status() {  # $1 = blocked-entries JSON fragment ("" when none)
   local tmp
   tmp=$(mktemp /var/run/.neuravps-balloon-status.XXXXXX) || return 0
   chmod 644 "$tmp"
-  printf '{"ts":%s,"ram_mb":%s,"avail_mb":%s,"committed_mb":%s,"floors_sum_mb":%s,"budget_mb":%s,"pswpin_ps":%s,"psi_io_pct":%s,"blocked":[%s]}\n' \
+  printf '{"ts":%s,"ram_mb":%s,"avail_mb":%s,"committed_mb":%s,"floors_sum_mb":%s,"budget_mb":%s,"pswpin_ps":%s,"psi_io_pct":%s,"overcommitted":%s,"blocked":[%s]}\n' \
     "$now" "$ram_mb" "$avail_mb" "${committed:-0}" "${floors_sum:-0}" "${budget_mb:-0}" \
-    "${pswpin_ps:-0}" "${psi_io_pct:-0}" "$1" > "$tmp"
+    "${pswpin_ps:-0}" "${psi_io_pct:-0}" "${overcommitted:-0}" "$1" > "$tmp"
   mv "$tmp" "$RUN_STATUS"
 }
 
@@ -255,10 +286,25 @@ for pf in /var/run/qemu-server/*.pid; do
   floors_sum=$(( floors_sum + fl ))
 done
 budget_mb=$(( ram_mb * FLOOR_BUDGET_PCT / 100 ))
-# not over-committed -> nothing can squeeze; still export empty rates/status + exit
-if [ "$committed" -le $(( ram_mb * 105 / 100 )) ] || [ "${#CUR_FLOOR[@]}" -eq 0 ]; then
+if [ "${#CUR_FLOOR[@]}" -eq 0 ]; then
   : > "$RUN_RATES"; write_status ""; exit 0
 fi
+# Over-commitment decides whether a guest CAN be squeezed, and therefore
+# whether the RAISE path means anything — but it must NOT gate the whole run.
+#
+# v7 (2026-08-17) removed the blanket early exit that used to end the run here
+# on any node with committed <= 1.05x RAM. That exit froze the ratchet in place
+# on 68 of 86 AX162: floors on those nodes can only ever have gone UP (they were
+# raised while the node was busier, then VMs migrated away), and nothing could
+# ever walk them back. Measured on 0000015 that day — oc 0.79, every guest at
+# actual == max, so NOBODY was squeezed — yet floors summed to 189 GB with four
+# of six guests pinned at 100 % of their RAM as floor. Walking those back to the
+# measured targets releases ~67 GB of SALES budget on that one node while
+# removing not a single MB from any guest: an unsqueezed guest keeps actual==max
+# regardless of its floor, because the floor is a minimum, not an allocation.
+# That is the bulk of the prize this whole mechanism exists for.
+overcommitted=1
+[ "$committed" -le $(( ram_mb * 105 / 100 )) ] && overcommitted=0
 
 # --- previous samples ---
 declare -A P_F P_T P_IDLE P_BLOCKED P_LLOW P_BNC P_BLKU
@@ -275,8 +321,12 @@ chmod 644 "$tmp_rates"
 blocked_json=""
 
 for v in "${!CUR_FLOOR[@]}"; do
-  f1=$(printf 'info balloon\n' | timeout 3 qm monitor "$v" 2>/dev/null | tr -d '\r' \
-        | grep -oE 'major_page_faults=[0-9]+' | cut -d= -f2)
+  # One monitor call, two facts: the fault counter AND how much RAM the guest
+  # currently holds (`actual`). The second one is what tells a SQUEEZED guest
+  # apart from one that is paging with everything we sold it.
+  binfo=$(printf 'info balloon\n' | timeout 3 qm monitor "$v" 2>/dev/null | tr -d '\r')
+  f1=$(printf '%s' "$binfo" | grep -oE 'major_page_faults=[0-9]+' | cut -d= -f2)
+  actual=$(printf '%s' "$binfo" | grep -oE 'actual=[0-9]+' | cut -d= -f2)
   [ -n "$f1" ] || { # QMP hiccup: carry forward prior sample unchanged
     [ -n "${P_F[$v]:-}" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$v" "${P_F[$v]}" "${P_T[$v]}" "${P_IDLE[$v]:-0}" "${P_BLOCKED[$v]:-0}" "${P_LLOW[$v]:-0}" "${P_BNC[$v]:-0}" "${P_BLKU[$v]:-0}" >> "$tmp_samples"
     continue; }
@@ -295,6 +345,20 @@ for v in "${!CUR_FLOOR[@]}"; do
       idle=0   # genuine distress: hard reset is deliberate (only band that does)
       fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
       new=$(( fl + STEP_MB )); [ "$new" -gt "$mx" ] && new=$mx
+      # Only raise a guest the host is actually SQUEEZING. If it already holds
+      # (almost) all of its configured RAM and is still faulting, the paging is
+      # INSIDE the guest — an -Xmx above its plan, a 200 GB databank on a 33 GB
+      # box — and a bigger floor cannot help: it has nothing more to be given.
+      # Raising anyway is how floors reached 100 % of RAM on nodes that were
+      # never even over-committed (measured on 0000015, 2026-08-17: 4 of 6
+      # guests pinned at max with actual == max the whole time). This is the
+      # ratchet's SOURCE, and it matches the entitlement policy support already
+      # follows: a guest with all its RAM that pages is a plan conversation,
+      # not an infrastructure fix.
+      if [ -n "${actual:-}" ] && [ "$actual" -ge $(( mx * 98 / 100 )) ]; then
+        blocked=0   # nothing placement or the floor can do for this guest
+        new=$fl     # fall through to the sample write without touching it
+      fi
       if [ "$new" -gt "$fl" ]; then
         if [ $(( floors_sum + new - fl )) -le "$budget_mb" ] && [ "$avail_mb" -ge "$HOST_FREE_MIN_MB" ]; then
           # remember the ORIGINAL floor before our first touch
@@ -310,6 +374,17 @@ PY
             logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
             # v7 bounce memory: a raise soon after OUR lower means we probed
             # below the real working set — back off exponentially.
+            #
+            # ONE bounce per lower->raise EPISODE, not per raise step. Clearing
+            # last_lower is what enforces that, and it is load-bearing: a guest
+            # that comes back hungry is walked up in +4G steps by the loop
+            # above, and each of those steps used to re-enter this branch. Real
+            # case that exposed it (canary 0000013, 2026-08-17): vm 1502 was
+            # lowered ONCE, then raised four times over 40 min as it recovered,
+            # and scored bounces #1-#4 — escalating its own lower-block from
+            # 48h to 336h and making the fleet-enable bounce metric read 8
+            # bounces on a node that had really had 3 bad probes. Safe in the
+            # conservative direction, but wrong, and it hid the real rate.
             if [ "$last_lower" -gt 0 ] && [ $(( now - last_lower )) -le "$REBOUND_WINDOW_S" ]; then
               bounces=$(( bounces + 1 ))
               if [ "$bounces" -ge 8 ]; then
@@ -320,6 +395,7 @@ PY
               fi
               block_until=$(( now + backoff ))
               logger -t neuravps-balloon " BOUNCE vm $v (raise $(( (now - last_lower) / 60 ))min after lower; bounce #${bounces}) — lower blocked $(( backoff / 3600 ))h"
+              last_lower=0   # episode closed: further raise steps are recovery
             fi
           fi
         else
@@ -347,7 +423,42 @@ d=json.load(open(sys.argv[1])); v=sys.argv[2]; mx=int(sys.argv[3]); fl=int(sys.a
 print(d.get(v, ""))
 PY
 )
-          # only lower what WE raised: no floors.json entry -> hands off.
+          # No floors.json record = we never raised this VM ourselves, so we do
+          # not know its original floor. v4-v7 stopped here ("hands off"), and
+          # that is why the canary on 0000238 did nothing at all: floors.json
+          # was EMPTY while both guests sat pinned at 100 % of their RAM. The
+          # record is lost routinely — a VM migrated in by defrag arrives
+          # without one, and ~13-20 VMs move every day — so "only what we
+          # raised" quietly excludes much of the fleet forever.
+          #
+          # v8 seeds the estimate the header has documented since v2 but nobody
+          # implemented: min(current floor, 30 % of max), 30 % being the plan
+          # baseline these floors started from. It is only a LOWER BOUND for
+          # floor_target, which still refuses to go under the plan's measured
+          # settle point, so seeding can never decay a guest below what its plan
+          # is known to need.
+          #
+          # Deliberately gated to UNDER-COMMITTED nodes. There a guest sits at
+          # actual == max no matter what its floor says, so seeding + decaying
+          # takes nothing from it today and is reversible with budget to spare.
+          # On an over-committed node a lowered guest can be squeezed within the
+          # minute, so there the strict rule stays: touch only what we raised
+          # and whose original we recorded. Same asymmetry as the rest of v7 —
+          # free moves everywhere, cautious moves only where they are safe.
+          if [ -z "$orig" ] && [ "$overcommitted" = 0 ]; then
+            est=$(( mx * 30 / 100 ))
+            [ "$fl" -lt "$est" ] && est=$fl
+            python3 - "$FLOORS" "$v" "$est" <<'PY'
+import json,sys
+p,v,est=sys.argv[1],sys.argv[2],int(sys.argv[3])
+d=json.load(open(p))
+if v not in d:
+    d[v]=est
+    json.dump(d,open(p,"w"))
+PY
+            orig=$est
+            logger -t neuravps-balloon " SEED vm $v original floor estimated ${est}MB (no record; node not over-committed, guest at its max)"
+          fi
           # v7: the target is the plan's measured settle floor, never `orig`.
           if [ -n "$orig" ]; then
             tgt=$(floor_target "$mx" "$orig")
