@@ -1,0 +1,16 @@
+[Unit]
+Description=NeuraVPS: refresco horario de los instaladores de los invitados
+
+[Timer]
+# Una vez por hora y por base = 2 peticiones/hora a GitHub en toda la flota,
+# en vez de una por cada VM aprovisionada o reinstalada.
+OnCalendar=hourly
+# Repartido a proposito: las dos bases no deben pedirlo a la vez.
+RandomizedDelaySec=900
+Persistent=true
+# Al arrancar, sin esperar a la hora en punto: una base recien reinstalada
+# tiene que poder servir instaladores desde el primer minuto.
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target
