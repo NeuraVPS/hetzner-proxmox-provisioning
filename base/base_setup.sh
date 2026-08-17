@@ -135,6 +135,33 @@ mkdir -p /etc/nftables.d
 # NADA: la base arrancaria sin cortafuegos y sin DNAT.
 [ -f /etc/nftables.d/base-nat-sin-internet.nft ] || : > /etc/nftables.d/base-nat-sin-internet.nft
 
+# --- Instaladores que la base sirve a los invitados --------------------------
+# Cada VM se bajaba su instalador de raw.githubusercontent.com al aprovisionarse
+# y al reinstalarse. Con la conversion de salida, las 1876 VMs comparten las dos
+# IPv4 de las bases, asi que el limite por IP de GitHub —que antes se repartia
+# entre 227 IPs de nodo— pasa a caer entero sobre dos. Ya nos mordio: la
+# instalacion de MT de la vm520 fallo con 429 el 2026-07-08.
+#
+# GitHub sigue siendo la fuente de verdad; lo que cambia es quien pregunta: la
+# base refresca su copia UNA VEZ POR HORA y los invitados la piden a ella, sin
+# salir a Internet y por IPv6 (que GitHub ni tiene).
+#
+# ⚠️ Sin esto, una base recien instalada sirve 404 a los invitados y TODA alta
+# que caiga en su region falla en la instalacion del programa.
+for f in nvx-installers.sh nvx-installers.service nvx-installers.timer; do
+  case "$f" in
+    *.sh) destino=/usr/local/sbin/$f ;;
+    *)    destino=/etc/systemd/system/$f ;;
+  esac
+  curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/$f" -o "$destino"
+done
+chmod 755 /usr/local/sbin/nvx-installers.sh
+systemctl daemon-reload
+systemctl enable --now nvx-installers.timer
+# Primera siembra inmediata: el timer no dispara hasta la hora en punto y una
+# base nueva tiene que poder servir instaladores desde ya.
+/usr/local/sbin/nvx-installers.sh || echo "AVISO: los instaladores no quedaron sembrados; revisar antes de aprovisionar en esta region"
+
 # 4b) veth-host.service: tiny early-boot oneshot that creates the
 # `veth-host` netdev pair before nftables.service loads. The flowtable
 # in /etc/nftables.conf references this device; loading the ruleset

@@ -1,0 +1,10 @@
+[Unit]
+Description=NeuraVPS: refresca los instaladores que sirven las bases a los invitados
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nvx-installers.sh
+# Idempotente y con modo degradado: si GitHub no contesta conserva la copia
+# anterior y sale 0. Solo falla si algun fichero no existe en absoluto.
