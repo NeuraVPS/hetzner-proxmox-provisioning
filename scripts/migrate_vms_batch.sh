@@ -312,9 +312,13 @@ trap _on_exit EXIT
 #   0  OK (printed)
 #   99 source == destination (no-op)
 #   1  any other failure (message on stderr)
+# Same identity prefix migrate_vm.sh uses (keep the two in step).
+IDENT_PREFIX="${IDENT_PREFIX:-2a01:4f9:c01f:e::/64}"
+
 _resolve_pair() {
   VMID="$1" NEW_NODE_NUM="$2" \
   PVE_NODES_FILE="$PVE_NODES_FILE" STATE_FILE="$STATE_FILE" \
+  IDENT_PREFIX="$IDENT_PREFIX" \
   python3 - <<'PY'
 import ipaddress, json, os, sys
 
@@ -348,15 +352,42 @@ try:
 except ValueError:
     fail(f"vmid {vmid} bad ipv6: {old_ipv6!r}")
 
-src = None
-for h, ip in nodes.items():
+# The identity model BREAKS the /64 trick: a VM's address no longer derives
+# from its node -- that is the entire point of the project -- so no node shares
+# a /64 with it and this pairing cannot work. `nodeId` is authoritative;
+# sync-base-nat.py writes it into state.json from Firestore and migrate_vm.sh
+# updates it at the end of every migration. migrate_vm.sh already resolved it
+# this way; the BATCH runner was missed, and because a skipped job still exits
+# rc=0 with "no runnable jobs", the DAILY DEFRAG SILENTLY MOVED NOTHING from
+# 2026-08-15 until this was found on the 18th -- 40/40 jobs skipped every
+# morning while the Firestore record still said status="done".
+ident_prefix = (os.environ.get("IDENT_PREFIX") or "").strip()
+es_modelo_nuevo = False
+if ident_prefix:
     try:
-        if prefix64(ip) == src_net:
-            src = (h, ip); break
+        es_modelo_nuevo = ipaddress.ip_address(old_ipv6) in ipaddress.ip_network(ident_prefix)
     except ValueError:
-        continue
-if not src:
-    fail(f"vmid {vmid}: no node shares /64 with {old_ipv6}")
+        pass
+
+src = None
+if es_modelo_nuevo:
+    node_id = (vm.get("nodeId") or "").strip()
+    if not node_id:
+        fail(f"vmid {vmid} es del modelo nuevo ({old_ipv6}) pero no tiene nodeId "
+             f"en state.json -- corre `sync-base-nat.py sync` y reintenta")
+    if node_id not in nodes:
+        fail(f"vmid {vmid} dice estar en {node_id}, que no esta en "
+             f"pve_nodes.json -- corre `sync-base-nat.py sync nodes`")
+    src = (node_id, nodes[node_id])
+else:
+    for h, ip in nodes.items():
+        try:
+            if prefix64(ip) == src_net:
+                src = (h, ip); break
+        except ValueError:
+            continue
+    if not src:
+        fail(f"vmid {vmid}: no node shares /64 with {old_ipv6}")
 src_node, _ = src
 
 if src_node == dst_node:
