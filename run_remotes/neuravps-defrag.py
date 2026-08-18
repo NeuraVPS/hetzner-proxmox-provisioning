@@ -731,6 +731,25 @@ def main():
                     fail = int(tok[5:])
     log(f"batch done rc={p.returncode} ok={ok} fail={fail}")
 
+    # A batch that migrated NOTHING while we handed it work is broken plumbing,
+    # not a quiet day — and it is invisible without this check: a job the runner
+    # cannot resolve is SKIPPED, the runner still exits rc=0 ("no runnable
+    # jobs"), and the run is journalled status="done" with ok=0. That is exactly
+    # how the identity-IPv6 change silently stopped every fleet migration from
+    # 2026-08-15 to the 18th while the record looked healthy. Shout instead.
+    if verified and ok == 0 and fail == 0:
+        log(f"ALERTA: se entregaron {len(verified)} migracion(es) al batch y NO se "
+            f"ejecuto ninguna (ok=0 fail=0, rc={p.returncode}). El runner las esta "
+            f"SALTANDO — revisa {LOG_DIR} y la resolucion de nodo origen; el defrag "
+            f"no esta reorganizando nada.")
+        try:
+            db.collection("defrag_runs").document(run_id).set(
+                {"batchNoop": True,
+                 "batchNoopDetail": f"handed {len(verified)}, executed 0 (rc={p.returncode})"},
+                merge=True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     # ---- refresh counters for touched nodes (panel reads these live) ----
     touched = sorted({m[1] for m in verified} | {m[2] for m in verified})
     agg = {t: {"usedCores": 0, "usedVms": 0, "usedDiskGb": 0,
