@@ -121,12 +121,21 @@
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
 #NBRVER=8
 set -u
-# v7 (2026-08-16): the walk-back exists again (see header) but stays OFF BY
-# DEFAULT until the 2-node canary (0000008/0000054) proves it converges.
-# first_boot.sh curls THIS FILE from master onto every new node, so the
-# default has to be the safe one; set LOWER_ENABLED=1 in
-# /etc/default/neuravps-balloon-reconciler per node to enable.
-LOWER_ENABLED=${LOWER_ENABLED:-0}
+# ON BY DEFAULT since 2026-08-19, after v8 ran the whole fleet clean.
+# It was 0 through v7/v8's canary for the right reason — first_boot.sh curls
+# THIS FILE from master onto every new node, so an unproven default would have
+# shipped itself everywhere. That reason is now spent, and leaving it at 0 has
+# the opposite failure: the 86 live nodes carry LOWER_ENABLED=1 in
+# /etc/default, but a NEW node — or any node REINSTALLED, which wipes /etc —
+# would come back silently never decaying, and nothing would report the
+# difference. A fleet that only works because someone remembered a manual step
+# drifts the moment nobody remembers.
+# Evidence for flipping it: 48h two-node canary (17 lowers, 2 bounces, PSI 0),
+# then 86/86 fleet-wide with 89 lowers / 4 raises / ZERO bounces and memory PSI
+# max 0.01 in the first 40 minutes.
+# Set LOWER_ENABLED=0 in /etc/default/neuravps-balloon-reconciler to disable on
+# a node; that file still wins over this default.
+LOWER_ENABLED=${LOWER_ENABLED:-1}
 RAISE_FAULTS_PS=${RAISE_FAULTS_PS:-100}   # sustained faults/s to trigger a raise
 IDLE_FAULTS_PS=${IDLE_FAULTS_PS:-5}       # below this counts as idle
 IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-1440}  # idle CREDIT (leaky) before the FIRST
