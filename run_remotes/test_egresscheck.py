@@ -140,6 +140,29 @@ class Analiza(unittest.TestCase):
         self.assertFalse(self._ana("")[0])
 
 
+class LaMedidaViajaConElVeredicto(unittest.TestCase):
+    """Sin el número, el aviso dice "lento" y no cuánto — que es el dato que lo
+    justifica y el único con el que se puede calibrar el umbral. Pasó el
+    2026-08-20 con la vm773: saltó la alerta, se resolvió sola en una hora, y no
+    había forma de saber si habían sido 3,1 segundos o 25."""
+
+    def test_el_detalle_incluye_la_salida_cruda(self):
+        sal = (f"v4g=200/{eg.BYTES}/6.49/0 v4p=200/{eg.BYTES_MIN}/0.02/0 "
+               f"v6g=200/{eg.BYTES}/0.09/0 v6p=200/{eg.BYTES_MIN}/0.02/0 dns=1.2.3.4")
+        _ok, det = eg.analiza(sal)
+        self.assertEqual(sal, det["medida"])
+        self.assertIn("6.49", det["medida"], "el tiempo que disparó la alerta")
+
+    def test_tambien_cuando_todo_va_bien(self):
+        # Una medida sana también sirve: es la línea base contra la que se
+        # decide si el umbral está bien puesto.
+        sal = (f"v4g=200/{eg.BYTES}/0.09/0 v4p=200/{eg.BYTES_MIN}/0.02/0 "
+               f"v6g=200/{eg.BYTES}/0.09/0 v6p=200/{eg.BYTES_MIN}/0.02/0 dns=1.2.3.4")
+        ok, det = eg.analiza(sal)
+        self.assertTrue(ok)
+        self.assertEqual(sal, det["medida"])
+
+
 class ParametrosQueNoDebenBajar(unittest.TestCase):
     def test_el_grande_llena_varios_segmentos(self):
         # Con menos de ~16 KB la descarga cabe en pocos segmentos y un camino

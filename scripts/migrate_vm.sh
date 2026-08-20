@@ -134,7 +134,14 @@ DOWNTIME_ESCALATE_HARD_S="${DOWNTIME_ESCALATE_HARD_S:-600}"  # RAM-phase seconds
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
 RDP_GUEST_PORT="${RDP_GUEST_PORT:-3389}"
-CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-120}"  # seconds — RDP listener can take a moment after the in-guest IPv6 rebind
+CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-420}"  # seconds — RDP listener can take a moment after the in-guest IPv6 rebind.
+# 120 was too short and it cried wolf: the defrag run of 2026-08-19 logged 24
+# "VM unreachable ... check the network interface" warnings on a run where every
+# single VM was fine (all 30 verified answering RDP minutes later). Windows can
+# take several minutes to bring the RDP listener back after a cutover, so the
+# probe was reporting its own impatience as a customer outage — and an alert
+# that its own evidence contradicts is worse than no alert, because it teaches
+# whoever reads it to skip the real ones.
 POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
