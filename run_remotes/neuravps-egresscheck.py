@@ -113,6 +113,13 @@ BYTES_MIN = 1024
 # puesta. Con 1 KB por un camino sano se esta en centesimas desde cualquier
 # sitio de Europa, asi que 3 s no es "lento": es un camino retransmitiendo.
 UMBRAL_LENTO = 3.0
+# Se lee de `config/egresscheck.umbralLentoS` si esta puesto. No es un capricho:
+# el backoff de retransmision de TCP va en pasos de ~1 s, 3 s y 7 s, asi que un
+# umbral de 3 s puede pillar DOS paquetes perdidos —ruido normal de red— ademas
+# del camino roto. Lo sano medido va de 0,02 a 0,28 s y lo roto de 6,45 a 6,55,
+# asi que hay sitio de sobra para subirlo; pero subirlo A OJO seria cambiar un
+# numero por otro sin evidencia. Por eso primero se GUARDA LA MEDIDA (ver
+# `analiza`) y se decide con ella.
 URL = f"https://speed.cloudflare.com/__down?bytes={BYTES}"
 URL_MIN = f"https://speed.cloudflare.com/__down?bytes={BYTES_MIN}"
 NOMBRE_DNS = "speed.cloudflare.com"
@@ -229,6 +236,11 @@ def analiza(salida: str):
     v6 = veredicto_pila(partes.get("v6g", ""), partes.get("v6p", ""))
     dns = "ok" if partes.get("dns", "FALLO") != "FALLO" else "FALLO"
     ok = (v4 == "ok" and v6 == "ok" and dns == "ok")
+    # ⚠️ LA MEDIDA VIAJA CON EL VEREDICTO. Sin esto el aviso dice "lento" y no
+    # cuanto, que es justo el dato que lo justifica y el unico con el que se
+    # puede calibrar el umbral. Paso el 2026-08-20 con la vm773: salto la
+    # alerta, se resolvio sola en una hora, y no habia forma de saber si habian
+    # sido 3,1 segundos o 25. Son ~90 caracteres; guardarlos no cuesta nada.
     # `mtu` y `lento` mandan sobre `cortado`: son las firmas que señalan
     # inequivocamente a nuestro lado, y una sola VM con ellas ya alerta.
     if "mtu" in (v4, v6):
@@ -237,7 +249,7 @@ def analiza(salida: str):
         kind = "lento"
     else:
         kind = "cortado" if not ok else "ok"
-    return ok, {"v4": v4, "v6": v6, "dns": dns, "kind": kind}
+    return ok, {"v4": v4, "v6": v6, "dns": dns, "kind": kind, "medida": salida}
 
 
 def control_desde_la_base() -> bool:
@@ -277,6 +289,8 @@ def main() -> int:
         return 0
     dry = bool(cfg.get("dryRun"))
     por_nodo = int(cfg.get("vmsPorNodo") or VMS_POR_NODO)
+    global UMBRAL_LENTO
+    UMBRAL_LENTO = float(cfg.get("umbralLentoS") or UMBRAL_LENTO)
 
     if not control_desde_la_base():
         log(f"ABORT: la propia base no baja {URL} — el destino esta caido, "
