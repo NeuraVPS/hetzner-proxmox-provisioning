@@ -81,6 +81,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -134,6 +135,11 @@ EXPECTED_FLOOR = {"mt": 2.0, "mt-plus": 4.0, "vps-a": 9.7, "vps-b": 11.9,
                   "vps-c": 15.5, "vps-d": 25.2, "vps-e": 52.2}
 WORST_FLOOR = max(EXPECTED_FLOOR.values())
 MIN_STRANDED = 5.0
+# How often the run doc gets a liveness beat while the batch runs. Small
+# enough that "the service died" is visible in minutes, large enough that a
+# 9 h batch costs ~110 Firestore writes and not 10.000.
+_HEARTBEAT_S = 300
+
 BATCH = "/root/migrate_vms_batch.sh"
 LOG_DIR = "/var/log/migrate_vm/defrag"
 RECENT_FILE = "/var/lib/neuravps-defrag-recent.json"
@@ -397,6 +403,18 @@ def main():
         ordered = head + tail
         for v in ([v for v in ordered if v["vmid"] not in recent_vmids]
                   + [v for v in ordered if v["vmid"] in recent_vmids]):
+            # Never hand the same VM to the batch twice. book() rebinds
+            # sn["vms"] to a fresh list, but every pass materializes its
+            # candidates BEFORE iterating, so a booked VM survives inside the
+            # local list and can be booked again for a second destination.
+            # Run 20260820-0630 did exactly that: vm 1269 was planned
+            # 0000237->0000046 AND 0000237->0000223. The first move won, the
+            # second could only fail ("not found on source") and paged the
+            # operator a 🔴 FALLIDA for a fleet that was working correctly.
+            # Worse than the noise: the planner had already counted 1269's RAM
+            # as relief for 0000237 twice, so it believed it freed double.
+            if v["vmid"] in booked:
+                continue
             if v.get("st") == "running" and not agent_alive(nid, v["vmid"]):
                 log(f"victim-skip vm {v['vmid']} ({nid}): guest agent no "
                     f"contesta — el reconfig IPv6 fallaría; probando la siguiente")
@@ -404,6 +422,7 @@ def main():
             yield v
 
     moves = []   # (vmid, src_id, dst_id, reason)
+    booked = set()   # vmids already planned this run — order_victims skips them
 
     def book(vm, src, dst, reason):
         sn, dn = nodes[src], nodes[dst]
@@ -414,6 +433,7 @@ def main():
         dn["fl"] += vm["fl"]
         dn["cores"] += vm["cores"]
         sn["vms"] = [v for v in sn["vms"] if v["vmid"] != vm["vmid"]]
+        booked.add(vm["vmid"])
         moves.append((vm["vmid"], src, dst, reason))
 
     # ---- relief mode: harm-targeted intra-day pass (see module docstring) ----
@@ -715,21 +735,102 @@ def main():
 
     os.makedirs(LOG_DIR, exist_ok=True)
     pairs = "/root/defrag_pairs.txt"
+    # Second line of defence behind the `booked` guard in order_victims: a
+    # duplicate vmid reaching the batch costs a guaranteed FAIL and a false
+    # 🔴 alert, so it is worth asserting at the boundary too.
+    seen_vmids = set()
+    deduped = []
+    for mv in verified:
+        if mv[0] in seen_vmids:
+            log(f"plan-dedup: vm {mv[0]} ya estaba planificado — descartando "
+                f"el segundo destino ({mv[2]})")
+            continue
+        seen_vmids.add(mv[0])
+        deduped.append(mv)
+    verified = deduped
     with open(pairs, "w") as f:
         for vmid, _s, dst, _r in verified:
             f.write(f"{vmid} {int(dst.split('-')[0])}\n")
     log(f"executing {len(verified)} migration(s) via {BATCH}")
-    p = subprocess.run(["bash", BATCH, "-f", pairs, "-c", "1", "-m", "2",
-                        "-l", LOG_DIR], capture_output=True, text=True)
+    run_ref = db.collection("defrag_runs").document(run_id)
+
+    # STREAM the batch; do not block on it. A full day is ~9 h of wall clock —
+    # a VPS E drags ~300 GB of disk over a 1 Gbit link, so ~48 min of storage
+    # copy before the 60 GiB of RAM state even starts (measured on vm1910,
+    # 2026-08-20). With the old capture_output=True the run doc sat at
+    # status="planned"/executed=0 for that entire ride, so the stall check —
+    # which reads exactly those fields — paged ATASCADA on every long-but-
+    # healthy batch. 20260820-0630 did it with 27 OK and 2 still in flight.
+    #
+    # Two DIFFERENT timestamps, because there are two different failures and
+    # one cannot stand in for the other:
+    #   heartbeatAt    — the defrag process is alive (ticked on a timer)
+    #   lastProgressAt — a migration actually finished (ticked on OK/FAIL)
+    # A dead service freezes both. A hung migrate_vm.sh child freezes only
+    # lastProgressAt while the parent keeps breathing, and that is the case
+    # the old single-timestamp check could never name.
+    proc = subprocess.Popen(
+        ["bash", BATCH, "-f", pairs, "-c", "1", "-m", "2", "-l", LOG_DIR],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+    stop_beat = threading.Event()
+
+    def _beat() -> None:
+        while not stop_beat.wait(_HEARTBEAT_S):
+            try:
+                run_ref.update({"heartbeatAt": firestore.SERVER_TIMESTAMP})
+            except Exception:  # pylint: disable=broad-except
+                pass          # a lost beat is not worth killing the batch over
+
+    run_ref.update({"status": "running",
+                    "heartbeatAt": firestore.SERVER_TIMESTAMP,
+                    "lastProgressAt": firestore.SERVER_TIMESTAMP})
+    beat = threading.Thread(target=_beat, daemon=True)
+    beat.start()
+
+    out_lines = []
+    live_ok = live_fail = 0
+    try:
+        for ln in proc.stdout:                      # type: ignore[union-attr]
+            ln = ln.rstrip("\n")
+            out_lines.append(ln)
+            tok = ln.split()
+            # batch log() format: "<ts> OK   vmid=..." / "<ts> FAIL vmid=..."
+            if len(tok) > 1 and tok[1] in ("OK", "FAIL") and "vmid=" in ln:
+                if tok[1] == "OK":
+                    live_ok += 1
+                else:
+                    live_fail += 1
+                try:
+                    run_ref.update({"executed": live_ok + live_fail,
+                                    "ok": live_ok, "fail": live_fail,
+                                    "heartbeatAt": firestore.SERVER_TIMESTAMP,
+                                    "lastProgressAt": firestore.SERVER_TIMESTAMP})
+                except Exception:  # pylint: disable=broad-except
+                    pass
+    finally:
+        stop_beat.set()
+        proc.wait()
+
     ok = fail = 0
-    for ln in p.stdout.splitlines():
+    saw_summary = False
+    for ln in out_lines:
         if "SUMMARY" in ln:
-            for tok in ln.split():
-                if tok.startswith("ok="):
-                    ok = int(tok[3:])
-                if tok.startswith("fail="):
-                    fail = int(tok[5:])
-    log(f"batch done rc={p.returncode} ok={ok} fail={fail}")
+            saw_summary = True
+            for t in ln.split():
+                if t.startswith("ok="):
+                    ok = int(t[3:])
+                if t.startswith("fail="):
+                    fail = int(t[5:])
+    # No SUMMARY means the batch was killed mid-flight (systemd TimeoutStartSec,
+    # OOM, operator). The streamed counts are then the only honest record — the
+    # old code left ok=fail=0 there, which the batchNoop guard below reads as
+    # "the runner executed nothing" and shouts about plumbing that is fine.
+    if not saw_summary:
+        ok, fail = live_ok, live_fail
+    p = proc
+    log(f"batch done rc={p.returncode} ok={ok} fail={fail}"
+        + ("" if saw_summary else " (no SUMMARY — batch cut short; streamed counts)"))
 
     # A batch that migrated NOTHING while we handed it work is broken plumbing,
     # not a quiet day — and it is invisible without this check: a job the runner
