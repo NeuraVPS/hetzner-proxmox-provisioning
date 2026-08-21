@@ -107,6 +107,40 @@ from firebase_admin import credentials, firestore
 # (audit 2026-07-31). Destination margins and over-gate corrections keep
 # using FLOOR: existing VMs are deliberately packed tighter than we sell.
 COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.90, 0.80
+# Ocupacion REAL del pool por encima de la cual un nodo deja de valer como
+# DESTINO. Es el mismo numero y la misma fuente que usa la venta
+# (auto_provision._DISK_REAL_MAX_PCT, alimentado por proxmox_nodes.zpoolCapPct),
+# y eso es deliberado: no tiene sentido que la venta se niegue a poner una VM
+# en un nodo y el rebalanceador se la mande igual media hora despues.
+#
+# ⚠️ ESTO NO REDUCE CUANTAS VMs CABEN EN UN NODO. No es un gate de venta y no
+# toca capacityGates: solo decide donde ATERRIZA una VM que ya se iba a mover
+# de todas formas. El sobrecompromiso de la flota (112% de media, permitido
+# hasta 180% por sqxDiskThinFactor) se queda exactamente donde esta.
+#
+# Por que hace falta: pick_dest filtraba por RAM y cores y no miraba disco en
+# absoluto, asi que podia amontonar VMs en un nodo que se esta llenando. Medido
+# el 2026-08-21 en 0000199-AX102-1, el mas lleno de la flota: 82% de pool, 71%
+# de fragmentacion (media de la flota 30%), presion de E/S 3,11 frente a
+# 0,10-0,25 de sus iguales y latencia de lectura de 313 us frente a 104-209.
+# Degradacion medible, no teorica.
+#
+# FAIL-OPEN a proposito: un nodo cuya ocupacion aun no ha sincronizado NO puede
+# volverse incolocable. Misma regla que usa la base de RAM.
+DISK_REAL_MAX_PCT = 80.0
+
+
+def disk_ok(n):
+    """False si el pool del destino esta realmente cerca de lleno.
+
+    Desconocido -> True: ver la nota de DISK_REAL_MAX_PCT sobre el fail-open.
+    Un nodo cuya ocupacion no ha sincronizado no debe quedarse sin destinos.
+
+    A nivel de modulo y no anidada en main() para que se pueda probar: no
+    necesita nada del contexto, solo el dict del nodo.
+    """
+    pct = n.get("zpool_pct")
+    return pct is None or pct < DISK_REAL_MAX_PCT
 # Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
 # max(ram_min, ram_min_observed), the same number auto_provision reserves).
 # vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
@@ -260,6 +294,10 @@ def main():
             "status": str(d.get("status") or "").strip(),
             "g": float(d.get("max_base_ram") or d.get("gbRam") or 0),
             "cap": int(d.get("max_cores") or 0),
+            # Ocupacion real del pool, la escribe node_health en el doc del nodo.
+            # None = todavia no sincronizada, y entonces no bloquea (fail-open).
+            "zpool_pct": (float(d["zpoolCapPct"])
+                          if d.get("zpoolCapPct") is not None else None),
             "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [], "n_all": 0,
         }
     for s in db.collection("servers").stream():
@@ -296,6 +334,7 @@ def main():
     def placeable(n):
         return not n["frozen"] and not n["status"]
 
+
     def pick_dest(model, ram, fl, cores, exclude, tidy=True):
         """tidy=False drops the leftover_clean() packing rule. Relief passes
         False: that rule exists to keep the fleet SELLABLE, and trading
@@ -308,6 +347,8 @@ def main():
         best = None
         for did, dn in nodes.items():
             if dn["model"] != model or did in exclude or not placeable(dn):
+                continue
+            if not disk_ok(dn):
                 continue
             if model == "SQX":
                 if dn["g"] <= 0:
