@@ -1296,9 +1296,41 @@ else
   _warn "$SYNC_BASE_NAT not executable; skipping local NAT reconcile."
 fi
 
-# Reachability check: probe the VM's IPv6 directly on RDP (3389) from BASE.
-# BASE routes the VM's /48 (that's how NAT64 works), so no hairpin — this
-# tests "Windows brought the new IPv6 up and RDP is listening". Soft warning;
+
+# Firestore: nodeId + ipv6 (ultima ESCRITURA; debajo solo queda comprobar).
+# Gated on NAT_OK so
+# we don't claim the VM lives on the new node until NAT actually points there.
+# If we skip, the doc keeps the old nodeId, signalling
+# "in-flux" so a re-run can reconcile.
+if (( NAT_OK == 1 )); then
+  _info "Updating Firestore servers/{${VMID}}: nodeId=${DST_NODE}, ipv6=${EXPECTED_VM_IPV6}…"
+  fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6")
+  if _firestore_update_servers "${fs_args[@]}"; then
+    _ok "Firestore updated."
+  else
+    _warn "Firestore update failed. Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} to retry."
+  fi
+else
+  _warn "Skipping Firestore nodeId update (NAT reconcile failed). Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} once $SYNC_BASE_NAT is working."
+fi
+
+# Comprobacion de alcance: se llama al RDP (3389) del invitado por su IPv6
+# desde la BASE.
+#
+# VA DESPUES DE ESCRIBIR EN FIRESTORE, Y ESE ORDEN ES TODO EL ASUNTO. La BASE
+# llega a cada invitado por una ruta /128 clavada al tunel de su nodo
+# (tun-fpNNN), y lo unico que reapunta esa ruta es el disparador de Firestore
+# al ver el `nodeId` que se acaba de escribir arriba. Mientras la sonda corria
+# ANTES de esa escritura estaba mandando paquetes por el tunel del nodo que la
+# VM acababa de abandonar, asi que no podia salir bien nunca: 31/31, 35/35 y
+# 39/39 migraciones la "fallaron" el 19, 20 y 21-08-2026, todas con el cliente
+# perfectamente conectado. Ademas costaba 420s cada vez — mas de dos horas
+# sumadas a cada pasada de defrag, esperando por una ruta que el propio script
+# todavia no habia puesto.
+#
+# Un aviso que salta en el 100% de las pasadas no es un aviso estricto, es un
+# aviso mudo: el cliente que SI se queda incomunicado tiene el mismo aspecto
+# que los otros treinta. Aqui abajo, cuando avisa, quiere decir algo.
 # does not gate Firestore. Skipped for non-Windows guests (3389 is RDP).
 if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/dev/null; then
   _info "Probing [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} from BASE (retrying up to ${CONNECTIVITY_TIMEOUT}s)…"
@@ -1336,24 +1368,8 @@ if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/
     if (( MIGRATION_DEGRADED == 1 )); then
       DEGRADED_REASON="${DEGRADED_REASON}; RDP also never came up after ${CONNECTIVITY_TIMEOUT}s"
     fi
-    _warn "VM ${VMID} unreachable on [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} after ${CONNECTIVITY_TIMEOUT}s. Most likely the in-guest IPv6 reconfig didn't apply — check the VM's network interface on ${DST_NODE}."
+    _warn "La VM ${VMID} no contesta en [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} tras ${CONNECTIVITY_TIMEOUT}s, con la ruta ya reapuntada a ${DST_NODE}. Por si solo no prueba dano: rdpEnabled=false y un Windows que aun arranca se ven igual que esto. Pero si el cliente dice que no entra, esta es su VM."
   fi
-fi
-
-# Firestore: nodeId + ipv6 (LAST step). Gated on NAT_OK so
-# we don't claim the VM lives on the new node until NAT actually points there.
-# If we skip, the doc keeps the old nodeId, signalling
-# "in-flux" so a re-run can reconcile.
-if (( NAT_OK == 1 )); then
-  _info "Updating Firestore servers/{${VMID}}: nodeId=${DST_NODE}, ipv6=${EXPECTED_VM_IPV6}…"
-  fs_args=(--vmid "$VMID" --node-id "$DST_NODE" --ipv6 "$EXPECTED_VM_IPV6")
-  if _firestore_update_servers "${fs_args[@]}"; then
-    _ok "Firestore updated."
-  else
-    _warn "Firestore update failed. Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} to retry."
-  fi
-else
-  _warn "Skipping Firestore nodeId update (NAT reconcile failed). Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} once $SYNC_BASE_NAT is working."
 fi
 
 # Cleanup the migration token (only if we created it this run).

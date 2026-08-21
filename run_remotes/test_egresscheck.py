@@ -163,6 +163,66 @@ class LaMedidaViajaConElVeredicto(unittest.TestCase):
         self.assertEqual(sal, det["medida"])
 
 
+class UnInvitadoOCUPADONoEsUnaREDLENTA(unittest.TestCase):
+    """La sonda corre `curl` DENTRO del invitado. Un invitado con la CPU al tope
+    hace que se planifique tarde y el reloj marque segundos que no son de red.
+
+    Pasó el 2026-08-21 con la vm587: saltó "salida a Internet rota" en el nodo
+    0000223 y lo que había era StrategyQuant llevando 2.303 HORAS de CPU al
+    100% — el cliente usando el servidor exactamente para lo que lo compró. Las
+    otras 13 VMs del mismo nodo dieron 222 medidas sin una sola lenta.
+
+    Confundir las dos cosas convierte a cada cliente que exprime su VPS en una
+    falsa alarma, y tres falsas alarmas seguidas enseñan a ignorar el aviso.
+    """
+
+    def _sal(self, tp, cpu):
+        return (f"v4g={G_OK} v4p=200/{eg.BYTES_MIN}/{tp}/0 "
+                f"v6g={G_OK} v6p={P_OK} dns=1.2.3.4 cpu={cpu}")
+
+    def test_lento_con_la_CPU_al_tope_NO_es_fallo(self):
+        ok, det = eg.analiza(self._sal("6.50", 100))
+        self.assertTrue(ok, "un invitado saturado no puede acusar a la red")
+        self.assertEqual("no_concluyente", det["kind"])
+        self.assertEqual(100, det["cpuInvitado"])
+
+    def test_lento_con_la_CPU_TRANQUILA_si_es_fallo(self):
+        ok, det = eg.analiza(self._sal("6.50", 12))
+        self.assertFalse(ok)
+        self.assertEqual("lento", det["kind"])
+
+    def test_el_caso_REAL_de_la_vm587(self):
+        # La medida literal que disparó el aviso, más su CPU real.
+        sal = ("v4g=200/32768/0.215979/0 v4p=200/1024/3.605303/0 "
+               "v6g=200/32768/0.162943/0 v6p=200/1024/0.111383/0 "
+               "dns=172.66.0.218 cpu=100")
+        ok, det = eg.analiza(sal)
+        self.assertTrue(ok, "no debería haber avisado")
+        self.assertEqual("no_concluyente", det["kind"])
+
+    def test_MTU_sigue_siendo_fallo_por_saturada_que_este(self):
+        # LO IMPORTANTE. Ninguna carga de CPU puede hacer que 1 KB pase y 32 KB
+        # no: esa firma es infalsificable y tiene que seguir alertando aunque el
+        # invitado esté al 100%. Si esto se rompiera, la excusa de la CPU
+        # taparía la única avería que sabemos diagnosticar con certeza.
+        sal = (f"v4g={TRUNCADO} v4p={P_OK} v6g={G_OK} v6p={P_OK} "
+               f"dns=1.2.3.4 cpu=100")
+        ok, det = eg.analiza(sal)
+        self.assertFalse(ok)
+        self.assertEqual("mtu", det["kind"])
+
+    def test_sin_dato_de_CPU_se_comporta_como_antes(self):
+        # Invitados con la sonda vieja, o donde el WMI falle: -1 no debe
+        # silenciar nada.
+        ok, det = eg.analiza(self._sal("6.50", -1))
+        self.assertFalse(ok)
+        self.assertEqual("lento", det["kind"])
+
+    def test_el_umbral_deja_margen_a_un_invitado_que_oscila(self):
+        self.assertGreaterEqual(eg.CPU_INVITADO_SATURADO, 85)
+        self.assertLess(eg.CPU_INVITADO_SATURADO, 100)
+
+
 class ParametrosQueNoDebenBajar(unittest.TestCase):
     def test_el_grande_llena_varios_segmentos(self):
         # Con menos de ~16 KB la descarga cabe en pocos segmentos y un camino

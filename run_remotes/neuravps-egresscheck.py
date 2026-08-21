@@ -113,6 +113,12 @@ BYTES_MIN = 1024
 # puesta. Con 1 KB por un camino sano se esta en centesimas desde cualquier
 # sitio de Europa, asi que 3 s no es "lento": es un camino retransmitiendo.
 UMBRAL_LENTO = 3.0
+# Por encima de esta CPU en el invitado, un veredicto `lento` NO se cree: no se
+# puede separar una red lenta de un `curl` que no llega a ejecutarse a tiempo.
+# 90% y no 100% porque un invitado exprimido oscila. `mtu` SIGUE valiendo por
+# encima de este umbral: ninguna carga de CPU puede hacer que 1 KB pase y 32 KB
+# no — esa firma sigue siendo infalsificable.
+CPU_INVITADO_SATURADO = 90
 # Se lee de `config/egresscheck.umbralLentoS` si esta puesto. No es un capricho:
 # el backoff de retransmision de TCP va en pasos de ~1 s, 3 s y 7 s, asi que un
 # umbral de 3 s puede pillar DOS paquetes perdidos —ruido normal de red— ademas
@@ -155,8 +161,19 @@ _PS = (
     "$bp=curl.exe -6 -s -o NUL --max-time 15 " + _W + " '" + URL_MIN + "';$rbp=$LASTEXITCODE;"
     "$d=try{(Resolve-DnsName " + NOMBRE_DNS + " -Type A -EA Stop|"
     "Select-Object -First 1).IPAddress}catch{'FALLO'};"
+    # ⚠️ LA CPU DEL INVITADO ES PARTE DE LA MEDIDA, no un extra.
+    # Este curl corre DENTRO del invitado, asi que un invitado con la CPU al
+    # tope hace que se planifique tarde y el reloj marque segundos que NO son
+    # de red. Paso el 2026-08-21 con la vm587: alerta de 'salida rota' cuando
+    # lo que habia era StrategyQuant llevando 2.303 HORAS de CPU al 100% — o
+    # sea, el cliente usando el servidor exactamente para lo que lo compro.
+    # Sin este dato, la sonda no puede distinguir una red lenta de un invitado
+    # ocupado, y confundirlas convierte a cada cliente que exprime su VPS en
+    # una falsa alarma.
+    "$cpu=try{[int](Get-CimInstance Win32_Processor -EA Stop|"
+    "Measure-Object LoadPercentage -Average).Average}catch{-1};"
     "'v4g='+$ag+'/'+$rag+' v4p='+$ap+'/'+$rap+"
-    "' v6g='+$bg+'/'+$rbg+' v6p='+$bp+'/'+$rbp+' dns='+$d"
+    "' v6g='+$bg+'/'+$rbg+' v6p='+$bp+'/'+$rbp+' dns='+$d+' cpu='+$cpu"
 )
 
 
@@ -235,6 +252,10 @@ def analiza(salida: str):
     v4 = veredicto_pila(partes.get("v4g", ""), partes.get("v4p", ""))
     v6 = veredicto_pila(partes.get("v6g", ""), partes.get("v6p", ""))
     dns = "ok" if partes.get("dns", "FALLO") != "FALLO" else "FALLO"
+    try:
+        cpu = int(partes.get("cpu", "-1"))
+    except (TypeError, ValueError):
+        cpu = -1
     ok = (v4 == "ok" and v6 == "ok" and dns == "ok")
     # ⚠️ LA MEDIDA VIAJA CON EL VEREDICTO. Sin esto el aviso dice "lento" y no
     # cuanto, que es justo el dato que lo justifica y el unico con el que se
@@ -246,10 +267,16 @@ def analiza(salida: str):
     if "mtu" in (v4, v6):
         kind = "mtu"
     elif "lento" in (v4, v6):
-        kind = "lento"
+        # Un invitado saturado explica la lentitud sin que la red tenga nada
+        # que ver. No se puede afirmar ni descartar: se marca `no_concluyente`
+        # y NO cuenta como fallo. Se guarda la CPU para que el aviso lo diga.
+        kind = "no_concluyente" if cpu >= CPU_INVITADO_SATURADO else "lento"
+        if kind == "no_concluyente":
+            ok = True
     else:
         kind = "cortado" if not ok else "ok"
-    return ok, {"v4": v4, "v6": v6, "dns": dns, "kind": kind, "medida": salida}
+    return ok, {"v4": v4, "v6": v6, "dns": dns, "kind": kind,
+                "medida": salida, "cpuInvitado": cpu}
 
 
 def control_desde_la_base() -> bool:
