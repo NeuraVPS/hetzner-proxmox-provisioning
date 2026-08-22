@@ -69,8 +69,13 @@ class Discriminador(unittest.TestCase):
         # EL CASO QUE SE ESCAPO. Código 200 y los bytes enteros, pero 6,5 s
         # donde se tarda 0,06: el camino está retransmitiendo. Con el clamp
         # quitado de verdad, la sonda daba verde sin esta comprobación.
-        self.assertEqual("lento", eg.veredicto_pila(G_OK, P_LENTO))
         self.assertEqual("lento", eg.veredicto_pila(G_LENTO, P_OK))
+        # El pequeño solo YA NO basta: su respuesta de 1 KB cabe en un segmento,
+        # nunca manda un paquete a tamaño completo y por tanto no puede probar
+        # la ruta del MTU. Lo que mide su `time_total` es sobre todo el saludo
+        # (DNS+TCP+TLS), y un SYN perdido cuesta 1+2 s. Ver el 0000045 el
+        # 22-08-2026: v6p=3.026s con v6g=0.123s por el mismo camino.
+        self.assertEqual("ok", eg.veredicto_pila(G_OK, P_LENTO))
 
     def test_rapido_de_verdad_sigue_siendo_ok(self):
         # El umbral no puede ser tan fino que un hipo normal alerte.
@@ -118,7 +123,7 @@ class Analiza(unittest.TestCase):
         # Decide si alertamos con UNA sola VM: `lento` va con `mtu`, no con
         # `cortado`. En los 115 nodos de una VM es la diferencia entre verlo
         # y no verlo nunca.
-        ok, det = self._ana(self._sal(v4p=P_LENTO))
+        ok, det = self._ana(self._sal(v4g=G_LENTO))
         self.assertFalse(ok)
         self.assertEqual("lento", det["kind"])
 
@@ -176,8 +181,11 @@ class UnInvitadoOCUPADONoEsUnaREDLENTA(unittest.TestCase):
     falsa alarma, y tres falsas alarmas seguidas enseñan a ignorar el aviso.
     """
 
-    def _sal(self, tp, cpu):
-        return (f"v4g={G_OK} v4p=200/{eg.BYTES_MIN}/{tp}/0 "
+    def _sal(self, tg, cpu):
+        # Se varia el GRANDE, no el pequeño: desde el 22-08-2026 un pequeño
+        # lento con el grande rapido ya no es `lento` (el grande lo desmiente),
+        # asi que montarlo sobre el pequeño probaria otra cosa.
+        return (f"v4g=200/{eg.BYTES}/{tg}/0 v4p={P_OK} "
                 f"v6g={G_OK} v6p={P_OK} dns=1.2.3.4 cpu={cpu}")
 
     def test_lento_con_la_CPU_al_tope_NO_es_fallo(self):
@@ -198,7 +206,11 @@ class UnInvitadoOCUPADONoEsUnaREDLENTA(unittest.TestCase):
                "dns=172.66.0.218 cpu=100")
         ok, det = eg.analiza(sal)
         self.assertTrue(ok, "no debería haber avisado")
-        self.assertEqual("no_concluyente", det["kind"])
+        # Antes se salvaba por la CPU al 100%. Desde el 22-08-2026 se descarta
+        # un paso ANTES: v4g=0.216s desmiente a v4p=3.605s sin necesidad de
+        # mirar la CPU. Mejor asi — deja de depender de que el invitado
+        # estuviera ocupado, que fue una coincidencia de aquel caso.
+        self.assertEqual("ok", det["kind"])
 
     def test_MTU_sigue_siendo_fallo_por_saturada_que_este(self):
         # LO IMPORTANTE. Ninguna carga de CPU puede hacer que 1 KB pase y 32 KB
@@ -246,6 +258,52 @@ class ParametrosQueNoDebenBajar(unittest.TestCase):
 
     def test_el_umbral_global_evita_227_correos(self):
         self.assertTrue(0 < eg.GLOBAL_PCT < 100)
+
+
+
+class UnGrandeRAPIDODesmienteAUnPequenoLENTO(unittest.TestCase):
+    """32 KB por el mismo camino y en la misma pasada son prueba positiva.
+
+    El 22-08-2026 el 0000045-AX102 alerto por `lento` con v6p=3.026s y
+    v6g=0.123s. Si el camino retransmitiera, el que lleva 32 veces mas
+    paquetes tardaria MAS, no 25 veces menos. Esos 3,026 s son un SYN perdido
+    (1 s + 2 s de reintento TCP), o sea establecimiento de conexion. Seis
+    re-sondeos posteriores: todos limpios, el peor 0,73 s.
+    """
+
+    def test_el_caso_REAL_del_0000045(self):
+        salida = ("v4g=200/32768/0.069428/0 v4p=200/1024/0.072745/0 "
+                  "v6g=200/32768/0.122970/0 v6p=200/1024/3.026448/0 "
+                  "dns=162.159.140.220 cpu=8")
+        ok, det = eg.analiza(salida)
+        self.assertTrue(ok, "un grande que vuela desmiente al pequeño")
+        self.assertEqual(det["kind"], "ok")
+
+    def test_si_el_GRANDE_va_lento_sigue_alertando(self):
+        # La firma del clamp de MSS: el grande es el que sufre. Intocada.
+        v = eg.veredicto_pila("200/32768/6.500000/0", "200/1024/0.070000/0")
+        self.assertEqual(v, "lento")
+
+    def test_los_DOS_lentos_siguen_alertando(self):
+        v = eg.veredicto_pila("200/32768/5.000000/0", "200/1024/4.000000/0")
+        self.assertEqual(v, "lento")
+
+    def test_pequeno_lento_con_grande_TAMBIEN_tocado_alerta(self):
+        # 1,5 s en 32 KB no es volar: el pequeño conserva su valor de señal.
+        v = eg.veredicto_pila("200/32768/1.500000/0", "200/1024/3.500000/0")
+        self.assertEqual(v, "lento")
+
+    def test_el_umbral_del_grande_sano_es_exclusivo_por_abajo(self):
+        # Justo por debajo de 1 s -> se descarta; justo por encima -> alerta.
+        self.assertEqual(eg.veredicto_pila("200/32768/0.999000/0",
+                                           "200/1024/3.500000/0"), "ok")
+        self.assertEqual(eg.veredicto_pila("200/32768/1.000000/0",
+                                           "200/1024/3.500000/0"), "lento")
+
+    def test_MTU_no_se_ve_afectado(self):
+        # El grande NO entrega: sigue siendo mtu, pase lo que pase con tiempos.
+        v = eg.veredicto_pila("000/0/0.100000/28", "200/1024/0.050000/0")
+        self.assertEqual(v, "mtu")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,11 @@ BYTES_MIN = 1024
 # puesta. Con 1 KB por un camino sano se esta en centesimas desde cualquier
 # sitio de Europa, asi que 3 s no es "lento": es un camino retransmitiendo.
 UMBRAL_LENTO = 3.0
+# Por debajo de esto, los 32 KB demuestran que el camino esta sano y un 1 KB
+# lento se descarta como ruido de establecimiento de conexion. 1 s es holgado:
+# las medidas buenas de la flota van en centesimas (0,06-0,25 s), asi que aqui
+# solo cabe algo que de verdad volo.
+GRANDE_SANO_S = 1.0
 # Por encima de esta CPU en el invitado, un veredicto `lento` NO se cree: no se
 # puede separar una red lenta de un `curl` que no llega a ejecutarse a tiempo.
 # 90% y no 100% porque un invitado exprimido oscila. `mtu` SIGUE valiendo por
@@ -236,9 +241,25 @@ def veredicto_pila(grande: str, pequeno: str):
     og, _mg, tg = _descarga(grande, BYTES)
     op, _mp, tp = _descarga(pequeno, BYTES_MIN)
     if og and op:
-        # Un 1 KB no tarda segundos por un camino sano. Se mira sobre todo el
-        # pequeño: si ESE va lento, no es ancho de banda, es retransmision.
-        return "lento" if (tp > UMBRAL_LENTO or tg > UMBRAL_LENTO) else "ok"
+        # Un 1 KB no tarda segundos por un camino sano: si ESE va lento suele
+        # ser retransmision y no ancho de banda, y por eso cuenta.
+        #
+        # PERO solo cuenta si el grande no lo desmiente. El 22-08-2026 el
+        # 0000045 alerto con v6p=3.026s y v6g=0.123s: 32 KB por el MISMO camino
+        # y en la MISMA pasada, 32 veces mas paquetes, 25 veces mas rapido. Si
+        # el camino retransmitiera, el grande sufriria mas que el pequeño, no
+        # menos. Esos 3,026 s son un SYN perdido (1 s + 2 s de reintento TCP da
+        # casi el numero exacto), o sea establecimiento de conexion, no red
+        # rota. Re-sondeado seis veces: todas limpias, la peor 0,73 s.
+        #
+        # Un grande RAPIDO es prueba positiva de que el camino esta sano, y una
+        # prueba positiva gana a un unico dato malo. No se toca el caso del
+        # grande lento: ese sigue alertando solo, que es la firma del clamp.
+        if tg > UMBRAL_LENTO:
+            return "lento"
+        if tp > UMBRAL_LENTO and tg >= GRANDE_SANO_S:
+            return "lento"
+        return "ok"
     if op and not og:
         return "mtu"       # NUESTRO: el camino no traga paquete lleno
     if not op and not og:
