@@ -1232,10 +1232,24 @@ fi
 # VPS-E balloon adaptation across the EX44<->AX162 boundary (operator,
 # 2026-07-03). Dedicated EX44s run the vps-e with balloon == memory (the whole
 # box is theirs; no deflation). Shared AX162s pack vps-e with ballooning down
-# to the plan's ram_min (18 GB) so KSM/zswap can breathe. Cross-family moves
+# to the plan's ram_min so KSM/zswap can breathe. Cross-family moves
 # are offline-only (Intel<->AMD blocks live), so the qm set lands cleanly on a
 # stopped VM. Same-family moves no-op. VM is a vps-e iff its name is "E-*".
-VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-18432}"
+#
+# 46 GB, NO 18. Este bloque nacio el 03-07-2026 con ram_min=18 GB, y el
+# 25-07-2026 el operador subio ram_min a 46 precisamente porque 18 estaba mal:
+# la colocacion reservaba 18 GB para un VPS E cuyo uso real es ~46 (mediana
+# medida 41,8 GB, p90 55,5 sobre los 149 vivos), metia un tercero donde no
+# cabia y el balloon-reconciler se quedaba sin presupuesto para alimentarlos
+# -> cliente estrangulado. La constante se quedo con el valor refutado tres
+# semanas despues de refutarlo. Corregida el 22-08-2026 al migrar la vm288,
+# que aterrizo con suelo de 18 GB.
+#
+# El suelo es un MINIMO, no una asignacion: en un nodo sin sobrecomprometer
+# dejarlo bajo no quita ni un MB (medido el mismo dia en la vecina vm1704,
+# suelo 18 GB y actual=61340). El dano aparece cuando el nodo se llena, que
+# es justo cuando el cliente menos puede permitirselo.
+VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-47104}"
 _vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
 if [[ "$_vm_name" == E-* ]]; then
   _fam() { case "$1" in *EX44*) echo EX44 ;; *AX162*) echo AX162 ;; *) echo other ;; esac; }
