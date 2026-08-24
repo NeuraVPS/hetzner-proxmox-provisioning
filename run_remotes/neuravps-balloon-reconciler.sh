@@ -226,6 +226,12 @@ floor_target() {  # $1 = max MB, $2 = orig MB -> echoes target MB
                         # lookup only sees the size, so take the HIGHER of the
                         # two: under-decaying a vps-d costs a little paper
                         # budget, over-decaying a vps-e is the v5 failure.
+    32768) t=23654 ;;   # vps-d 32G  -> 23.1G (gen 2026-08-24)
+    43008) t=41164 ;;   # vps-e 42G  -> 40.2G (gen 2026-08-24). SIN esta entrada
+                        # el fallback del 60% le pondria 25.2G a un invitado
+                        # que corre SQX con -Xmx 35G: exactamente el fallo de
+                        # v5. Una talla nueva de plan SIEMPRE se anade aqui
+                        # ANTES de que salga a la venta.
     49152) t=47104 ;;   # vps-e 48G  -> 46G
     61440) t=53453 ;;   # vps-e 60G  -> 52.2G (grandfathered gen)
     *)     t=$(( mx * FLOOR_TARGET_FALLBACK_PCT / 100 )) ;;
