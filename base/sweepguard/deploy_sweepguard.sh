@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Despliega el auto-bloqueo de barridos RDP en una BASE. Idempotente.
 #
-#   bf_seen  (addr . port, 1h)  <- se llena con una regla SIN veredicto
+#   bf_seen  (addr . port, 6h)  <- se llena con una regla SIN veredicto
 #   bf_auto  (addr, timeout)    <- bloqueos automáticos que CADUCAN solos
 #
 # Orden final de la cadena `pre` (importa):
@@ -14,7 +14,7 @@ add_family() {
   local fam=$1 atype=$2 saddr=$3
   # 1) sets (idempotente)
   nft list set "$fam" rdpguard bf_seen >/dev/null 2>&1 || \
-    nft add set "$fam" rdpguard bf_seen "{ type ${atype} . inet_service; flags dynamic,timeout; timeout 1h; size 65536; }"
+    nft add set "$fam" rdpguard bf_seen "{ type ${atype} . inet_service; flags dynamic,timeout; timeout 6h; size 65536; }"
   nft list set "$fam" rdpguard bf_auto >/dev/null 2>&1 || \
     nft add set "$fam" rdpguard bf_auto "{ type ${atype}; flags dynamic,timeout; timeout 24h; size 65536; }"
 
@@ -103,7 +103,7 @@ for tbl,atype,saddr,counter in specs:
     j=s.find('chain pre', i)
     k=s.find('{', j)
     sets=(f"\n    set bf_seen {{\n        type {atype} . inet_service\n"
-          f"        flags dynamic,timeout\n        timeout 1h\n        size 65536\n    }}\n"
+          f"        flags dynamic,timeout\n        timeout 6h\n        size 65536\n    }}\n"
           f"\n    set bf_auto {{\n        type {atype}\n        flags dynamic,timeout\n"
           f"        timeout 24h\n        size 65536\n    }}\n")
     s = s[:j] + sets + "\n    " + s[j:]
