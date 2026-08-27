@@ -1156,8 +1156,20 @@ cat > /mnt/etc/sysctl.d/zz-neuravps-rpfilter.conf <<'NVXEOF'
 # pone explicitamente neuravps-tunnels.sh / neuravps-base-tunnels.sh sobre cada
 # tunel, y solo sobre ellos: solo llevan GRE entre maquinas nuestras, ya filtrado
 # por gre_peers y por el [IPSET base] del nodo.
+#
+# ⚠️ NO BASTA con que el script ponga el 0 sobre cada tunel: udev lo pisa. Al
+# aparecer una interfaz, udev lanza `systemd-sysctl --prefix=.../<iface>`, que
+# reaplica el comodin `net.ipv4.conf.*.rp_filter = 2` de 50-default.conf. Es
+# ASINCRONO y gana casi siempre al `sysctl -w` del script. En geo-split no se
+# nota (camino simetrico); solo muerde DURANTE UN FAILOVER, cuando una maquina
+# sostiene la VIP de la otra region, y entonces los invitados se quedan sin
+# Internet con el RDP de entrada funcionando, asi que no alerta nada. El comodin
+# acotado a `tun-*` gana a 50-default.conf por el orden de nombre de fichero y
+# deja `default` en 2. Medido 2026-08-27: 162 s sin salida en b1 recien
+# reiniciada.
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.tun-*.rp_filter = 0
 NVXEOF
 
 

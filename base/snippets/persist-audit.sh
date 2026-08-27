@@ -36,3 +36,11 @@ else
   ok "tuneles arriba" "$(ip -br link show type ip6gre | grep -c 'tun-[fh]p.*UP')/4"
 fi
 ok "rp_filter all/default" "$(sysctl -n net.ipv4.conf.all.rp_filter)/$(sysctl -n net.ipv4.conf.default.rp_filter)"
+# El de arriba NO basta y por si solo enganya: el kernel usa el MAXIMO de all y
+# de la interfaz, asi que `0/2` puede convivir con todos los tuneles a 2. El
+# 2026-08-27 b1 recien reiniciada daba exactamente `0/2` — sano a la vista — con
+# los 438 tuneles a 2, y perdio 162 s de salida a Internet en cuanto sostuvo la
+# VIP de la otra region. Lo que hay que auditar es el valor EFECTIVO en los
+# tuneles, que es el unico que decide si un failover deja a los invitados sin
+# Internet.
+ok "rp_filter en tuneles (0 = a 2)" "$(for i in $(ls /proc/sys/net/ipv4/conf/ | grep "^tun-"); do cat "/proc/sys/net/ipv4/conf/$i/rp_filter"; done | grep -vc "^0$")"
