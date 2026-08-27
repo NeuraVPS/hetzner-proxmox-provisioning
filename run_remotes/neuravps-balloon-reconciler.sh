@@ -293,7 +293,13 @@ write_status() {  # $1 = blocked-entries JSON fragment ("" when none)
 }
 
 # --- collect running ballooning VMs: vmid|floor|max ---
-declare -A CUR_FLOOR CUR_MAX
+# The `=()` matters: `declare -A x` DECLARES without assigning, so on a node
+# with no ballooning VMs `${#CUR_FLOOR[@]}` below trips `set -u` with
+# "unbound variable" and the run dies at the very guard written to handle
+# that case. Silent since forever on the empty SQX nodes — 8 of them were
+# crashing every minute and never wrote a status file (found 2026-08-27
+# while rolling v9; the fault predates it).
+declare -A CUR_FLOOR=() CUR_MAX=()
 committed=0; floors_sum=0
 for pf in /var/run/qemu-server/*.pid; do
   [ -e "$pf" ] || continue
