@@ -45,6 +45,23 @@
   way to have the terminals come up minimised on every reboot. Meant to accompany
   -AddToStartup (the Portfolios.io DFY build passes both).
 
+.PARAMETER ApplyLiveUpdate
+  At logon, press "Restart" on MetaTrader's "Welcome to LiveUpdate" dialog so a downloaded
+  update is actually installed. Left alone the dialog sits on the desktop indefinitely (the
+  terminals never restart on their own), and MetaTrader centres it on the saved desktop size,
+  so on a small console it lands half off-screen with the Restart button unreachable - which
+  is what the Portfolios.io partner reported as a window that cannot be removed. Safe here:
+  the helper only runs at logon, when the terminals have just started, and the IFEO hook
+  re-adds /portable to the relaunch. Meant to accompany -AddToStartup.
+
+.PARAMETER RemoveStockExperts
+  Delete MetaQuotes' bundled sample Expert Advisors (MQL5\Experts\Advisors, \Examples and
+  \Free Robots) from every instance. The Portfolios.io DFY desktop ships the partner's own
+  EAs and the sample robots are noise in the Navigator. Applied to the extracted instance
+  before it is cloned, and re-applied on every logon by the Startup helper, because a
+  MetaTrader LiveUpdate reinstalls the standard MQL5 tree ("updating ... MQL5 folder,
+  N files updated") and brings the samples back.
+
 .PARAMETER WebRequestUrls
   URLs to add to each instance's "Allow WebRequest for listed URL" allow-list on first
   logon. MT5 stores this list in config\common.ini encrypted with a MACHINE-BOUND key, so
@@ -97,6 +114,14 @@ param(
     # logon session (MT5 ignores shortcut/STARTUPINFO minimise hints and restores its own
     # saved window placement, so a per-logon ShowWindow sweep is the only reliable way).
     [switch]$StartMinimized,
+
+    # Delete MetaQuotes' sample Expert Advisors from every instance (the DFY build ships the
+    # partner's own EAs; a LiveUpdate puts the samples back, so the logon helper re-applies it).
+    [switch]$RemoveStockExperts,
+
+    # Press "Restart" on MetaTrader's LiveUpdate dialog at logon, so a downloaded update is
+    # installed instead of the prompt sitting on the customer's desktop for weeks.
+    [switch]$ApplyLiveUpdate,
 
     # WebRequest allow-list URLs to add to every instance on first logon. MT5 encrypts this
     # list with a machine-bound key, so a list baked into the zip cannot be decrypted on a
@@ -192,6 +217,9 @@ function Connect-StorageBoxUnc {
 }
 
 $MtRoot        = 'C:\MetaTrader'
+# MetaQuotes' own sample Expert Advisors, shipped inside every MetaTrader 5 build and
+# reinstalled by every LiveUpdate. Names are the same in every language.
+$StockExpertDirs = @('Advisors', 'Examples', 'Free Robots')
 # Start Menu folder name is always "MetaTrader"; version (4/5) appears only in each shortcut label (Get-MtInstanceFolderName).
 $StartMenuMt   = Join-Path -Path 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs' -ChildPath 'MetaTrader'
 $PublicDesktop = 'C:\Users\Public\Desktop'
@@ -203,6 +231,32 @@ if ($MetaTraderVersion -eq 5) {
 } else {
     $TerminalExeName = 'terminal.exe'
     $EditorExeName = 'metaeditor.exe'
+}
+
+function Remove-MtStockExperts {
+    <#
+    .SYNOPSIS
+      Drop MetaQuotes' sample EAs from one instance's MQL5\Experts folder.
+    .NOTES
+      experts.dat is the Navigator's cache of compiled programs; deleting it makes MetaTrader
+      rebuild the tree instead of listing entries whose files are gone.
+    #>
+    param([Parameter(Mandatory)][string]$InstancePath)
+    $experts = Join-Path -Path $InstancePath -ChildPath 'MQL5\Experts'
+    if (-not (Test-Path -LiteralPath $experts)) { return 0 }
+    $removed = 0
+    foreach ($dir in $StockExpertDirs) {
+        $target = Join-Path -Path $experts -ChildPath $dir
+        if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $target)) { $removed++ }
+        }
+    }
+    $dat = Join-Path -Path $InstancePath -ChildPath 'MQL5\experts.dat'
+    if (Test-Path -LiteralPath $dat) {
+        Remove-Item -LiteralPath $dat -Force -ErrorAction SilentlyContinue
+    }
+    return $removed
 }
 
 function Get-MtInstanceFolderName {
@@ -389,6 +443,12 @@ try {
         throw "Expected executable missing after extract: $terminalExe001 (check zip layout)."
     }
 
+    if ($RemoveStockExperts) {
+        # Before the clone loop, so 002..N are copied already clean instead of N deletions.
+        $stockGone = Remove-MtStockExperts -InstancePath $firstPath
+        Write-Output "Removed $stockGone stock Expert folder(s) from the extracted instance."
+    }
+
     for ($i = 2; $i -le $InstanceCount; $i++) {
         $dest = Get-MtInstancePath -Index $i
         if (Test-Path -LiteralPath $dest) {
@@ -448,7 +508,7 @@ try {
         }
     }
 
-    if ($StartMinimized -or $WebRequestUrls.Count -gt 0) {
+    if ($StartMinimized -or $RemoveStockExperts -or $ApplyLiveUpdate -or $WebRequestUrls.Count -gt 0) {
         # Per-logon setup helper. Two jobs, and they MUST run in this order in one script:
         #   1. WebRequest allow-list. MT5 stores it in config\common.ini as a blob encrypted
         #      with a MACHINE-BOUND key, so the list baked into the golden zip cannot be
@@ -456,8 +516,10 @@ try {
         #      CLI/MQL5 API for it, so the only way is to drive the Options GUI once; MT5 then
         #      re-writes the blob under THIS machine's key and it persists across restarts.
         #   2. Minimise. MT5 ignores shortcut / STARTUPINFO minimise hints and restores its own
-        #      saved window placement, so the only reliable "start minimised" is a ShowWindow
+        #      saved window placement, so the only reliable "start minimised" is a window-placement
         #      sweep. It has to come AFTER the injection, or it fights it for window state.
+        # A third job runs FIRST and needs no window at all: deleting MetaQuotes' sample EAs,
+        # which a LiveUpdate reinstalls behind our back every time it refreshes the MQL5 tree.
         # Runs in the INTERACTIVE logon session (a terminal's MainWindowHandle reads 0 from
         # SYSTEM/session 0, and the Options dialog can only be driven on a real desktop).
         # Pure user32 P/Invoke via Add-Type - no compiled binary, so it is not subject to the
@@ -476,15 +538,47 @@ $PROC     = '__PROCNAME__'
 $URLS     = @(__URLS__)
 $MINIMIZE = __MINIMIZE__
 $EXPECT   = __EXPECT__
+$MTROOT   = '__MTROOT__'
+$CLEANEXP = __CLEANEXPERTS__
+$LIVEUPD  = __LIVEUPDATE__
+$STOCKEXP = @('Advisors','Examples','Free Robots')
 $MarkDir  = 'C:\ProgramData\neuravps'
 $LogFile  = Join-Path $MarkDir 'mt_logon_setup.log'
 function L($m){ try { Add-Content -LiteralPath $LogFile -Value ((Get-Date -Format o) + '  ' + $m) } catch {} }
 if (-not (Test-Path $MarkDir)) { New-Item -ItemType Directory -Path $MarkDir -Force | Out-Null }
+# MetaQuotes' sample EAs. The installer already deleted them, but a LiveUpdate reinstalls the
+# whole standard MQL5 tree ("updating ... MQL5 folder, N files updated") and puts them back, so
+# this cannot be a one-shot: it runs at logon and then again from the watch loop, because the
+# update we apply below IS one of those reinstalls, and because a terminal that is starting or
+# shutting down holds the folder open and the delete just fails (observed on the test box:
+# identical code removed nothing at T+2s and all 8 a minute later).
+function NvCleanExperts(){
+  $gone=0
+  foreach($d in (Get-ChildItem $MTROOT -Directory -Filter 'MetaTrader *' -ErrorAction SilentlyContinue)){
+    $hit=0
+    foreach($sd in $STOCKEXP){
+      $t=Join-Path $d.FullName ('MQL5\Experts\' + $sd)
+      if(Test-Path -LiteralPath $t){
+        Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue
+        if(-not (Test-Path -LiteralPath $t)){ $hit++ }
+      }
+    }
+    if($hit -gt 0){
+      # experts.dat caches the Navigator tree; drop it so MT5 rebuilds it without the samples
+      $dat=Join-Path $d.FullName 'MQL5\experts.dat'
+      if(Test-Path -LiteralPath $dat){ Remove-Item -LiteralPath $dat -Force -ErrorAction SilentlyContinue }
+      $gone+=$hit
+    }
+  }
+  if($gone -gt 0){ L "stock experts: removed $gone folder(s)" }
+}
+if($CLEANEXP){ NvCleanExperts }
 Add-Type @"
 using System;using System.Text;using System.Runtime.InteropServices;
 public delegate bool NvEnumCb(IntPtr h, IntPtr l);
 [StructLayout(LayoutKind.Sequential)] public struct NvRECT { public int L,T,R,B; }
 [StructLayout(LayoutKind.Sequential)] public struct NvPOINT { public int X,Y; }
+[StructLayout(LayoutKind.Sequential)] public struct NvWP { public int len,flags,show; public NvPOINT ptMin,ptMax; public NvRECT rcNormal; }
 public class NvU {
  [DllImport("user32.dll")] public static extern bool EnumWindows(NvEnumCb cb,IntPtr l);
  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p,NvEnumCb cb,IntPtr l);
@@ -509,6 +603,9 @@ public class NvU {
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
  [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,IntPtr e);
  [DllImport("user32.dll")] public static extern bool SystemParametersInfo(int a,int b,IntPtr c,int d);
+ [DllImport("user32.dll")] public static extern bool SystemParametersInfo(int a,int b,ref NvRECT r,int d);
+ [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h,ref NvWP p);
+ [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr h,ref NvWP p);
  [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr OpenProcess(int a,bool i,uint pid);
  [DllImport("kernel32.dll")] public static extern IntPtr VirtualAllocEx(IntPtr h,IntPtr addr,uint size,uint typ,uint prot);
  [DllImport("kernel32.dll")] public static extern bool VirtualFreeEx(IntPtr h,IntPtr addr,uint size,uint typ);
@@ -544,6 +641,14 @@ function NvDlgsFor($fpid){
 # exist as child #32770s at once), and is NOT the account wizard.
 function NvFindOptions($fpid){
   foreach($d in (NvDlgsFor $fpid)){ if((NvHasDesc $d 10322) -and -not (NvHasDesc $d 12324)){ return $d } }
+  return [IntPtr]::Zero
+}
+# MetaTrader's "Welcome to LiveUpdate" prompt ("Updates have been downloaded ... Press
+# "Restart""). Its statics are LiveUpdate's own control ids, so it cannot be confused with the
+# account wizard (12324) or Options (10322), and unlike the title they are the same in every
+# language. Buttons are the standard IDOK/IDCANCEL: 1 = Restart, 2 = Later.
+function NvFindLiveUpdate($fpid){
+  foreach($d in (NvDlgsFor $fpid)){ if(NvHasDesc $d 10426){ return $d } }
   return [IntPtr]::Zero
 }
 # the Expert Advisors page: the child #32770 that directly owns the checkbox
@@ -582,7 +687,9 @@ function NvInject($proc,$inst){
   # Ctrl+O only lands while our input queue is attached to the terminal's thread
   $tt=0;[void][NvU]::GetWindowThreadProcessId($hwnd,[ref]$tt)
   [void][NvU]::AttachThreadInput($me,$tt,$true)
-  [void][NvU]::ShowWindow($hwnd,9);[void][NvU]::BringWindowToTop($hwnd);[void][NvU]::SetForegroundWindow($hwnd);[void][NvU]::SetFocus($hwnd);Start-Sleep -Milliseconds 300
+  # 3 = SW_SHOWMAXIMIZED, not 9 = SW_RESTORE: restoring a maximised terminal drops it back to
+  # its saved "normal" rect and that is the state the minimise sweep would then preserve.
+  [void][NvU]::ShowWindow($hwnd,3);[void][NvU]::BringWindowToTop($hwnd);[void][NvU]::SetForegroundWindow($hwnd);[void][NvU]::SetFocus($hwnd);Start-Sleep -Milliseconds 300
   [NvU]::keybd_event(0x11,0,0,[IntPtr]::Zero);Start-Sleep -Milliseconds 50
   [NvU]::keybd_event(0x4F,0,0,[IntPtr]::Zero);Start-Sleep -Milliseconds 70
   [NvU]::keybd_event(0x4F,0,2,[IntPtr]::Zero);Start-Sleep -Milliseconds 50
@@ -655,25 +762,90 @@ if($URLS.Count -gt 0){
     if($ok){ Set-Content -LiteralPath $mark -Value (Get-Date -Format o) }
   }
 }
-if($MINIMIZE){
+# On the taskbar, but full-screen when the customer clicks the icon. Two independent things:
+#   showCmd = SW_SHOWMINNOACTIVE  -> minimised, and without stealing focus 8 times in a row
+#   WPF_RESTORETOMAXIMIZED        -> the restore is maximised
+# Without the flag the terminal comes back at its saved "normal" rect, and the golden zip baked
+# that rect on a 2560x1392 desktop: on a customer console the window is larger than the screen
+# and its edges run off it - the "partial windows" the partner reported. rcNormalPosition is
+# clamped to the work area for the same reason, so a manual un-maximise also lands on-screen.
+function NvMinToTaskbarRestoreMax($h){
+  $wp=New-Object NvWP
+  $wp.len=[System.Runtime.InteropServices.Marshal]::SizeOf($wp)
+  if(-not [NvU]::GetWindowPlacement($h,[ref]$wp)){
+    [void][NvU]::ShowWindow($h,3);[void][NvU]::ShowWindowAsync($h,6);return
+  }
+  $wa=New-Object NvRECT
+  if([NvU]::SystemParametersInfo(0x0030,0,[ref]$wa,0)){
+    if(($wp.rcNormal.R-$wp.rcNormal.L) -gt ($wa.R-$wa.L) -or
+       ($wp.rcNormal.B-$wp.rcNormal.T) -gt ($wa.B-$wa.T) -or
+       $wp.rcNormal.L -lt $wa.L -or $wp.rcNormal.T -lt $wa.T){ $wp.rcNormal=$wa }
+  }
+  $wp.flags=$wp.flags -bor 2   # WPF_RESTORETOMAXIMIZED
+  $wp.show=7                   # SW_SHOWMINNOACTIVE
+  if(-not [NvU]::SetWindowPlacement($h,[ref]$wp)){
+    [void][NvU]::ShowWindow($h,3);[void][NvU]::ShowWindowAsync($h,6)
+  }
+}
+# One watch loop for both jobs, because they interact: pressing Restart makes the terminal
+# relaunch, and the new window has to be minimised again. Keyed by window handle / pid, so
+# each window is touched once and a customer who restores a terminal is never fought.
+# The loop is long because LiveUpdate downloads ~180 MB in the background before it prompts;
+# a 2-minute sweep would end before the dialog appears.
+if($MINIMIZE -or $LIVEUPD){
   $seen=@{}
-  $md=(Get-Date).AddSeconds(60)
+  $luDone=@{}
+  $md=(Get-Date).AddSeconds($(if($LIVEUPD){900}else{120}))
+  $tick=0
   while((Get-Date) -lt $md){
-    foreach($p in (Get-Process $PROC -ErrorAction SilentlyContinue)){
-      $h=$p.MainWindowHandle
-      if($h -ne [IntPtr]::Zero -and -not $seen.ContainsKey([int64]$h)){
-        [void][NvU]::ShowWindowAsync($h,11)   # SW_FORCEMINIMIZE; once only, never fight the user
-        $seen[[int64]$h]=$true
+    $procs=@(Get-Process $PROC -ErrorAction SilentlyContinue)
+    if($LIVEUPD -and ($tick % 5) -eq 0){
+      foreach($p in $procs){
+        # Re-press after 2 min: pressing Restart on all 8 at once made only 3 of them actually
+        # come back updated on the test box, so this both staggers (one terminal per pass, 10 s
+        # apart) and retries the ones that stayed on the old build.
+        $last=$luDone[$p.Id]
+        if($last -ne $null -and ((Get-Date)-$last).TotalSeconds -lt 120){ continue }
+        $d=NvFindLiveUpdate $p.Id
+        if($d -ne [IntPtr]::Zero){
+          # MetaTrader centres this dialog on the desktop size it remembers, which on a small
+          # console puts the buttons off-screen; move it on before clicking anything.
+          [void][NvU]::SetWindowPos($d,[IntPtr]::Zero,20,20,0,0,0x0005)
+          $btn=[NvU]::GetDlgItem($d,1)
+          if($btn -ne [IntPtr]::Zero){
+            [void][NvU]::SendMessage($btn,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero)
+            L "liveupdate: pressed Restart (pid $($p.Id))"
+          }
+          $luDone[$p.Id]=Get-Date
+          break
+        }
       }
     }
-    Start-Sleep -Milliseconds 800
+    if($MINIMIZE){
+      foreach($p in $procs){
+        $h=$p.MainWindowHandle
+        if($h -ne [IntPtr]::Zero -and -not $seen.ContainsKey([int64]$h)){
+          NvMinToTaskbarRestoreMax $h        # once only, never fight the user
+          $seen[[int64]$h]=$true
+        }
+      }
+    }
+    # every ~30 s: catches the samples the update we just applied reinstalled, and retries the
+    # instances whose folders were locked by a terminal that was starting or shutting down
+    if($CLEANEXP -and ($tick % 15) -eq 14){ NvCleanExperts }
+    $tick++
+    Start-Sleep -Milliseconds 2000
   }
+  if($CLEANEXP){ NvCleanExperts }
 }
 '@
         $setupScript = $setupScript.Replace('__PROCNAME__', $procName).
                                     Replace('__URLS__', $urlLiteral).
                                     Replace('__MINIMIZE__', $(if ($StartMinimized) { '$true' } else { '$false' })).
-                                    Replace('__EXPECT__', [string]$InstanceCount)
+                                    Replace('__EXPECT__', [string]$InstanceCount).
+                                    Replace('__MTROOT__', $MtRoot).
+                                    Replace('__CLEANEXPERTS__', $(if ($RemoveStockExperts) { '$true' } else { '$false' })).
+                                    Replace('__LIVEUPDATE__', $(if ($ApplyLiveUpdate) { '$true' } else { '$false' }))
         $setupPath = Join-Path -Path $neuraDir -ChildPath 'mt_logon_setup.ps1'
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)   # BOM so Windows PowerShell 5.1 reads it as UTF-8
         [System.IO.File]::WriteAllText($setupPath, $setupScript, $utf8Bom)
@@ -931,10 +1103,12 @@ finally {
 $summary = "Done: $InstanceCount MetaTrader $MetaTraderVersion instance(s) under $MtRoot (zip: $ZipName); Start Menu shortcuts applied."
 if (-not $NoDesktopShortcuts) { $summary += ' Desktop shortcuts applied.' }
 if ($AddToStartup)            { $summary += ' Startup shortcuts applied.' }
-if ($StartMinimized -or $WebRequestUrls.Count -gt 0) {
+if ($StartMinimized -or $RemoveStockExperts -or $ApplyLiveUpdate -or $WebRequestUrls.Count -gt 0) {
     $bits = @()
     if ($WebRequestUrls.Count -gt 0) { $bits += ("WebRequest allow-list ({0} url(s))" -f $WebRequestUrls.Count) }
-    if ($StartMinimized)             { $bits += 'start-minimised' }
+    if ($StartMinimized)             { $bits += 'start-minimised (restores maximised)' }
+    if ($RemoveStockExperts)         { $bits += 'stock-EA cleanup' }
+    if ($ApplyLiveUpdate)            { $bits += 'apply-LiveUpdate' }
     $summary += (' Logon helper applied: {0}.' -f ($bits -join ' + '))
 }
 if ($PinToTaskbar)            { $summary += ' Taskbar pin layout applied.' }
