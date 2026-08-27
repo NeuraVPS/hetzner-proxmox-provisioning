@@ -119,7 +119,7 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=8
+#NBRVER=9
 set -u
 # ON BY DEFAULT since 2026-08-19, after v8 ran the whole fleet clean.
 # It was 0 through v7/v8's canary for the right reason — first_boot.sh curls
@@ -150,6 +150,14 @@ IDLE_RUNS_TO_LOWER=${IDLE_RUNS_TO_LOWER:-1440}  # idle CREDIT (leaky) before the
 # and moves the probe clear of a working pause. Total decay of a fully idle
 # guest is still ~1 day thanks to the 1h step pacing below.
 LOWER_COOLDOWN_RUNS=${LOWER_COOLDOWN_RUNS:-60}  # calm runs to re-earn between -4G steps (1h)
+# v9: seeding an original floor for a guest we never raised is now allowed on
+# OVER-COMMITTED nodes too, where 70 guests / ~700 GB were stranded forever.
+# It costs twice the idle credit there (48 h of quiet instead of 24) because
+# that is the node where a lowered guest can actually be squeezed. Set
+# SEED_OVERCOMMITTED=0 in /etc/default/neuravps-balloon-reconciler to go back
+# to v8 behaviour on a single node without touching the fleet.
+SEED_OVERCOMMITTED=${SEED_OVERCOMMITTED:-1}
+SEED_IDLE_RUNS_OC=${SEED_IDLE_RUNS_OC:-2880}
 REBOUND_WINDOW_S=${REBOUND_WINDOW_S:-86400}   # RAISE within this of our LOWER = bounce
 BACKOFF_BASE_S=${BACKOFF_BASE_S:-172800}      # lower-block after 1st bounce (48h), x2 each
 BACKOFF_MAX_S=${BACKOFF_MAX_S:-1209600}       # bounce-block cap (14d)
@@ -453,14 +461,35 @@ PY
           # settle point, so seeding can never decay a guest below what its plan
           # is known to need.
           #
-          # Deliberately gated to UNDER-COMMITTED nodes. There a guest sits at
+          # v8 gated this to UNDER-COMMITTED nodes: there a guest sits at
           # actual == max no matter what its floor says, so seeding + decaying
           # takes nothing from it today and is reversible with budget to spare.
-          # On an over-committed node a lowered guest can be squeezed within the
-          # minute, so there the strict rule stays: touch only what we raised
-          # and whose original we recorded. Same asymmetry as the rest of v7 —
-          # free moves everywhere, cautious moves only where they are safe.
-          if [ -z "$orig" ] && [ "$overcommitted" = 0 ]; then
+          # On an over-committed node a lowered guest can be squeezed within
+          # the minute, so the strict rule stayed: touch only what we raised.
+          #
+          # v9 opens that door, because the fleet sweep of 2026-08-27 showed
+          # what it was costing. 163 guests across 61 of the 86 SQX nodes run
+          # with balloon == memory, holding 4,517 GB immovably, median age 114
+          # days. SEVENTY of them are on over-committed nodes with no
+          # floors.json record — the exact intersection this gate excluded, so
+          # they could never decay, ever. That is ~700 GB, about 53 sellable
+          # VMs, on iron already paid for.
+          #
+          # What makes it safe is what was already required and stays required:
+          # a full IDLE_RUNS_TO_LOWER of leaky idle credit (24 h of quiet, and
+          # DOUBLE that here — see SEED_IDLE_RUNS_OC), budget headroom to undo
+          # the step, HOST_FREE_MIN_MB of real free memory, and a floor_target
+          # that never goes below the plan's MEASURED settle point. A guest
+          # that starts faulting is raised back within the minute by the RAISE
+          # branch above. An idle guest giving RAM back on a tight node is the
+          # whole point of this daemon, not a hazard.
+          seed_ok=0
+          if [ "$overcommitted" = 0 ]; then
+            seed_ok=1
+          elif [ "$SEED_OVERCOMMITTED" = 1 ] && [ "$idle" -ge "$SEED_IDLE_RUNS_OC" ]; then
+            seed_ok=1
+          fi
+          if [ -z "$orig" ] && [ "$seed_ok" = 1 ]; then
             est=$(( mx * 30 / 100 ))
             [ "$fl" -lt "$est" ] && est=$fl
             python3 - "$FLOORS" "$v" "$est" <<'PY'
@@ -472,7 +501,9 @@ if v not in d:
     json.dump(d,open(p,"w"))
 PY
             orig=$est
-            logger -t neuravps-balloon " SEED vm $v original floor estimated ${est}MB (no record; node not over-committed, guest at its max)"
+            _why="nodo holgado"
+            [ "$overcommitted" = 1 ] && _why="sobrecomprometido, credito ocioso ${idle}>=${SEED_IDLE_RUNS_OC}"
+            logger -t neuravps-balloon " SEED vm $v original floor estimated ${est}MB (sin registro; ${_why}; guest at its max)"
           fi
           # v7: the target is the plan's measured settle floor, never `orig`.
           if [ -n "$orig" ]; then
