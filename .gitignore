@@ -1,2 +1,13 @@
 __pycache__/
 .DS_Storebase/file_bridge/node_modules/
+
+# --- Base de conocimiento: vive FUERA de git, a propósito ---------------------
+# Las notas de /home/neuravps/NeuraVPS/memory/ contienen correos, nombres y
+# casos de clientes reales. El operador decidió (2026-08-30) que se quedan en
+# el workspace y NO viajan con el repositorio. Una rama con ellas llegó a
+# subirse a GitHub ese día y hubo que borrarla.
+# Estos patrones son el seguro contra un `git add -A` distraído.
+knowledge/
+docs/knowledge/
+memory/
+WORKING-HERE.md
