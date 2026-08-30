@@ -259,6 +259,42 @@ function Remove-MtStockExperts {
     return $removed
 }
 
+function Disable-MtAssistantMcp {
+    <#
+    .SYNOPSIS
+      Switch off the AI-assistant MCP server in one instance's config\assistant.ini.
+    .DESCRIPTION
+      MetaTrader 5 build 6090 added an MCP server for its AI assistant and pins it to FIXED
+      loopback ports (22345 MetaEditor / 22346 MetaTrader). With several terminals on one box
+      only the first to start can bind; every other instance logs, at severity 3 (a red line
+      in the Journal on every start):
+
+        MCP  bind error on 127.0.0.1:22346 [Only one usage of each socket address ... (10048)]
+
+      MetaQuotes ships the assistant OFF - a stock 10-instance box on the same 6140 build has
+      no assistant.ini and no MCP lines at all. It is on here only because it happened to be
+      enabled when the golden image was captured, and the file was then cloned into every
+      instance.
+
+      Deleting the file does NOT work: the terminal recreates it on the next start, with the
+      fixed port back. It does honour a file that is already there, so the switch has to be
+      written, not removed. Verified on a test box: Enable=0 -> no MCP line and the file is
+      left alone; distinct Endpoint ports -> each terminal binds its own and none error, which
+      is the one-line alternative if the assistant is ever actually wanted here.
+
+      The ApiKey and Endpoint are preserved so a customer can turn it back on from the GUI.
+    #>
+    param([Parameter(Mandatory)][string]$InstancePath)
+    $ini = Join-Path -Path $InstancePath -ChildPath 'config\assistant.ini'
+    if (-not (Test-Path -LiteralPath $ini)) { return $false }
+    $text = Get-Content -LiteralPath $ini -Raw
+    if ($text -notmatch '(?m)^Enable=1') { return $false }
+    $text = [regex]::Replace($text, '(?m)^Enable=1', 'Enable=0')
+    # BOM-less UTF-8: how MetaTrader writes this file itself.
+    [System.IO.File]::WriteAllText($ini, $text, (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+}
+
 function Get-MtInstanceFolderName {
     param([int]$Index)
     return ('MetaTrader {0} - {1:000}' -f $MetaTraderVersion, $Index)
@@ -447,6 +483,15 @@ try {
         # Before the clone loop, so 002..N are copied already clean instead of N deletions.
         $stockGone = Remove-MtStockExperts -InstancePath $firstPath
         Write-Output "Removed $stockGone stock Expert folder(s) from the extracted instance."
+    }
+
+    if ($InstanceCount -gt 1) {
+        # Also before the clone loop. Not gated behind a switch: a fixed loopback port simply
+        # cannot be shared by N terminals, whatever image ships the file, and it is a no-op
+        # when there is no assistant.ini (the stock zip has none). See Disable-MtAssistantMcp.
+        if (Disable-MtAssistantMcp -InstancePath $firstPath) {
+            Write-Output "Disabled the AI-assistant MCP server (its fixed port cannot be shared by $InstanceCount terminals)."
+        }
     }
 
     for ($i = 2; $i -le $InstanceCount; $i++) {
