@@ -11,6 +11,7 @@ ops tooling to reach the (otherwise firewalled) Proxmox nodes.
 | NAT46/NAT66 (netns + Jool) guide | `docs/netns-jool-nat46-nat66-guide.md` |
 | nginx PVE proxy / set-ticket / wildcard TLS guide | `docs/pve-proxy-base-server-setup.md` |
 | **Dual-region (DE+FI) cutover runbook** | `docs/dual-region-cutover.md` |
+| **Reemplazo de las BASES por hierro con ECC** | `docs/base-hardware-swap-ecc.md` |
 | Deployed config snippets (curl'd by the runbook) | `snippets/` |
 
 **`/root/migrate_vm.sh` (+ `migrate_vms_batch.sh`) are BASE-resident but
