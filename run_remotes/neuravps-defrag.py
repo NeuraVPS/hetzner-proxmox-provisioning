@@ -165,6 +165,15 @@ PLANS = [("vps-a", 16, 8.2), ("vps-b", 19, 9.7), ("vps-c", 31, 15.5),
 # vps-d stays 25.2 here (not the 23.8 of the new 33 GB generation): this
 # table charges docs with NO ramFloorGb, and a floor-less D is more likely
 # a legacy 35/45 GB box — charge the conservative generation.
+# Umbral de dano de CPU para elegir DESTINO, en ms de espera involuntaria por
+# vCPU. Mismo numero que el gate de colocacion (config/capacityGates.json
+# mtCpuContentionMaxMsS): si los dos no coinciden, el defrag reparte hacia
+# nodos que la colocacion considera cerrados. Medido el 2026-09-03 sobre las
+# 1001 VMs de la flota MT: 13 de 22 nodos por encima, y no correlaciona con el
+# numero de VMs (r=+0,26).
+CPU_MAX_MS = float(os.getenv("DEFRAG_CPU_MAX_MS", "50"))
+CPU_MAX_AGE_H = float(os.getenv("DEFRAG_CPU_MAX_AGE_H", "6"))
+
 EXPECTED_FLOOR = {"mt": 2.0, "mt-plus": 4.0, "vps-a": 9.7, "vps-b": 11.9,
                   "vps-c": 15.5, "vps-d": 25.2, "vps-e": 52.2}
 WORST_FLOOR = max(EXPECTED_FLOOR.values())
@@ -298,6 +307,11 @@ def main():
             # None = todavia no sincronizada, y entonces no bloquea (fail-open).
             "zpool_pct": (float(d["zpoolCapPct"])
                           if d.get("zpoolCapPct") is not None else None),
+            # Espera involuntaria por vCPU, la escribe floor_sync cada hora
+            # (NeuraVPS PR#381). None = sin medir todavia -> no bloquea.
+            "cpu_ms": (float(d["cpuContentionMsS"])
+                       if d.get("cpuContentionMsS") is not None else None),
+            "cpu_at": d.get("cpuContentionAt"),
             "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [], "n_all": 0,
         }
     for s in db.collection("servers").stream():
@@ -335,6 +349,33 @@ def main():
         return not n["frozen"] and not n["status"]
 
 
+    def cpu_ok(n):
+        """False si el destino ya esta por encima del umbral de dano de CPU.
+
+        La colocacion de pedidos nuevos aprendio esto el 2026-09-03 (NeuraVPS
+        PR#381) pero el defrag no, y son dos programas distintos: aqui el
+        destino se elegia por `cap - cores`, o sea CORES VENDIDOS. Eso ordena
+        justo al reves de lo que duele — el 2026-09-04 el nodo con 58 VMs iba
+        a 110 ms/s y el que tenia 46 a 315, porque unos acumularon clientes
+        activos y otros dormidos. Sin esta guarda el defrag mueve VMs HACIA el
+        nodo que mas sufre, precisamente porque le ve cores libres.
+
+        Falla ABIERTO igual que zpool_pct: sin medida, o con medida rancia, no
+        bloquea. Un dato ausente no puede dejar sin destino a un nodo que
+        necesita alivio.
+        """
+        if CPU_MAX_MS is None or n.get("cpu_ms") is None:
+            return True
+        at = n.get("cpu_at")
+        if at is not None:
+            try:
+                if (time.time() - float(at)) / 3600.0 > CPU_MAX_AGE_H:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        return n["cpu_ms"] <= CPU_MAX_MS
+
+
     def pick_dest(model, ram, fl, cores, exclude, tidy=True):
         """tidy=False drops the leftover_clean() packing rule. Relief passes
         False: that rule exists to keep the fleet SELLABLE, and trading
@@ -349,6 +390,8 @@ def main():
             if dn["model"] != model or did in exclude or not placeable(dn):
                 continue
             if not disk_ok(dn):
+                continue
+            if not cpu_ok(dn):
                 continue
             if model == "SQX":
                 if dn["g"] <= 0:
