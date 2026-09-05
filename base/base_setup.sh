@@ -46,8 +46,33 @@
 #   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp2s0
 
 # 1) Install runtime dependencies.
-apt update && apt upgrade -y
-apt install -y nftables nginx libnginx-mod-http-js python3 python3-pip curl ca-certificates certbot ethtool sshpass smbclient netcat-openbsd freerdp3-x11 xvfb imagemagick conntrack
+BASE_RUNTIME_PACKAGES=(
+  nftables nginx libnginx-mod-http-js python3 python3-pip curl
+  ca-certificates certbot ethtool sshpass smbclient netcat-openbsd
+  freerdp3-x11 xvfb imagemagick conntrack
+)
+
+# This script intentionally does not use a global `set -e`: several later
+# reconciliation commands are best-effort. Package installation is different:
+# continuing without these binaries leaves NAT diagnostics, SMB auth or RDP
+# screenshots half-working while the rest of the BASE appears healthy.
+if ! apt update || ! apt upgrade -y \
+  || ! apt install -y "${BASE_RUNTIME_PACKAGES[@]}"; then
+  echo "ERROR: BASE runtime dependency installation failed" >&2
+  exit 1
+fi
+
+missing_packages=()
+for package in "${BASE_RUNTIME_PACKAGES[@]}"; do
+  if ! dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null \
+    | grep -qx installed; then
+    missing_packages+=("$package")
+  fi
+done
+if ((${#missing_packages[@]})); then
+  echo "ERROR: BASE runtime packages missing after apt install: ${missing_packages[*]}" >&2
+  exit 1
+fi
 # Debian 13: the dpkg-owned `requests` blocks the dependency upgrade
 # (uninstall-no-record-file) — --ignore-installed installs the tree into
 # /usr/local without touching dpkg files.
