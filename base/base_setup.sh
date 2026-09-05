@@ -8,7 +8,7 @@
 #   - reconcile dynamic VM forwardings in `ip6 nat prerouting` from Firestore
 #   - keep nginx proxmox_nodes map + firewall sync commands
 
-# 0) Interfaces example — as built on the German b0 (2026-07-04).
+# 0) Interfaces example — current German b0 ECC (2026-09-05).
 # Per-base values: main IPs change; bind ALL failover VIPs with
 # preferred_lft 0 (deprecated => never chosen as source) so a failover
 # swing needs no config change on the base.
@@ -21,29 +21,29 @@
 # iface lo inet loopback
 # iface lo inet6 loopback
 
-# auto enp6s0
-# iface enp6s0 inet static
-#   address 188.40.153.120
-#   netmask 255.255.255.128
-#   gateway 188.40.153.1
-#   up route add -net 188.40.153.0 netmask 255.255.255.128 gw 188.40.153.1 dev enp6s0
+# auto enp2s0
+# iface enp2s0 inet static
+#   address 116.202.118.221
+#   netmask 255.255.255.192
+#   gateway 116.202.118.193
+#   up route add -net 116.202.118.192 netmask 255.255.255.192 gw 116.202.118.193 dev enp2s0
 #   # failover FSN (sqx-fsn)
-#   up ip addr add 94.130.3.118/32 dev enp6s0 preferred_lft 0
-#   down ip addr del 94.130.3.118/32 dev enp6s0
+#   up ip addr add 94.130.3.118/32 dev enp2s0 preferred_lft 0
+#   down ip addr del 94.130.3.118/32 dev enp2s0
 #   # failover HEL (sqx-hel)
-#   up ip addr add 77.42.49.79/32 dev enp6s0 preferred_lft 0
-#   down ip addr del 77.42.49.79/32 dev enp6s0
+#   up ip addr add 77.42.49.79/32 dev enp2s0 preferred_lft 0
+#   down ip addr del 77.42.49.79/32 dev enp2s0
 
-# iface enp6s0 inet6 static
-#   address 2a01:4f8:2b03:18a9::2
+# iface enp2s0 inet6 static
+#   address 2a01:4f8:2b01:124::2
 #   netmask 64
 #   gateway fe80::1
 #   # failover FSN v6
-#   up ip addr add 2a01:4f8:fff2:95::2/64 dev enp6s0 preferred_lft 0
-#   down ip addr del 2a01:4f8:fff2:95::2/64 dev enp6s0
+#   up ip addr add 2a01:4f8:fff2:95::2/64 dev enp2s0 preferred_lft 0
+#   down ip addr del 2a01:4f8:fff2:95::2/64 dev enp2s0
 #   # failover HEL v6
-#   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp6s0 preferred_lft 0
-#   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp6s0
+#   up ip addr add 2a01:4f9:fff1:5f::2/64 dev enp2s0 preferred_lft 0
+#   down ip addr del 2a01:4f9:fff1:5f::2/64 dev enp2s0
 
 # 1) Install runtime dependencies.
 apt update && apt upgrade -y
@@ -63,9 +63,9 @@ sshd -t && systemctl reload ssh
 # 2) Runtime configuration for sync-base-nat.py.
 cat >/etc/default/base-nat <<'EOF'
 # Host addresses (used by boot checks only).
-# Per-base values — this example is the German b0 (2026-07-04).
-MAIN_IPV4=188.40.153.120
-MAIN_IPV6=2a01:4f8:2b03:18a9::2
+# Per-base values — this example is the German b0 ECC (2026-09-05).
+MAIN_IPV4=116.202.118.221
+MAIN_IPV6=2a01:4f8:2b01:124::2
 FAILOVER_IPV4=94.130.3.118
 FAILOVER_IPV6=2a01:4f8:fff2:95::2
 
@@ -103,8 +103,8 @@ FIREWALL_SCP_PORT=23
 
 # Named base aliases (name=ipv6; '=' because b0/b00/b1 are valid IPv6
 # hextets, so a colon would be ambiguous). Keep identical on every BASE.
-# b00 = old Helsinki base-0 (retiring), b0 = German base, b1 = Helsinki.
-BASE_HOSTS=b0=2a01:4f8:2b03:18a9::2,b00=2a01:4f9:3090:2488::2,b1=2a01:4f9:3070:3984::2
+# b0 = German ECC base, b1 = Helsinki ECC base.
+BASE_HOSTS=b0=2a01:4f8:2b01:124::2,b1=2a01:4f9:2a:2d56::2
 EOF
 
 # 3) Install Firebase credentials before starting service.

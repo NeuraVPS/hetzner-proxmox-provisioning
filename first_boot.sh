@@ -743,8 +743,8 @@ fi
 # netconsole streams over IPv6; the base only accepts our nodes' /64s.
 ############################################
 log "Configuring netconsole (kernel console -> region BASE over IPv6)"
-NC_HEL=2a01:4f9:3070:3984::2   # b1 (Helsinki) IPv6
-NC_FSN=2a01:4f8:2b03:18a9::2   # b0 (Falkenstein) IPv6
+NC_HEL=2a01:4f9:2a:2d56::2     # b1 ECC (Helsinki) IPv6
+NC_FSN=2a01:4f8:2b01:124::2    # b0 ECC (Falkenstein) IPv6
 NC_BASE=""
 NC_LOC=""
 if [ -s /etc/firebase-credentials.json ]; then
