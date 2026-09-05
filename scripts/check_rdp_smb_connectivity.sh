@@ -16,12 +16,14 @@ VMID_SMB=( )
 
 # Ingress IPs to probe (IPv4 and/or IPv6). Add as many entries as needed.
 HOST_IPS=(
-  "46.62.188.207"         # BASE 0
-  "2a01:4f9:3090:2488::2" # BASE 0
-  "37.27.135.250"         # BASE 1
-  "2a01:4f9:3070:3984::2" # BASE 1
-  "77.42.49.79"         # FAILOVER <- Pointing to BASE 1 <- PRODUCTION (domain DNS)
-  "2a01:4f9:fff1:5f::2" # FAILOVER <- Pointing to BASE 1 <- PRODUCTION (domain DNS)
+  "116.202.118.221"         # BASE 0 ECC
+  "2a01:4f8:2b01:124::2"   # BASE 0 ECC
+  "95.216.102.179"          # BASE 1 ECC
+  "2a01:4f9:2a:2d56::2"    # BASE 1 ECC
+  "94.130.3.118"            # FAILOVER FSN v4
+  "2a01:4f8:fff2:95::2"    # FAILOVER FSN v6
+  "77.42.49.79"             # FAILOVER HEL v4
+  "2a01:4f9:fff1:5f::2"    # FAILOVER HEL v6
 )
 NC_TIMEOUT=3
 

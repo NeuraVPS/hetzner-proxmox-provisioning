@@ -16,8 +16,8 @@
 #
 # Run FROM the region's BASE (it can `ssh <node>` directly AND is the netconsole
 # collector target):
-#   b1$ ./apply_freeze_mitigations.sh --base-ip 2a01:4f9:3070:3984::2 [-n] p2 p3 ...
-#   b0$ ./apply_freeze_mitigations.sh --base-ip 2a01:4f8:2b03:18a9::2 [-n] -f fsn.txt
+#   b1$ ./apply_freeze_mitigations.sh --base-ip 2a01:4f9:2a:2d56::2 [-n] p2 p3 ...
+#   b0$ ./apply_freeze_mitigations.sh --base-ip 2a01:4f8:2b01:124::2 [-n] -f fsn.txt
 # --base-ip is the region base's IPv6 (netconsole streams over IPv6; the
 # collector only accepts our nodes' /64s).
 #     -n = DRY-RUN (report only). Needs the netconsole-collector service on the BASE.

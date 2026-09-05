@@ -10,8 +10,8 @@
 # Config: /etc/neuravps/failover-watchdog.env  (mode 600, root)
 #   SELF=b1                 # this base's id (b0|b1)
 #   PEER=b0                 # the other base's id
-#   PEER_V6=2a01:4f8:2b03:18a9::2
-#   PEER_V4=188.40.153.120
+#   PEER_V6=2a01:4f8:2b01:124::2
+#   PEER_V4=116.202.118.221
 #   CF_URL=https://failover-watchdog-....a.run.app
 #   TOKEN=<shared bearer token = GCP secret FAILOVER_WATCHDOG_TOKEN>
 #   THRESHOLD=6             # consecutive failures before reporting (~3 min)

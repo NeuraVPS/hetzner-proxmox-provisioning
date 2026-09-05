@@ -51,8 +51,8 @@ STATE_FILE = os.environ.get("BASE_NAT_STATE", "/var/lib/base-nat/state.json")
 CREDS = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
 # main v4 de la OTRA base (constantes de topología; ver memoria dual-región)
 PEER_V4 = {
-    "0000000-BASE": "37.27.135.250",   # b0 sondea a través de b1 (HEL)
-    "0000001-BASE": "188.40.153.120",  # b1 sondea a través de b0 (FSN)
+    "0000000-BASE": "95.216.102.179",   # b0 sondea a través de b1 ECC (HEL)
+    "0000001-BASE": "116.202.118.221",  # b1 sondea a través de b0 ECC (FSN)
 }
 CONNECT_TIMEOUT = 3.0
 WORKERS = 48

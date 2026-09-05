@@ -11,16 +11,16 @@ MARK = "# --- egress-failover (modelo nuevo)"
 
 which = sys.argv[1]
 if which == "b0":
-    MAIN_V4, MAIN_V6, V6_PREFIX = "188.40.153.120", "2a01:4f8:2b03:18a9::2", "2a01:4f8:2b03:18a9::/64"
+    MAIN_V4, MAIN_V6, V6_PREFIX = "116.202.118.221", "2a01:4f8:2b01:124::2", "2a01:4f8:2b01:124::/64"
     CANON6 = "2a01:4f9:c01f:e:ffff::"
 elif which == "b1":
-    MAIN_V4, MAIN_V6, V6_PREFIX = "37.27.135.250", "2a01:4f9:3070:3984::2", "2a01:4f9:3070:3984::/64"
+    MAIN_V4, MAIN_V6, V6_PREFIX = "95.216.102.179", "2a01:4f9:2a:2d56::2", "2a01:4f9:2a:2d56::/64"
     CANON6 = "2a01:4f9:c01f:e:ffff::2"
 else:
     sys.exit("uso: persist_nft.py b0|b1")
 
 IDENT = "2a01:4f9:c01f:e::/64"
-UP = "enp6s0"
+UP = "enp2s0"
 
 src = open(CONF).read()
 if MARK in src:
