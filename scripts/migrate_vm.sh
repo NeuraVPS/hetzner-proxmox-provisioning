@@ -525,6 +525,22 @@ def docs_for_vmid(db, vmid):
     q = ref.where(filter=FieldFilter("proxmoxId", "==", vmid)) if FF else ref.where("proxmoxId", "==", vmid)
     return list(q.stream())
 
+def selected_base_ipv4(config, location):
+    """Closed selector shared with the application watchdog; no network changes."""
+    selection = config.get('activeBases', {'b0': 'legacy', 'b1': 'legacy'})
+    if not isinstance(selection, dict) or set(selection) != {'b0', 'b1'}:
+        raise ValueError('activeBases must contain exactly b0 and b1')
+    if any(not isinstance(v, str) or v not in ('legacy', 'ecc') for v in selection.values()):
+        raise ValueError('activeBases values must be legacy or ecc')
+    role = {'falkenstein': 'b0', 'helsinki': 'b1'}.get(str(location or '').strip().lower())
+    if role is None:
+        return None
+    addresses = {
+        'legacy': {'b0': '188.40.153.120', 'b1': '37.27.135.250'},
+        'ecc': {'b0': '116.202.118.221', 'b1': '95.216.102.179'},
+    }
+    return addresses[selection[role]][role]
+
 p = argparse.ArgumentParser()
 p.add_argument("--vmid", type=int, required=True)
 p.add_argument("--maintenance", choices=("true", "false"))
@@ -561,9 +577,9 @@ if args.node_id is not None:
             _ip6_vm = (args.ipv6 or (docs[0].to_dict() or {}).get("ipv6") or "")
             _es_nuevo = str(_ip6_vm).strip().lower().startswith("2a01:4f9:c01f:e:")
             if _es_nuevo:
-                _base = {"falkenstein": "188.40.153.120",
-                         "helsinki": "37.27.135.250"}.get(
-                    str(ndata.get("location") or "").strip().lower())
+                _cfg = db.collection("config").document("failover_watchdog").get(retry=None, timeout=5)
+                _base = selected_base_ipv4(
+                    (_cfg.to_dict() or {}) if _cfg.exists else {}, ndata.get("location"))
                 if _base:
                     patch["publicIpv4"] = _base
             elif ndata.get("server_ipv4"):
