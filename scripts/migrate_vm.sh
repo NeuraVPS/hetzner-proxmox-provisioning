@@ -1077,14 +1077,22 @@ PY
     for _ in $(seq 1 540); do   # ~3 h self-cap at 20 s cadence (covers the
       # disk phase of a full zvol; must outlive it to see the RAM rounds)
       sleep 20
-      out=$(src_ssh "printf 'info migrate\n' | timeout 10 qm monitor '${VMID}'" 2>/dev/null)
+      # qm monitor adds a greeting even when QEMU returns an empty result
+      # during block mirroring. Use the monitor API's JSON string to keep
+      # that empty result distinct from an actual migration status.
+      out=$(src_ssh "timeout 10 pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/monitor' --command 'info migrate' --output-format json" 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin))' 2>/dev/null)
       if [[ -z "$out" ]]; then
         continue   # SSH hiccup or source VM already deleted; parent reaps us
       fi
       status=$(grep -oE 'Migration status: [a-z-]+' <<<"$out" | awk '{print $3}')
       case "$status" in
         active|postcopy-active|device|setup|cancelling) ;;
-        *) return 0 ;;   # completed/failed/none: nothing left to escalate
+        *)
+          # Block mirroring precedes RAM migration. An empty/none status
+          # (or the previous migration's terminal status) is normal then.
+          [[ -z "$ram_ts" ]] && continue
+          return 0 ;;   # RAM phase already observed: it is now terminal.
       esac
       grep -q 'transferred ram:' <<<"$out" && [[ -z "$ram_ts" ]] && ram_ts=$(date +%s)
       [[ -z "$ram_ts" ]] && continue   # still in the disk phase: nothing to escalate
@@ -1100,7 +1108,8 @@ PY
       fi
       [[ "$target" -gt "$MIGRATE_DOWNTIME" ]] && target="$MIGRATE_DOWNTIME"
       if [[ "$target" -gt "$cur" ]]; then
-        if src_ssh "printf 'migrate_set_parameter downtime-limit %s\n' '$(( target * 1000 ))' | timeout 10 qm monitor '${VMID}'" >/dev/null 2>&1; then
+        if src_ssh "timeout 10 pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/monitor' --command 'migrate_set_parameter downtime-limit $(( target * 1000 ))' --output-format json" 2>/dev/null \
+          | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin) == "" else 1)' >/dev/null 2>&1; then
           _info "downtime-escalator: budget ${cur}s → ${target}s (dirty rounds=${dirty:-?}, elapsed=${elapsed}s — guest dirties memory faster than the link drains it)."
           cur="$target"
         fi
