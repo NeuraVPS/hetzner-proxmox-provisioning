@@ -73,7 +73,7 @@ State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
 
 --dry-run flag: plan + journal (as dryRun) but never execute, without
 touching the config/defrag kill-switch the hourly timers read.
-#NDFVER=10
+#NDFVER=11
 """
 import fcntl
 import json
@@ -106,7 +106,7 @@ from firebase_admin import credentials, firestore
 # freeze a customer per node per day chasing holes no sale can ever fill
 # (audit 2026-07-31). Destination margins and over-gate corrections keep
 # using FLOOR: existing VMs are deliberately packed tighter than we sell.
-COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.90, 0.80
+COMMIT, FLOOR, FLOOR_SALES = 1.5, 0.90, 0.85
 # Ocupacion REAL del pool por encima de la cual un nodo deja de valer como
 # DESTINO. Es el mismo numero y la misma fuente que usa la venta
 # (auto_provision._DISK_REAL_MAX_PCT, alimentado por proxmox_nodes.zpoolCapPct),
@@ -141,16 +141,30 @@ def disk_ok(n):
     """
     pct = n.get("zpool_pct")
     return pct is None or pct < DISK_REAL_MAX_PCT
+
+
+def base_ram(data):
+    values = [float(data[k]) for k in ('max_base_ram', 'gbRam')
+              if data.get(k) and float(data[k]) > 0]
+    return min(values) if values else 0.0
+
+
+def weekday_cpu_ok(data, now=None):
+    """Recent weekly demand remains relevant when markets are closed."""
+    now = time.time() if now is None else now
+    at = data.get('cpuProfileAt')
+    return not (at is not None and 0 <= now - float(at) <= 48 * 3600
+                and float(data.get('cpuWeekdayP95Pct') or 0) >= 85)
 # Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
 # max(ram_min, ram_min_observed), the same number auto_provision reserves).
 # vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
 # nominal floors (5.7-18.0) that understate the measured settle points 1.66x,
 # so fits_any_plan() under-estimated what a destination must reserve.
 # RE-MEASURE together with pricingPlans.json ram_min_observed.
-PLAN_SIZES = [16, 19, 31, 33, 45]          # SQX sellable GB sizes (vps-a..e;
+PLAN_SIZES = [16, 19, 31, 32, 42]          # SQX sellable GB sizes (vps-a..e;
                                            # catalogue-wide respec 2026-08-16)
 PLANS = [("vps-a", 16, 8.2), ("vps-b", 19, 9.7), ("vps-c", 31, 15.5),
-         ("vps-d", 33, 23.8), ("vps-e", 45, 43.1)]
+         ("vps-d", 32, 23.1), ("vps-e", 42, 40.2)]
 
 # Floor a guest of each plan ACTUALLY settles at — pricingPlans.json
 # max(ram_min, ram_min_observed), measured 2026-07-29 over 657 live guests.
@@ -276,6 +290,8 @@ def main():
         return 0
     dry = bool(cfg.get("dryRun")) or force_dry
     max_moves = int(cfg.get("maxMovesPerRun") or 8)
+    if not relief:
+        max_moves = min(max_moves, int(cfg.get('routineMaxMovesPerRun') or 4))
     cooldown_h = float(cfg.get("moveCooldownH") or 72)
     recent_vmids = load_recent_moves(cooldown_h)
     if recent_vmids:
@@ -301,7 +317,7 @@ def main():
         nodes[nd.id] = {
             "model": model, "ip": d.get("ip") or "", "frozen": bool(d.get("frozen")),
             "status": str(d.get("status") or "").strip(),
-            "g": float(d.get("max_base_ram") or d.get("gbRam") or 0),
+            "g": base_ram(d),
             "cap": int(d.get("max_cores") or 0),
             # Ocupacion real del pool, la escribe node_health en el doc del nodo.
             # None = todavia no sincronizada, y entonces no bloquea (fail-open).
@@ -312,6 +328,8 @@ def main():
             "cpu_ms": (float(d["cpuContentionMsS"])
                        if d.get("cpuContentionMsS") is not None else None),
             "cpu_at": d.get("cpuContentionAt"),
+            "cpuWeekdayP95Pct": d.get('cpuWeekdayP95Pct'),
+            "cpuProfileAt": d.get('cpuProfileAt'),
             "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [], "n_all": 0,
         }
     for s in db.collection("servers").stream():
@@ -364,6 +382,8 @@ def main():
         bloquea. Un dato ausente no puede dejar sin destino a un nodo que
         necesita alivio.
         """
+        if n['model'] == 'MT5' and not weekday_cpu_ok(n):
+            return False
         if CPU_MAX_MS is None or n.get("cpu_ms") is None:
             return True
         at = n.get("cpu_at")
@@ -409,13 +429,13 @@ def main():
                 key = ch
             else:
                 free = dn["cap"] - dn["cores"]
-                if free - cores < 0:
+                if free - cores < 0 or dn['g'] <= 0 or dn['fl'] + fl > dn['g']:
                     continue
                 key = free
             # BEST-FIT: fullest fitting node (min headroom), and NEVER an
             # empty node — empties are the operator's drain/maintenance
             # reserve (worst-fit here is what consumed them on 07-12).
-            if len(dn["vms"]) == 0 and dn["ram"] <= 0 and dn["cores"] <= 0:
+            if tidy and len(dn["vms"]) == 0 and dn["ram"] <= 0 and dn["cores"] <= 0:
                 continue
             if best is None or key < best[1]:
                 best = (did, key)
@@ -499,6 +519,8 @@ def main():
             # as relief for 0000237 twice, so it believed it freed double.
             if v["vmid"] in booked:
                 continue
+            if not relief and v['vmid'] in recent_vmids:
+                continue  # routine packing cannot repeatedly move one customer
             if v.get("st") == "running" and not agent_alive(nid, v["vmid"]):
                 log(f"victim-skip vm {v['vmid']} ({nid}): guest agent no "
                     f"contesta — el reconfig IPv6 fallaría; probando la siguiente")
@@ -576,6 +598,8 @@ def main():
                 log(f"relief: move cap {relief_max} reached — remaining nodes wait for next tick")
                 break
             n = nodes[nid]
+            if not placeable(n):
+                continue
             vm_list = ",".join(str(b.get("vmid")) for b in live_blocked[nid][:3])
             worst = max((int(b.get("rate") or 0) for b in live_blocked[nid]), default=0)
 
@@ -639,9 +663,11 @@ def main():
     # ---- phase 1: corrections ----
     for nid in sorted(nodes) if not relief else []:
         n = nodes[nid]
+        if not placeable(n) or len(moves) >= max_moves:
+            continue
         if n["model"] == "SQX" and n["g"] > 0:
             guard = 0
-            while guard < 6:
+            while guard < 6 and len(moves) < max_moves:
                 ch, fh = sqx_head(n)
                 if ch >= 0 and fh >= 0:
                     break
@@ -659,7 +685,7 @@ def main():
                 guard += 1
         elif n["model"] == "MT5":
             guard = 0
-            while n["cap"] > 0 and n["cores"] > n["cap"] and guard < 6:
+            while n["cap"] > 0 and n["cores"] > n["cap"] and guard < 6 and len(moves) < max_moves:
                 cand = order_victims(n["vms"], nid,
                                      sizekey=lambda v: v["cores"])
                 moved = False
@@ -682,11 +708,11 @@ def main():
     # thrashing guest's floor). Moving one small VM out restores burst
     # headroom. Seen live on 0000192 (2026-07-12: vms 795/865/812 thrashing,
     # reconciler logging NO BUDGET for hours).
-    for nid in sorted(nodes) if not relief else []:
+    for nid in sorted(nodes) if not relief and cfg.get('preventiveFloorRelief', False) else []:
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
-        if n["model"] != "SQX" or n["g"] <= 0:
+        if not placeable(n) or n["model"] != "SQX" or n["g"] <= 0:
             continue
         ch, fh = sqx_head(n)
         if fh < 0 or fh >= 6.0:
@@ -707,7 +733,7 @@ def main():
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
-        if n["model"] != "SQX" or n["g"] <= 0:
+        if not placeable(n) or n["model"] != "SQX" or n["g"] <= 0:
             continue
         ch, fh = sqx_head(n)
         fh_s = FLOOR_SALES * n["g"] - n["fl"]
@@ -729,6 +755,15 @@ def main():
         if len(moves) >= max_moves:
             break
         n = nodes[nid]
+        if not placeable(n):
+            continue
+        reserve = int(cfg.get('reserveEmptySqx' if n['model'] == 'SQX' else 'reserveEmptyMt', 2))
+        empty = sum(1 for x in nodes.values() if x['model'] == n['model']
+                    and placeable(x) and x['ram'] <= 0 and x['cores'] <= 0)
+        if empty >= reserve:
+            continue  # consolidation must restore a reserve that is missing
+        if any(v['vmid'] in recent_vmids for v in n['vms']):
+            continue
         if not (0 < len(n["vms"]) <= CONSOL_MAX_VMS):
             continue
         # Consolidation only pays off when EVERY server doc on the node is

@@ -119,7 +119,7 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=9
+#NBRVER=10
 set -u
 # ON BY DEFAULT since 2026-08-19, after v8 ran the whole fleet clean.
 # It was 0 through v7/v8's canary for the right reason — first_boot.sh curls
@@ -207,6 +207,8 @@ BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # leaky blocked-counter level (+1 bloc
 [ -f /etc/default/neuravps-balloon-reconciler ] && . /etc/default/neuravps-balloon-reconciler
 
 STATE_DIR=/var/lib/neuravps-balloon
+exec 9>/run/neuravps-ram.lock
+flock -n 9 || exit 0  # shared with demand boosts; no overlapping writers
 RUN_RATES=/var/run/neuravps-balloon-rates.tsv
 RUN_STATUS=/var/run/neuravps-balloon-status.json
 mkdir -p "$STATE_DIR"
@@ -250,6 +252,17 @@ floor_target() {  # $1 = max MB, $2 = orig MB -> echoes target MB
 
 ram_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
 avail_mb=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1024 ))
+pending_mb=$(python3 - <<'PY'
+import json,time
+from pathlib import Path
+p=Path('/var/lib/neuravps-balloon/pending-boosts.json')
+try:
+    print(sum(v['mb'] for v in json.loads(p.read_text()).values() if v['until'] > time.time()) if p.exists() else 0)
+except Exception:
+    print(1 << 40)  # unreadable reservations cannot become free capacity
+PY
+)
+granted_mb=0
 now=$(date +%s)
 
 # --- node-level REAL disk swap-in + IO pressure ----------------------------
@@ -308,7 +321,10 @@ for pf in /var/run/qemu-server/*.pid; do
   mx=$(awk -F': ' '/^memory:/{print $2;exit}' "$conf"); mx=${mx:-0}
   fl=$(awk -F': ' '/^balloon:/{print $2;exit}' "$conf"); fl=${fl:-0}
   committed=$(( committed + mx ))
-  [ "$fl" -gt 0 ] || continue   # balloon:0 = ballooning disabled
+  if [ "$fl" -le 0 ]; then
+    floors_sum=$(( floors_sum + mx ))  # fixed guests also consume the budget
+    continue
+  fi
   # NB: fl==mx stays managed (a VM we raised to max must lower again later);
   # deliberately-fixed VMs are protected by the floors.json-only LOWER rule.
   CUR_FLOOR[$v]=$fl; CUR_MAX[$v]=$mx
@@ -356,11 +372,22 @@ for v in "${!CUR_FLOOR[@]}"; do
   binfo=$(printf 'info balloon\n' | timeout 3 qm monitor "$v" 2>/dev/null | tr -d '\r')
   f1=$(printf '%s' "$binfo" | grep -oE 'major_page_faults=[0-9]+' | cut -d= -f2)
   actual=$(printf '%s' "$binfo" | grep -oE 'actual=[0-9]+' | cut -d= -f2)
-  [ -n "$f1" ] || { # QMP hiccup: carry forward prior sample unchanged
+  updated=$(printf '%s' "$binfo" | grep -oE 'last_update=[0-9]+' | cut -d= -f2)
+  sample_now=$(date +%s)
+  if [ -z "$f1" ] || [ -z "$updated" ] || [ -z "$actual" ] \
+     || [ $(( sample_now - ${updated:-0} )) -gt 120 ] \
+     || [ "${updated:-0}" -gt $(( sample_now + 5 )) ]; then
+    # Missing/stale guest telemetry must not earn idle credit. Preserve backoff.
     [ -n "${P_F[$v]:-}" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$v" "${P_F[$v]}" "${P_T[$v]}" "${P_IDLE[$v]:-0}" "${P_BLOCKED[$v]:-0}" "${P_LLOW[$v]:-0}" "${P_BNC[$v]:-0}" "${P_BLKU[$v]:-0}" >> "$tmp_samples"
-    continue; }
+    continue
+  fi
+  current_avail=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1024 ))
+  conservative_avail=$(( avail_mb - granted_mb ))
+  [ "$current_avail" -lt "$conservative_avail" ] && conservative_avail=$current_avail
+  conservative_avail=$(( conservative_avail - pending_mb ))
   rate=-1
-  if [ -n "${P_F[$v]:-}" ] && [ -n "${P_T[$v]:-}" ] && [ "$now" -gt "${P_T[$v]}" ] && [ "$f1" -ge "${P_F[$v]}" ]; then
+  if [ -n "${P_F[$v]:-}" ] && [ -n "${P_T[$v]:-}" ] && [ "$now" -gt "${P_T[$v]}" ] \
+     && [ $(( now - P_T[$v] )) -le 180 ] && [ "$f1" -ge "${P_F[$v]}" ]; then
     rate=$(( (f1 - P_F[$v]) / (now - P_T[$v]) ))
   fi
   idle=${P_IDLE[$v]:-0}
@@ -389,7 +416,8 @@ for v in "${!CUR_FLOOR[@]}"; do
         new=$fl     # fall through to the sample write without touching it
       fi
       if [ "$new" -gt "$fl" ]; then
-        if [ $(( floors_sum + new - fl )) -le "$budget_mb" ] && [ "$avail_mb" -ge "$HOST_FREE_MIN_MB" ]; then
+        if [ $(( floors_sum + new - fl )) -le "$budget_mb" ] \
+           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + new - fl )) ]; then
           # remember the ORIGINAL floor before our first touch
           python3 - "$FLOORS" "$v" "$fl" <<'PY'
 import json,sys
@@ -398,6 +426,7 @@ d=json.load(open(p))
 if v not in d: d[v]=fl; json.dump(d,open(p,"w"))
 PY
           if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
+            granted_mb=$(( granted_mb + new - fl ))
             floors_sum=$(( floors_sum + new - fl ))
             blocked=0
             logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
@@ -444,7 +473,7 @@ PY
         # 0.80 sales gate under the 0.90 ceiling keeps the last band
         # reconciler-only, so released budget cannot ALL be resold.
         if [ $(( budget_mb - floors_sum )) -ge "$STEP_MB" ] \
-           && [ "$avail_mb" -ge "$HOST_FREE_MIN_MB" ]; then
+           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + STEP_MB )) ]; then
           fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
           orig=$(python3 - "$FLOORS" "$v" "$mx" "$fl" <<'PY'
 import json,sys

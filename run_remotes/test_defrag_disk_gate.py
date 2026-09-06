@@ -66,7 +66,7 @@ class NoEsUnGateDeVenta(unittest.TestCase):
         # Este cambio NO reduce cuántas VMs caben en un nodo: solo decide dónde
         # aterriza una que ya se estaba moviendo. Los factores de venta y de
         # colocación siguen donde estaban.
-        self.assertEqual((1.5, 0.90, 0.80),
+        self.assertEqual((1.5, 0.90, 0.85),
                          (df.COMMIT, df.FLOOR, df.FLOOR_SALES))
 
 
