@@ -633,13 +633,18 @@ def boot_ram_guard(vmid: int) -> None:
         # into a detached transient unit — by then the lock is gone and the
         # Windows memory init is still >10 s away — and restore in the same
         # unit after BOOT_RAM_GUARD_S unless something re-raised meanwhile.
-        script = (
-            f"qm set {vmid} --balloon {memory} && "
-            f"printf 'balloon {memory}\\n' | timeout 5 qm monitor {vmid} >/dev/null; "
-            f"sleep {BOOT_RAM_GUARD_S}; "
-            f'cur=$(awk -F": " \'/^balloon:/{{print $2; exit}}\' {conf}); '
-            f'[ "$cur" = "{memory}" ] && qm set {vmid} --balloon {balloon}'
-        )
+        import shlex
+        import socket
+        helper = '/usr/local/sbin/neuravps-ram-guard.py'
+        if not Path(helper).is_file():
+            logger.warning('Boot RAM guard unavailable: missing resource helper')
+            return
+        token = f'{time.time_ns()}'
+        args = ['python3',helper]
+        identity = [str(vmid),socket.gethostname(),token]
+        script = (shlex.join(args+['boot']+identity) + '; '
+                  f'sleep {BOOT_RAM_GUARD_S}; ' +
+                  shlex.join(args+['restore']+identity))
         run([
             "systemd-run", "--collect", "--on-active=5",
             f"--unit=nvps-bootram-{vmid}-{int(time.time())}",

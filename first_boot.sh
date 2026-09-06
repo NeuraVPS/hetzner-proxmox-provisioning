@@ -902,6 +902,12 @@ smartd -q onecheck 2>/dev/null || true
 systemctl restart smartd || true
 log "smartd NVMe filter installed"
 
+# Demand boost helper is needed on MT as well as SQX nodes.
+curl -fSsL --retry 3 --retry-delay 5 \
+  https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes/neuravps-ram-guard.py \
+  -o /usr/local/sbin/neuravps-ram-guard.py \
+  && chmod 755 /usr/local/sbin/neuravps-ram-guard.py
+
 # --- Balloon reconciler (AX162/SQX nodes only, 2026-07-11) -------------------
 # "RAM follows activity": PVE autoballooning is blind to guest distress — a
 # guest squeezed below its working set pages to its OWN pagefile (invisible to

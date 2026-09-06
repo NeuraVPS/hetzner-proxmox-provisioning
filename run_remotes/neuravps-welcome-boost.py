@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#NWBVER=1
+#NWBVER=2
 """neuravps-welcome-boost — infla el balloon de una VM estrujada en el momento
 en que su cliente se conecta por RDP (daemon en cada BASE).
 
@@ -34,18 +34,21 @@ ciclo. Kill-switch Firestore `config/welcomeboost` {enabled, dryRun} — doc
 ausente o enabled!=true = APAGADO.
 """
 import json
+import ipaddress
 import os
 import re
 import socket
+import shlex
 import subprocess
 import sys
 import time
 
 STATE_FILE = os.environ.get("BASE_NAT_STATE", "/var/lib/base-nat/state.json")
+NODES_FILE = os.environ.get("BASE_NAT_NODES", "/var/lib/base-nat/pve_nodes.json")
 CREDS = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
 POLL_S = int(os.environ.get("POLL_S", "12"))
 CONFIG_EVERY = 10          # ciclos entre relecturas de config/welcomeboost
-PORT_MIN, PORT_MAX = 20000, 21999
+PORT_MIN = 20000
 HANDLED_TTL_S = 3600       # un flujo se atiende una vez por hora
 BOOST_COOLDOWN_S = 1800    # no re-evaluar una vmid boosteada en 30 min
 FULL_TTL_S = 1800          # vmid comprobada "ya a tope": no re-consultar en 30 min
@@ -69,7 +72,7 @@ def log(msg):
     print(f"welcome-boost: {msg}", flush=True)
 
 
-def conntrack_flows():
+def conntrack_flows(ports):
     """Set de (src, sport, dport) de flujos VIVOS con dport en el rango RDP."""
     flows = set()
     try:
@@ -85,7 +88,7 @@ def conntrack_flows():
                 if not m:
                     continue
                 dport = int(m.group(3))
-                if PORT_MIN <= dport <= PORT_MAX:
+                if dport in ports:
                     flows.add((m.group(1), int(m.group(2)), dport))
     except OSError as e:
         log(f"no puedo leer {CONNTRACK_PROC}: {e}")
@@ -97,7 +100,7 @@ class StateFile:
         self.mtime = 0.0
         self.data = {}
 
-    def get(self, vmid):
+    def refresh(self):
         try:
             mt = os.stat(STATE_FILE).st_mtime
             if mt != self.mtime:
@@ -106,14 +109,21 @@ class StateFile:
                 self.mtime = mt
         except Exception as e:  # noqa: BLE001
             log(f"state.json ilegible: {e}")
+            self.data = {}  # stale ownership is not safe to act on
+            self.mtime = 0.0
+
+    def get(self, vmid):
+        self.refresh()
         return self.data.get(vmid)
 
 
-def node_addr(ipv6):
-    """vmbr0 del nodo = prefijo /64 de la VM + ::2 (red routeada por nodo)."""
-    if not ipv6 or "::" not in ipv6:
+def node_addr(state, nodes):
+    """Identity IPv6 is portable: only nodeId determines the current host."""
+    addr = nodes.get(state.get('nodeId'))
+    try:
+        return str(ipaddress.ip_address(addr))
+    except (ValueError, TypeError):
         return None
-    return ipv6.split("::")[0] + "::2"
 
 
 def ssh_out(node, script, timeout=15):
@@ -122,45 +132,34 @@ def ssh_out(node, script, timeout=15):
     return r.returncode, r.stdout.strip()
 
 
-def query_vm(node, vmid):
+def query_vm(node, vmid, expected_node):
     """(memory_mb, floor_mb, actual_mb, avail_mb) o None si algo falla."""
-    script = (
-        f"awk -F': ' '/^memory:/{{m=$2}} /^balloon:/{{b=$2}} /^\\[/{{exit}} "
-        f"END{{print m\" \"b}}' /etc/pve/qemu-server/{vmid}.conf; "
-        f"printf 'info balloon\\n' | timeout 5 qm monitor {vmid} 2>/dev/null "
-        f"| grep -oE 'actual=[0-9]+' | head -1; "
-        f"awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo"
-    )
+    script = shlex.join(['python3', '/usr/local/sbin/neuravps-ram-guard.py',
+                         'query', str(vmid), expected_node])
     try:
         rc, out = ssh_out(node, script)
     except Exception:  # noqa: BLE001
         return None
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if rc != 0 or len(lines) < 3:
+    if rc != 0:
         return None
     try:
-        mem_s, floor_s = lines[0].split()
-        actual = int(lines[1].split("=")[1])
-        return int(mem_s), int(floor_s), actual, int(lines[2])
-    except (ValueError, IndexError):
+        result = json.loads(out)
+        return tuple(result) if isinstance(result, list) and len(result) == 4 else None
+    except (ValueError, TypeError):
         return None
 
 
-def boost_vm(node, vmid, memory, orig_floor):
+def boost_vm(node, vmid, expected_node):
     """Sembrar floor original + suelo=plan + empujón HMP. True si aplicado."""
-    seed = (
-        "import json,os; p='/var/lib/neuravps-balloon/floors.json'; "
-        "d=json.load(open(p)) if os.path.exists(p) else {}; "
-        f"d.setdefault('{vmid}', {orig_floor}); json.dump(d, open(p,'w'))"
-    )
-    script = (
-        f'python3 -c "{seed}" && '
-        f"qm set {vmid} --balloon {memory} >/dev/null && "
-        f"printf 'balloon {memory}\\n' | timeout 5 qm monitor {vmid} >/dev/null"
-    )
+    script = shlex.join(['python3', '/usr/local/sbin/neuravps-ram-guard.py',
+                         'boost', str(vmid), expected_node])
     try:
-        rc, _ = ssh_out(node, script, timeout=20)
-        return rc == 0
+        rc, out = ssh_out(node, script, timeout=30)
+        result = json.loads(out)
+        if rc == 0 and result.get('status') in ('boosted', 'full'):
+            return True
+        log(f"vm {vmid}: boost no aplicado: {result}")
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -205,7 +204,16 @@ def main():
         for v in [v for v, (exp, _) in skip_until.items() if exp < now]:
             del skip_until[v]
 
-        flows = conntrack_flows()
+        state.refresh()
+        ports = {PORT_MIN + v for v in state.data if 0 < v <= 65535 - PORT_MIN}
+        try:
+            with open(NODES_FILE) as fh:
+                nodes = json.load(fh)
+        except (OSError, ValueError) as exc:
+            log(f"mapa de nodos ilegible: {exc}")
+            prev_flows = set()
+            continue
+        flows = conntrack_flows(ports)
         qualified = (flows & prev_flows) - set(handled)
         prev_flows = flows
 
@@ -213,23 +221,38 @@ def main():
         for flow in sorted(qualified):
             if queries >= MAX_QUERIES_PER_CYCLE:
                 break  # el resto re-cualifica el ciclo siguiente
-            handled[flow] = now + HANDLED_TTL_S
             vmid = flow[2] - PORT_MIN
             if vmid in skip_until:
                 continue
             st = state.get(vmid)
             if not st:
                 continue
-            node = node_addr(st.get("ipv6"))
+            if not any(family in str(st.get('nodeId')) for family in ('-AX162', '-AX102')):
+                handled[flow] = now + HANDLED_TTL_S
+                continue  # dedicated EX44 guests have no dynamic RAM policy
+            node = node_addr(st, nodes)
             if not node:
+                skip_until[vmid] = (now + BLOCKED_TTL_S, "unresolved-node")
+                log(f"vm {vmid}: nodeId no resoluble")
                 continue
             queries += 1
-            info = query_vm(node, vmid)
+            info = query_vm(node, vmid, st['nodeId'])
             if info is None:
                 skip_until[vmid] = (now + BLOCKED_TTL_S, "query-fail")
+                log(f"vm {vmid}: consulta fallida en {st['nodeId']}")
                 continue
             memory, floor, actual, avail = info
             if actual >= memory - 1024:
+                # A login during the boot window takes ownership of the boost;
+                # the delayed boot restore must not undo a demand guarantee.
+                try:
+                    hold_rc, _ = ssh_out(node, shlex.join(['python3','/usr/local/sbin/neuravps-ram-guard.py',
+                                                         'hold',str(vmid),st['nodeId']]))
+                    if hold_rc:
+                        continue  # retry next poll while the boot window is open
+                except Exception:
+                    continue
+                handled[flow] = now + FULL_TTL_S
                 skip_until[vmid] = (now + FULL_TTL_S, "ya-a-tope")
                 continue
             need = memory - actual
@@ -239,11 +262,15 @@ def main():
                     f"(necesita {need}MB, avail {avail}MB) — no boost")
                 continue
             if dry:
+                handled[flow] = now + BOOST_COOLDOWN_S
                 skip_until[vmid] = (now + BOOST_COOLDOWN_S, "dry")
                 log(f"DRY-RUN: boostearía vm {vmid} en {node} "
                     f"({actual}->{memory}MB, suelo original {floor}MB)")
                 continue
-            if boost_vm(node, vmid, memory, floor):
+            if state.get(vmid) != st:
+                continue  # ownership changed while querying
+            if boost_vm(node, vmid, st['nodeId']):
+                handled[flow] = now + HANDLED_TTL_S
                 skip_until[vmid] = (now + BOOST_COOLDOWN_S, "boosted")
                 log(f"BOOST vm {vmid}: {actual}->{memory}MB al detectar login "
                     f"(suelo original {floor}MB sembrado; nodo avail {avail}MB)")
