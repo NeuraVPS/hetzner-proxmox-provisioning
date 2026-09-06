@@ -36,6 +36,7 @@ import fcntl
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -257,7 +258,28 @@ def set_server_ipv6(vmid, ipv6):
         return False
 
 
+VM_CONFIG_DIR = Path("/etc/pve/qemu-server")
+
+
+def status_is_current_and_local(vmid, status):
+    """A migration's stopped source/incoming target is not a guest shutdown."""
+    try:
+        config = (VM_CONFIG_DIR / f"{int(vmid)}.conf").read_text().split("\n[", 1)[0]
+        if re.search(r"^lock:\s*migrate\s*$", config, re.MULTILINE):
+            return False
+        actual = run(["qm", "status", str(vmid)]).strip()
+        # Never publish a state sampled before a concurrent start/stop/move.
+        return actual == f"status: {status}"
+    except (OSError, subprocess.CalledProcessError):
+        # A removed config means this node no longer owns the guest. An
+        # inconclusive status read must not change its desired power state.
+        return False
+
+
 def update_status_in_firestore(vmid, status):
+    if not status_is_current_and_local(vmid, status):
+        logger.info(f"Status sync deferred for VM {vmid}: migrating, absent or state changed")
+        return
     if not ensure_firebase_initialized():
         return
     # Bounded retry with backoff + jitter. The write is idempotent (setting
@@ -277,10 +299,12 @@ def update_status_in_firestore(vmid, status):
             if len(docs) > 1:
                 logger.warning(f"Multiple Firestore documents for VM {vmid}; updating all")
             for doc_snapshot in docs:
+                if not status_is_current_and_local(vmid, status):
+                    return
                 db.collection('servers').document(doc_snapshot.id).update({
                     'status': status,
                     'lastStatusUpdate': firestore.SERVER_TIMESTAMP,
-                })
+                }, option=db.write_option(last_update_time=doc_snapshot.update_time))
                 logger.info(f"Updated Firestore server {doc_snapshot.id} (VM {vmid}): status={status}")
             # Only now, with the write acknowledged: the watchdog trusts this
             # file to mean "Firestore has it".
