@@ -145,6 +145,20 @@ CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-420}"  # seconds — RDP listener 
 POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
 
+# Controller state uses a non-blocking lock shared with the reconciler.
+# Retry before copying, or after routing has recovered; never in the cutover.
+_balloon_state_retry() {
+  local ssh_fn="$1" command="$2" attempt output
+  for ((attempt=1; attempt<=12; attempt++)); do
+    if output=$("$ssh_fn" "$command" 2>/dev/null); then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    if (( attempt < 12 )); then sleep 5; fi
+  done
+  return 1
+}
+
 # ----- Modelo de direccionamiento: se DEDUCE, no se pasa por parametro --------
 # Una VM del modelo nuevo lleva su propia identidad de red, que NO se deriva del
 # nodo: IPv6 `<IDENT>::<vmid>` y puerta de enlace `fe80::1`, iguales en toda la
@@ -1100,7 +1114,7 @@ PY
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   BALLOON_HISTORY=""
   if [[ "$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162* ]]; then
-    BALLOON_HISTORY=$(src_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py export-state '${VMID}' '${SRC_NODE}'" 2>/dev/null) || BALLOON_HISTORY=""
+    BALLOON_HISTORY=$(_balloon_state_retry src_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py export-state '${VMID}' '${SRC_NODE}'") || BALLOON_HISTORY=""
     [[ "$BALLOON_HISTORY" =~ ^[A-Za-z0-9+/=]+$ ]] || BALLOON_HISTORY=""
     [[ -n "$BALLOON_HISTORY" ]] || _warn "Balloon history unavailable; destination will re-learn conservatively."
   fi
@@ -1166,13 +1180,6 @@ PY
     fi
   fi
   _ok "Verified VM ${VMID} is on dest ${DST_NODE}."
-  if [[ -n "${BALLOON_HISTORY:-}" ]]; then
-    if dst_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py import-state '${VMID}' '${DST_NODE}' '${BALLOON_HISTORY}'" >/dev/null; then
-      _ok "Balloon working-set history restored with a 24h decay hold."
-    else
-      _warn "Could not restore balloon history; inspect destination controller state."
-    fi
-  fi
 
   _vm_on_dst=1; _vm_on_src=0
 else
@@ -1412,6 +1419,16 @@ if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]] && command -v nc >/
       DEGRADED_REASON="${DEGRADED_REASON}; RDP also never came up after ${CONNECTIVITY_TIMEOUT}s"
     fi
     _warn "La VM ${VMID} no contesta en [${EXPECTED_VM_IPV6}]:${RDP_GUEST_PORT} tras ${CONNECTIVITY_TIMEOUT}s, con la ruta ya reapuntada a ${DST_NODE}. Por si solo no prueba dano: rdpEnabled=false y un Windows que aun arranca se ven igual que esto. Pero si el cliente dice que no entra, esta es su VM."
+  fi
+fi
+
+# Routes have now been committed and the connectivity probe has run. A busy
+# reconciler may delay restoring its history, but cannot delay customer routing.
+if [[ -n "${BALLOON_HISTORY:-}" ]]; then
+  if _balloon_state_retry dst_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py import-state '${VMID}' '${DST_NODE}' '${BALLOON_HISTORY}'" >/dev/null; then
+    _ok "Balloon working-set history restored with a 24h decay hold."
+  else
+    _warn "Could not restore balloon history; inspect destination controller state."
   fi
 fi
 
