@@ -24,6 +24,24 @@ iface eth0 inet manual
 
 
 class BridgeMacTests(unittest.TestCase):
+    def test_live_address_is_preserved(self):
+        self.assertEqual(bridge_mac.select_mac(MAC, ['tap42i0'], 'node'), MAC)
+
+    def test_empty_zero_address_gets_stable_unicast_address(self):
+        mac = bridge_mac.select_mac('00:00:00:00:00:00', [], 'node-one')
+        self.assertTrue(bridge_mac.valid_mac(mac))
+        self.assertTrue(mac.startswith('02:'))
+        self.assertEqual(mac, bridge_mac.select_mac('00:00:00:00:00:00', [], 'node-one'))
+        self.assertNotEqual(mac, bridge_mac.select_mac('00:00:00:00:00:00', [], 'node-two'))
+
+    def test_zero_address_with_guest_port_is_rejected(self):
+        with self.assertRaises(ValueError):
+            bridge_mac.select_mac('00:00:00:00:00:00', ['tap42i0'], 'node')
+
+    def test_invalid_nonzero_address_is_not_replaced(self):
+        with self.assertRaises(ValueError):
+            bridge_mac.select_mac('ff:ff:ff:ff:ff:ff', [], 'node')
+
     def test_only_one_line_is_added(self):
         result = bridge_mac.configured_text(CONFIG, MAC)
         self.assertEqual(result.replace(f'    hwaddress {MAC}\n', ''), CONFIG)

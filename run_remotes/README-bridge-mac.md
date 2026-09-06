@@ -4,6 +4,10 @@ Without an explicit MAC, Linux selects a bridge address from its ports. A VM
 starting or leaving can therefore change the gateway MAC for other guests.
 Their neighbor caches then point to the old address until they recover.
 
+Linux may clear the MAC to zero when the last bridge port leaves. The helper
+initializes a stable local MAC in that case only after checking that no ports
+remain, and rechecks before applying. Bridges with guests keep the current MAC.
+
 New installations set a stable, locally administered MAC in the generated
 `vmbr0` configuration. Existing nodes should keep the address already in use:
 
