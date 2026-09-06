@@ -81,6 +81,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -240,7 +241,8 @@ def fits_any_plan(commit_h, floor_h):
 def load_recent_moves(cooldown_h):
     """vmids moved within the last cooldown_h hours ({} state file -> none)."""
     try:
-        data = json.load(open(RECENT_FILE))
+        with open(RECENT_FILE) as f:
+            data = json.load(f)
     except Exception:
         return set()
     cutoff = time.time() - cooldown_h * 3600
@@ -251,21 +253,49 @@ def load_recent_moves(cooldown_h):
 
 
 def record_recent_moves(vmids):
-    """Merge just-moved vmids into the state file; prune entries >30 days."""
+    """Merge under a short state lock, independently of the full-run lock.
+
+    A manual migration must be able to record its cooldown while an automatic
+    run is busy elsewhere. Atomic replacement also gives unlocked readers a
+    complete JSON document. Preserve an unreadable existing file for review.
+    """
+    temp_name = None
     try:
-        data = json.load(open(RECENT_FILE))
-    except Exception:
-        data = {}
-    now_e = time.time()
-    for v in vmids:
-        data[str(v)] = now_e
-    data = {v: ts for v, ts in data.items()
-            if isinstance(ts, (int, float)) and now_e - ts < 30 * 86400}
-    try:
-        with open(RECENT_FILE, "w") as f:
-            json.dump(data, f)
+        with open(RECENT_FILE + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with open(RECENT_FILE) as f:
+                    data = json.load(f)
+                    state_mode = os.fstat(f.fileno()).st_mode & 0o777
+            except FileNotFoundError:
+                data = {}
+                state_mode = 0o600
+            now_e = time.time()
+            for v in vmids:
+                data[str(v)] = now_e
+            data = {v: ts for v, ts in data.items()
+                    if isinstance(ts, (int, float)) and now_e - ts < 30 * 86400}
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=os.path.dirname(RECENT_FILE) or ".",
+                prefix=".recent-moves-", delete=False,
+            ) as f:
+                temp_name = f.name
+                os.fchmod(f.fileno(), state_mode)
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, RECENT_FILE)
+            temp_name = None
+        return True
     except Exception as exc:
         log(f"WARN could not persist recent-moves state: {exc}")
+        return False
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError as exc:
+                log(f"WARN could not remove recent-moves temporary file: {exc}")
 
 
 def main():
