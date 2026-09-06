@@ -43,6 +43,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import functools
 from pathlib import Path
 
 try:
@@ -1235,6 +1236,22 @@ def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
     return "".join(lines[:start]) + new_block + "".join(lines[end:])
 
 
+def serialize_node_state(fn):
+    """Lock the whole node-map read/update/apply, independently of VM routing.
+
+    Registering several nodes at once must not overwrite another invocation's
+    additions. A separate lock keeps tunnel/nginx updates from delaying the
+    short, time-sensitive per-VM NAT cutover lock.
+    """
+    @functools.wraps(fn)
+    def locked(*args, **kwargs):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with (STATE_DIR / ".pve-nodes.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return fn(*args, **kwargs)
+    return locked
+
+
 def read_pve_nodes_state() -> dict[str, str]:
     if not PVE_NODES_STATE_FILE.is_file():
         return {}
@@ -1259,9 +1276,18 @@ def read_pve_nodes_state() -> dict[str, str]:
 
 def write_pve_nodes_state(nodes: dict[str, str]):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    PVE_NODES_STATE_FILE.write_text(
-        json.dumps(dict(sorted(nodes.items())), indent=2, sort_keys=True) + "\n"
-    )
+    # migrate_vm.sh reads this without the writer lock. Atomic replacement
+    # guarantees it sees either complete generation, never a truncated map.
+    PVE_NODES_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".pve-nodes-", dir=PVE_NODES_STATE_FILE.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(json.dumps(dict(sorted(nodes.items())), indent=2, sort_keys=True) + "\n")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, PVE_NODES_STATE_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def write_pve_nginx_map(nodes: dict[str, str]):
@@ -1609,6 +1635,7 @@ def sync_nodes_apply_state(nodes: dict[str, str], reload_nginx: bool = True):
 SHRINK_GUARD_PCT = float(os.environ.get("PVE_MAP_SHRINK_GUARD_PCT", "80"))
 
 
+@serialize_node_state
 def sync_nodes_full(force: bool = False):
     nodes = firestore_list_proxmox_nodes()
     prev = read_pve_nodes_state()
@@ -1629,6 +1656,7 @@ def sync_nodes_full(force: bool = False):
     logger.info("sync nodes full done (%d from Firestore)", len(nodes))
 
 
+@serialize_node_state
 def sync_nodes_single(node_id: str):
     node_id = node_id.strip()
     if not node_id:
@@ -1648,6 +1676,7 @@ def sync_nodes_single(node_id: str):
     sync_nodes_apply_state(state)
 
 
+@serialize_node_state
 def sync_nodes_add(node_id: str, ipv6: str):
     node_id = node_id.strip()
     ipv6 = ipv6.strip()
@@ -1662,6 +1691,7 @@ def sync_nodes_add(node_id: str, ipv6: str):
     logger.info("sync nodes add %s -> %s", node_id, ipv6)
 
 
+@serialize_node_state
 def sync_nodes_del(node_id: str):
     node_id = node_id.strip()
     state = read_pve_nodes_state()
