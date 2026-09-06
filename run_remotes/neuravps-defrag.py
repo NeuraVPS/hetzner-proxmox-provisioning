@@ -155,6 +155,15 @@ def weekday_cpu_ok(data, now=None):
     at = data.get('cpuProfileAt')
     return not (at is not None and 0 <= now - float(at) <= 48 * 3600
                 and float(data.get('cpuWeekdayP95Pct') or 0) >= 85)
+
+
+def sustained_cpu_harm(history, now=None):
+    """Only two independent, recent, stable-population windows permit a move."""
+    now = time.time() if now is None else now
+    recent = sorted([p for p in history if 0 <= now - p['at'] <= 3 * 3600],
+                    key=lambda p:p['at'])
+    return (len(recent) >= 2 and recent[-1]['at'] - recent[-2]['at'] >= 600
+            and all(p['ms'] > CPU_MAX_MS for p in recent[-2:]))
 # Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
 # max(ram_min, ram_min_observed), the same number auto_provision reserves).
 # vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
@@ -330,6 +339,8 @@ def main():
             "cpu_at": d.get("cpuContentionAt"),
             "cpuWeekdayP95Pct": d.get('cpuWeekdayP95Pct'),
             "cpuProfileAt": d.get('cpuProfileAt'),
+            "cpu_history": d.get('cpuContentionHistory') or [],
+            "threads": int(d.get('numCores') or 0),
             "ram": 0.0, "fl": 0.0, "cores": 0, "vms": [], "n_all": 0,
         }
     for s in db.collection("servers").stream():
@@ -659,6 +670,65 @@ def main():
                 dest_failed.add(nid)
                 log(f"ESCALATION {nid}: vm {vm_list} blocked-thrashing @{worst}/s but no "
                     f"destination fits — needs operator (capacity)")
+
+        # MT needs a demand-driven origin test, not only a sold-core counter.
+        # At most ONE CPU relief move per tick. It must measurably remove CPU
+        # work and fit beneath 70% destination CPU even at the sampled p95.
+        # Missing RRD/history blocks this path rather than guessing a victim.
+        def cpu_p95(nid, vmid=None):
+            import shlex
+            suffix = f'/qemu/{vmid}' if vmid is not None else ''
+            path = f'/nodes/{nid}{suffix}/rrddata'
+            try:
+                command = shlex.join(['pvesh','get',path,'--timeframe','hour',
+                                      '--cf','AVERAGE','--output-format','json'])
+                result = subprocess.run(SSH + ['root@'+nodes[nid]['ip'], command],
+                                        capture_output=True,text=True,timeout=20,check=True)
+                values = sorted(float(p['cpu']) for p in json.loads(result.stdout)
+                                if p.get('cpu') is not None and time.time()-p['time'] <= 3600)
+                if len(values) >= 10:
+                    return values[min(len(values)-1,int(len(values)*.95))]
+            except Exception:
+                pass
+            return None
+
+        if cfg.get('mtCpuReliefEnabled', True) and len(moves) < relief_max:
+            cpu_moved = False
+            dest_load = {}
+            for nid, n in nodes.items():
+                if (n['model'] != 'MT5' or not placeable(n)
+                        or not sustained_cpu_harm(n['cpu_history'])):
+                    continue
+                victims = []
+                for vm in n['vms']:
+                    if vm['st'] != 'running' or vm['vmid'] in recent_vmids or vm['vmid'] in booked:
+                        continue
+                    usage = cpu_p95(nid,vm['vmid'])
+                    if usage is not None and usage * vm['cores'] >= .5:
+                        victims.append((usage * vm['cores'],vm))
+                for demand, vm in sorted(victims,key=lambda x:-x[0]):
+                    excluded = {nid}
+                    while True:
+                        dst = pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False)
+                        if not dst:
+                            break
+                        excluded.add(dst)
+                        dn = nodes[dst]
+                        if dst not in dest_load:
+                            dest_load[dst] = cpu_p95(dst)
+                        load = dest_load[dst]
+                        if load is None or dn['threads'] <= 0 or load + demand / dn['threads'] > .70:
+                            continue
+                        if not agent_alive(nid,vm['vmid']):
+                            break
+                        book(vm,nid,dst,f'cpu-relief (two sustained wait windows; guest p95 {demand:.2f} CPUs)')
+                        cpu_moved = True
+                        break
+                    if cpu_moved:
+                        break
+                if cpu_moved:
+                    break
+                log(f'CPU ESCALATION {nid}: sustained wait, no measured safe move')
 
     # ---- phase 1: corrections ----
     for nid in sorted(nodes) if not relief else []:

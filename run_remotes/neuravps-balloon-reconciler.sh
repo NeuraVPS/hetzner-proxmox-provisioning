@@ -312,7 +312,7 @@ write_status() {  # $1 = blocked-entries JSON fragment ("" when none)
 # that case. Silent since forever on the empty SQX nodes — 8 of them were
 # crashing every minute and never wrote a status file (found 2026-08-27
 # while rolling v9; the fault predates it).
-declare -A CUR_FLOOR=() CUR_MAX=()
+declare -A CUR_FLOOR=() CUR_MAX=() LOCKED_VMS=()
 committed=0; floors_sum=0
 for pf in /var/run/qemu-server/*.pid; do
   [ -e "$pf" ] || continue
@@ -325,10 +325,16 @@ for pf in /var/run/qemu-server/*.pid; do
     floors_sum=$(( floors_sum + mx ))  # fixed guests also consume the budget
     continue
   fi
+  floors_sum=$(( floors_sum + fl ))
+  # A migrating/backup-locked guest still consumes capacity but is not ours
+  # to tune. Preserve its history for the migration state transfer.
+  if grep -q '^lock:' "$conf"; then
+    LOCKED_VMS[$v]=1
+    continue
+  fi
   # NB: fl==mx stays managed (a VM we raised to max must lower again later);
   # deliberately-fixed VMs are protected by the floors.json-only LOWER rule.
   CUR_FLOOR[$v]=$fl; CUR_MAX[$v]=$mx
-  floors_sum=$(( floors_sum + fl ))
 done
 budget_mb=$(( ram_mb * FLOOR_BUDGET_PCT / 100 ))
 if [ "${#CUR_FLOOR[@]}" -eq 0 ]; then
@@ -364,6 +370,9 @@ tmp_samples=$(mktemp "$STATE_DIR/.samples.XXXXXX")
 tmp_rates=$(mktemp /var/run/.neuravps-balloon-rates.XXXXXX)
 chmod 644 "$tmp_rates"
 blocked_json=""
+for v in "${!LOCKED_VMS[@]}"; do
+  [ -n "${P_F[$v]:-}" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$v" "${P_F[$v]}" "${P_T[$v]}" "${P_IDLE[$v]:-0}" "${P_BLOCKED[$v]:-0}" "${P_LLOW[$v]:-0}" "${P_BNC[$v]:-0}" "${P_BLKU[$v]:-0}" >> "$tmp_samples"
+done
 
 for v in "${!CUR_FLOOR[@]}"; do
   # One monitor call, two facts: the fault counter AND how much RAM the guest

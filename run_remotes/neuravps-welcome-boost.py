@@ -243,6 +243,15 @@ def main():
                 continue
             memory, floor, actual, avail = info
             if actual >= memory - 1024:
+                # A login during the boot window takes ownership of the boost;
+                # the delayed boot restore must not undo a demand guarantee.
+                try:
+                    hold_rc, _ = ssh_out(node, shlex.join(['python3','/usr/local/sbin/neuravps-ram-guard.py',
+                                                         'hold',str(vmid),st['nodeId']]))
+                    if hold_rc:
+                        continue  # retry next poll while the boot window is open
+                except Exception:
+                    continue
                 handled[flow] = now + FULL_TTL_S
                 skip_until[vmid] = (now + FULL_TTL_S, "ya-a-tope")
                 continue

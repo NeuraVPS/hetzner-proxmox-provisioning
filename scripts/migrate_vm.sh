@@ -1098,6 +1098,12 @@ PY
   }
 
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
+  BALLOON_HISTORY=""
+  if [[ "$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162* ]]; then
+    BALLOON_HISTORY=$(src_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py export-state '${VMID}' '${SRC_NODE}'" 2>/dev/null) || BALLOON_HISTORY=""
+    [[ "$BALLOON_HISTORY" =~ ^[A-Za-z0-9+/=]+$ ]] || BALLOON_HISTORY=""
+    [[ -n "$BALLOON_HISTORY" ]] || _warn "Balloon history unavailable; destination will re-learn conservatively."
+  fi
   TARGET_HOST="[${DST_IPV6}]"
   _info "Starting pvesh remote_migrate (${SRC_NODE} → ${DST_NODE}, mode=${ONLINE_FLAG:-offline})…"
   _ESC_PID=""
@@ -1160,6 +1166,13 @@ PY
     fi
   fi
   _ok "Verified VM ${VMID} is on dest ${DST_NODE}."
+  if [[ -n "${BALLOON_HISTORY:-}" ]]; then
+    if dst_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py import-state '${VMID}' '${DST_NODE}' '${BALLOON_HISTORY}'" >/dev/null; then
+      _ok "Balloon working-set history restored with a 24h decay hold."
+    else
+      _warn "Could not restore balloon history; inspect destination controller state."
+    fi
+  fi
 
   _vm_on_dst=1; _vm_on_src=0
 else

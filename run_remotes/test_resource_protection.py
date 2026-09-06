@@ -49,6 +49,13 @@ class Capacity(unittest.TestCase):
         self.assertFalse(df.weekday_cpu_ok({'cpuProfileAt':1000,'cpuWeekdayP95Pct':94},1001))
         self.assertTrue(df.weekday_cpu_ok({'cpuProfileAt':1000,'cpuWeekdayP95Pct':55},1001))
 
+    def test_cpu_relief_requires_two_recent_bad_windows(self):
+        self.assertFalse(df.sustained_cpu_harm([{'at':1000,'ms':80}],2000))
+        self.assertFalse(df.sustained_cpu_harm([{'at':1000,'ms':80},{'at':1900,'ms':10}],2000))
+        self.assertFalse(df.sustained_cpu_harm([{'at':1000,'ms':80},{'at':1001,'ms':80}],2000))
+        self.assertTrue(df.sustained_cpu_harm([{'at':1000,'ms':80},{'at':1900,'ms':80}],2000))
+        self.assertFalse(df.sustained_cpu_harm([{'at':1000,'ms':80},{'at':1900,'ms':80}],20000))
+
     def test_fixed_and_stopped_configs_consume_budget(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(guard,'CONF_DIR',Path(directory)):
             for vmid, floor in [(1,0),(2,2048)]:
@@ -82,6 +89,56 @@ class Capacity(unittest.TestCase):
         self.assertEqual(result['status'],'boosted')
         self.assertEqual(calls,1)
         self.assertEqual(args.args,(99,'balloon',{'value':19456*1048576}))
+
+
+class BootOwnership(unittest.TestCase):
+    def control(self, held, token):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(guard,'STATE_DIR',Path(directory)), \
+             patch('builtins.open',return_value=MagicMock()), \
+             patch.object(guard.fcntl,'flock'), \
+             patch.object(guard.socket,'gethostname',return_value='node'), \
+             patch.object(guard,'config',return_value={'balloon':'19456','smbios1':'uuid=one'}), \
+             patch.object(guard.subprocess,'run') as qm:
+            p=Path(directory)/'boot-guards.json'
+            p.write_text(json.dumps({'99':{'token':'current','floor':9932,'target':19456,'uuid':'uuid=one','held':held}}))
+            guard.boot_control(99,'node',token)
+            return qm.call_count, json.loads(p.read_text())
+
+    def test_original_boot_can_restore_its_floor(self):
+        calls,state=self.control(False,'current')
+        self.assertEqual(calls,1)
+        self.assertEqual(state,{})
+
+    def test_login_preserves_demand_floor_after_boot(self):
+        calls,state=self.control(True,'current')
+        self.assertEqual(calls,0)
+        self.assertEqual(state,{})
+
+    def test_old_boot_cannot_restore_a_new_boot(self):
+        calls,state=self.control(False,'old')
+        self.assertEqual(calls,0)
+        self.assertEqual(state['99']['token'],'current')
+
+
+class MigrationHistory(unittest.TestCase):
+    def test_import_preserves_bounces_without_reusing_old_host_rates(self):
+        import base64
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(guard,'STATE_DIR',Path(directory)), \
+             patch('builtins.open',return_value=MagicMock()), \
+             patch.object(guard.fcntl,'flock'), \
+             patch.object(guard.socket,'gethostname',return_value='node'), \
+             patch.object(guard,'config',return_value={'smbios1':'uuid=one'}):
+            data={'uuid':'uuid=one','floor':9932,'sample':['99',123456,1000,2000,12,800,3,9999999999]}
+            encoded=base64.b64encode(json.dumps(data).encode()).decode()
+            self.assertEqual(guard.transfer_state(99,'node',encoded)['status'],'state-imported')
+            row=(Path(directory)/'samples.tsv').read_text().split()
+            self.assertEqual(row[:5],['99','0','0','0','0'])
+            self.assertEqual(row[6:],['3','9999999999'])
+            data['uuid']='uuid=other'
+            with self.assertRaisesRegex(RuntimeError,'UUID'):
+                guard.transfer_state(99,'node',base64.b64encode(json.dumps(data).encode()).decode())
 
 
 class ReconcilerTelemetry(unittest.TestCase):

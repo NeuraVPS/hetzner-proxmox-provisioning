@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Serialize demand boosts with the balloon reconciler; never trust old capacity."""
 import fcntl
+import base64
 import json
 import os
 from pathlib import Path
@@ -83,12 +84,12 @@ def inspect(vmid, expected_node):
     return maximum, floor, actual, meminfo()['MemAvailable']
 
 
-def boost(vmid, expected_node):
+def boost(vmid, expected_node, boot_token=None):
     # Also protects floors.json against concurrent bases and reconciler writes.
     with open('/run/neuravps-ram.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         maximum, floor, actual, avail = inspect(vmid, expected_node)
-        if actual >= maximum - 1024:
+        if actual >= maximum - 1024 and boot_token is None:
             return {'status': 'full'}
         info = meminfo()
         need = max(0, maximum - actual)
@@ -111,16 +112,95 @@ def boost(vmid, expected_node):
                        check=True, capture_output=True, timeout=15)
         pending[str(vmid)] = {'mb': need, 'until': now + 120}
         atomic_json(pending_path, pending)
+        if boot_token is not None:
+            path = STATE_DIR / 'boot-guards.json'
+            guards = json.loads(path.read_text()) if path.exists() else {}
+            guards[str(vmid)] = {'token':boot_token, 'floor':floor, 'target':maximum,
+                                 'uuid':config(vmid).get('smbios1'), 'held':False}
+            atomic_json(path, guards)
         qmp(vmid, 'balloon', {'value': maximum * 1048576})
         return {'status': 'boosted', 'before': actual, 'target': maximum}
 
 
+def boot_control(vmid, expected_node, token=None):
+    """Hold on a real RDP return; otherwise restore only this boot's own floor."""
+    with open('/run/neuravps-ram.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if socket.gethostname() != expected_node:
+            raise RuntimeError('node identity mismatch')
+        path = STATE_DIR / 'boot-guards.json'
+        guards = json.loads(path.read_text()) if path.exists() else {}
+        entry = guards.get(str(vmid))
+        if not entry:
+            return {'status':'no-boot-guard'}
+        fields = config(vmid)
+        if fields.get('lock') or fields.get('smbios1') != entry.get('uuid'):
+            raise RuntimeError('VM changed or locked')
+        if token is None:
+            entry['held'] = True
+        elif entry['token'] == token:
+            if not entry['held'] and int(fields.get('balloon',0)) == entry['target']:
+                subprocess.run(['qm','set',str(vmid),'--balloon',str(entry['floor'])],
+                               check=True,capture_output=True,timeout=15)
+            del guards[str(vmid)]
+        atomic_json(path,guards)
+        return {'status':'boot-guard-updated'}
+
+
+def transfer_state(vmid, expected_node, encoded=None):
+    """Carry working-set history across migration, tied to the VM's UUID."""
+    with open('/run/neuravps-ram.lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if socket.gethostname() != expected_node:
+            raise RuntimeError('node identity mismatch')
+        uuid = config(vmid).get('smbios1')
+        if not uuid:
+            raise RuntimeError('no VM UUID for state transfer')
+        floors_path = STATE_DIR / 'floors.json'
+        samples_path = STATE_DIR / 'samples.tsv'
+        floors = json.loads(floors_path.read_text()) if floors_path.exists() else {}
+        rows = samples_path.read_text().splitlines() if samples_path.exists() else []
+        sample = next((r.split('\t') for r in rows if r.split('\t')[0] == str(vmid)),None)
+        if encoded is None:
+            return base64.b64encode(json.dumps({'uuid':uuid,'floor':floors.get(str(vmid)),
+                                               'sample':sample}).encode()).decode()
+        state = json.loads(base64.b64decode(encoded,validate=True))
+        if state['uuid'] != uuid:
+            raise RuntimeError('VM UUID changed during migration')
+        STATE_DIR.mkdir(parents=True,exist_ok=True)
+        if state.get('floor') is not None:
+            floors[str(vmid)] = max(int(state['floor']),int(floors.get(str(vmid),0)))
+            atomic_json(floors_path,floors)
+        source = state.get('sample') or [str(vmid),0,0,0,0,0,0,0]
+        source = list(source) + [0] * (8-len(source))
+        prior = list(sample or []) + [0] * (8-len(sample or []))
+        # New rate baseline and no immediate decay at the new host. Preserve
+        # bounce/backoff learning; old blocked counters belong to the old host.
+        restored = [vmid,0,0,0,0,source[5],max(int(source[6]),int(prior[6])),
+                    max(int(source[7]),int(prior[7]),int(time.time())+86400)]
+        rows = [r for r in rows if r.split('\t')[0] != str(vmid)]
+        rows.append('\t'.join(map(str,restored)))
+        tmp = samples_path.with_name(f'.samples.{os.getpid()}.tmp')
+        tmp.write_text('\n'.join(rows)+'\n');os.replace(tmp,samples_path)
+        return {'status':'state-imported'}
+
+
 def main():
-    action, raw_vmid, node = sys.argv[1:]
+    action, raw_vmid, node, *extra = sys.argv[1:]
     vmid = int(raw_vmid)
-    if vmid <= 0 or action not in ('query', 'boost'):
+    if vmid <= 0 or action not in ('query', 'boost', 'boot', 'restore', 'hold', 'export-state', 'import-state'):
         raise ValueError('invalid action or VMID')
-    result = inspect(vmid, node) if action == 'query' else boost(vmid, node)
+    if action == 'export-state':
+        print(transfer_state(vmid,node))
+        return
+    if action == 'import-state':
+        result = transfer_state(vmid,node,extra[0])
+    elif action == 'query':
+        result = inspect(vmid,node)
+    elif action in ('hold','restore'):
+        result = boot_control(vmid,node,extra[0] if action == 'restore' else None)
+    else:
+        result = boost(vmid,node,extra[0] if action == 'boot' else None)
     print(json.dumps(result))
 
 
