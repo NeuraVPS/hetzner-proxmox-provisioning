@@ -173,7 +173,7 @@ detect_firmware() {
 ### --- STEP 1: prepare environment ----------------------------------
 
 log "Checking required tools"
-require_cmd wget lsblk awk ip zpool zfs dmidecode udevadm
+require_cmd wget curl lsblk awk ip dmidecode udevadm
 
 # --- Require UEFI boot (NeuraVPS fleet standard) -------------------
 # The whole fleet boots UEFI. The QEMU/SeaBIOS (Legacy BIOS) path leaves
@@ -212,6 +212,15 @@ curl -fsSL --retry 3 \
 bash -n "$FIRST_BOOT_SCRIPT_PATH" \
   || die "Invalid first-boot script — refusing to wipe disks"
 chmod 755 "$FIRST_BOOT_SCRIPT_PATH"
+
+log "Preparing ZFS support in rescue before touching disks"
+curl -fsSL --retry 3 \
+  https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes/prepare-rescue-zfs.sh \
+  -o /root/neuravps-prepare-rescue-zfs.sh \
+  || die "Cannot fetch rescue ZFS preparation helper"
+bash /root/neuravps-prepare-rescue-zfs.sh \
+  || die "Rescue ZFS preparation failed — refusing to wipe disks"
+require_cmd zpool zfs
 
 log "Installing qemu, OVMF, and proxmox-auto-install-assistant (this may take a bit)..."
 
