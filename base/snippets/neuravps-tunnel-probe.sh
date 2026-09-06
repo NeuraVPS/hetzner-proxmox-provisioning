@@ -12,7 +12,6 @@ set -u
 
 TRANSIT_BASE="${TRANSIT_BASE:-2a01:4f9:c01f:e:ffff::}"
 HOME_REGION="${HOME_REGION:-fsn}"
-OTHER_REGION=$([ "$HOME_REGION" = fsn ] && echo hel || echo fsn)
 STATE=/run/neuravps-tunnel-probe.state
 FAILS_TO_SWITCH=2      # ~30 s con el timer a 15 s
 OKS_TO_RETURN=4        # volver a casa cuesta mas: evita el ping-pong
@@ -23,8 +22,25 @@ canon() { [ "$1" = fsn ] && printf '%s0' "$TRANSIT_BASE" || printf '%s2' "$TRANS
 # ida Y vuelta; el ping NO sirve: PVE tira el eco ICMPv6 y da falso negativo.
 alive() { timeout 4 bash -c "</dev/tcp/$(canon "$1")/443" 2>/dev/null; }
 
-cur="$(ip -4 route show default | sed -n 's/.*dev tun-\([a-z]*\).*/\1/p' | head -1)"
+cur="$(ip -6 route show default table 100 | sed -n 's/.*dev tun-\([a-z]*\).*/\1/p' | head -1)"
 [ -n "$cur" ] || exit 0
+
+# A brand-new node can boot before BASE has created its tunnels. Retry the
+# initial measurement instead of permanently caching an unreachable fallback.
+if [ "$HOME_REGION" = auto ]; then
+  best=""; bestms=999999
+  for r in fsn hel; do
+    t0=$(date +%s%N)
+    if alive "$r"; then
+      ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+      [ "$ms" -lt "$bestms" ] && { bestms=$ms; best=$r; }
+    fi
+  done
+  [ -n "$best" ] || exit 0
+  HOME_REGION="$best"
+  sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+fi
+OTHER_REGION=$([ "$HOME_REGION" = fsn ] && echo hel || echo fsn)
 
 read -r st n < "$STATE" 2>/dev/null || { st=""; n=0; }
 [ "$st" = "$cur" ] || n=0

@@ -172,6 +172,11 @@ detect_firmware() {
 
 ### --- STEP 1: prepare environment ----------------------------------
 
+# admin/nodos knows the provider location. Prefer its explicit region over a
+# boot-time RTT probe that can race BASE tunnel provisioning.
+INSTALL_HOME_REGION="${NEURAVPS_HOME_REGION:-auto}"
+case "$INSTALL_HOME_REGION" in fsn|hel|auto) ;; *) die "Invalid NEURAVPS_HOME_REGION" ;; esac
+
 log "Checking required tools"
 require_cmd wget curl lsblk awk ip dmidecode udevadm
 
@@ -766,6 +771,10 @@ mk() { # iface remoto direccion_local/127
   # IPv4 no. El modo laxo (2) NO basta: tiene que ser 0.
   # Riesgo acotado: estos enlaces solo llevan GRE entre maquinas nuestras, ya
   # filtrado por [IPSET base]; la uplink conserva su rp_filter.
+  # `all` tambien: el kernel usa el MAXIMO de all y de la interfaz, y PVE deja
+  # all=2 desde /usr/lib/sysctl.d/pve-firewall.conf. Con all=2 no hay forma de
+  # bajar de laxo, que ya medimos que NO basta.
+  sysctl -qw "net.ipv4.conf.all.rp_filter=0" 2>/dev/null
   sysctl -qw "net.ipv4.conf.$1.rp_filter=0" 2>/dev/null
 }
 
@@ -825,10 +834,14 @@ if [ "$HOME_REGION" = auto ]; then
     fi
   done
   HOME_REGION="${best:-fsn}"
-  logger -t neuravps-tunnels "region de casa detectada: $HOME_REGION (${bestms} ms)"
-  # Cachearla: si en el proximo arranque la base local esta caida, la medicion
-  # elegiria la remota y el nodo se quedaria ahi para siempre.
-  sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+  if [ -n "$best" ]; then
+    logger -t neuravps-tunnels "region de casa detectada: $HOME_REGION (${bestms} ms)"
+    sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+  else
+    # BASE may not have installed this new node's tunnels yet. Keep auto in
+    # the config so the probe can retry; fsn is only a temporary fallback.
+    logger -t neuravps-tunnels "bases not ready; temporary fsn fallback, detection pending"
+  fi
 fi
 
 # Rutas por defecto hacia el tunel de casa. El sondeo
@@ -853,8 +866,14 @@ ip link show "$TUN" >/dev/null 2>&1 || { echo "$TUN no existe" >&2; exit 1; }
 
 # Si ya estamos ahi, no tocar nada: reescribir la ruta por defecto tira las
 # conexiones en curso de los invitados.
-cur="$(ip -4 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
-[ "$cur" = "$TUN" ] && exit 0
+cur6="$(ip -6 route show default table 100 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+cur4="$(ip -4 route show default table 101 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+curhost="$(ip -4 route show default table 102 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+curmain="$TUN"
+if [ "${DEFAULT_V4_VIA_TUNNEL:-0}" = 1 ]; then
+  curmain="$(ip -4 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+fi
+[ "$cur6" = "$TUN" ] && [ "$cur4" = "$TUN" ] && [ "$curhost" = "$TUN" ] && [ "$curmain" = "$TUN" ] && exit 0
 
 ip -6 route replace default dev "$TUN" table 100
 ip route    replace default dev "$TUN" table 101
@@ -886,7 +905,6 @@ set -u
 
 TRANSIT_BASE="${TRANSIT_BASE:-2a01:4f9:c01f:e:ffff::}"
 HOME_REGION="${HOME_REGION:-fsn}"
-OTHER_REGION=$([ "$HOME_REGION" = fsn ] && echo hel || echo fsn)
 STATE=/run/neuravps-tunnel-probe.state
 FAILS_TO_SWITCH=2      # ~30 s con el timer a 15 s
 OKS_TO_RETURN=4        # volver a casa cuesta mas: evita el ping-pong
@@ -897,8 +915,25 @@ canon() { [ "$1" = fsn ] && printf '%s0' "$TRANSIT_BASE" || printf '%s2' "$TRANS
 # ida Y vuelta; el ping NO sirve: PVE tira el eco ICMPv6 y da falso negativo.
 alive() { timeout 4 bash -c "</dev/tcp/$(canon "$1")/443" 2>/dev/null; }
 
-cur="$(ip -4 route show default | sed -n 's/.*dev tun-\([a-z]*\).*/\1/p' | head -1)"
+cur="$(ip -6 route show default table 100 | sed -n 's/.*dev tun-\([a-z]*\).*/\1/p' | head -1)"
 [ -n "$cur" ] || exit 0
+
+# A brand-new node can boot before BASE has created its tunnels. Retry the
+# initial measurement instead of permanently caching an unreachable fallback.
+if [ "$HOME_REGION" = auto ]; then
+  best=""; bestms=999999
+  for r in fsn hel; do
+    t0=$(date +%s%N)
+    if alive "$r"; then
+      ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+      [ "$ms" -lt "$bestms" ] && { bestms=$ms; best=$r; }
+    fi
+  done
+  [ -n "$best" ] || exit 0
+  HOME_REGION="$best"
+  sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+fi
+OTHER_REGION=$([ "$HOME_REGION" = fsn ] && echo hel || echo fsn)
 
 read -r st n < "$STATE" 2>/dev/null || { st=""; n=0; }
 [ "$st" = "$cur" ] || n=0
@@ -1159,7 +1194,7 @@ cat > /mnt/etc/default/neuravps-tunnels <<NVXEOF
 # Parametros de ESTE nodo. Ver docs/egress-failover-e-ipv6-estable.md §4.5.
 NODE_ID=${NODE_NUM}
 SLOT=${NODE_NUM}
-HOME_REGION=auto
+HOME_REGION=${INSTALL_HOME_REGION}
 IDENT6=2a01:4f9:c01f:e::/64
 TRANSIT_BASE=2a01:4f9:c01f:e:ffff::
 VIP_FSN=2a01:4f8:fff2:95::2
