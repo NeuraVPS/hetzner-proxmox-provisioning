@@ -28,6 +28,7 @@ PVE_ISO_URL="https://enterprise.proxmox.com/iso/proxmox-ve_${PVE_VERSION}.iso"
 ISO_PATH="/root/proxmox-ve_${PVE_VERSION}.iso"
 AUTO_ISO_PATH="/root/proxmox-ve_${PVE_VERSION}-auto-from-iso.iso"
 ANSWER_FILE="/root/answer.toml"
+FIRST_BOOT_SCRIPT_PATH="/root/neuravps-first-boot.sh"
 
 # Must be set before running, or edit here:
 : "${PVE_FQDN:=$NAME.neuravps.com}"
@@ -200,6 +201,18 @@ if [ ! -s /root/.ssh/neuravps_id ]; then
   die "Missing /root/.ssh/neuravps_id in rescue — the installed node could not pull its credentials/firewall from the Storage Box."
 fi
 
+# Fetch with the rescue host's native networking, before wiping disks. The
+# installer runs behind QEMU user networking, whose IPv4 NAT cannot reach the
+# Internet on IPv6-only servers. Embedding the hook keeps installation offline.
+log "Fetching and validating the first-boot script for inclusion in the ISO"
+curl -fsSL --retry 3 \
+  https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/first_boot.sh \
+  -o "$FIRST_BOOT_SCRIPT_PATH" \
+  || die "Cannot fetch first-boot script — refusing to wipe disks"
+bash -n "$FIRST_BOOT_SCRIPT_PATH" \
+  || die "Invalid first-boot script — refusing to wipe disks"
+chmod 755 "$FIRST_BOOT_SCRIPT_PATH"
+
 log "Installing qemu, OVMF, and proxmox-auto-install-assistant (this may take a bit)..."
 
 # Add Proxmox repositories and keys
@@ -371,9 +384,8 @@ ${ZFS_HDSIZE_LINE}
 disk-list = ${DISK_LIST}
 
 [first-boot]
-source = "from-url"
+source = "from-iso"
 ordering = "fully-up"
-url = "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/first_boot.sh"
 EOF
 
 log "Validating answer file"
@@ -384,6 +396,7 @@ log "Preparing auto-install ISO"
 proxmox-auto-install-assistant prepare-iso \
   --fetch-from iso \
   --answer-file "$ANSWER_FILE" \
+  --on-first-boot "$FIRST_BOOT_SCRIPT_PATH" \
   --output "$AUTO_ISO_PATH" \
   "$ISO_PATH"
 
