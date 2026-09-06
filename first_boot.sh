@@ -655,6 +655,22 @@ EOF
 # Enable firewall at both scopes and start it
 pve-firewall restart || true
 
+# The boot hook and welcome boost use the same node-local RAM budget helper.
+# Install it on new nodes as well as the existing fleet before enabling hooks.
+log "Installing shared RAM budget helper for boot guard and welcome boost"
+RAM_GUARD_TMP="$(mktemp /usr/local/sbin/neuravps-ram-guard.py.XXXXXX)"
+if curl -fsSL --retry 3 \
+    https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes/neuravps-ram-guard.py \
+    -o "$RAM_GUARD_TMP" \
+    && python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); compile(p.read_text(),str(p),"exec")' "$RAM_GUARD_TMP"; then
+  chmod 755 "$RAM_GUARD_TMP"
+  mv "$RAM_GUARD_TMP" /usr/local/sbin/neuravps-ram-guard.py
+else
+  rm -f "$RAM_GUARD_TMP"
+  FIRST_BOOT_FAILED=1
+  log "WARNING: RAM budget helper installation failed; repair before admitting VMs"
+fi
+
 # ---- Cluster-wide snippets storage + dynamic RDP hookscript ----
 log "Installing cluster-wide hookscript for dynamic RDP DNAT + INPUT open/close"
 mkdir -p /var/lib/svz
