@@ -117,10 +117,14 @@ if [ "$HOME_REGION" = auto ]; then
     fi
   done
   HOME_REGION="${best:-fsn}"
-  logger -t neuravps-tunnels "region de casa detectada: $HOME_REGION (${bestms} ms)"
-  # Cachearla: si en el proximo arranque la base local esta caida, la medicion
-  # elegiria la remota y el nodo se quedaria ahi para siempre.
-  sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+  if [ -n "$best" ]; then
+    logger -t neuravps-tunnels "region de casa detectada: $HOME_REGION (${bestms} ms)"
+    sed -i "s/^HOME_REGION=.*/HOME_REGION=$HOME_REGION/" /etc/default/neuravps-tunnels
+  else
+    # BASE may not have installed this new node's tunnels yet. Keep auto in
+    # the config so the probe can retry; fsn is only a temporary fallback.
+    logger -t neuravps-tunnels "bases not ready; temporary fsn fallback, detection pending"
+  fi
 fi
 
 # Rutas por defecto hacia el tunel de casa. El sondeo

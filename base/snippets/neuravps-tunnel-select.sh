@@ -12,8 +12,14 @@ ip link show "$TUN" >/dev/null 2>&1 || { echo "$TUN no existe" >&2; exit 1; }
 
 # Si ya estamos ahi, no tocar nada: reescribir la ruta por defecto tira las
 # conexiones en curso de los invitados.
-cur="$(ip -4 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
-[ "$cur" = "$TUN" ] && exit 0
+cur6="$(ip -6 route show default table 100 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+cur4="$(ip -4 route show default table 101 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+curhost="$(ip -4 route show default table 102 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+curmain="$TUN"
+if [ "${DEFAULT_V4_VIA_TUNNEL:-0}" = 1 ]; then
+  curmain="$(ip -4 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+fi
+[ "$cur6" = "$TUN" ] && [ "$cur4" = "$TUN" ] && [ "$curhost" = "$TUN" ] && [ "$curmain" = "$TUN" ] && exit 0
 
 ip -6 route replace default dev "$TUN" table 100
 ip route    replace default dev "$TUN" table 101
