@@ -20,19 +20,12 @@ archive="/root/zfs-$version.tar.gz"
 url="https://github.com/openzfs/zfs/releases/download/zfs-$version/zfs-$version.tar.gz"
 if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c - >/dev/null 2>&1; then
   tmp="$(mktemp /root/neuravps-zfs-download.XXXXXX)"
-  # Native HTTPS first; the fleet base supplies IPv4 egress when unavailable.
-  # SSH authenticates with the same key already required by install.sh.
+  # The admin provisioner pre-stages this public archive through its BASE
+  # connection. Direct IPv4-capable rescue runs can also fetch it here.
   if ! curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp"; then
-    fetched=0
-    for base in b1.neuravps.com b0.neuravps.com; do
-      if ssh -6 -i /root/.ssh/neuravps_id -o BatchMode=yes \
-          -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$base" \
-          "curl -fsSL --connect-timeout 10 --max-time 180 '$url'" > "$tmp"; then
-        fetched=1
-        break
-      fi
-    done
-    [[ "$fetched" = 1 ]] || { rm -f "$tmp"; echo 'ZFS download failed' >&2; exit 1; }
+    rm -f "$tmp"
+    echo "ZFS download failed; stage the verified $archive from the provisioning host" >&2
+    exit 1
   fi
   printf '%s  %s\n' "$checksum" "$tmp" | sha256sum -c -
   mv "$tmp" "$archive"
