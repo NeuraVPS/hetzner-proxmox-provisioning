@@ -866,6 +866,8 @@ def main():
         log("relief: no sustained-blocked thrashers — nothing to do")
         return 0
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    if force_dry:
+        run_id += f'-dry-{time.time_ns() % 1000000000}'
     plan_txt = [f"{m[0]} {m[1].split('-')[0]}->{m[2].split('-')[0]} [{m[3]}]" for m in moves]
     log(f"plan: {len(moves)} move(s)" + (f" (DRY-RUN)" if dry else ""))
     for t in plan_txt:
