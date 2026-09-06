@@ -613,10 +613,16 @@ fi
 # VM. Fail loudly here rather than silently shipping a broken node into the pool.
 [[ -z "$VM_V6_GATEWAY" ]] && die "Could not derive vmbr0 IPv6 gateway from /etc/network/interfaces (uplink=${UPLINK_IF}); refusing to ship a node without guest IPv6."
 
+# A port-less bridge must not inherit a guest TAP MAC: removing that VM would
+# change the gateway MAC for every remaining guest. Stable, locally administered
+# per-node value for new installs; existing nodes keep their current MAC.
+NVPS_BRIDGE_MAC_HEX="$(printf '%s' "$PRIMARY_V6_ADDR" | sha256sum)"
+NVPS_BRIDGE_MAC="02:${NVPS_BRIDGE_MAC_HEX:0:2}:${NVPS_BRIDGE_MAC_HEX:2:2}:${NVPS_BRIDGE_MAC_HEX:4:2}:${NVPS_BRIDGE_MAC_HEX:6:2}:${NVPS_BRIDGE_MAC_HEX:8:2}"
 {
   echo ""
   echo "auto vmbr0"
   echo "iface vmbr0 inet static"
+  echo "    hwaddress ${NVPS_BRIDGE_MAC}"
   # ⚠️ El MASQUERADE de estos dos rangos se retiro el 16-08-2026. Salia por
   # ${UPLINK_IF}, que ya NO tiene IPv4 (bajas de Hetzner de ese dia), asi que
   # no podia funcionar. Medido antes de quitarlo: contadores a cero y 0
