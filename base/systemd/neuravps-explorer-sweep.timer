@@ -1,0 +1,9 @@
+[Unit]
+Description=Run neuravps-explorer-sweep daily at 03:40 UTC (off-peak, ahead of the 06:00 salud sweep and 06:30 defrag)
+
+[Timer]
+OnCalendar=*-*-* 03:40:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=NeuraVPS daily explorer.exe /factory orphan sweep (RAM leak cleanup on Windows guests)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-explorer-sweep.py
+TimeoutStartSec=2h
+SyslogIdentifier=neuravps-explorer-sweep
