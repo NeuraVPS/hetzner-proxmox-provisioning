@@ -47,9 +47,49 @@ NO_AGENT = "ERROR: QEMU guest agent is not running"
 
 class ParseAgentOutput(unittest.TestCase):
     def test_count_only_result_is_trusted(self):
+        # REAL_COUNT_ONLY predates the commit sample (captured 2026-09-12) —
+        # pinning that an old-shape payload still parses cleanly, with the
+        # three new fields defaulting to None, is the backward-compat
+        # guarantee: a rollout that mixes old/new guest responses for a
+        # moment must never look like a parse failure.
         r = es.parse_agent_output(REAL_COUNT_ONLY)
         self.assertEqual(r, {"ok": True, "found": 3, "killed": 0,
-                             "errors": [], "mode": "count-only"})
+                             "errors": [], "mode": "count-only",
+                             "commitPct": None, "commitChargeMb": None,
+                             "commitLimitMb": None})
+
+    def test_commit_sample_is_parsed_when_present(self):
+        raw = ('{"exitcode":0,"exited":1,'
+               '"out-data":"EXPLORERSWEEP:{\\"found\\":0,\\"killed\\":0,'
+               '\\"errors\\":[],\\"mode\\":\\"count-only\\",'
+               '\\"commitPct\\":96.4,\\"commitChargeMb\\":3948,'
+               '\\"commitLimitMb\\":4096}\\r\\n"}')
+        r = es.parse_agent_output(raw)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["commitPct"], 96.4)
+        self.assertEqual(r["commitChargeMb"], 3948)
+        self.assertEqual(r["commitLimitMb"], 4096)
+
+    def test_commit_sample_null_from_guest_side_wmi_failure(self):
+        # The guest-side try/catch sets these to $null on a WMI failure —
+        # must still be a fully trusted, ok=True result.
+        raw = ('{"exitcode":0,"exited":1,'
+               '"out-data":"EXPLORERSWEEP:{\\"found\\":1,\\"killed\\":0,'
+               '\\"errors\\":[],\\"mode\\":\\"count-only\\",'
+               '\\"commitPct\\":null,\\"commitChargeMb\\":null,'
+               '\\"commitLimitMb\\":null}\\r\\n"}')
+        r = es.parse_agent_output(raw)
+        self.assertTrue(r["ok"])
+        self.assertIsNone(r["commitPct"])
+
+    def test_garbage_commit_fields_never_raise_or_pass_through(self):
+        raw = ('{"exitcode":0,"exited":1,'
+               '"out-data":"EXPLORERSWEEP:{\\"found\\":0,\\"killed\\":0,'
+               '\\"errors\\":[],\\"mode\\":\\"count-only\\",'
+               '\\"commitPct\\":\\"not-a-number\\"}\\r\\n"}')
+        r = es.parse_agent_output(raw)
+        self.assertTrue(r["ok"])
+        self.assertIsNone(r["commitPct"])
 
     def test_kill_result_is_trusted(self):
         r = es.parse_agent_output(REAL_KILL)
@@ -107,6 +147,51 @@ class ParseAgentOutput(unittest.TestCase):
         self.assertEqual(len(r["errors"]), 1)
 
 
+class CommitSampleHelpers(unittest.TestCase):
+    def test_as_number_passes_through_numbers(self):
+        self.assertEqual(es._as_number(96.4), 96.4)
+        self.assertEqual(es._as_number(4096), 4096)
+
+    def test_as_number_rejects_non_numbers_and_bools(self):
+        # bool is a subclass of int in Python — explicitly excluded so a
+        # stray True/False in the JSON never gets treated as commitPct=1/0.
+        for v in (None, "x", [], {}, True, False):
+            with self.subTest(v=v):
+                self.assertIsNone(es._as_number(v))
+
+    def test_no_process_reason_matches_the_three_named_reasons(self):
+        self.assertTrue(es._is_no_process_reason("guest-timeout"))
+        self.assertTrue(es._is_no_process_reason("no-marker"))
+        self.assertTrue(es._is_no_process_reason("ps-exitcode-1"))
+        self.assertTrue(es._is_no_process_reason("ps-exitcode-3221225620"))
+
+    def test_no_process_reason_excludes_connectivity_failures(self):
+        # These are a DIFFERENT failure class (SSH/agent down, not commit
+        # exhaustion) and must not pollute the /admin/salud card.
+        for reason in ("no-agent", "unresolved-node", "ssh/TimeoutExpired",
+                       "bad-json:garbage", "unparseable-payload"):
+            with self.subTest(reason=reason):
+                self.assertFalse(es._is_no_process_reason(reason))
+
+    def test_high_commit_threshold_is_90_percent(self):
+        self.assertEqual(es.HIGH_COMMIT_PCT, 90.0)
+
+
+class ParseArgs(unittest.TestCase):
+    def test_defaults(self):
+        args = es.parse_args([])
+        self.assertIsNone(args.only_vmids)
+        self.assertFalse(args.force_dry_run)
+        self.assertFalse(args.no_journal)
+
+    def test_manual_test_flags(self):
+        args = es.parse_args(
+            ["--only-vmids", "215,701", "--force-dry-run", "--no-journal"])
+        self.assertEqual(args.only_vmids, "215,701")
+        self.assertTrue(args.force_dry_run)
+        self.assertTrue(args.no_journal)
+
+
 class PsPayload(unittest.TestCase):
     def test_dry_and_kill_variants_differ_only_in_doKill(self):
         dry = es._ps_payload(False)
@@ -130,6 +215,19 @@ class PsPayload(unittest.TestCase):
 
     def test_clsid_is_the_validated_literal(self):
         self.assertEqual(es.CLSID, "{75dff2b7-6936-4c06-a8bb-676a7b00b24b}")
+
+    def test_commit_sample_is_present_and_wrapped_in_its_own_try_catch(self):
+        # The commit sample must never be able to stop the marker line from
+        # being written — a guest-side WMI failure has to degrade to nulls,
+        # not to a missing EXPLORERSWEEP: marker (which would silently
+        # cancel this VM's kill for the day, per the module docstring).
+        ps = es._ps_payload(True)
+        self.assertIn("Win32_OperatingSystem", ps)
+        self.assertIn("TotalVirtualMemorySize", ps)
+        self.assertIn("FreeVirtualMemory", ps)
+        self.assertIn("commitPct = $commitPct", ps)
+        self.assertIn("try {", ps)
+        self.assertIn("} catch { }", ps)
 
 
 class ResolveIp(unittest.TestCase):

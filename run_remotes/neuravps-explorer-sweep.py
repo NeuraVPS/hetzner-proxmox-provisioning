@@ -110,10 +110,36 @@ of vmids — everyone gets a turn within a few days.
 JOURNAL
 Every real run (kill-switch enabled) writes one summary doc to
 `explorer_sweep_runs/<YYYYMMDD-HHMM>`: counts, cap state, and a `perVm` map
-containing ONLY the VMs that had something to report (found>0 or an error) —
-keeping the doc small while still being fully auditable. Full detail also
-goes to syslog (`journalctl -t neuravps-explorer-sweep`).
+containing ONLY the VMs that had something to report (found>0, an error, or
+high commit — see COMMIT SAMPLE below) — keeping the doc small while still
+being fully auditable. Full detail also goes to syslog
+(`journalctl -t neuravps-explorer-sweep`).
+
+COMMIT SAMPLE (2026-09-13, see memory/neuravps-vm215-commit-limit-2026-09-12.md
+and memory/neuravps-guest-commit-limit-diagnosis.md)
+The SAME PowerShell payload above also reads Win32_OperatingSystem's
+TotalVirtualMemorySize/FreeVirtualMemory (the commit limit and free commit,
+cheap — one extra WMI call, wrapped in its own try/catch so it can never
+break the explorer-kill marker) and reports `commitPct`/`commitChargeMb`/
+`commitLimitMb` for EVERY measured VM. Two derived, purely additive signals
+feed a /admin/salud card, written to the fixed doc
+`explorer_sweep_runs/_latest` on every real run (not written with
+--no-journal): VMs at or above HIGH_COMMIT_PCT (90%) commit, and VMs where
+`qm guest exec` could not even start a process at all (`guest-timeout`,
+`no-marker`, `ps-exitcode-*` — on a healthy guest that round-trip always
+gets SOME response, so this failure signature is itself the
+commit-exhaustion signal). Neither list can ever affect who gets killed —
+they are computed from the same `measured`/`unreachable` result lists the
+kill logic already produced, never fed back into it.
+
+TESTING WITHOUT TOUCHING THE LIVE INSTALL OR THE JOURNAL
+`--only-vmids 215,701 --force-dry-run --no-journal` restricts a run to
+specific vmids, guarantees the kill-enabled payload is never sent (even if
+config/explorerSweep.dryRun is false), and skips both Firestore writes —
+safe to run directly from a git checkout without installing anything or
+touching config/explorerSweep. See README-explorer-sweep.md.
 """
+import argparse
 import base64
 import fcntl
 import json
@@ -167,7 +193,26 @@ if ($doKill) {
   }
 }
 $mode = if ($doKill) { 'kill' } else { 'count-only' }
-$r = @{ found = $found; killed = $killed; errors = $errors; mode = $mode } |
+# Piggyback the §9.9.19 commit-exhaustion sample on this SAME round-trip —
+# one Get-CimInstance, no extra process, no extra schedule. Wrapped so a WMI
+# failure here can NEVER stop the explorer-kill payload above from reporting
+# (a missing marker would silently cancel this VM's kill for the day).
+$commitPct = $null
+$commitChargeMb = $null
+$commitLimitMb = $null
+try {
+  $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+  $totalKb = $os.TotalVirtualMemorySize
+  $freeKb = $os.FreeVirtualMemory
+  if ($totalKb -gt 0) {
+    $commitLimitMb = [math]::Round($totalKb / 1024, 0)
+    $commitChargeMb = [math]::Round(($totalKb - $freeKb) / 1024, 0)
+    $commitPct = [math]::Round(100 * ($totalKb - $freeKb) / $totalKb, 1)
+  }
+} catch { }
+$r = @{ found = $found; killed = $killed; errors = $errors; mode = $mode;
+        commitPct = $commitPct; commitChargeMb = $commitChargeMb;
+        commitLimitMb = $commitLimitMb } |
   ConvertTo-Json -Compress
 Write-Output "''' + MARKER + r'''$r"
 '''
@@ -218,7 +263,37 @@ def parse_agent_output(raw: str) -> dict:
         return {"ok": False, "reason": "unparseable-payload"}
     return {"ok": True, "found": found, "killed": killed,
             "errors": list(payload.get("errors") or [])[:5],
-            "mode": payload.get("mode")}
+            "mode": payload.get("mode"),
+            # §9.9.19 commit sample, piggybacked on this same round-trip.
+            # Missing/non-numeric (older payload shape, or the guest-side
+            # try/catch swallowed a WMI failure) never invalidates the
+            # explorer-kill result above — these three are ALWAYS optional.
+            "commitPct": _as_number(payload.get("commitPct")),
+            "commitChargeMb": _as_number(payload.get("commitChargeMb")),
+            "commitLimitMb": _as_number(payload.get("commitLimitMb"))}
+
+
+def _as_number(v):
+    """None/garbage -> None; a real int/float passes through unchanged."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+# Commit is at least this saturated: worth a card on /admin/salud even if
+# the explorer-orphan filter found nothing on this VM.
+HIGH_COMMIT_PCT = 90.0
+
+# `parse_agent_output` reasons meaning "the guest could not even START a
+# process" — on a healthy VM `qm guest exec` always gets SOME response, so
+# this specific failure signature is itself the commit-exhaustion signal
+# (memory/neuravps-guest-commit-limit-diagnosis.md: cmd-internal commands
+# keep working, PowerShell/tasklist die with STATUS_COMMITMENT_LIMIT).
+# "no-agent"/"ssh/*"/"unresolved-node" are excluded on purpose — those are
+# connectivity/QGA problems, a different failure class.
+_NO_PROCESS_REASONS = frozenset({"guest-timeout", "no-marker"})
+
+
+def _is_no_process_reason(reason: str) -> bool:
+    return reason in _NO_PROCESS_REASONS or (reason or "").startswith("ps-exitcode-")
 
 
 def sweep_vm(node_ip: str, vmid: int, do_kill: bool) -> dict:
@@ -291,7 +366,31 @@ def resolve_ip(nodes_ip: dict, nid: str):
     return None
 
 
-def main() -> int:
+def parse_args(argv=None) -> argparse.Namespace:
+    """CLI options for a manual, bounded test run — e.g. validating the new
+    commit sample against a couple of real VMs before the fleet-wide daily
+    run picks up the change. None of these affect the scheduled/unattended
+    invocation (`ExecStart=... neuravps-explorer-sweep.py`, no args)."""
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--only-vmids", default=None, metavar="VMID[,VMID...]",
+        help="Restrict this run to these vmids (comma-separated). The "
+             "usual Firestore candidate list is still loaded first and "
+             "then filtered down, so node lookup/exclusions are unchanged.")
+    p.add_argument(
+        "--force-dry-run", action="store_true",
+        help="Never send the kill-enabled payload this run, regardless of "
+             "config/explorerSweep.dryRun — every candidate gets the "
+             "count-only payload only.")
+    p.add_argument(
+        "--no-journal", action="store_true",
+        help="Do not write explorer_sweep_runs/<runId> or /_latest — "
+             "console/syslog output only. For a one-off manual check.")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
     lock = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -308,7 +407,7 @@ def main() -> int:
     if not cfg or cfg.get("enabled") is not True:
         log("config/explorerSweep missing or enabled!=true — disabled, exiting")
         return 0
-    dry = bool(cfg.get("dryRun"))
+    dry = bool(cfg.get("dryRun")) or args.force_dry_run
     max_vms = int(cfg.get("maxVmsPerRun") or DEFAULT_MAX_VMS_PER_RUN)
     workers = int(cfg.get("workers") or WORKERS)
 
@@ -316,6 +415,17 @@ def main() -> int:
         nodes_ip = json.load(fh)
 
     candidates = load_candidates(db, nodes_ip)
+    if args.only_vmids:
+        try:
+            wanted = {int(v) for v in args.only_vmids.split(",") if v.strip()}
+        except ValueError:
+            log(f"--only-vmids {args.only_vmids!r} is not a comma-separated "
+                f"list of integers — aborting")
+            return 1
+        before = len(candidates)
+        candidates = [c for c in candidates if c[1] in wanted]
+        log(f"--only-vmids restricted {before} candidates to "
+            f"{len(candidates)} ({sorted(wanted)})")
     if not candidates:
         log("no candidates — nothing to do")
         return 0
@@ -350,12 +460,36 @@ def main() -> int:
     total_killed = sum(r[2]["killed"] for r in measured)
     reason_counts = Counter(r[2]["reason"] for r in unreachable)
 
+    # §9.9.19 commit-exhaustion signals for /admin/salud. Two independent
+    # lists, never touching the explorer-kill filter/logic above:
+    #   * a VM still measured fine but sitting on very high commit, and
+    #   * a VM where the guest-exec round-trip could not even start a
+    #     process at all — on a healthy guest `qm guest exec` always gets
+    #     SOME response, so this specific failure IS the signature.
+    high_commit = sorted(
+        ({"node": nid, "vmid": vmid, "commitPct": res["commitPct"]}
+         for nid, vmid, res in measured
+         if isinstance(res.get("commitPct"), (int, float))
+         and res["commitPct"] >= HIGH_COMMIT_PCT),
+        key=lambda x: x["commitPct"], reverse=True,
+    )
+    could_not_start = [
+        {"node": nid, "vmid": vmid, "reason": res["reason"]}
+        for nid, vmid, res in unreachable
+        if _is_no_process_reason(res.get("reason"))
+    ]
+
     per_vm = {}
     for nid, vmid, res in measured:
-        if res["found"] > 0 or res["errors"]:
+        pct = res.get("commitPct")
+        high = isinstance(pct, (int, float)) and pct >= HIGH_COMMIT_PCT
+        if res["found"] > 0 or res["errors"] or high:
             per_vm[str(vmid)] = {"node": nid, "found": res["found"],
                                  "killed": res["killed"], "mode": res.get("mode"),
-                                 "errors": res["errors"]}
+                                 "errors": res["errors"],
+                                 "commitPct": pct,
+                                 "commitChargeMb": res.get("commitChargeMb"),
+                                 "commitLimitMb": res.get("commitLimitMb")}
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     doc = {
@@ -374,13 +508,41 @@ def main() -> int:
         "maxVmsPerRun": max_vms,
         "perVm": per_vm,
         "durationS": round(duration, 1),
+        "highCommitCount": len(high_commit),
+        "couldNotStartProcessCount": len(could_not_start),
     }
-    db.collection("explorer_sweep_runs").document(run_id).set(doc)
+
+    if args.no_journal:
+        log("--no-journal: skipping explorer_sweep_runs writes")
+    else:
+        db.collection("explorer_sweep_runs").document(run_id).set(doc)
+        # Compact, fixed-id rollup for the /admin/salud card — same pattern
+        # as node_health's `_summary` / support_metrics/waiting: one doc the
+        # panel subscribes to directly instead of querying the (growing,
+        # timestamp-keyed) run collection.
+        db.collection("explorer_sweep_runs").document("_latest").set({
+            "at": firestore.SERVER_TIMESTAMP,
+            "runId": run_id,
+            "dryRun": dry,
+            "candidates": len(candidates),
+            "measured": len(measured),
+            "unreachable": len(unreachable),
+            "affected": len(affected),
+            "totalFound": total_found,
+            "totalKilled": total_killed,
+            "highCommitVms": high_commit[:50],
+            "highCommitCount": len(high_commit),
+            "couldNotStartProcess": could_not_start[:50],
+            "couldNotStartProcessCount": len(could_not_start),
+            "durationS": round(duration, 1),
+        })
 
     log(f"fin: {len(candidates)} candidatas, {len(measured)} medidas, "
         f"{len(unreachable)} sin medir ({dict(reason_counts)}), "
         f"{len(affected)} con huerfanos, {total_found} encontrados, "
-        f"{total_killed} cerrados, {duration:.0f}s"
+        f"{total_killed} cerrados, {len(high_commit)} con commit>="
+        f"{HIGH_COMMIT_PCT:g}%, {len(could_not_start)} sin poder lanzar "
+        f"proceso, {duration:.0f}s"
         f"{' [DRY-RUN]' if dry else ''}")
     return 0
 
