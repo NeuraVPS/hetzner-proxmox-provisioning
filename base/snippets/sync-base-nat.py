@@ -22,6 +22,12 @@ Commands:
   sync-base-nat.py sync <proxmoxId> del
       Remove one VM from local desired map, reconcile rules.
 
+  sync-base-nat.py sync egress
+      Per-VM outbound IPv4 pools only: re-read config/egressPools and every
+      server's `egressIpv4` pair from Firestore and re-render the two pool maps
+      (`ip nat egress_hel4` / `egress_fsn4`) in one atomic transaction. Touches
+      nothing else. See egress_* below and NeuraVPS docs/EGRESS_IPV4_POOLS_ROLLOUT.md.
+
   sync-base-nat.py sync nodes
       PVE proxy: full sync from Firestore "proxmox_nodes" (doc id -> field ip),
       write nginx backend map, reload nginx.
@@ -324,6 +330,8 @@ def _server_entry(
     node_id: str = "",
     ipv4: str = "",
     internet: bool = True,
+    egress_hel: str = "",
+    egress_fsn: str = "",
 ) -> dict:
     return {
         "ipv6": ipv6,
@@ -339,7 +347,19 @@ def _server_entry(
         # túnel correcto. En el modelo viejo estos campos se ignoran.
         "nodeId": str(node_id or ""),
         "ipv4": str(ipv4 or ""),
+        # Par de IPv4 de salida de la VM (pools por VM, `servers.egressIpv4`).
+        # Vacío = sin par: la VM sale por la IP principal de la base, como hoy.
+        "egressHel": str(egress_hel or ""),
+        "egressFsn": str(egress_fsn or ""),
     }
+
+
+def _egress_pair(doc: dict) -> tuple[str, str]:
+    """(hel, fsn) de `servers.egressIpv4`, o ("", "") si no hay par legible."""
+    a = doc.get("egressIpv4") if isinstance(doc, dict) else None
+    if not isinstance(a, dict):
+        return "", ""
+    return str(a.get("hel") or "").strip(), str(a.get("fsn") or "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +592,8 @@ def desired_from_state() -> dict[int, dict]:
             # Internet: equivocarse hacia "abierto" deja a un cliente con red
             # de más; hacia "cerrado" lo deja sin ella y sin saber por qué.
             internet=bool(net_flag) if isinstance(net_flag, bool) else True,
+            egress_hel=d.get("egressHel") or "",
+            egress_fsn=d.get("egressFsn") or "",
         )
     return out
 
@@ -613,6 +635,7 @@ def firestore_list_configured_servers() -> dict[int, dict]:
             logger.warning("Skip server %s: bad ipv6 %s", doc.id, s)
             continue
         firewall = d.get("firewall")
+        egress_hel, egress_fsn = _egress_pair(d)
         out[vmid] = _server_entry(
             normalized,
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
@@ -621,6 +644,8 @@ def firestore_list_configured_servers() -> dict[int, dict]:
             internet=_firewall_flag(firewall, "internetEnabled", True),
             node_id=d.get("nodeId") or "",
             ipv4=d.get("ipv4") or "",
+            egress_hel=egress_hel,
+            egress_fsn=egress_fsn,
         )
     return out
 
@@ -647,6 +672,7 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
         except ValueError:
             return None
         firewall = d.get("firewall")
+        egress_hel, egress_fsn = _egress_pair(d)
         return _server_entry(
             normalized,
             rdp=_firewall_flag(firewall, "rdpEnabled", True),
@@ -658,6 +684,8 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
             # cargador masivo si los pasaba; este se habia quedado atras.
             node_id=d.get("nodeId") or "",
             ipv4=d.get("ipv4") or "",
+            egress_hel=egress_hel,
+            egress_fsn=egress_fsn,
         )
     return None
 
@@ -1010,6 +1038,259 @@ def reconcile_sin_internet(desired: dict[int, dict]) -> None:
     )
 
 
+# --- Pools de IPv4 de salida por VM --------------------------------------------
+#
+# POR QUE. Hoy todos los invitados de una region salen a Internet por UNA IPv4:
+# la principal de la base que sostiene la VIP de la region. Tras las
+# desconexiones masivas de Darwinex-Demo, los terminales de detras de la IP de
+# Helsinki tardan 37-85 min en poder volver a entrar (limitacion por IP en el
+# broker). Con un bloque por region, cada VM tiene su PAR fijo —una direccion
+# de cada bloque— y la carga se reparte entre ~62 IPs.
+#
+# COMO. Dos mapas `ip nat egress_hel4` / `egress_fsn4` (IPv4 privada -> publica)
+# y una cadena `egress_pools` a la que salta postrouting ANTES de la regla
+# general `ip saddr 10.64.0.0/16 ... snat to <IP principal>`, que se queda como
+# red de seguridad (ver persist-egress-pools-nft.py):
+#
+#   iifname "tun-hp*" ip saddr @egress_hel4 snat to ip saddr map @egress_hel4
+#   iifname "tun-fp*" ip saddr @egress_fsn4 snat to ip saddr map @egress_fsn4
+#   iifname "tun-hp*" ip saddr @egress_fsn4 snat to ip saddr map @egress_fsn4
+#   iifname "tun-fp*" ip saddr @egress_hel4 snat to ip saddr map @egress_hel4
+#
+# La REGION la da el tunel por el que entra el paquete: `tun-hp*` estan anclados
+# a la VIP de Helsinki, `tun-fp*` a la de Falkenstein. Asi sigue siendo correcto
+# cuando una sola base sostiene las dos VIPs tras un failover.
+#
+# PROPIEDAD. Un mapa solo se puebla en la base a la que Hetzner enruta ese bloque
+# (`pools.<r>.activeServerIp` == MAIN_IPV4 de esta base). Hacer SNAT a una
+# direccion cuyo bloque esta enrutado a la OTRA base deja las respuestas en la
+# otra base, sin conntrack: la unica forma de romper la salida que tiene esto.
+# Las dos ultimas reglas cubren la base que tiene la VIP de una region pero no
+# su bloque (bloque adicional en una base caida, o bloque failover aun
+# moviendose): la VM sale con la OTRA IP de su par, que el cliente ya conoce.
+# Si esta base no tiene ningun bloque, nada casa y manda la regla general: hoy.
+#
+# Todo fallo degrada a "como hoy": config ausente/invalida, Firestore caido sin
+# cache, mapas no declarados, par fuera del bloque. Las conexiones YA abiertas
+# conservan su direccion al cambiar los mapas (conntrack): el cambio no corta.
+# Freno de emergencia que no depende de Firestore: EGRESS_POOLS_FORCE_OFF=1 en
+# /etc/default/base-nat y `sync-base-nat.py sync egress`.
+EGRESS_REGIONS = ("hel", "fsn")
+EGRESS_MAPS = {"hel": "egress_hel4", "fsn": "egress_fsn4"}
+NFT_EGRESS_FAMILY = os.environ.get("NFT_EGRESS_FAMILY", "ip")
+NFT_EGRESS_TABLE = os.environ.get("NFT_EGRESS_TABLE", "nat")
+NFT_EGRESS_FILE = Path(
+    os.environ.get("NFT_EGRESS_FILE", "/etc/nftables.d/base-nat-egress-pools.nft")
+)
+EGRESS_CONFIG_CACHE = Path(
+    os.environ.get("EGRESS_CONFIG_CACHE", str(STATE_DIR / "egress-pools.json"))
+)
+EGRESS_POOLS_FORCE_OFF = parse_bool_env("EGRESS_POOLS_FORCE_OFF", False)
+MAIN_IPV4 = (os.environ.get("MAIN_IPV4") or "").strip()
+_EGRESS_FORBIDDEN = tuple(ipaddress.IPv4Network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3",
+))
+_EGRESS_MAX_ADDRESSES = 4096
+
+
+def _egress_maps_exist() -> bool:
+    for nombre in EGRESS_MAPS.values():
+        r = subprocess.run(
+            ["nft", "list", "map", NFT_EGRESS_FAMILY, NFT_EGRESS_TABLE, nombre],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            return False
+    return True
+
+
+def load_egress_config() -> dict | None:
+    """`config/egressPools` crudo. Firestore primero (y se cachea en disco);
+    si Firestore no contesta, la ultima copia buena. None = ausente."""
+    try:
+        if not ensure_firebase():
+            raise RuntimeError("firebase no disponible")
+        snap = firestore.client().collection("config").document("egressPools").get()
+        raw = (snap.to_dict() or {}) if snap.exists else None
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = EGRESS_CONFIG_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"config": raw}, default=str, sort_keys=True))
+            os.replace(tmp, EGRESS_CONFIG_CACHE)
+        except OSError as e:
+            logger.warning("egress: no pude cachear la config: %s", e)
+        return raw
+    except Exception as e:  # pylint: disable=broad-except
+        try:
+            cached = json.loads(EGRESS_CONFIG_CACHE.read_text()).get("config")
+            logger.warning("egress: Firestore no disponible (%s); uso la cache", e)
+            return cached
+        except (OSError, ValueError):
+            logger.warning("egress: sin Firestore ni cache (%s); pools APAGADOS", e)
+            return None
+
+
+def _egress_usable(raw_pool: dict) -> tuple[list, set] | None:
+    """(bloques, direcciones utilizables) de un pool, o None si es invalido.
+    Mismas reglas que functions/egress_pools.py: red/broadcast fuera salvo
+    `useNetworkAndBroadcast`, `exclude` fuera, nunca espacio privado."""
+    if not isinstance(raw_pool, dict) or raw_pool.get("kind") not in ("failover", "additional"):
+        return None
+    cidrs = raw_pool.get("cidrs")
+    if not isinstance(cidrs, list) or not cidrs:
+        return None
+    nets = []
+    try:
+        for c in cidrs:
+            net = ipaddress.IPv4Network(str(c).strip(), strict=True)
+            if any(net.overlaps(f) for f in _EGRESS_FORBIDDEN) or any(net.overlaps(o) for o in nets):
+                return None
+            nets.append(net)
+        exclude = {str(ipaddress.IPv4Address(str(x).strip())) for x in (raw_pool.get("exclude") or [])}
+    except ValueError:
+        return None
+    if sum(n.num_addresses for n in nets) > _EGRESS_MAX_ADDRESSES:
+        return None
+    todas = raw_pool.get("useNetworkAndBroadcast") is True
+    usable: set = set()
+    for net in nets:
+        for off in range(net.num_addresses):
+            if not todas and net.prefixlen < 31 and off in (0, net.num_addresses - 1):
+                continue
+            addr = str(net.network_address + off)
+            if addr not in exclude:
+                usable.add(addr)
+    return nets, usable
+
+
+def egress_plan(desired: dict[int, dict], raw: dict | None,
+                main_ipv4: str) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Puro. {region: {ipv4 privada: ipv4 publica}} para ESTA base + notas."""
+    vacio: dict[str, dict[str, str]] = {r: {} for r in EGRESS_REGIONS}
+    if EGRESS_POOLS_FORCE_OFF:
+        return vacio, ["EGRESS_POOLS_FORCE_OFF=1: pools apagados en esta base"]
+    if not isinstance(raw, dict):
+        return vacio, ["config/egressPools ausente: pools apagados"]
+    if raw.get("enabled") is not True:
+        return vacio, ["enabled != true: pools apagados"]
+    pools_raw = raw.get("pools") if isinstance(raw.get("pools"), dict) else {}
+    pools = {r: _egress_usable(pools_raw.get(r)) for r in EGRESS_REGIONS}
+    if any(p is None for p in pools.values()):
+        return vacio, ["config/egressPools INVALIDA: pools apagados"]
+    for a in pools["hel"][0]:
+        for b in pools["fsn"][0]:
+            if a.overlaps(b):
+                return vacio, ["bloques hel y fsn solapados: pools apagados"]
+    try:
+        canary = {int(v) for v in (raw.get("canaryVmids") or [])}
+    except (TypeError, ValueError):
+        return vacio, ["canaryVmids ilegible: pools apagados"]
+    fleet = raw.get("fleetWide") is True
+    try:
+        main = str(ipaddress.IPv4Address(main_ipv4))
+    except ValueError:
+        return vacio, [f"MAIN_IPV4 {main_ipv4!r} ilegible: esta base no reclama ningun bloque"]
+    propios = [r for r in EGRESS_REGIONS if pools_raw[r].get("activeServerIp") == main]
+    notas = [f"bloques enrutados a esta base ({main}): {propios or 'ninguno'}"]
+    if not propios:
+        return vacio, notas
+    try:
+        vm_net = ipaddress.IPv4Network(VM_V4_PREFIX)
+    except ValueError:
+        return vacio, notas + [f"VM_V4_PREFIX {VM_V4_PREFIX!r} ilegible: pools apagados"]
+    plan = {r: {} for r in EGRESS_REGIONS}
+    fuera = 0
+    for vmid in sorted(desired):
+        if not fleet and vmid not in canary:
+            continue
+        ent = desired[vmid]
+        try:
+            priv = str(ipaddress.IPv4Address(str(ent.get("ipv4") or "").strip()))
+        except ValueError:
+            continue
+        if ipaddress.IPv4Address(priv) not in vm_net:
+            continue
+        for r in propios:
+            pub = str(ent.get("egressHel" if r == "hel" else "egressFsn") or "").strip()
+            if not pub:
+                continue
+            if pub not in pools[r][1]:
+                fuera += 1
+                continue
+            if priv in plan[r]:
+                notas.append(f"{priv} repetida (vm {vmid}); me quedo con la primera")
+                continue
+            plan[r][priv] = pub
+    if fuera:
+        notas.append(f"{fuera} par(es) fuera de su bloque o en direccion excluida: ignorados")
+    return plan, notas
+
+
+def reconcile_egress_pools(desired: dict[int, dict], raw) -> None:
+    """Repuebla los dos mapas en UNA transaccion y persiste los elementos.
+
+    `raw` es la config ya leida o un callable que la lee: asi una base SIN la
+    estructura no paga ni la lectura de Firestore en cada sync de VM."""
+    if not _egress_maps_exist():
+        # Base sin la estructura (persist-egress-pools-nft.py sin aplicar): nada
+        # que poblar, y el resto de la sincronizacion sigue igual que siempre.
+        logger.debug("egress: mapas no declarados en nftables; omito")
+        return
+    if callable(raw):
+        raw = raw()
+    plan, notas = egress_plan(desired, raw, MAIN_IPV4)
+    lineas = [f"flush map {NFT_EGRESS_FAMILY} {NFT_EGRESS_TABLE} {m}" for m in EGRESS_MAPS.values()]
+    elementos = [
+        f"add element {NFT_EGRESS_FAMILY} {NFT_EGRESS_TABLE} {EGRESS_MAPS[r]} {{ {priv} : {pub} }}"
+        for r in EGRESS_REGIONS for priv, pub in sorted(plan[r].items())
+    ]
+    _apply_nft_transaction(lineas + elementos)
+    try:
+        NFT_EGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cuerpo = "# generado por sync-base-nat.py - no editar a mano\n"
+        cuerpo += "\n".join(elementos) + ("\n" if elementos else "")
+        tmp = NFT_EGRESS_FILE.with_suffix(NFT_EGRESS_FILE.suffix + ".tmp")
+        tmp.write_text(cuerpo)
+        os.replace(tmp, NFT_EGRESS_FILE)
+    except OSError as e:
+        logger.warning("egress: no pude escribir %s: %s", NFT_EGRESS_FILE, e)
+    logger.info("egress reconcile: hel=%d fsn=%d | %s",
+                len(plan["hel"]), len(plan["fsn"]), "; ".join(notas))
+
+
+def sync_egress() -> None:
+    """Solo los pools: config + pares desde Firestore, sin tocar DNAT ni rutas."""
+    raw = load_egress_config()
+    pares: dict[int, tuple[str, str, str]] | None = None
+    if isinstance(raw, dict) and raw.get("enabled") is True and not EGRESS_POOLS_FORCE_OFF:
+        if not ensure_firebase():
+            logger.error("egress: Firebase requerido para leer los pares")
+            sys.exit(1)
+        pares = {}
+        cols = ["proxmoxId", "ipv4", "egressIpv4"]
+        for doc in firestore.client().collection("servers").select(cols).stream():
+            d = doc.to_dict() or {}
+            try:
+                vmid = int(d.get("proxmoxId"))
+            except (TypeError, ValueError):
+                continue
+            hel, fsn = _egress_pair(d)
+            pares.setdefault(vmid, (str(d.get("ipv4") or ""), hel, fsn))
+    with state_lock():
+        desired = desired_from_state()
+        if pares is not None:
+            for vmid, ent in desired.items():
+                ipv4, hel, fsn = pares.get(vmid, (ent.get("ipv4", ""), "", ""))
+                ent["egressHel"], ent["egressFsn"] = hel, fsn
+                if ipv4 and not ent.get("ipv4"):
+                    ent["ipv4"] = ipv4
+        reconcile_egress_pools(desired, raw)
+        if pares is not None:
+            write_state(_state_payload(desired))
+    logger.info("Egress sync done (%d servers in state)", len(desired))
+
+
 def _state_payload(desired: dict[int, dict]) -> dict:
     """Serializable view of the desired map for STATE_FILE."""
     return {
@@ -1024,6 +1305,8 @@ def _state_payload(desired: dict[int, dict]) -> dict:
             "internetEnabled": bool(desired[k].get("internet", True)),
             "nodeId": desired[k].get("nodeId", ""),
             "ipv4": desired[k].get("ipv4", ""),
+            "egressHel": desired[k].get("egressHel", ""),
+            "egressFsn": desired[k].get("egressFsn", ""),
         }
         for k in sorted(desired.keys())
     }
@@ -1034,10 +1317,12 @@ def sync_full():
     # and we don't want to block per-VM syncs that whole time. The lock
     # only needs to cover the nft+state critical section.
     desired = firestore_list_configured_servers()
+    egress_cfg = load_egress_config if not _egress_maps_exist() else load_egress_config()
     with state_lock():
         reconcile_dynamic_dnat_rules(desired)
         reconcile_vm_routes(desired)
         reconcile_sin_internet(desired)
+        reconcile_egress_pools(desired, egress_cfg)
         write_state(_state_payload(desired))
     logger.info("Full sync done (%d servers)", len(desired))
 
@@ -1108,12 +1393,17 @@ def sync_single_vmid(
                 # se cerraria la salida v6 y la v4 seguiria abierta. Se recupera
                 # del estado en disco, que lo dejo el ultimo sync completo.
                 ipv4_flag = str((existing or {}).get("ipv4") or "")
+                # Mismo criterio para el par de salida: esta via no lo trae.
+                egress_hel = str((existing or {}).get("egressHel") or "")
+                egress_fsn = str((existing or {}).get("egressFsn") or "")
             else:
                 rdp_flag = bool(server.get("rdp", True))
                 samba_flag = bool(server.get("samba", True))
                 ssh_flag = bool(server.get("ssh", True))
                 net_flag = bool(server.get("internet", True))
                 ipv4_flag = str(server.get("ipv4") or "")
+                egress_hel = str(server.get("egressHel") or "")
+                egress_fsn = str(server.get("egressFsn") or "")
             desired[vmid] = _server_entry(
                 normalize_ipv6(server["ipv6"]),
                 rdp=rdp_flag,
@@ -1121,6 +1411,8 @@ def sync_single_vmid(
                 ssh=ssh_flag,
                 internet=net_flag,
                 ipv4=ipv4_flag,
+                egress_hel=egress_hel,
+                egress_fsn=egress_fsn,
             )
         else:
             desired.pop(vmid, None)
@@ -1151,10 +1443,14 @@ def sync_single_vmid(
                     # explicitamente, manda quien llama.
                     if "internet" not in (flags_override or {}):
                         ent["internet"] = bool(fresco.get("internet", True))
+                    if ipv6_override and (fresco.get("egressHel") or fresco.get("egressFsn")):
+                        ent["egressHel"] = fresco.get("egressHel") or ""
+                        ent["egressFsn"] = fresco.get("egressFsn") or ""
 
         reconcile_dynamic_dnat_rules(desired)
         reconcile_vm_routes(desired)
         reconcile_sin_internet(desired)
+        reconcile_egress_pools(desired, load_egress_config)
         write_state(_state_payload(desired))
     logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
@@ -1877,6 +2173,7 @@ def main():
             "       sync-base-nat.py sync <proxmoxId>\n"
             "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1] [internet=0|1]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
+            "       sync-base-nat.py sync egress\n"
             "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,
         )
@@ -1890,6 +2187,10 @@ def main():
     args = sys.argv[2:]
     if not args:
         sync_full()
+        return
+
+    if args[0] == "egress":
+        sync_egress()
         return
 
     try:

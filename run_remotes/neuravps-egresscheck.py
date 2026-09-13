@@ -72,6 +72,20 @@ registra cuantas midio y cuantas no pudo, y el resumen lo dice siempre.
 Kill-switch `config/egresscheck` {enabled, dryRun, vmsPorNodo}: doc ausente o
 enabled!=true = APAGADO (sistema nuevo, falla cerrado).
 
+IP DE SALIDA (pools de IPv4 por VM, 2026-09)
+Con `config/egressPools.enabled`, cada VM tiene un PAR de IPv4 de salida
+(`servers.egressIpv4`) y las bases la sacan por la de su region. La misma pasada
+pregunta tambien a Cloudflare con que IPv4 LLEGA el invitado
+(`/cdn-cgi/trace`, una peticion mas, ~0,1 s) y la compara con su par:
+  propia   la de su region                     -> bien
+  del_par  la otra de su par                   -> bien (failover o bloque moviendose)
+  general  la IP principal de una base         -> alerta si los dos bloques estan
+                                                  concedidos (el mapa no la lleva)
+  ajena    ninguna de las anteriores           -> alerta siempre
+Las VMs canario se sondean SIEMPRE, ademas del muestreo. Se presenta UN doc por
+region (`EGRESSIP-<region>`, kind `egress_ip`). `config/egresscheck.verificarIpSalida`
+= false lo apaga.
+
 Reparto: cada base sondea los nodos de SU region (b0=Falkenstein,
 b1=Helsinki). Que una base caida deje su region sin sondear no es un hueco:
 eso ya lo alerta el failover watchdog, y mucho antes.
@@ -158,12 +172,22 @@ def log(msg: str) -> None:
 # 28 (timeout con la conexion hecha) es la firma del MSS roto, mientras que 7
 # (no conecta) apunta a ruta o firewall.
 _W = "-w '%{http_code}/%{size_download}/%{time_total}'"
+URL_TRACE = "https://speed.cloudflare.com/cdn-cgi/trace"
+# Las IPs principales de las bases: si un invitado con pool activo llega con una
+# de estas, el mapa de la base no lo lleva. Sobrescribible sin desplegar codigo.
+BASES_IPV4 = {x.strip() for x in os.environ.get(
+    "EGRESS_BASE_IPV4S", "116.202.118.221,95.216.102.179").split(",") if x.strip()}
+REGION_POOL = {"helsinki": "hel", "falkenstein": "fsn"}
 _PS = (
     "$ErrorActionPreference='SilentlyContinue';"
     "$ag=curl.exe -4 -s -o NUL --max-time 25 " + _W + " '" + URL + "';$rag=$LASTEXITCODE;"
     "$ap=curl.exe -4 -s -o NUL --max-time 15 " + _W + " '" + URL_MIN + "';$rap=$LASTEXITCODE;"
     "$bg=curl.exe -6 -s -o NUL --max-time 25 " + _W + " '" + URL + "';$rbg=$LASTEXITCODE;"
     "$bp=curl.exe -6 -s -o NUL --max-time 15 " + _W + " '" + URL_MIN + "';$rbp=$LASTEXITCODE;"
+    # Con que IPv4 llega el invitado a Internet (pools de salida por VM).
+    "$tr=(curl.exe -4 -s --max-time 10 '" + URL_TRACE + "') -join ' ';"
+    "$ip4=([regex]::Match([string]$tr,'(?:^|\\s)ip=([0-9.]+)')).Groups[1].Value;"
+    "if(-not $ip4){$ip4='NA'};"
     "$d=try{(Resolve-DnsName " + NOMBRE_DNS + " -Type A -EA Stop|"
     "Select-Object -First 1).IPAddress}catch{'FALLO'};"
     # ⚠️ LA CPU DEL INVITADO ES PARTE DE LA MEDIDA, no un extra.
@@ -178,7 +202,7 @@ _PS = (
     "$cpu=try{[int](Get-CimInstance Win32_Processor -EA Stop|"
     "Measure-Object LoadPercentage -Average).Average}catch{-1};"
     "'v4g='+$ag+'/'+$rag+' v4p='+$ap+'/'+$rap+"
-    "' v6g='+$bg+'/'+$rbg+' v6p='+$bp+'/'+$rbp+' dns='+$d+' cpu='+$cpu"
+    "' v6g='+$bg+'/'+$rbg+' v6p='+$bp+'/'+$rbp+' dns='+$d+' cpu='+$cpu+' ip4='+$ip4"
 )
 
 
@@ -300,6 +324,49 @@ def analiza(salida: str):
                 "medida": salida, "cpuInvitado": cpu}
 
 
+def ip_vista(salida: str) -> str | None:
+    """La IPv4 con la que Cloudflare vio llegar al invitado, o None."""
+    for p in (salida or "").split():
+        if p.startswith("ip4="):
+            v = p[4:]
+            partes = v.split(".")
+            if len(partes) == 4 and all(x.isdigit() and int(x) < 256 for x in partes):
+                return v
+    return None
+
+
+def pools_activos(raw) -> dict | None:
+    """Lo minimo de `config/egressPools` que necesita la sonda, o None si los
+    pools no estan encendidos (entonces no hay nada que verificar)."""
+    if not isinstance(raw, dict) or raw.get("enabled") is not True:
+        return None
+    pools = raw.get("pools") if isinstance(raw.get("pools"), dict) else {}
+    try:
+        canary = {int(v) for v in (raw.get("canaryVmids") or [])}
+    except (TypeError, ValueError):
+        return None
+    return {
+        "fleet": raw.get("fleetWide") is True,
+        "canary": canary,
+        "concedidos": all((pools.get(r) or {}).get("activeServerIp") for r in ("hel", "fsn")),
+    }
+
+
+def veredicto_ip(vista, par: dict, region: str, pools: dict) -> str:
+    """propia | del_par | general | ajena | sin_dato  (ver cabecera)."""
+    if not vista:
+        return "sin_dato"
+    propia = par.get(REGION_POOL.get(region, ""))
+    otra = par.get("fsn" if REGION_POOL.get(region) == "hel" else "hel")
+    if vista == propia:
+        return "propia"
+    if vista == otra:
+        return "del_par"
+    if vista in BASES_IPV4:
+        return "general"
+    return "ajena"
+
+
 def control_desde_la_base() -> bool:
     """El destino es de un tercero. Si la base tampoco lo baja, el caido es el
     destino y no nosotros — y sondear la flota solo produciria 227 mentiras."""
@@ -372,9 +439,14 @@ def main() -> int:
         q = db.collection("servers").where(filter=FieldFilter("status", "==", "running"))
     except ImportError:
         q = db.collection("servers").where("status", "==", "running")
+    pools = None
+    if cfg.get("verificarIpSalida", True) is not False:
+        snap_pools = db.collection("config").document("egressPools").get()
+        pools = pools_activos(snap_pools.to_dict() if snap_pools.exists else None)
+    pares = {}
     por_nodo_cands = {}
     for snap in q.select(["proxmoxId", "nodeId", "maintenance",
-                          "provisioningStatus", "reinstalling"]).stream():
+                          "provisioningStatus", "reinstalling", "egressIpv4"]).stream():
         d = snap.to_dict() or {}
         nid = d.get("nodeId")
         if nid not in nodos or d.get("maintenance") or d.get("reinstalling") is True:
@@ -383,9 +455,14 @@ def main() -> int:
         if prov is not None and prov != "provisioned":
             continue
         try:
-            por_nodo_cands.setdefault(nid, []).append(int(d.get("proxmoxId")))
+            vmid_c = int(d.get("proxmoxId"))
         except (TypeError, ValueError):
             continue
+        por_nodo_cands.setdefault(nid, []).append(vmid_c)
+        par = d.get("egressIpv4")
+        if pools and isinstance(par, dict) and par.get("hel") and par.get("fsn") \
+                and (pools["fleet"] or vmid_c in pools["canary"]):
+            pares[vmid_c] = {"hel": par["hel"], "fsn": par["fsn"]}
 
     # --- muestreo rotatorio -------------------------------------------------
     # Determinista dentro de la pasada (mismo nodo -> mismo orden) pero girando
@@ -403,17 +480,24 @@ def main() -> int:
             continue
         off = hora % len(vms)
         elegidas = [vms[(off + i) % len(vms)] for i in range(min(por_nodo, len(vms)))]
+        # Los canarios de los pools se miran SIEMPRE: son pocos y son justo
+        # los que dicen si el cambio de IP de salida funciona.
+        if pools and not pools["fleet"]:
+            elegidas += [v for v in vms if v in pools["canary"] and v not in elegidas]
         for v in elegidas:
             trabajos.append((nid, v))
 
     log(f"{region}: {len(nodos)} nodos, {sum(len(v) for v in por_nodo_cands.values())} "
         f"VMs candidatas, {len(trabajos)} sondas (hasta {por_nodo}/nodo, giro h={hora})")
 
+    ips_vistas = {}
+
     def sondear(job):
         nid, vmid = job
         ok_canal, salida = por_agente(nodos[nid], vmid)
         if not ok_canal:
             return (nid, vmid, None, salida)      # no medible
+        ips_vistas[vmid] = ip_vista(salida)
         ok, det = analiza(salida)
         return (nid, vmid, ok, det if not ok else salida)
 
@@ -529,6 +613,28 @@ def main() -> int:
                 "regla": c["regla"], "certeza": c["certeza"],
             })
 
+    # --- IP de salida: pools por VM ----------------------------------------
+    ip_fuera = []
+    ip_medidas = 0
+    if pools:
+        cuenta = {"propia": 0, "del_par": 0, "general": 0, "ajena": 0, "sin_dato": 0}
+        nodo_de = {v: n for n, v in trabajos}
+        for vmid, par in pares.items():
+            if vmid not in ips_vistas:
+                continue
+            v = veredicto_ip(ips_vistas[vmid], par, region, pools)
+            cuenta[v] += 1
+            if v == "ajena" or (v == "general" and pools["concedidos"]):
+                ip_fuera.append({"vmid": vmid, "nodeId": nodo_de.get(vmid), "vista": ips_vistas[vmid],
+                                 "veredicto": v, "hel": par["hel"], "fsn": par["fsn"]})
+        ip_medidas = sum(cuenta[k] for k in ("propia", "del_par", "general", "ajena"))
+        log(f"ip de salida: {cuenta} (con pool activo y medidas: {ip_medidas})")
+        if ip_fuera:
+            presenta(f"EGRESSIP-{region}", {
+                "kind": "egress_ip", "vmsFuera": ip_fuera[:30], "vmsConPool": ip_medidas,
+                "correctas": cuenta["propia"], "delPar": cuenta["del_par"],
+            })
+
     # --- cerrar lo que ya se recupero ---------------------------------------
     resueltos = 0
     if not dry:
@@ -542,6 +648,18 @@ def main() -> int:
             if str(d.get("region") or "") != region:
                 continue  # el doc es de la otra base; no tengo datos frescos
             nid = d.get("nodeId") or snap.id
+            if d.get("kind") == "egress_ip":
+                # Solo lo cierra una pasada que SI midio VMs con pool y no vio
+                # ninguna fuera de su par.
+                if ip_fuera or not ip_medidas:
+                    continue
+                snap.reference.update({
+                    "resolvedAt": firestore.SERVER_TIMESTAMP,
+                    "resolvedBy": hostname, "resolution": "recovered",
+                })
+                resueltos += 1
+                log(f"resuelto: {snap.id}")
+                continue
             if nid in culpables or (d.get("kind") == "egress_region" and culpables):
                 continue
             # Solo cierro lo que ACABO de medir. Un nodo que no se muestreo
