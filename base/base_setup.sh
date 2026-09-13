@@ -159,6 +159,10 @@ mkdir -p /etc/nftables.d
 # ⚠️ Si el fichero falta y el include esta en nftables.conf, nftables NO CARGA
 # NADA: la base arrancaria sin cortafuegos y sin DNAT.
 [ -f /etc/nftables.d/base-nat-sin-internet.nft ] || : > /etc/nftables.d/base-nat-sin-internet.nft
+# Elementos de los pools de IPv4 de salida por VM (mapas `ip nat egress_*4`,
+# los puebla sync-base-nat). Su include va con COMODIN, asi que la falta del
+# fichero no rompe la carga; se crea igual para que no dependa de eso.
+[ -f /etc/nftables.d/base-nat-egress-pools.nft ] || : > /etc/nftables.d/base-nat-egress-pools.nft
 
 # --- Instaladores que la base sirve a los invitados --------------------------
 # Cada VM se bajaba su instalador de raw.githubusercontent.com al aprovisionarse
@@ -255,6 +259,15 @@ grep -q '^TUNNEL_IFACE_PREFIX=' /etc/default/base-nat \
 # Antes que base-nat-boot: sus rutas por VM apuntan a estas interfaces.
 systemctl daemon-reload
 systemctl enable --now neuravps-base-tunnels.service
+
+# Pools de IPv4 de salida por VM: estructura nft (mapas vacios = inerte). Una
+# base NUEVA la necesita antes de recibir una VIP, o sus invitados saldrian por
+# la IP principal aunque los pools esten encendidos. Idempotente; valida con
+# `nft -c` antes de tocar nada. Ver NeuraVPS docs/EGRESS_IPV4_POOLS_ROLLOUT.md.
+curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/persist-egress-pools-nft.py \
+  -o /usr/local/sbin/persist-egress-pools-nft.py
+chmod +x /usr/local/sbin/persist-egress-pools-nft.py
+python3 /usr/local/sbin/persist-egress-pools-nft.py --apply || echo "AVISO: estructura de pools de salida NO aplicada"
 
 # 6) Validation.
 systemctl status --no-pager jool-nat46.service

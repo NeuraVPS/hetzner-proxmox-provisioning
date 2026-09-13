@@ -2529,3 +2529,25 @@ salida, y **las VMs nuevas nacen rotas**.
 Desplegado a los **234 nodos**; los 5 clientes que fallaban pasaron a 200 en
 <0,25 s **sin tocar su MTU**, y el parche temporal de MTU 1440 en cuatro VMs
 quedó revertido a 1500.
+
+---
+
+## 25. Pools de IPv4 de salida por VM (2026-09-13, construido e inerte)
+
+La salida IPv4 deja de ser UNA IP por región (la principal de la base con la VIP)
+y pasa a un **par por VM**: una dirección de un bloque de Helsinki y otra de uno
+de Falkenstein, persistidas en `servers.egressIpv4`. Motivo: Darwinex-Demo tarda
+37–85 min en dejar volver a los terminales de detrás de la IP de Helsinki tras una
+desconexión masiva (limitación por IP), frente a segundos desde Falkenstein. §3.2
+sigue siendo cierto: no es capacidad de NAT.
+
+En las bases es una cadena y dos mapas **delante** de la regla general de §4.4, que
+se queda como red de seguridad: `iifname "tun-hp*"` → mapa HEL, `tun-fp*` → mapa
+FSN (la región la da la VIP del túnel, igual que la canónica v6 de §17), y reserva
+cruzada a la otra IP del par cuando la base tiene la VIP de una región pero no su
+bloque. Un mapa solo se puebla en la base a la que Hetzner enruta el bloque.
+
+- Estructura: `base/snippets/persist-egress-pools-nft.py` (vivo sin flush + fichero validado).
+- Mapas: `sync-base-nat.py` (`sync egress`, y en cada sync completo/por VM).
+- Prueba con paquetes reales sin root: `base/snippets/test-egress-pools-netns.py`.
+- Diseño, flags, despliegue, rollback y operación: **`NeuraVPS/docs/EGRESS_IPV4_POOLS_ROLLOUT.md`**.

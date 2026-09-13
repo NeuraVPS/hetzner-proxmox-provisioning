@@ -30,7 +30,14 @@ else
   ok "TUNNEL_IFACE_PREFIX" "$(grep '^TUNNEL_IFACE_PREFIX=' /etc/default/base-nat | cut -d= -f2)"
   ok "IDENT/TRANSIT/VM_V4 en base-nat" "$(grep -cE '^(IDENT_PREFIX|TRANSIT_PREFIX|VM_V4_PREFIX)=' /etc/default/base-nat)/3"
   ok "canonicas por VIP en nftables.conf" "$(grep -c 'oifname \"tun-[fh]p\*\"' /etc/nftables.conf)/2"
-  ok "snat v4 10.64/10.65 en conf" "$(grep -cE 'ip saddr 10\.6[45]\.' /etc/nftables.conf)/2"
+  ok "snat v4 10.64/10.65 en conf" "$(grep -cE 'ip saddr 10\.6[45]\..*snat to' /etc/nftables.conf)/2"
+  # Pools de IPv4 de salida por VM: el salto tiene que estar en vivo Y en el
+  # fichero (o un reinicio los apaga en silencio), y los elementos del fichero
+  # tienen que coincidir con los vivos (o un reinicio los deja viejos hasta el
+  # primer sync). Estructura ausente en los dos = pools no instalados, no fallo.
+  ok "pools salida: salto vivo/fichero" "$(nft list chain ip nat postrouting 2>/dev/null | grep -c 'jump egress_pools')/$(grep -c 'jump egress_pools' /etc/nftables.conf)"
+  ok "pools salida: include en conf" "$(grep -c 'base-nat-egress-pools\*\.nft' /etc/nftables.conf)/1"
+  ok "pools salida: elementos vivo/fichero" "$( (nft list map ip nat egress_hel4; nft list map ip nat egress_fsn4) 2>/dev/null | grep -oE '[0-9.]+ : [0-9.]+' | wc -l)/$(grep -c '^add element' /etc/nftables.d/base-nat-egress-pools.nft 2>/dev/null || true)"
   ok "gre_peers en conf" "$(grep -c 'set gre_peers' /etc/nftables.conf)/1"
   ok "forward de tuneles en conf" "$(grep -c 'tun-\*' /etc/nftables.conf)/3"
   ok "tuneles arriba" "$(ip -br link show type ip6gre | grep -c 'tun-[fh]p.*UP')/4"
