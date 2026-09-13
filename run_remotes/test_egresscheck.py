@@ -15,7 +15,9 @@ vuelven los 115 nodos ciegos y nada más se rompe visiblemente.
 """
 import importlib.util
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 _spec = importlib.util.spec_from_file_location(
     "neuravps_egresscheck", Path(__file__).with_name("neuravps-egresscheck.py"))
@@ -304,6 +306,134 @@ class UnGrandeRAPIDODesmienteAUnPequenoLENTO(unittest.TestCase):
         # El grande NO entrega: sigue siendo mtu, pase lo que pase con tiempos.
         v = eg.veredicto_pila("000/0/0.100000/28", "200/1024/0.050000/0")
         self.assertEqual(v, "mtu")
+
+
+class ConfirmaLentoDentroDeLaPasada(unittest.TestCase):
+    """Un 'lento' de UNA medida no basta (ver ANTI-RUIDO, 13-09-2026): tres
+    pasadas de b1 seguidas marcaron "certeza alta" a partir de una sola
+    descarga de 2-4 s mientras el uplink estaba al 0,16% de uso, y las tres se
+    resolvieron solas en la pasada siguiente. `_confirma_lento` exige mayoria
+    (2 de 3) antes de aceptar el veredicto."""
+
+    def _det(self, kind):
+        return {"kind": kind, "v4": kind if kind != "ok" else "ok", "v6": "ok",
+                "dns": "ok", "medida": "x", "cpuInvitado": -1}
+
+    def test_un_solo_hipo_no_confirma(self):
+        # Las dos re-medidas salen limpias: era un SYN perdido, no una averia.
+        salidas = iter([self._det("ok"), self._det("ok")])
+        probe_fn = lambda ip, vmid: (True, "cualquier-cosa")
+        with mock.patch.object(eg, "analiza", side_effect=lambda s: (True, next(salidas))):
+            ok, det = eg._confirma_lento("10.0.0.1", 100, self._det("lento"), probe_fn=probe_fn, sleep_fn=lambda *_: None)
+        self.assertTrue(ok, "un hipo de un momento no debe confirmarse como lento")
+
+    def test_lento_persistente_si_confirma(self):
+        # Las dos re-medidas TAMBIEN salen lentas: mayoria 3 de 3.
+        salidas = iter([self._det("lento"), self._det("lento")])
+        probe_fn = lambda ip, vmid: (True, "cualquier-cosa")
+        with mock.patch.object(eg, "analiza", side_effect=lambda s: (False, next(salidas))):
+            ok, det = eg._confirma_lento("10.0.0.1", 100, self._det("lento"), probe_fn=probe_fn, sleep_fn=lambda *_: None)
+        self.assertFalse(ok)
+        self.assertEqual("lento", det["kind"])
+
+    def test_mayoria_2_de_3_tambien_confirma(self):
+        salidas = iter([self._det("lento"), self._det("ok")])
+        probe_fn = lambda ip, vmid: (True, "cualquier-cosa")
+        with mock.patch.object(eg, "analiza", side_effect=lambda s: (True, next(salidas))):
+            ok, det = eg._confirma_lento("10.0.0.1", 100, self._det("lento"), probe_fn=probe_fn, sleep_fn=lambda *_: None)
+        self.assertFalse(ok, "2 de 3 diciendo lento ya es mayoria")
+
+    def test_un_mtu_en_el_reintento_gana_sin_esperar_a_la_mayoria(self):
+        # Es la firma infalsificable: no necesita mayoria ni una segunda vuelta.
+        salidas = iter([self._det("mtu")])
+        probe_fn = lambda ip, vmid: (True, "cualquier-cosa")
+        with mock.patch.object(eg, "analiza", side_effect=lambda s: (False, next(salidas))):
+            ok, det = eg._confirma_lento("10.0.0.1", 100, self._det("lento"), probe_fn=probe_fn, sleep_fn=lambda *_: None)
+        self.assertFalse(ok)
+        self.assertEqual("mtu", det["kind"])
+
+    def test_agente_mudo_en_el_reintento_no_cuenta_ni_a_favor_ni_en_contra(self):
+        # Si el canal no contesta esa vuelta, ni confirma ni descarta: se
+        # descuenta la muestra, no se convierte en "confirmado por defecto".
+        probe_fn = lambda ip, vmid: (False, "sin canal")
+        ok, det = eg._confirma_lento("10.0.0.1", 100, self._det("lento"), probe_fn=probe_fn, sleep_fn=lambda *_: None)
+        self.assertTrue(ok, "sin mas medidas que la primera, no hay mayoria")
+
+    def test_no_duerme_mas_de_lo_necesario_si_ya_gano_mtu(self):
+        sleeps = []
+        salidas = iter([self._det("mtu")])
+        probe_fn = lambda ip, vmid: (True, "cualquier-cosa")
+        with mock.patch.object(eg, "analiza", side_effect=lambda s: (False, next(salidas))):
+            eg._confirma_lento("10.0.0.1", 100, self._det("lento"),
+                               probe_fn=probe_fn, sleep_fn=sleeps.append)
+        self.assertEqual(1, len(sleeps), "un mtu corta el bucle a la primera vuelta")
+
+
+class ClasificaCulpables(unittest.TestCase):
+    """Quien alerta a la primera y quien queda pendiente de confirmar entre
+    pasadas. Pura: no toca Firestore."""
+
+    def _vm(self, vmid, kind):
+        return {"vmid": vmid, "detalle": {"kind": kind}}
+
+    def test_mtu_una_sola_vm_alerta_ya(self):
+        culpables, pendiente = eg.clasifica_culpables(
+            {"n1": [self._vm(1, "mtu")]}, {"n1": [False]})
+        self.assertIn("n1", culpables)
+        self.assertEqual("mtu", culpables["n1"]["regla"])
+        self.assertEqual({}, pendiente)
+
+    def test_lento_una_sola_vm_queda_pendiente_no_alerta_ya(self):
+        # ESTE es el caso que producia ruido el 13-09: una sola VM 'lento'.
+        culpables, pendiente = eg.clasifica_culpables(
+            {"n1": [self._vm(1, "lento")]}, {"n1": [False]})
+        self.assertEqual({}, culpables, "una sola VM lenta no debe alertar sola")
+        self.assertIn("n1", pendiente)
+
+    def test_lento_dos_vms_del_mismo_nodo_alerta_ya(self):
+        # Dos VMs distintas coincidiendo en 'lento' se corroboran solas.
+        culpables, pendiente = eg.clasifica_culpables(
+            {"n1": [self._vm(1, "lento"), self._vm(2, "lento")]}, {"n1": [False, False]})
+        self.assertIn("n1", culpables)
+        self.assertEqual("lento", culpables["n1"]["regla"])
+        self.assertEqual({}, pendiente)
+
+    def test_mtu_manda_sobre_lento_si_conviven_en_el_nodo(self):
+        culpables, pendiente = eg.clasifica_culpables(
+            {"n1": [self._vm(1, "lento"), self._vm(2, "mtu")]}, {"n1": [False, False]})
+        self.assertEqual("mtu", culpables["n1"]["regla"])
+        self.assertEqual({}, pendiente)
+
+    def test_cortado_sigue_exigiendo_dos_vms_sin_pasar_por_pendiente(self):
+        culpables, pendiente = eg.clasifica_culpables(
+            {"n1": [self._vm(1, "cortado")]}, {"n1": [False]})
+        self.assertEqual({}, culpables, "una sola VM cortada sigue sin bastar")
+        self.assertEqual({}, pendiente, "'cortado' no pasa por el buzon de 'lento'")
+        culpables, pendiente = eg.clasifica_culpables(
+            {"n1": [self._vm(1, "cortado"), self._vm(2, "cortado")]}, {"n1": [False, False]})
+        self.assertEqual("varias_vms", culpables["n1"]["regla"])
+
+
+class LentoConfirmadoEntrePasadas(unittest.TestCase):
+    AHORA = datetime(2026, 9, 13, 13, 0, tzinfo=timezone.utc)
+
+    def test_sin_watch_previo_no_confirma(self):
+        self.assertFalse(eg.lento_confirmado(None, self.AHORA))
+
+    def test_watch_de_la_pasada_anterior_confirma(self):
+        # Vista hace 1h (pasadas horarias): dentro del TTL, confirma.
+        wd = {"createdAt": self.AHORA - timedelta(hours=1)}
+        self.assertTrue(eg.lento_confirmado(wd, self.AHORA))
+
+    def test_watch_viejo_fuera_de_ttl_no_confirma(self):
+        # Un hipo de hace dias no debe resucitar como confirmado.
+        wd = {"createdAt": self.AHORA - timedelta(hours=eg.LENTO_WATCH_TTL_H + 1)}
+        self.assertFalse(eg.lento_confirmado(wd, self.AHORA))
+
+    def test_ttl_cubre_una_pasada_perdida(self):
+        # Cada base pasa una vez por hora: el TTL tiene que ser mayor que
+        # una pasada, para no perder la confirmacion si una se retrasa.
+        self.assertGreater(eg.LENTO_WATCH_TTL_H, 1.0)
 
 
 if __name__ == "__main__":
