@@ -159,6 +159,49 @@ GLOBAL_PCT = 30.0
 DEDUPE_OPEN_H = 6
 DEDUPE_ALERT_H = 24
 
+# --- ANTI-RUIDO de 'lento' (medido el 13-09-2026) -----------------------
+# Tres pasadas de b1 seguidas (09:47/10:47/12:47 UTC) marcaron "certeza alta"
+# con nodos DISTINTOS cada vez a partir de UNA sola descarga de 32 KB por UNA
+# sola pata (v4 o v6): 2-4 s, mientras el 1 KB de la misma pata y la otra pata
+# iban finas. Los tres se resolvieron solos en la pasada siguiente y b1 tenia
+# el uplink al 0,16% de uso — no era congestion, era ruido de establecimiento
+# de conexion (un SYN perdido cuesta 1-2 s de reintento TCP, y eso solo ya
+# roza el umbral). El caso REAL del clamp perdido, en cambio, entregaba 6,45-
+# 6,55 s de forma REPETIDA: no hace falta perder sensibilidad para dejar de
+# fiarse de UNA medida.
+#
+# Dos filtros, uno detras de otro, y los dos son necesarios por separado:
+#
+#  1. REINTENTO EN LA MISMA PASADA. Un 'lento' de la ronda 1 no se acepta a la
+#     primera: se remide la MISMA VM dos veces mas, unos segundos aparte (no
+#     los REPROBE_DELAY_S=45s de la ronda 2 general, que busca otra cosa: un
+#     reinicio del invitado o un pico que ya paso). Se necesita MAYORIA
+#     (2 de 3) para que siga contando como 'lento'. Un 'mtu' en cualquier
+#     reintento manda: es la firma infalsificable y no necesita mayoria.
+#
+#  2. CONFIRMACION ENTRE PASADAS para una sola VM. Con >=2 VMs del mismo nodo
+#     lentas en la MISMA pasada ya se corroboran solas (bastante improbable
+#     que dos VMs distintas compartan el mismo SYN perdido) y se alerta ya.
+#     Con una sola VM, el 22-08 y el 13-09 demostraron que hasta un `curl`
+#     tres veces seguidas puede pillar el mismo hipo de unos segundos si el
+#     hipo dura mas que el hueco entre reintentos. Asi que no se alerta a la
+#     primera: se anota en `egress_lento_watch` (coleccion aparte, NO dispara
+#     el trigger de correo) y solo se convierte en aviso si el MISMO nodo
+#     vuelve a salir 'lento' de una sola VM en la pasada siguiente. Una averia
+#     de verdad (clamp perdido, tunel caido) sigue lenta hora tras hora; un
+#     hipo de red no.
+#
+# `mtu` y `cortado` (>=2 VMs) NO pasan por ninguno de los dos filtros: son las
+# firmas que YA exigian evidencia fuerte (infalsificable, o >=2 VMs) y deben
+# seguir alertando a la primera, tal como pide el diseño.
+REINTENTOS_LENTO = 2                # medidas extra tras la primera, no la sustituyen
+REINTENTOS_LENTO_DELAY_S = 6        # "unos segundos", no los 45s de la ronda 2
+LENTO_MAYORIA = 2                   # de 3 medidas (1+REINTENTOS_LENTO), hacen falta 2
+LENTO_WATCH_COLL = "egress_lento_watch"
+# Cada base pasa una vez por hora; 3h cubre una pasada perdida sin arrastrar
+# para siempre un hipo de hace una semana.
+LENTO_WATCH_TTL_H = 3.0
+
 
 def log(msg: str) -> None:
     print(f"egresscheck: {msg}", flush=True)
@@ -322,6 +365,67 @@ def analiza(salida: str):
         kind = "cortado" if not ok else "ok"
     return ok, {"v4": v4, "v6": v6, "dns": dns, "kind": kind,
                 "medida": salida, "cpuInvitado": cpu}
+
+
+def _confirma_lento(node_ip: str, vmid: int, primer_det: dict, *,
+                     probe_fn=por_agente, sleep_fn=time.sleep):
+    """(ok, detalle) tras exigir MAYORIA a un veredicto 'lento' de una sola
+    medida (ver ANTI-RUIDO arriba). No sustituye la firma 'mtu': si aparece en
+    cualquier reintento, gana al momento porque un cliente no puede fabricarla
+    y no necesita mayoria."""
+    veredictos = [primer_det]
+    for _ in range(REINTENTOS_LENTO):
+        sleep_fn(REINTENTOS_LENTO_DELAY_S)
+        ok_canal, salida = probe_fn(node_ip, vmid)
+        if not ok_canal:
+            continue  # esta vuelta no cuenta ni a favor ni en contra
+        _ok, det = analiza(salida)
+        if det.get("kind") == "mtu":
+            return False, det
+        veredictos.append(det)
+    lentos = sum(1 for d in veredictos if d.get("kind") == "lento")
+    if lentos >= LENTO_MAYORIA:
+        return False, veredictos[-1]
+    return True, primer_det  # no confirmado: un hipo de un momento, se descarta
+
+
+def clasifica_culpables(fallos_por_nodo: dict, medidas_por_nodo: dict):
+    """(culpables, lento_pendiente). Pura: no toca Firestore ni el reloj.
+
+    TRES reglas, y la primera es la que salva a los 115 nodos de una sola VM:
+      `mtu`     -> el pequeño pasa y el grande no. Un cliente no puede
+                   fabricar eso. Basta UNA VM, a la primera.
+      `lento`   -> ya paso por la mayoria de 3 en `_confirma_lento`. Con
+                   >=2 VMs del mismo nodo se corroboran solas y alerta ya;
+                   con UNA sola VM no basta (ver ANTI-RUIDO): vuelve en
+                   `lento_pendiente`, y quien llama decide si ya se vio antes
+                   en `egress_lento_watch` (confirmacion entre pasadas).
+      `cortado` -> ambiguo. Se exigen >=2 VMs fallando del mismo nodo, con
+                   >=2 medidas, para no alertar por el cliente que se ha
+                   cerrado el firewall.
+    """
+    culpables = {}
+    lento_pendiente = {}
+    for nid, v in fallos_por_nodo.items():
+        mtu_vms = [x for x in v if (x.get("detalle") or {}).get("kind") == "mtu"]
+        lento_vms = [x for x in v if (x.get("detalle") or {}).get("kind") == "lento"]
+        if mtu_vms:
+            culpables[nid] = {"vms": v, "regla": "mtu", "certeza": "alta"}
+        elif len(lento_vms) >= 2:
+            culpables[nid] = {"vms": v, "regla": "lento", "certeza": "alta"}
+        elif len(lento_vms) == 1:
+            lento_pendiente[nid] = v
+        elif len(v) >= 2 and len(medidas_por_nodo.get(nid, [])) >= 2:
+            culpables[nid] = {"vms": v, "regla": "varias_vms", "certeza": "media"}
+    return culpables, lento_pendiente
+
+
+def lento_confirmado(watch_doc: dict | None, now, ttl_horas: float = LENTO_WATCH_TTL_H) -> bool:
+    """True si un 'lento' de una sola VM ya se habia visto en la pasada
+    anterior (documento leido de `egress_lento_watch`) y sigue dentro del
+    plazo de confirmacion. Pura: decide solo con lo que ya se leyo."""
+    return bool(watch_doc and watch_doc.get("createdAt")
+                and now - watch_doc["createdAt"] < timedelta(hours=ttl_horas))
 
 
 def ip_vista(salida: str) -> str | None:
@@ -499,6 +603,10 @@ def main() -> int:
             return (nid, vmid, None, salida)      # no medible
         ips_vistas[vmid] = ip_vista(salida)
         ok, det = analiza(salida)
+        if det.get("kind") == "lento":
+            # No se acepta un 'lento' a la primera medida (ver ANTI-RUIDO):
+            # se remide la MISMA VM un par de veces mas, unos segundos aparte.
+            ok, det = _confirma_lento(nodos[nid], vmid, det)
         return (nid, vmid, ok, det if not ok else salida)
 
     t0 = time.time()
@@ -539,21 +647,50 @@ def main() -> int:
     for nid, vmid, _ok, det in fallos:
         fallos_por_nodo.setdefault(nid, []).append({"vmid": vmid, "detalle": det})
 
-    # DOS reglas, y la primera es la que salva a los 115 nodos de una sola VM:
-    #   `mtu`     -> el pequeño pasa y el grande no. Un cliente no puede
-    #                fabricar eso. Basta UNA VM.
-    #   `cortado` -> ambiguo. Se exigen >=2 VMs fallando del mismo nodo, con
-    #                >=2 medidas, para no alertar por el cliente que se ha
-    #                cerrado el firewall.
-    culpables = {}
-    for nid, v in fallos_por_nodo.items():
-        nuestras = [x for x in v
-                    if (x.get("detalle") or {}).get("kind") in ("mtu", "lento")]
-        if nuestras:
-            regla = (nuestras[0].get("detalle") or {}).get("kind")
-            culpables[nid] = {"vms": v, "regla": regla, "certeza": "alta"}
-        elif len(v) >= 2 and len(medidas_por_nodo.get(nid, [])) >= 2:
-            culpables[nid] = {"vms": v, "regla": "varias_vms", "certeza": "media"}
+    culpables, lento_pendiente = clasifica_culpables(fallos_por_nodo, medidas_por_nodo)
+
+    # --- CONFIRMACION ENTRE PASADAS de un 'lento' de una sola VM ------------
+    # Ver ANTI-RUIDO: ni la mayoria de 3 dentro de la pasada basta si el hipo
+    # dura mas que el hueco entre reintentos (pasaba el 13-09 y sobrevivia
+    # incluso a la ronda 2 de 45s). Se exige que el MISMO nodo reaparezca en
+    # la pasada siguiente antes de convertirlo en aviso; mientras tanto se
+    # anota en una coleccion aparte que NO dispara el trigger de correo.
+    now = datetime.now(timezone.utc)
+    watch = db.collection(LENTO_WATCH_COLL)
+    for nid, v in lento_pendiente.items():
+        if dry:
+            log(f"DRY-RUN 'lento' de 1 VM en {nid}: quedaria pendiente de "
+                "confirmar en la pasada siguiente")
+            continue
+        wref = watch.document(nid)
+        wsnap = wref.get()
+        wd = wsnap.to_dict() if wsnap.exists else None
+        if lento_confirmado(wd, now):
+            culpables[nid] = {"vms": v, "regla": "lento", "certeza": "alta"}
+            wref.delete()
+            log(f"'lento' confirmado entre pasadas: {nid}")
+        else:
+            wref.set({"createdAt": firestore.SERVER_TIMESTAMP, "region": region,
+                      "vms": v[:5]})
+            log(f"'lento' de 1 VM en {nid}: primera vez, pendiente de "
+                "confirmar en la pasada siguiente")
+    if not dry:
+        # Limpiar candidatos que esta pasada ya salen limpios: si no, un hipo
+        # de hace semanas confirmaria uno nuevo sin relacion. Basta con
+        # `watch.stream()` sin filtrar por region: el id es el nodeId, y un
+        # nodo de la otra region nunca aparece en `medidas_por_nodo` de esta
+        # base, asi que nunca se borra por error.
+        for snap in watch.stream():
+            nid = snap.id
+            if nid in lento_pendiente:
+                continue  # sigue acumulando evidencia, no tocar
+            if nid in medidas_por_nodo:
+                # Ya confirmado (y borrado arriba), o culpable por otra via
+                # (mtu/varias VMs), o simplemente limpio: en los tres casos un
+                # watch de un 'lento' viejo ya no debe sobrevivir, para que no
+                # confirme sin querer un hipo nuevo sin relacion con el de antes.
+                snap.reference.delete()
+                log(f"'lento' watch limpiado: {nid}")
 
     nodos_medidos = len(medidas_por_nodo)
     # Punto ciego DECLARADO, y ahora mucho mas estrecho: los nodos de una sola
@@ -567,7 +704,6 @@ def main() -> int:
         log(f"alcance: {len(ciegos)} nodo(s) con 1 sola VM medible (alertan por "
             f"`mtu`, no por `cortado`) y {len(sin_medir)} sin ninguna VM medida")
     pct = 100.0 * len(culpables) / max(nodos_medidos, 1)
-    now = datetime.now(timezone.utc)
     coll = db.collection("egress_distress")
 
     def presenta(doc_id: str, payload: dict):

@@ -25,7 +25,10 @@ Type=oneshot
 ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-egresscheck.py
 SyslogIdentifier=neuravps-egresscheck
 # Una pasada son ~240 sondas por el agente + una re-sonda a los 45 s. Medido:
-# 60 s la primera ronda. 900 s da margen de sobra sin dejarla colgada.
+# 60 s la primera ronda. Desde el 13-09-2026 un 'lento' se remide 2 veces mas
+# (unos segundos aparte, en el mismo hilo) antes de aceptarlo — solo afecta a
+# los pocos jobs marcados 'lento', no a la pasada entera. 900 s da margen de
+# sobra sin dejarla colgada.
 TimeoutStartSec=900
 UNIT
 
