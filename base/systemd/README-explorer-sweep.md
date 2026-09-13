@@ -52,3 +52,44 @@ if a run ever takes past the next scheduled tick.
 Tests: `python3 run_remotes/test_explorer_sweep.py` — pure parsing logic
 only (no network), including a regression fixture for a real qemu-ga
 exec-status cross-talk case reproduced live on 2026-09-12.
+
+## Commit sample (2026-09-13, piggybacked on the same round-trip)
+
+The same PowerShell payload above also reads
+`Win32_OperatingSystem.TotalVirtualMemorySize`/`FreeVirtualMemory` (the
+commit limit and free commit) for every measured VM — no extra process, no
+extra schedule. `commitPct`/`commitChargeMb`/`commitLimitMb` land in the
+run's `perVm` entries whenever a VM is included there; two rollups feed an
+`/admin/salud` card via the fixed doc `explorer_sweep_runs/_latest`:
+- **`highCommitVms`** — VMs at or above 90% commit (`HIGH_COMMIT_PCT`),
+  worst first.
+- **`couldNotStartProcess`** — VMs where `qm guest exec` could not even
+  start a process (`guest-timeout` / `no-marker` / `ps-exitcode-*`). On a
+  healthy guest that round-trip always gets some response, so this failure
+  signature is itself the commit-exhaustion signal (see
+  `memory/neuravps-guest-commit-limit-diagnosis.md`).
+
+Neither list can affect who gets killed — the explorer-orphan filter and the
+kill cap are untouched.
+
+## Testing without touching the live install, the journal, or any VM's kill
+
+```
+--only-vmids 215,701 --force-dry-run --no-journal
+```
+- `--only-vmids` restricts the run to the given vmids (still resolved
+  through the normal Firestore candidate list, so node lookup/exclusions
+  are unchanged).
+- `--force-dry-run` guarantees every candidate gets the count-only payload
+  — `Stop-Process` is never sent, regardless of `config/explorerSweep.dryRun`.
+- `--no-journal` skips both Firestore writes (`explorer_sweep_runs/<runId>`
+  and `/_latest`).
+
+Because the script only needs `/etc/firebase-credentials.json` and
+`/var/lib/base-nat/pve_nodes.json` (both already on b0) plus SSH to the
+nodes, this can be run from a plain checkout on b0 without installing
+anything over `/usr/local/sbin/neuravps-explorer-sweep.py`:
+```
+scp run_remotes/neuravps-explorer-sweep.py root@b0:/root/neuravps-explorer-sweep-test.py
+ssh root@b0 'python3 /root/neuravps-explorer-sweep-test.py --only-vmids 215,701 --force-dry-run --no-journal'
+```
