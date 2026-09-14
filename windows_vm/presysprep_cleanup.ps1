@@ -69,21 +69,33 @@ Get-ChildItem 'C:\Users\*\AppData\Local\Packages\Microsoft.DesktopAppInstaller_*
 }
 Remove-Item 'C:\Windows\Temp\WinGet\*' -Recurse -Force
 
-Step '10. Recycle Bin'
+Step '10. OpenSSH host keys (avoid shared fingerprint across clones)'
+if (Get-Service sshd) {
+  Stop-Service sshd -Force
+  $keys = Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*'
+  Remove-Item 'C:\ProgramData\ssh\ssh_host_*' -Force
+  $authKeys = Test-Path 'C:\ProgramData\ssh\administrators_authorized_keys'
+  if ($authKeys) { Remove-Item 'C:\ProgramData\ssh\administrators_authorized_keys' -Force }
+  Step ("  removed {0} host key file(s){1}" -f (($keys | Measure-Object).Count), $(if ($authKeys) { ' + administrators_authorized_keys' } else { '' }))
+} else {
+  Step '  sshd not installed - skipped'
+}
+
+Step '11. Recycle Bin'
 Clear-RecycleBin -Force
 
-Step '11. Hibernation off'
+Step '12. Hibernation off'
 powercfg.exe /hibernate off
 
-Step '12. Clear event logs'
+Step '13. Clear event logs'
 Get-WinEvent -ListLog * | Where-Object { $_.RecordCount -gt 0 -and $_.IsEnabled } |
   ForEach-Object { wevtutil.exe cl $_.LogName 2>$null }
 
-Step '13. Optimize-Volume (defrag + retrim -> host reclaims via discard=on)'
+Step '14. Optimize-Volume (defrag + retrim -> host reclaims via discard=on)'
 Optimize-Volume -DriveLetter C -Defrag
 Optimize-Volume -DriveLetter C -ReTrim
 
-Step '14. sdelete -z (zero free space, fills C: temporarily - normal)'
+Step '15. sdelete -z (zero free space, fills C: temporarily - normal)'
 if(-not (Test-Path "$env:WINDIR\System32\sdelete64.exe")){
   $tmp="$env:WINDIR\Temp\SDelete.zip"
   Invoke-WebRequest -Uri 'https://download.sysinternals.com/files/SDelete.zip' -OutFile $tmp
@@ -92,7 +104,7 @@ if(-not (Test-Path "$env:WINDIR\System32\sdelete64.exe")){
 $env:TEMP="$env:WINDIR\Temp"; $env:TMP="$env:WINDIR\Temp"
 & "$env:WINDIR\System32\sdelete64.exe" -accepteula -nobanner -z C: 2>&1 | Select-Object -Last 3
 
-Step '15. Final retrim (release the zeroed blocks to the host)'
+Step '16. Final retrim (release the zeroed blocks to the host)'
 Optimize-Volume -DriveLetter C -ReTrim
 
 $v1=(Get-Volume -DriveLetter C).SizeRemaining

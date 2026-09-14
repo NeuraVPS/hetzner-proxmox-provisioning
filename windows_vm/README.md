@@ -42,13 +42,19 @@
   firewall rule to `-Profile Any` (the in-box capability's rule is
   Private-only, which leaves port 22 filtered on Public networks) and sets
   `MaxAuthTries 20`.
-  - ⚠️ **Delete the host keys before sysprep** — `Stop-Service sshd` then
-    `Remove-Item C:\ProgramData\ssh\ssh_host_*`. They are NOT machine-specific
-    data to sysprep, so without this **every clone ships the same SSH host
-    fingerprint**. Verified 2026-08-04: sshd regenerates all three key pairs
-    by itself on the next service start, so the clone gets its own on first
-    boot and nothing else is needed. Also drop
-    `administrators_authorized_keys` if the box ever had one.
+  - ⚠️ **Host keys must be deleted before sysprep** — they are NOT
+    machine-specific data to sysprep, so without this **every clone ships the
+    same SSH host fingerprint**. Verified 2026-08-04: sshd regenerates all
+    three key pairs by itself on the next service start, so the clone gets
+    its own on first boot and nothing else is needed.
+    **No longer a manual step** — this was a manual reminder that got missed
+    on 2026-09-14 (both templates were exported with their host keys still in
+    place; caught and fixed after the fact). Step 10 of
+    [`presysprep_cleanup.ps1`](presysprep_cleanup.ps1) now stops `sshd`,
+    removes `C:\ProgramData\ssh\ssh_host_*` and
+    `administrators_authorized_keys`, and logs how many key files it
+    deleted — it runs as part of the unattended pre-sysprep cleanup, so
+    there's nothing left to remember by hand.
 
 ```powershell
 # Disable WindowsFeedbackHub installation for new users
@@ -181,7 +187,7 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
   > it per VM via `set_user_password`. Note the account name differs per
   > template: **`Administrador` in windows-es, `Administrator` in windows-en**.
 
-- Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). [prepare.md](prepare.md) documents every step (DISM `/ResetBase`, NGEN, SoftwareDistribution, Delivery Optimization, winget caches, defrag/TRIM, SDelete zero-fill) and the remote-run procedure
+- Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). [prepare.md](prepare.md) documents every step (DISM `/ResetBase`, NGEN, SoftwareDistribution, Delivery Optimization, winget caches, SSH host key wipe, defrag/TRIM, SDelete zero-fill) and the remote-run procedure
 - From Linux, remove recovery partition
 - **Back up the current templates on the Storage Box before exporting** —
   `OVERWRITE=1` deletes the old streams. The Storage Box does have its own
