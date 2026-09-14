@@ -8,7 +8,7 @@ Recommended cleanup steps **before** running sysprep on a Windows template VM, t
 
 Run all commands in **PowerShell as Administrator**. Order matters — do cleanup first, then defrag, then zero free space, **then** sysprep.
 
-> **Canonical script:** [`presysprep_cleanup.ps1`](presysprep_cleanup.ps1) in this directory runs steps 0–16 unattended and logs to `C:\ProgramData\NeuraVPS\presysprep.log`. The sections below explain each step; the script is the executable source of truth. See [Running it remotely via the guest agent](#running-it-remotely-via-the-guest-agent-qga) for the hands-off procedure used on 2026-07-06.
+> **Canonical script:** [`presysprep_cleanup.ps1`](presysprep_cleanup.ps1) in this directory runs steps 0–17 unattended and logs to `C:\ProgramData\NeuraVPS\presysprep.log`. The sections below explain each step; the script is the executable source of truth. See [Running it remotely via the guest agent](#running-it-remotely-via-the-guest-agent-qga) for the hands-off procedure used on 2026-07-06.
 
 ---
 
@@ -181,7 +181,38 @@ Remove-Item 'C:\Windows\Temp\WinGet\*' -Recurse -Force -ErrorAction SilentlyCont
 
 ---
 
-## 11. Empty the Recycle Bin
+## 11. OpenSSH host keys (avoid a shared fingerprint across clones)
+
+The host keys in `C:\ProgramData\ssh\ssh_host_*` are NOT machine-specific data
+to sysprep — sysprep does not regenerate them — so if they survive into the
+exported template, **every clone ships the same SSH host fingerprint**.
+`administrators_authorized_keys` (if the template ever had one configured)
+must go for the same reason: it is per-machine authorization state, not
+template content.
+
+This used to be a manual step in the checklist (README) and got missed on
+2026-09-14 — both templates were exported with their host keys still present.
+It is now folded into the unattended script so there is nothing left to
+remember by hand.
+
+```powershell
+$sshSvc = Get-Service sshd -ErrorAction SilentlyContinue
+if ($sshSvc) {
+    Stop-Service sshd -Force -ErrorAction SilentlyContinue
+    Remove-Item 'C:\ProgramData\ssh\ssh_host_*' -Force -ErrorAction SilentlyContinue
+    Remove-Item 'C:\ProgramData\ssh\administrators_authorized_keys' -Force -ErrorAction SilentlyContinue
+}
+```
+
+> Verified 2026-08-04: sshd regenerates all three key pairs by itself on the
+> next service start, so the clone gets its own fingerprint on first boot —
+> nothing else is needed. Idempotent and safe on templates that never had
+> OpenSSH installed: `Get-Service sshd` returns nothing and the step is
+> skipped.
+
+---
+
+## 12. Empty the Recycle Bin
 
 ```powershell
 Clear-RecycleBin -Force -ErrorAction SilentlyContinue
@@ -189,7 +220,7 @@ Clear-RecycleBin -Force -ErrorAction SilentlyContinue
 
 ---
 
-## 12. Disable + delete hibernation file (`hiberfil.sys`)
+## 13. Disable + delete hibernation file (`hiberfil.sys`)
 
 Server SKUs usually don't have it, but if it exists it's `RAM-size` GB of dead weight.
 
@@ -199,7 +230,7 @@ powercfg.exe /hibernate off
 
 ---
 
-## 13. Clear Event Logs (late on purpose)
+## 14. Clear Event Logs (late on purpose)
 
 Removes traces from template prep that would otherwise appear in every cloned VM's log history. Run this **after** all the steps above so the cleanup's own noise (service stops, DISM, VSS…) is wiped too.
 
@@ -215,7 +246,7 @@ Get-WinEvent -ListLog * -ErrorAction SilentlyContinue |
 
 > **`compact.exe /CompactOS` — considered and rejected.** NTFS-compressing the OS binaries saves 2–4 GB in-guest, but our zvols already sit on ZFS lz4 (host-side compression overlaps most of the gain) and it adds a small permanent CPU tax on every binary read in every customer VM. Not worth it for this fleet.
 
-## 14. Built-in Disk Cleanup (`cleanmgr`) — interactive sessions only
+## 15. Built-in Disk Cleanup (`cleanmgr`) — interactive sessions only
 
 Catches a few leftovers the manual steps miss (font cache, icon cache, setup log files). **Do not run it in unattended/QGA runs**: it is a GUI app — under the guest agent it runs as SYSTEM in session 0, where it can hang forever waiting on a window nobody can see. The heavyweight handler ("Update Cleanup") is already covered by step 2, and steps 8–9 cover most of the rest, so skipping it costs a few hundred MB at most.
 
@@ -238,7 +269,7 @@ cleanmgr.exe /sagerun:64
 
 ---
 
-## 15. Defragment and TRIM the C: volume
+## 16. Defragment and TRIM the C: volume
 
 On SSD-backed storage this issues TRIM, which lets the underlying storage actually free the blocks you just deleted. Our template VMs have `discard=on` + `virtio-scsi-single`, so in-guest TRIM propagates straight to the ZFS zvol.
 
@@ -249,7 +280,7 @@ Optimize-Volume -DriveLetter C -ReTrim -Verbose
 
 ---
 
-## 16. Zero out free space (critical for thin provisioning)
+## 17. Zero out free space (critical for thin provisioning)
 
 This is the step that makes the previous cleanup **actually shrink the image on the Proxmox host**. Without it, the deleted files still occupy blocks from the host's perspective — ZFS/qcow2 only reclaim space that's been explicitly zeroed (or TRIM'd, but in-guest TRIM doesn't always propagate to the host depending on the SCSI controller / discard setting). With ZFS compression enabled, zero blocks are detected at write time and stored as holes, so this is cheap on the host even though the guest writes gigabytes.
 
@@ -286,7 +317,7 @@ After this completes, on the Proxmox host the disk image will compact dramatical
 
 ---
 
-## 17. Final pre-sysprep check
+## 18. Final pre-sysprep check
 
 ```powershell
 # Confirm WU service is set to Manual (per README — manual updates still work on clones)
@@ -348,7 +379,7 @@ qm guest exec 100 --timeout 40 -- powershell -NoProfile -EncodedCommand "$B64"
 
 Notes:
 
-- QGA exec runs as SYSTEM in session 0 — everything in the script works there **except GUI apps** (hence the `cleanmgr` rule in step 14).
+- QGA exec runs as SYSTEM in session 0 — everything in the script works there **except GUI apps** (hence the `cleanmgr` rule in step 15).
 - Both templates can run in parallel; DISM pegs one core each.
 - The `out-data` JSON from `qm guest exec` can contain raw control characters (CRLF inside strings) — parse with `json.loads(s, strict=False)` in Python.
 - Transient `guest-exec` errors ("PID … does not exist") happen — just re-poll (see provisioning PR #45/#46 background).
@@ -365,6 +396,6 @@ Measured 2026-07-06 on the windows-es / windows-en templates (Server 2025, 40 G 
 | Host zvol `REFER` before → after | 14.4 → **11.4 G** | 14.2 → **11.2 G** |
 | Host shrink | **−3.0 G (−21%)** | **−3.0 G (−21%)** |
 
-The in-guest free space change is misleading — what actually matters is the post-zero shrink of the zvol's `REFER` on the Proxmox host (steps 15–16), which is what the storagebox export stream and every future clone/migration pay for. A template that skipped several update cycles will see bigger DISM wins (5–15 GB); this one was refreshed monthly.
+The in-guest free space change is misleading — what actually matters is the post-zero shrink of the zvol's `REFER` on the Proxmox host (steps 16–17), which is what the storagebox export stream and every future clone/migration pay for. A template that skipped several update cycles will see bigger DISM wins (5–15 GB); this one was refreshed monthly.
 
 > While a pre-cleanup safety snapshot exists, `REFER` drops but `USED` doesn't — the snapshot pins the old blocks. Destroy it once the new template generation is validated/exported.
