@@ -15,6 +15,21 @@ escalera de remediación (converge NAT -> re-probe -> drift IPv6 in-guest ->
 email a soporte). Kill-switch: `config/conncheck` {enabled, dryRun} — doc
 ausente o enabled!=true = APAGADO (sistema nuevo, fallo cerrado).
 
+RDP se sonda con un saludo X.224 real (Connection Request -> Connection
+Confirm), no solo `connect()`. Medido 2026-09-14: TermService puede
+encravarse dentro del invitado sin que el puerto deje de escuchar — el TCP
+`connect()` sigue devolviendo OK mientras el cliente lleva horas sin poder
+entrar. Un `connect()` a secas no distingue esto de un forward sano, así
+que confirmó "todo bien" en tres casos reales de soporte. Los dos fallos que
+puede dar la sonda de RDP quedan DIFERENCIADOS en el doc (nunca fundidos):
+`kind=unreachable` (ni siquiera abre el TCP -> NAT/reenvío roto) frente a
+`kind=rdp_not_negotiating` (abre el TCP pero no completa el handshake ->
+invitado encravado). Son averías distintas con remedios distintos: la
+primera se arregla convergiendo el NAT, la segunda reiniciando TermService
+dentro del invitado; fundirlas le quita a la CF la información para elegir.
+SMB no lleva saludo de protocolo (no lo necesita para este caso, y tocarlo
+no era parte del problema medido): sigue siendo un `connect()` puro.
+
 Exclusiones (spec del operador 2026-08-01):
   * VM con status != 'running' en Firestore (cliente puede apagarla).
   * maintenance == true (migración en curso).
@@ -24,6 +39,9 @@ Exclusiones (spec del operador 2026-08-01):
     bloquearlo a propósito); ídem sambaEnabled para SMB. state.json refleja
     los flags, pero Firestore se re-consulta en los fallos como fuente de
     verdad.
+  * vmid en EXCLUDED_VMIDS: `devel` (2988898) es la caja personal del
+    operador, fuera de la flota — nunca en Firestore, pero el filtro es
+    explícito y no depende de que siga siendo así.
   * Una VM 'running' SIN entrada en el state.json local ES una discrepancia
     (kind=nat_mapping_missing).
 
@@ -54,13 +72,32 @@ PEER_V4 = {
     "0000000-BASE": "95.216.102.179",   # b0 sondea a través de b1 ECC (HEL)
     "0000001-BASE": "116.202.118.221",  # b1 sondea a través de b0 ECC (FSN)
 }
+# devel (Hetzner Robot #2988898): caja personal del operador, fuera de la
+# flota (ver memory/neuravps-fleet-and-ssh-access.md). Nunca se sondea.
+EXCLUDED_VMIDS = {2988898}
 CONNECT_TIMEOUT = 3.0
+# Saludo X.224 completo (connect + send + recv), no solo el connect. Algo más
+# generoso que CONNECT_TIMEOUT a propósito: un invitado sano responde el
+# Connection Confirm en milisegundos, así que esto casi nunca se agota contra
+# una VM buena — cuando se agota es la propia señal (TermService encravado no
+# contesta nunca, ni rápido ni despacio).
+RDP_NEGOTIATE_TIMEOUT = 4.0
 WORKERS = 48
 REPROBE_DELAY_S = 60
 ABORT_FAIL_PCT = 10.0
 ABORT_FAIL_MIN = 20
 DEDUPE_OPEN_H = 6    # doc abierto más joven que esto -> solo tocar lastSeenAt
 DEDUPE_ALERT_H = 24  # doc con alertedAt más joven que esto -> no re-presentar
+
+# X.224 Connection Request válido (TPKT + CR TPDU + RDP_NEG_REQ pidiendo
+# protocolo estándar). Calibrado a mano 2026-09-14 contra 3 VMs sanas (dan
+# Connection Confirm) y 2 encravadas (no responden nada) — el primer intento
+# tenía el PDU mal formado y daba "no negocia" hasta en máquinas buenas, así
+# que este exacto byte a byte es el que quedó verificado, no uno "parecido".
+RDP_X224_CR = bytes([
+    0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
 
 
 def log(msg: str) -> None:
@@ -75,12 +112,55 @@ def tcp_open(host: str, port: int, timeout: float = CONNECT_TIMEOUT) -> bool:
         return False
 
 
+def rdp_negotiates(host: str, port: int,
+                   timeout: float = RDP_NEGOTIATE_TIMEOUT) -> "tuple[bool, str]":
+    """Saludo X.224 real, no solo `connect()`. Devuelve (ok, reason).
+
+    `reason` distingue las DOS averías que esto puede encontrar, a propósito
+    para que quien escriba el doc de distress no las funda en una:
+      * "tcp_closed"    -> ni abre el TCP (NAT/reenvío roto en la base).
+      * "no_negotiate"  -> abre el TCP pero no completa el Connection
+                            Confirm (TermService encravado en el invitado:
+                            el puerto escucha, pero nadie habla el protocolo).
+    Éxito: ok=True, reason="".
+    """
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as s:
+            s.settimeout(timeout)
+            try:
+                s.sendall(RDP_X224_CR)
+                r = s.recv(64)
+            except OSError:
+                return False, "no_negotiate"
+    except OSError:
+        return False, "tcp_closed"
+    if len(r) >= 11 and r[:2] == b"\x03\x00" and r[5] == 0xd0:
+        return True, ""
+    return False, "no_negotiate"
+
+
 def fw_enabled(firewall, key) -> bool:
     # Espeja _firewall_flag_enabled de functions/n8n_handlers.py: ausente = ON.
     if not isinstance(firewall, dict):
         return True
     v = firewall.get(key)
     return True if v is None else bool(v)
+
+
+def kind_for(reasons: dict) -> str:
+    """`kind` del doc a partir de las razones por servicio de esa VM.
+
+    Prioriza `rdp_not_negotiating`: si CUALQUIER servicio de la VM falló por
+    no negociar el protocolo (solo puede ser rdp — SMB no lleva saludo), eso
+    es un invitado encravado y hay que decirlo, aunque otro servicio de la
+    misma VM haya fallado por TCP cerrado. `unreachable` es el valor de
+    siempre (TCP cerrado) — sin razones "no_negotiate" el comportamiento no
+    cambia respecto al script anterior, así que no rompe a quien ya lee ese
+    valor.
+    """
+    if any(r == "no_negotiate" for r in reasons.values()):
+        return "rdp_not_negotiating"
+    return "unreachable"
 
 
 def resolution_for(vmid, confirmed_vmids, probed_vmids, running_vmids):
@@ -144,6 +224,8 @@ def main() -> int:
             vmid = int(d.get("proxmoxId"))
         except (TypeError, ValueError):
             continue
+        if vmid in EXCLUDED_VMIDS:
+            continue
         # Una VM REINSTALÁNDOSE está parada casi todo el proceso y su guest se
         # rehace entero (adiós IPv6 in-guest, adiós RDP/SMB). `reset_vm` deja
         # `status` en 'running' y `provisioningStatus` en 'provisioned', así que
@@ -190,25 +272,39 @@ def main() -> int:
         log(f"ABORT: peer {peer} no responde ni al 22 — sweep cancelado")
         return 0
 
+    def probe_job(job):
+        """(ok, reason) para UN job. RDP hace el saludo X.224; SMB sigue
+        siendo `connect()` puro — no se toca su lógica. Nunca deja escapar
+        una excepción: una sonda rota no puede tumbar el barrido entero."""
+        vmid, service, port = job
+        try:
+            if service == "rdp":
+                return rdp_negotiates(peer, port)
+            ok = tcp_open(peer, port)
+            return ok, ("" if ok else "tcp_closed")
+        except Exception as exc:  # noqa: BLE001
+            log(f"excepción sondeando vm {vmid} {service}:{port} — {exc!r}")
+            return False, "probe_error"
+
     def round_probe(job_list):
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            oks = list(ex.map(lambda j: tcp_open(peer, j[2]), job_list))
-        return [j for j, ok in zip(job_list, oks) if not ok]
+            results = list(ex.map(probe_job, job_list))
+        return [(j, reason) for j, (ok, reason) in zip(job_list, results) if not ok]
 
     t0 = time.time()
     fails = round_probe(jobs)
     log(f"ronda 1: {len(jobs)} sondas via {peer}, {len(fails)} fallos, {time.time()-t0:.0f}s")
     if fails:
         time.sleep(REPROBE_DELAY_S)
-        fails = round_probe(fails)
+        fails = round_probe([j for j, _reason in fails])
         log(f"ronda 2 (tras {REPROBE_DELAY_S}s): {len(fails)} fallos persistentes")
 
     # --- confirmación contra Firestore fresco ------------------------------
-    by_vm = {}
-    for vmid, service, _port in fails:
-        by_vm.setdefault(vmid, []).append(service)
+    by_vm = {}  # vmid -> {service: reason}
+    for (vmid, service, _port), reason in fails:
+        by_vm.setdefault(vmid, {})[service] = reason
     confirmed = {}
-    for vmid, services in by_vm.items():
+    for vmid, svc_reasons in by_vm.items():
         snap = db.collection("servers").document(running[vmid]["docId"]).get()
         d = snap.to_dict() or {}
         prov = d.get("provisioningStatus")
@@ -218,10 +314,14 @@ def main() -> int:
                 or (prov is not None and prov != "provisioned")):
             continue  # cambió mientras sondeábamos (migración, reinstall, o aún instalándose)
         fw = d.get("firewall") or {}
-        keep = [s for s in services
+        keep = [s for s in svc_reasons
                 if fw_enabled(fw, "rdpEnabled" if s == "rdp" else "sambaEnabled")]
         if keep:
-            confirmed[vmid] = {"services": sorted(keep), "ipv6": d.get("ipv6")}
+            confirmed[vmid] = {
+                "services": sorted(keep),
+                "ipv6": d.get("ipv6"),
+                "reasons": {s: svc_reasons[s] for s in keep},
+            }
 
     probed_ids = {j[0] for j in jobs}
     probed_vms = len(probed_ids)
@@ -265,7 +365,7 @@ def main() -> int:
             resolved += 1
             log(f"resuelto: vm {vmid} ({reason})")
 
-    def file_doc(vmid: int, kind: str, services, ipv6):
+    def file_doc(vmid: int, kind: str, services, ipv6, reasons=None):
         nonlocal filed, touched
         payload = {
             "vmid": vmid, "kind": kind, "services": list(services),
@@ -273,6 +373,12 @@ def main() -> int:
             "state": "open", "createdAt": firestore.SERVER_TIMESTAMP,
             "lastSeenAt": firestore.SERVER_TIMESTAMP, "resolvedAt": None,
         }
+        # Campo aditivo — nadie más lo lee hoy, no rompe a quien solo mira
+        # `kind`/`services`. Le da a la CF el detalle por servicio (p.ej. rdp
+        # sin negociar + smb con TCP cerrado a la vez) sin tener que
+        # reconstruirlo a partir de un único `kind` por VM.
+        if reasons:
+            payload["serviceReasons"] = dict(reasons)
         if dry:
             log(f"DRY-RUN presentaría: vm {vmid} {kind} {services}")
             return
@@ -300,12 +406,18 @@ def main() -> int:
         svcs = [s for s, on in (("rdp", r["rdpEnabled"]), ("smb", r["sambaEnabled"])) if on]
         if svcs:
             file_doc(vmid, "nat_mapping_missing", svcs, None)
+    rdp_wedged = 0
     for vmid, info in sorted(confirmed.items()):
-        file_doc(vmid, "unreachable", info["services"], info["ipv6"])
+        kind = kind_for(info["reasons"])
+        if kind == "rdp_not_negotiating":
+            rdp_wedged += 1
+        file_doc(vmid, kind, info["services"], info["ipv6"], info["reasons"])
 
     log(f"fin: {probed_vms} VMs sondeadas, {len(missing)} sin entrada NAT, "
-        f"{len(confirmed)} inalcanzables confirmadas, {filed} presentadas, "
-        f"{touched} ya en curso, {resolved} resueltas{' [DRY-RUN]' if dry else ''}")
+        f"{len(confirmed)} inalcanzables confirmadas "
+        f"(tcp_closed={len(confirmed) - rdp_wedged} rdp_not_negotiating={rdp_wedged}), "
+        f"{filed} presentadas, {touched} ya en curso, "
+        f"{resolved} resueltas{' [DRY-RUN]' if dry else ''}")
     return 0
 
 
