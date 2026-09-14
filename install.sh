@@ -180,6 +180,78 @@ case "$INSTALL_HOME_REGION" in fsn|hel|auto) ;; *) die "Invalid NEURAVPS_HOME_RE
 log "Checking required tools"
 require_cmd wget curl lsblk awk ip dmidecode udevadm
 
+# --- DEFAULT_V4_VIA_TUNNEL auto-detection ---------------------------
+# NAMING TRAP, read before touching this: DEFAULT_V4_VIA_TUNNEL=0 means the
+# node HAS its own public IPv4 and keeps a normal default route. =1 means it
+# does NOT, and its own (host, not guest) v4 egress must go via the tunnel
+# with an explicit `src` — see neuravps-tunnel-select.sh below, which is the
+# code this constant actually drives. Anyone reading just the name guesses
+# the opposite of what it does.
+#
+# Until 2026-09-14 this was hardcoded to 0, i.e. "every node has its own
+# IPv4". That stopped being true a while ago: the fleet buys nodes WITHOUT a
+# public IPv4 now (~212/215 today), so every fresh install silently shipped
+# with no v4 egress at all — neither the node nor its guests — until someone
+# noticed and hand-fixed /etc/default/neuravps-tunnels. Caught installing
+# 0000019-AX102-3 today; confirmed against a healthy production AX102
+# (0000006-AX102, which runs with =1) that the fleet's real value is the
+# opposite of the constant this script wrote.
+#
+# Detection: does the rescue's own uplink carry a real (scope global) IPv4
+# address? Hetzner boots the rescue system with the server's actual purchased
+# addressing — a node bought without IPv4 boots an IPv6-only rescue (the
+# reason install.sh already special-cases IPv6-only rescues elsewhere, for
+# fetching over curl and for ZFS prep) — so "does rescue have a global IPv4"
+# is the same signal, just read earlier and used for a different config.
+#
+# An explicit DEFAULT_V4_VIA_TUNNEL in the environment always wins, for the
+# rare exception (e.g. reinstalling a node whose IPv4 order hasn't landed
+# yet, or the inverse).
+is_private_ipv4() {
+  case "$1" in
+    10.*|192.168.*|169.254.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+detect_public_ipv4() {
+  local ifc addr addr_only
+  while read -r ifc addr; do
+    case "$ifc" in
+      lo|docker*|veth*|virbr*|tap*|br-*|tun*|fwbr*|fwln*|fwpr*) continue ;;
+    esac
+    addr_only="${addr%%/*}"
+    is_private_ipv4 "$addr_only" && continue
+    echo "$ifc $addr"
+    return 0
+  done < <(ip -4 -o addr show scope global up 2>/dev/null | awk '{print $2, $4}')
+  return 1
+}
+if [ -z "${DEFAULT_V4_VIA_TUNNEL:-}" ]; then
+  if PUBLIC_V4_FOUND="$(detect_public_ipv4)"; then
+    DEFAULT_V4_VIA_TUNNEL=0
+    log "Public IPv4 detected on rescue (${PUBLIC_V4_FOUND}) -> DEFAULT_V4_VIA_TUNNEL=0 (node keeps its own v4 egress)"
+  else
+    # Inconclusive is treated the same as "confirmed no IPv4": that's the safe
+    # default today (fleet buys nodes without one). A node that gets the
+    # tunnel route it didn't need is harmless; one that silently doesn't get a
+    # route it needed loses ALL v4 egress, host and guests, until someone
+    # notices — that's the failure this fix exists to stop. So: fail safe, but
+    # LOUDLY, so a wrong guess here doesn't cost another half hour to find.
+    DEFAULT_V4_VIA_TUNNEL=1
+    log "=============================================================================="
+    log "WARNING: no public IPv4 detected on the rescue system's uplink."
+    log "Defaulting DEFAULT_V4_VIA_TUNNEL=1 (this node's own v4 egress will go via the tunnel to the base, like the rest of the fleet)."
+    log "If this node DOES have its own public IPv4 and this guess is wrong, re-run with DEFAULT_V4_VIA_TUNNEL=0 in the environment, or fix /etc/default/neuravps-tunnels by hand after install and re-run neuravps-tunnel-select.sh."
+    log "=============================================================================="
+  fi
+else
+  case "$DEFAULT_V4_VIA_TUNNEL" in
+    0|1) log "DEFAULT_V4_VIA_TUNNEL explicitly set via environment: ${DEFAULT_V4_VIA_TUNNEL} (auto-detection skipped)" ;;
+    *) die "Invalid DEFAULT_V4_VIA_TUNNEL '$DEFAULT_V4_VIA_TUNNEL' (expected 0 or 1)" ;;
+  esac
+fi
+
 # --- Require UEFI boot (NeuraVPS fleet standard) -------------------
 # The whole fleet boots UEFI. The QEMU/SeaBIOS (Legacy BIOS) path leaves
 # the node with an empty/non-functional bootloader (empty ESPs, no
@@ -1199,7 +1271,13 @@ IDENT6=2a01:4f9:c01f:e::/64
 TRANSIT_BASE=2a01:4f9:c01f:e:ffff::
 VIP_FSN=2a01:4f8:fff2:95::2
 VIP_HEL=2a01:4f9:fff1:5f::2
-DEFAULT_V4_VIA_TUNNEL=0
+# 0 = this node has its OWN public IPv4 (normal default route). 1 = it does
+# NOT, and its host (not guest) v4 egress goes via the tunnel with an
+# explicit src — see neuravps-tunnel-select.sh. The name says the opposite of
+# what it means; read the block above (STEP 1) for why and how this value was
+# chosen. Autodetected from the rescue's own addressing unless the operator
+# forced it via the DEFAULT_V4_VIA_TUNNEL environment variable.
+DEFAULT_V4_VIA_TUNNEL=${DEFAULT_V4_VIA_TUNNEL}
 NVXEOF
 
 cat > /mnt/etc/sysctl.d/zz-neuravps-rpfilter.conf <<'NVXEOF'
