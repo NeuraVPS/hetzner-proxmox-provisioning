@@ -80,3 +80,42 @@ if (Test-Path 'C:\ProgramData\NeuraVPS\hook_optout.txt') {
 A central list was considered and rejected: it drifts the moment a VM is
 rebuilt, migrated or restored from backup, and the failure mode of a stale
 central list is the exact bug this is meant to prevent.
+
+## A different question: `mt_portable_optout.txt`
+
+`hook_optout.txt` above answers *"should this machine have the hook wired at
+all?"* — a per-**machine** decision, checked by a sweep before it touches the
+registry. `mt_portable_optout.txt` answers a narrower question that only the
+MT hook needs: *given the hook IS wired on this machine, should THIS ONE
+installation be forced into `/portable`?*
+
+The reason it has to be separate: a single box can carry several MT
+installations (our own `C:\MetaTrader\...` plus one or more broker installs
+under `C:\Program Files\...`), and MetaTrader installed outside our tree
+redirects its data to `%APPDATA%\MetaQuotes\Terminal\<hash>` **by design**.
+Forcing `/portable` on that install hides the customer's account and EAs even
+though the box, as a whole, correctly has the hook. A per-machine opt-out
+would be too blunt: it would either force portable on the whole box (hiding
+that one broker install) or drop the hook everywhere (losing the
+self-update/file-association protection for the installs that *are*
+portable).
+
+        C:\ProgramData\NeuraVPS\mt_portable_optout.txt
+
+One **installation directory** per line (the folder holding `terminal64.exe`
+etc., e.g. `C:\Program Files\Darwinex MetaTrader 5`), `#` comments and blank
+lines ignored, matched case-insensitively with trailing backslashes stripped.
+Read by `mt_hook_launcher.vbs` itself — no PowerShell snippet to paste, this
+one lives inside the VBS because the decision depends on which installation
+the launch resolved to (`ResolveMT5Target`), which only the launcher knows.
+
+**A missing file means no opt-outs — exactly the behaviour before this
+existed — so a freshly provisioned VM needs no extra state.** Same convention
+as `hook_optout.txt`, deliberately: one pattern, not two.
+
+Written by a fleet sweep from the AppData side (matching each roaming profile
+to its installation via `origin.txt`, then comparing EA counts / accounts
+file / terminal logs against the install directory — see
+`base/mt_portable_optout_sweep.py` for that comparison). **As of 2026-09-14
+no sweep writes this file yet**; the VBS reads it unconditionally, so the
+file's absence is not a gap, it is the documented default.

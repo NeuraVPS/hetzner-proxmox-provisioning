@@ -116,7 +116,7 @@ key so they intercept each target `.exe` and relaunch it with the right options:
 
 - `sqx_hook_launcher.vbs` — SQX **v142/v143** engine `StrategyQuantX_nocheck.exe` → injects `JAVA_TOOL_OPTIONS=-Djava.awt.headless=true` for the SQX process only, so SQX never binds to the volatile Remote-Desktop display and survives RDP/network blips (the `awt.dll`/`displayChanged` crash — agent doc §9.9.15b "Mode A").
 - `sqx144_hook_launcher.vbs` — SQX **v144** engine `StrategyQuantX.exe`. **🛑 WITHDRAWN 2026-08-03 — fork-bombs, see the banner at the top. Do not wire.** Kept in the repo only so the withdrawal is traceable.
-- `mt_hook_launcher.vbs` — MetaTrader `terminal64/metaeditor64/terminal/metaeditor.exe` → ensures `/portable` on non-shortcut launches (e.g. MT's self-update relaunch) so the terminal keeps using its portable data dir. **Portable-data boxes ONLY — see the gate below.**
+- `mt_hook_launcher.vbs` — MetaTrader `terminal64/metaeditor64/terminal/metaeditor.exe` → ensures `/portable` on non-shortcut launches (e.g. MT's self-update relaunch) so the terminal keeps using its portable data dir. **Portable-data boxes ONLY — see the gate below.** A box can carry several MT installs at once, so the flag is decided per resolved installation, not once per machine — see gate 2ter.
 
 ## Before any sweep: check the per-machine opt-out
 
@@ -185,6 +185,34 @@ hazard in the install steps themselves. All three are now mandatory:
    (safe — the editor holds no accounts, and it takes effect on its next
    launch). Where `metaeditor64` lost it, the terminal is genuinely portable,
    so removing `terminal64`'s Debugger would be gate 2 all over again.
+
+2ter. **Per-installation opt-out from forced `/portable`** (2026-09-14, ported
+   from a July branch that never shipped). Gate 2 is a per-*machine* yes/no,
+   but a box wired for the hook can hold several MT installations, and it is
+   common for one to be a broker's own `C:\Program Files\...` install that
+   redirects its data to `%APPDATA%\MetaQuotes\Terminal\<hash>` **by design**
+   (Darwinex, Axi, OANDA…). Forcing `/portable` on that one install hides its
+   account/EAs exactly like gate 2 describes — the difference is it does not
+   show up as "the whole box is non-portable", so a machine-wide gate 2 check
+   passes while one install on it is still wrong.
+
+   `mt_hook_launcher.vbs` reads
+   `C:\ProgramData\NeuraVPS\mt_portable_optout.txt` — one installation
+   directory per line, `#` comments and blanks ignored — and skips the forced
+   `/portable` only for installs listed there. **Missing file = no opt-outs =
+   exactly the behaviour before this existed**, so a fresh VM needs no extra
+   state. The decision is made **after** `ResolveMT5Target`, because it
+   depends on which installation the launch actually resolved to, not on the
+   machine as a whole. See [`optout.md`](optout.md) for the file format and
+   how it differs from the per-machine `hook_optout.txt`.
+
+   A fleet-wide read-only measurement (2026-09-14, pairing each roaming
+   profile to its installation via `origin.txt`, same rule as
+   `base/mt_portable_optout_sweep.py`) found **249 VMs** that would lose data
+   if the hook were reasserted on them today, plus **24 already hooked and
+   already hiding a customer's real data** right now. The VBS mechanism alone
+   changes nothing until a sweep writes the file — that sweep is a separate,
+   follow-up piece of work.
 
 3bis. **Detect a v144+ engine BY CONTENT, never by folder name** (gate 4,
    2026-08-02). The original gate-1 snippet tested
