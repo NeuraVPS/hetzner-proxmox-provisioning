@@ -110,12 +110,27 @@
 > in place afterwards. Checking the registry alone would have passed every one
 > of these broken boxes.
 
+> **2026-09-15 — a separate bug fixed, this one NOT reconsidered.** `sqx_hook_launcher.vbs`
+> used to hardcode its recursion-guard key to `StrategyQuantX_nocheck.exe`, so
+> pointing any *other* exe's Debugger at that same file cleared the wrong key —
+> a real, different fork-bomb class from the one above. It now derives the
+> guard key from `fso.GetFileName()` of whatever exe Windows handed it (the
+> `mt_hook_launcher.vbs` pattern: dynamic key, cross-process lock, TOCTOU-safe
+> unconditional restore), and `sqx144_hook_launcher.vbs` is deleted — one file
+> now covers `StrategyQuantX_nocheck.exe` and `StrategyQuantX.exe` in any
+> install path. **This does not touch the mechanism established above.**
+> Dynamic key derivation cannot distinguish v144's `StrategyQuantX.exe` from
+> v143's self-relaunching `StrategyQuantX.exe` — they are the same filename,
+> and IFEO keys by name, not path. Wiring `StrategyQuantX.exe` on a box that
+> also carries a v143 install is still expected to fork-bomb exactly as
+> described above; nothing here was measured against a dual-install box (no
+> such box was available in the lab run — see the test report). Do not wire
+> `StrategyQuantX.exe` fleet-wide off the strength of this change alone.
 
 These VBS launchers are wired via the **Image File Execution Options** `Debugger`
 key so they intercept each target `.exe` and relaunch it with the right options:
 
-- `sqx_hook_launcher.vbs` — SQX **v142/v143** engine `StrategyQuantX_nocheck.exe` → injects `JAVA_TOOL_OPTIONS=-Djava.awt.headless=true` for the SQX process only, so SQX never binds to the volatile Remote-Desktop display and survives RDP/network blips (the `awt.dll`/`displayChanged` crash — agent doc §9.9.15b "Mode A").
-- `sqx144_hook_launcher.vbs` — SQX **v144** engine `StrategyQuantX.exe`. **🛑 WITHDRAWN 2026-08-03 — fork-bombs, see the banner at the top. Do not wire.** Kept in the repo only so the withdrawal is traceable.
+- `sqx_hook_launcher.vbs` — SQX engine, either `StrategyQuantX_nocheck.exe` (v142/v143) or `StrategyQuantX.exe` (v144+, any install path) → injects `JAVA_TOOL_OPTIONS=-Djava.awt.headless=true` for the SQX process only, so SQX never binds to the volatile Remote-Desktop display and survives RDP/network blips (the `awt.dll`/`displayChanged` crash — agent doc §9.9.15b "Mode A"). Derives its recursion-guard IFEO key from the target exe's filename (2026-09-15), so one file now covers both names; `sqx144_hook_launcher.vbs` is retired. **Wiring `StrategyQuantX.exe` is still gated — see the withdrawal banner above, unchanged.**
 - `mt_hook_launcher.vbs` — MetaTrader `terminal64/metaeditor64/terminal/metaeditor.exe` → ensures `/portable` on non-shortcut launches (e.g. MT's self-update relaunch) so the terminal keeps using its portable data dir. **Portable-data boxes ONLY — see the gate below.** A box can carry several MT installs at once, so the flag is decided per resolved installation, not once per machine — see gate 2ter.
 
 ## Before any sweep: check the per-machine opt-out
@@ -139,8 +154,11 @@ hazard in the install steps themselves. All three are now mandatory:
 1. **SUPERSEDED 2026-08-03 — do not wire `StrategyQuantX.exe` at all** (see the
    withdrawal banner at the top: it fork-bombs). Gate 1 as written below was
    about *where* to wire it; the answer is now *nowhere*. Kept for context.
-   **`StrategyQuantX.exe` → `sqx144_hook_launcher.vbs` ONLY on boxes with a real
-   v144 install** (a `C:\SQX*144*` / `StrategyQuant*144*` dir). On **v143**
+   **`StrategyQuantX.exe` → `sqx_hook_launcher.vbs` ONLY on boxes with a real
+   v144 install** (a `C:\SQX*144*` / `StrategyQuant*144*` dir) **and no v143
+   install anywhere on the box** — the 2026-09-15 dynamic-key change (below)
+   only retired the second launcher file, it did not touch this gate; see the
+   2026-09-15 note in the withdrawal banner. On **v143**
    boxes `StrategyQuantX.exe` is the interactive launcher/checker, and hooking
    it makes every double-click **die silently** (cursor spins, no window, no
    process — customers report "SQX no abre"; a VPS reboot does not help). The
@@ -284,14 +302,21 @@ hazard in the install steps themselves. All three are now mandatory:
        if (-not (Test-Path (Join-Path $f.FullName 'StrategyQuantX_nocheck.exe'))) { $has144 = $true }
      }
    }
-   # 🛑 WITHDRAWN 2026-08-03: the $has144 branch below fork-bombs. Run ONLY the
-   # `else` action — remove the Debugger — until the launcher is fixed.
+   # 🛑 WITHDRAWN 2026-08-03: the $has144 branch below fork-bombs on any box that
+   # ALSO carries a v143 install (see the withdrawal banner, and its 2026-09-15
+   # addendum — dynamic key derivation in sqx_hook_launcher.vbs fixed a different
+   # bug and did not touch this one). This snippet does not even detect that
+   # case ($has144 above never checks for a coexisting v143 StrategyQuantX.exe)
+   # — that detection would have to be added, and proven against a dual-install
+   # box, before this branch could ever be enabled. Run ONLY the `else` action —
+   # remove the Debugger — until then.
    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\StrategyQuantX.exe'
    if ($false -and $has144) {
      if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
-     Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\sqx144_hook_launcher.vbs"'
+     Set-ItemProperty -Path $k -Name Debugger -Type String -Value '"C:\Windows\System32\wscript.exe" "C:\ProgramData\NeuraVPS\sqx_hook_launcher.vbs"'
    } else {
-     # v143-only box: this IFEO must NOT exist (silent launcher death otherwise)
+     # v143-only OR dual-install box: this IFEO must NOT exist (silent death on
+     # v143-only, fork-bomb on dual — see the withdrawal banner)
      Remove-ItemProperty -Path $k -Name Debugger -Force -EA SilentlyContinue
    }
    ```
@@ -310,9 +335,25 @@ hazard in the install steps themselves. All three are now mandatory:
 
 The hooks take effect on the **next launch** of each app — no reinstall, no reboot, no data loss. Existing running SQX/MT keep their current process; they pick up the hook when next opened.
 
-## ⚠️ Critical: v144 needs `sqx144_hook_launcher.vbs`, never `sqx_hook_launcher.vbs`
+## ⚠️ Critical: `sqx_hook_launcher.vbs` derives its guard key, but wiring `StrategyQuantX.exe` is still gated
 
-`sqx_hook_launcher.vbs` hardcodes its recursion-guard IFEO key to `StrategyQuantX_nocheck.exe`. If you point `StrategyQuantX.exe`'s Debugger at *that* VBS, the guard clears the wrong key on relaunch and the hook **fork-bombs**. `sqx144_hook_launcher.vbs` is identical except the guard key is `StrategyQuantX.exe`. (Derive it from the v143 file by replacing `StrategyQuantX_nocheck.exe` → `StrategyQuantX.exe`, which is its only occurrence — this also carries over any local customization such as an added `_JAVA_OPTIONS` line.)
+Until 2026-09-15, `sqx_hook_launcher.vbs` hardcoded its recursion-guard IFEO key
+to `StrategyQuantX_nocheck.exe`. Pointing `StrategyQuantX.exe`'s Debugger at
+that same file cleared the wrong key on relaunch and the hook **fork-bombed**
+— a second, separate launcher (`sqx144_hook_launcher.vbs`) existed only to
+carry a different hardcoded key. That bug class is fixed now: the guard key is
+derived from `fso.GetFileName(target)`, one file covers both exe names in any
+install path, and the second file is gone.
+
+**That fix does not make it safe to wire `StrategyQuantX.exe`.** The reason
+`StrategyQuantX.exe` fork-bombs on a dual v143+v144 box (see the withdrawal
+banner near the top, and its 2026-09-15 addendum) has nothing to do with which
+key gets cleared — it is that v143's own `StrategyQuantX.exe` self-relaunches
+under that same image name, IFEO keys by name and not by path, so a key meant
+for the v144 engine also intercepts v143's self-relaunch, and no launcher-side
+code can tell the two apart. Keep gate 1 as written: `StrategyQuantX.exe` gets
+wired on **no box** until a dual-install box passes the behavioural test
+described in the withdrawal banner.
 
 ## ⚠️ Critical: the MT hook guard must stay concurrency-safe
 
