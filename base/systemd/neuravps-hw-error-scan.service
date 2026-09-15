@@ -1,0 +1,8 @@
+[Unit]
+Description=NeuraVPS daily netconsole hardware-error sweep (fleet-wide, this base's nodes only)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-hw-error-scan.py --base-id %H
+TimeoutStartSec=10m
+SyslogIdentifier=neuravps-hw-error-scan
