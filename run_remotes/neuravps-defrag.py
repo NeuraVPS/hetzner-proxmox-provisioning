@@ -54,8 +54,13 @@ placement should relieve this node" with nobody listening). Relief mode:
     run doc (capacity problem = operator decision); the node_health daily
     sweep independently warns when a thrasher persists >24h.
   * skips daily phases 1/1.5/2/3 entirely; cap reliefMaxMovesPerRun
-    (default 4); journals to defrag_runs ONLY when it found work (hourly
-    empty ticks stay out of Firestore).
+    (default 4); journals to defrag_runs ONLY when it found work or a
+    destination search failed (hourly empty ticks stay out of defrag_runs).
+  * v12: every run doc carries `noDestNodes` {MT5: [...], SQX: [...]} (also
+    when other nodes WERE relieved), MT CPU relief classifies each node it
+    tries (plan_mt_cpu_relief: only a measured "no-dest" is capacity), and
+    every relief tick -- quiet ones included -- updates defrag_state/relief
+    (`mtEvaluatedAt`, `noDestNodes`). NeuraVPS' expensive purchase reads both.
 
 VICTIM CHOICE (v9): every migration freezes the moved guest at cutover
 (measured 2026-07-31: 12-90 s, median ~38 s over the last 25 moves), so WHO
@@ -73,7 +78,7 @@ State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
 
 --dry-run flag: plan + journal (as dryRun) but never execute, without
 touching the config/defrag kill-switch the hourly timers read.
-#NDFVER=11
+#NDFVER=12
 """
 import fcntl
 import json
@@ -165,6 +170,70 @@ def sustained_cpu_harm(history, now=None):
                     key=lambda p:p['at'])
     return (len(recent) >= 2 and recent[-1]['at'] - recent[-2]['at'] >= 600
             and all(p['ms'] > CPU_MAX_MS for p in recent[-2:]))
+
+
+# Outcome of one hot MT node in the CPU relief pass. ONLY "no-dest" is capacity
+# evidence: the node had measured victims, every destination the planner
+# offered was MEASURED, and none of them had room below the ceiling.
+#   moved       a move was booked for it
+#   no-dest     measured victims, measured destinations, none with room
+#   unmeasured  some destination's load (or thread count) was unreadable:
+#               "no room" was not proven, it may just be an SSH/RRD failure
+#   agent-down  a destination with room existed, the victim's agent is dead
+#   no-victim   no running VM with a measured demand >= 0.5 CPUs
+# The distinction matters because NeuraVPS' expensive-hardware purchase reads
+# "no-dest" (capacity_procurement / ltd_procurement, 2026-09-16): an SSH
+# timeout must never look like a full fleet and buy a 452 EUR/month server.
+MT_RELIEF_CEILING = 0.70
+
+
+def plan_mt_cpu_relief(hot, victims_of, pick_dest, load_of, threads_of,
+                       agent_alive, book, ceiling=MT_RELIEF_CEILING):
+    """One CPU-relief move at most, and a classified outcome per node tried.
+
+    `hot` is the ordered list of MT nodes with sustained CPU harm. Every node
+    up to and including the one that gets the move is classified; the nodes
+    after it are NOT probed (one move per tick is the design, and probing costs
+    one SSH per VM) -- they are "rate-limited", not "no destination", and
+    appear in neither list. Returns (moved_nid or None, {nid: outcome})."""
+    outcomes = {}
+    for nid in hot:
+        victims = victims_of(nid)
+        if not victims:
+            outcomes[nid] = "no-victim"
+            continue
+        unmeasured = agent_down = False
+        for demand, vm in victims:
+            excluded = {nid}
+            while True:
+                dst = pick_dest(vm, excluded)
+                if not dst:
+                    break
+                excluded.add(dst)
+                load, threads = load_of(dst), threads_of(dst)
+                if load is None or not threads or threads <= 0:
+                    unmeasured = True
+                    continue
+                if load + demand / threads > ceiling:
+                    continue
+                if not agent_alive(nid, vm):
+                    agent_down = True
+                    break
+                book(vm, nid, dst, demand)
+                outcomes[nid] = "moved"
+                return nid, outcomes
+        outcomes[nid] = ("unmeasured" if unmeasured
+                         else "agent-down" if agent_down else "no-dest")
+    return None, outcomes
+
+
+def no_dest_nodes(mt_outcomes, sqx_failed):
+    """`defrag_runs.noDestNodes` / `defrag_state/relief.noDestNodes`: the
+    relief-pass nodes whose destination search genuinely failed, by model.
+    Always both keys, lists possibly empty, so a reader can tell "measured,
+    nothing failed" (empty list) from "old defrag, not recorded" (no field)."""
+    return {"MT5": sorted(n for n, o in (mt_outcomes or {}).items() if o == "no-dest"),
+            "SQX": sorted(sqx_failed or ())}
 # Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
 # max(ram_min, ram_min_observed), the same number auto_provision reserves).
 # vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
@@ -588,6 +657,9 @@ def main():
     live_io = {}        # nid -> (pswpin_ps, psi_io_pct) — real-I/O evidence
     gate_skipped = {}   # nid -> blocked list, suppressed by the zswap gate
     dest_failed = set()  # nids whose victim search genuinely found NO dest
+    mt_outcomes = {}     # MT nid -> plan_mt_cpu_relief outcome (relief only)
+    mt_hot = []
+    mt_evaluated = False  # did THIS tick run the MT CPU relief pass at all?
     if relief:
         import concurrent.futures as cf
         STATUS_MAX_AGE_S = 900
@@ -723,42 +795,36 @@ def main():
             return None
 
         if cfg.get('mtCpuReliefEnabled', True) and len(moves) < relief_max:
-            cpu_moved = False
             dest_load = {}
-            for nid, n in nodes.items():
-                if (n['model'] != 'MT5' or not placeable(n)
-                        or not sustained_cpu_harm(n['cpu_history'])):
-                    continue
+
+            def victims_of(nid):
                 victims = []
-                for vm in n['vms']:
+                for vm in nodes[nid]['vms']:
                     if vm['st'] != 'running' or vm['vmid'] in recent_vmids or vm['vmid'] in booked:
                         continue
                     usage = cpu_p95(nid,vm['vmid'])
                     if usage is not None and usage * vm['cores'] >= .5:
                         victims.append((usage * vm['cores'],vm))
-                for demand, vm in sorted(victims,key=lambda x:-x[0]):
-                    excluded = {nid}
-                    while True:
-                        dst = pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False)
-                        if not dst:
-                            break
-                        excluded.add(dst)
-                        dn = nodes[dst]
-                        if dst not in dest_load:
-                            dest_load[dst] = cpu_p95(dst)
-                        load = dest_load[dst]
-                        if load is None or dn['threads'] <= 0 or load + demand / dn['threads'] > .70:
-                            continue
-                        if not agent_alive(nid,vm['vmid']):
-                            break
-                        book(vm,nid,dst,f'cpu-relief (two sustained wait windows; guest p95 {demand:.2f} CPUs)')
-                        cpu_moved = True
-                        break
-                    if cpu_moved:
-                        break
-                if cpu_moved:
-                    break
-                log(f'CPU ESCALATION {nid}: sustained wait, no measured safe move')
+                return sorted(victims,key=lambda x:-x[0])
+
+            def load_of(dst):
+                if dst not in dest_load:
+                    dest_load[dst] = cpu_p95(dst)
+                return dest_load[dst]
+
+            mt_hot = [nid for nid, n in nodes.items()
+                      if n['model'] == 'MT5' and placeable(n)
+                      and sustained_cpu_harm(n['cpu_history'])]
+            _moved, mt_outcomes = plan_mt_cpu_relief(
+                mt_hot, victims_of,
+                lambda vm, excluded: pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False),
+                load_of, lambda dst: nodes[dst]['threads'],
+                lambda nid, vm: agent_alive(nid,vm['vmid']),
+                lambda vm, nid, dst, demand: book(vm,nid,dst,f'cpu-relief (two sustained wait windows; guest p95 {demand:.2f} CPUs)'))
+            mt_evaluated = True
+            for nid, outcome in mt_outcomes.items():
+                if outcome != 'moved':
+                    log(f'CPU ESCALATION {nid}: sustained wait, no measured safe move ({outcome})')
 
     # ---- phase 1: corrections ----
     for nid in sorted(nodes) if not relief else []:
@@ -891,7 +957,29 @@ def main():
             continue
 
     moves[:] = moves[:max_moves]
-    if relief and not moves and not live_blocked:
+    no_dest = no_dest_nodes(mt_outcomes, dest_failed)
+    if relief:
+        # Liveness + pain record for EVERY relief tick, including the quiet
+        # ones that stay out of defrag_runs. NeuraVPS' expensive-hardware
+        # purchase (ltd_procurement, 2026-09-16) reads it: without a fresh
+        # `mtEvaluatedAt` it cannot tell "no relief failed" from "the defrag
+        # did not run", and it refuses to buy. One small doc, 24 writes/day.
+        beat = {"at": firestore.SERVER_TIMESTAMP, "version": 12,
+                "mtCpuReliefEnabled": bool(cfg.get('mtCpuReliefEnabled', True)),
+                "mtEvaluated": mt_evaluated, "mtHotNodes": sorted(mt_hot),
+                "mtOutcomes": mt_outcomes, "noDestNodes": no_dest,
+                "planned": len(moves)}
+        fields = list(beat)
+        if mt_evaluated:
+            beat["mtEvaluatedAt"] = firestore.SERVER_TIMESTAMP
+            fields.append("mtEvaluatedAt")
+        try:
+            # merge=<fields>: listed fields are replaced whole (no stale keys
+            # inside mtOutcomes), unlisted mtEvaluatedAt keeps its last value.
+            db.collection("defrag_state").document("relief").set(beat, merge=fields)
+        except Exception as exc:  # noqa: BLE001 - a lost beat must not stop relief
+            log(f"WARN could not write defrag_state/relief: {exc}")
+    if relief and not moves and not live_blocked and not no_dest["MT5"]:
         # hourly tick with nothing to do: syslog only, no Firestore clutter
         log("relief: no sustained-blocked thrashers — nothing to do")
         return 0
@@ -904,7 +992,12 @@ def main():
         log("  " + t)
 
     doc = {"at": firestore.SERVER_TIMESTAMP, "dryRun": dry, "planned": plan_txt,
-           "executed": 0, "ok": 0, "fail": 0, "status": "planned", "relief": relief}
+           "executed": 0, "ok": 0, "fail": 0, "status": "planned", "relief": relief,
+           # Written in EVERY run, moves or not: a run that relieved one node
+           # and found no destination for another used to record only "done".
+           "noDestNodes": no_dest}
+    if relief and mt_evaluated:
+        doc["mtReliefOutcomes"] = mt_outcomes
     if relief and live_blocked:
         real_blocked = {nid: bl for nid, bl in live_blocked.items()
                         if nid not in gate_skipped}
@@ -921,7 +1014,7 @@ def main():
         # "no-dest" (the one case that genuinely pages the operator: capacity)
         # requires a victim search to have actually FAILED — not a zswap-gate
         # skip, which by definition needed no move at all.
-        if relief and dest_failed:
+        if relief and (dest_failed or no_dest["MT5"]):
             status = "no-dest"
         elif relief and gate_skipped:
             status = "zswap-quiet"
