@@ -49,9 +49,22 @@ Una pasada por minuto (timer), solo nodos -AX102, solo VMs <= MAX_VM_MB:
          decay bloqueado BACKOFF_BASE_S * 2^(n-1), máx BACKOFF_MAX_S.
   HOST   ninguna subida deja MemAvailable - pendientes < HOST_FREE_MIN_MB.
 
+v3 (2026-09-17, canario 0000147): PROTECT (PIN/STALE) APAGADO por defecto.
+  41 subidas en 9 min devolvieron ~40 GB de globo en un nodo donde casi todas
+  las MT ya estaban en su suelo (2048): pvestatd no tenía a quién quitárselo y
+  el HOST lo sacó a swap — swap usado 77 -> 95 GB, swap-in 2.979 pág/s (pares
+  1-37) con MemAvailable estable, así que la reserva de 12 GB no lo vio.
+  Revertido (42 suelos a su valor previo) y el swap-in cayó a 127/s en 2 min.
+  Si se reactiva (PROTECT_ENABLED=1), dos frenos nuevos: ninguna subida si el
+  host sacó a swap > HOST_SWAPOUT_MAX_PS pág/s en la pasada anterior, y como
+  mucho RAISE_MB_PER_RUN por pasada para que la reacción llegue a tiempo.
+  Pero la cuestión de fondo (en un nodo sin nadie estrujable, devolver globo
+  = swap del host) necesita rediseño, no solo frenos.
+
 Kill switch: /etc/default/neuravps-mt-freemem-guard
   ENABLED=0 no hace nada · DRY_RUN=1 (por defecto) decide y registra sin tocar
-  nada · DECAY_ENABLED=0 solo protege · EXCLUDE_VMIDS=1,2 fuera del guard.
+  nada · DECAY_ENABLED=0 sin decay · PROTECT_ENABLED=1 reactiva PIN/STALE
+  (0 por defecto desde v3) · EXCLUDE_VMIDS=1,2 fuera del guard.
 Telemetría: journal (SyslogIdentifier neuravps-mt-freemem-guard) y
 /var/run/neuravps-mt-freemem-guard.json.
 """
@@ -67,7 +80,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = 2
+VERSION = 3
 CONF_DIR = Path('/etc/pve/qemu-server')
 STATE_DIR = Path('/var/lib/neuravps-balloon')
 STATE_PATH = STATE_DIR / 'memguard.json'
@@ -83,6 +96,9 @@ DEFAULTS = {
     'ENABLED': 1,
     'DRY_RUN': 1,
     'DECAY_ENABLED': 1,
+    'PROTECT_ENABLED': 0,
+    'HOST_SWAPOUT_MAX_PS': 64,
+    'RAISE_MB_PER_RUN': 1024,
     'LOW_FREE_PCT': 15,
     'TARGET_FREE_PCT': 25,
     'RELEASE_FREE_PCT': 35,
@@ -336,6 +352,26 @@ def rdp_sessions(cfg):
         return set(), False
 
 
+def host_swapout_rate(now):
+    """pswpout pages/s since the previous run (0 on the first run). An unreadable
+    previous sample counts as swapping: a raise is never the default."""
+    path = STATE_DIR / 'memguard-vmstat.json'
+    cur = 0
+    for line in Path('/proc/vmstat').read_text().splitlines():
+        if line.startswith('pswpout '):
+            cur = int(line.split()[1])
+    try:
+        prev = json.loads(path.read_text())
+        rate = (cur - prev['pswpout']) / max(1, now - prev['ts'])
+        rate = int(rate) if 0 < now - prev['ts'] <= 600 and cur >= prev['pswpout'] else 1 << 30
+    except FileNotFoundError:
+        rate = 1 << 30
+    except Exception:
+        rate = 1 << 30
+    atomic_json(path, {'pswpout': cur, 'ts': now})
+    return rate
+
+
 def collect(node, now):
     out = subprocess.run(['pvesh', 'get', f'/nodes/{node}/qemu', '--full', '1',
                           '--output-format', 'json'], capture_output=True, text=True,
@@ -412,7 +448,7 @@ def apply_change(vm, new_floor, action, orig):
 
 
 def run(cfg, node, now, vms, state, avail_mb, pending, floors, sessions, session_known,
-        boot_guards, apply=apply_change, dry_seen=None):
+        boot_guards, apply=apply_change, dry_seen=None, swapout_ps=0):
     """One tick. Mutates state (and dry_seen); returns the status dict."""
     pending_map, pending_mb = pending
     dry_seen = {} if dry_seen is None else dry_seen
@@ -420,6 +456,8 @@ def run(cfg, node, now, vms, state, avail_mb, pending, floors, sessions, session
               'decayEnabled': bool(cfg['DECAY_ENABLED']), 'availMb': avail_mb,
               'pendingMb': pending_mb, 'reserveMb': cfg['HOST_FREE_MIN_MB'],
               'sessionDetection': session_known, 'rdpSessions': len(sessions),
+              'protectEnabled': bool(cfg['PROTECT_ENABLED']), 'hostSwapoutPs': swapout_ps,
+              'blockedSwap': 0,
               'raised': [], 'lowered': [], 'blockedHost': [], 'errors': [],
               'noStats': 0, 'stale': 0, 'lowFreeFixed': 0, 'aboveTarget': 0,
               'aboveTargetMb': 0, 'bounces': 0, 'decayWouldQualify': 0,
@@ -477,6 +515,12 @@ def run(cfg, node, now, vms, state, avail_mb, pending, floors, sessions, session
             continue
         raising = action in ('stale', 'pin')
         delta = max(0, new - vm['actual']) if raising else cfg['STEP_DOWN_MB']
+        if raising and (not cfg['PROTECT_ENABLED'] or swapout_ps > cfg['HOST_SWAPOUT_MAX_PS']
+                        or (granted > 0 and granted + delta > cfg['RAISE_MB_PER_RUN'])):
+            rollback()
+            if cfg['PROTECT_ENABLED']:
+                status['blockedSwap'] += 1
+            continue
         # A raise must fit the reserve; a lower must leave room to undo itself.
         if not host_allows(granted + delta, avail_mb, pending_mb, cfg):
             rollback()
@@ -539,9 +583,10 @@ def main():
     vms = collect(node, now)
     sessions, session_known = rdp_sessions(cfg)
     dry_seen = {k: v for k, v in read_json(DRY_LOG_PATH, {}).items() if now - v < 3600}
+    swapout_ps = host_swapout_rate(now)
     status = run(cfg, node, now, vms, state, mem_available_mb(), pending_boosts(now),
                  read_json(FLOORS_PATH, {}), sessions, session_known,
-                 read_json(BOOT_GUARDS_PATH, {}), dry_seen=dry_seen)
+                 read_json(BOOT_GUARDS_PATH, {}), dry_seen=dry_seen, swapout_ps=swapout_ps)
     if cfg['DRY_RUN']:
         atomic_json(DRY_LOG_PATH, dry_seen)
     atomic_json(STATE_PATH, state)
