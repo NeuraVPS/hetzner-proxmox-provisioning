@@ -20,6 +20,8 @@ H = 3600
 def cfg(**kw):
     c = dict(g.DEFAULTS)
     c['DRY_RUN'] = 0
+    c['PROTECT_ENABLED'] = 1
+    c['RAISE_MB_PER_RUN'] = 10 ** 6
     c['EXCLUDE_VMIDS'] = set()
     c.update(kw)
     return c
@@ -188,11 +190,12 @@ class Decay(unittest.TestCase):
 
 
 def run(c, vms, state=None, avail=10 ** 6, pending=({}, 0), floors=None, sessions=(), known=True,
-        boot=None, apply=None, now=NOW, dry_seen=None):
+        boot=None, apply=None, now=NOW, dry_seen=None, swapout=0):
     applied = []
     fn = apply or (lambda v, new, action, orig: applied.append((v['vmid'], action, new, orig)))
     st = g.run(c, 'n-AX102', now, vms, {} if state is None else state, avail, pending,
-               floors or {}, set(sessions), known, boot or {}, apply=fn, dry_seen=dry_seen)
+               floors or {}, set(sessions), known, boot or {}, apply=fn, dry_seen=dry_seen,
+               swapout_ps=swapout)
     return st, applied
 
 
@@ -258,6 +261,33 @@ class Tick(unittest.TestCase):
                            fresh_seen=True)}
         _, applied = run(cfg(), [boosted(vmid='5', uuid='5', floor=3584)], state, floors={})
         self.assertEqual(applied, [('5', 'lower', 3072, 2048)])
+
+
+class ProtectGatesV3(unittest.TestCase):
+    def test_protect_is_off_by_default(self):
+        self.assertEqual(g.DEFAULTS['PROTECT_ENABLED'], 0)
+        state = {}
+        st, applied = run(cfg(PROTECT_ENABLED=0), [vm()], state)
+        self.assertEqual((applied, st['raised']), ([], []))
+        self.assertEqual(state['719']['last_pin'], 0)
+
+    def test_decay_still_runs_with_protect_off(self):
+        state = {'5': dict(g.new_entry({'uuid': '5'}), last_floor=4096, credit=500, raised_at=NOW - 10 * H,
+                           fresh_seen=True)}
+        _, applied = run(cfg(PROTECT_ENABLED=0), [boosted(vmid='5', uuid='5')], state)
+        self.assertEqual(applied, [('5', 'lower', 3584, 2048)])
+
+    def test_no_raise_while_host_swaps_out(self):
+        st, applied = run(cfg(), [vm()], swapout=500)
+        self.assertEqual(applied, [])
+        self.assertEqual(st['blockedSwap'], 1)
+
+    def test_raise_budget_per_run(self):
+        vms = [vm(vmid=str(i), uuid=str(i)) for i in range(4)]    # 768 MB each
+        _, applied = run(cfg(RAISE_MB_PER_RUN=1024), vms)
+        self.assertEqual(len(applied), 1)
+        _, applied = run(cfg(RAISE_MB_PER_RUN=1024), [vm(actual=2048, free=100)])
+        self.assertEqual(len(applied), 1)                          # first raise always fits
 
 
 class Sessions(unittest.TestCase):
