@@ -1,5 +1,6 @@
 #!/bin/bash
-# Instala neuravps-mt-freemem-guard en un NODO AX102 (MT). Idempotente.
+# Instala neuravps-mt-freemem-guard en un NODO AX102 (MT). Idempotente: nunca
+# pisa /etc/default si ya existe (ahi vive el kill switch del nodo).
 # Arranca en DRY_RUN=1: decide y registra, no toca nada. Para actuar:
 #   sed -i 's/^DRY_RUN=.*/DRY_RUN=0/' /etc/default/neuravps-mt-freemem-guard
 # Kill switch (efecto en <1 min, sin redesplegar): ENABLED=0 en ese fichero.
@@ -11,7 +12,8 @@ install -m 755 "${HERE}/neuravps-mt-freemem-guard.py" /usr/local/sbin/neuravps-m
 
 if [ ! -f /etc/default/neuravps-mt-freemem-guard ]; then
   cat > /etc/default/neuravps-mt-freemem-guard <<'CONF'
-# Gestionado por NeuraVPS. ENABLED=0 apaga el guard; DRY_RUN=1 solo registra.
+# Gestionado por NeuraVPS. ENABLED=0 apaga el guard; DRY_RUN=1 solo registra;
+# DECAY_ENABLED=0 deja solo la proteccion; EXCLUDE_VMIDS=1,2 saca VMs concretas.
 ENABLED=1
 DRY_RUN=1
 CONF
