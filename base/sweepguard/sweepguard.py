@@ -478,6 +478,23 @@ def run_family(family, cfg):
     return len(picked)
 
 
+def report_smb_rate_limit():
+    """Telemetria del limite de ritmo SMB VM<->VM (deploy-smb-rate-limit.sh).
+
+    No es un detector de sweepguard: es un contador nftables inline
+    (`smb_rl_drops`) que cuenta los SYN de SMB entre VMs descartados por pasar
+    del umbral por origen. Se reporta aqui, cada pasada, para que salga en el
+    mismo journal que los bloqueos y no haga falta otra telemetria. Silencioso
+    si la regla no esta desplegada o si no ha descartado nada nuevo."""
+    for obj in nft_json(["list", "counter", "inet", "filter", "smb_rl_drops"]):
+        c = obj.get("counter")
+        if c and c.get("name") == "smb_rl_drops":
+            pk = c.get("packets", 0)
+            if pk:
+                log(f"smb-rate-limit: {pk} SMB SYN entre VMs descartados por exceso de ritmo (acumulado)")
+            return
+
+
 def main():
     cfg = dict(DEFAULTS)
     try:
@@ -500,6 +517,7 @@ def main():
             log(f"{family}: ERROR {exc}")
     if total:
         log(f"done: {total} sweeper(s) {'identified' if cfg['dryRun'] else 'blocked'}")
+    report_smb_rate_limit()
     return 0
 
 
