@@ -1,0 +1,21 @@
+[Unit]
+Description=NeuraVPS: aislamiento L3 vmbr0<->vmbr0 en el nodo
+# ⚠️ Mismo motivo que nvx-aisla.service: /etc/nftables.conf empieza por
+# `flush ruleset`. NI Requires= NI Wants= sobre nftables.service (un enable
+# arrancaria nftables inactivo y su flush borraria esta tabla y el clamp MSS
+# en toda la flota, como el 16-08-2026). After= conserva el orden; PartOf=
+# repone la tabla si alguien reinicia nftables.
+After=nftables.service network-online.target
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# MODE lo fija el operador por drop-in (Environment=MODE=count|drop); defecto drop.
+ExecStart=/usr/local/sbin/nvx-aisla-l3.sh
+Restart=on-failure
+RestartSec=15s
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target
