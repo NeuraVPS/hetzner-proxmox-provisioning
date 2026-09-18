@@ -961,6 +961,32 @@ NBRTIMER
   fi
 fi
 
+# --- MT free-memory guard (AX102/MT nodes only, 2026-09-18) ------------------
+# AX102 nodes run no reconciler: the MT balloon is moved only by pvestatd, and
+# floors raised by welcome-boost / the boot guard were never lowered again.
+# The guard's DECAY hands that RAM back (512 MB/h, only with no RDP session,
+# fresh stats and >=35 % free after the step). Installed with decay ACTIVE and
+# PROTECT (PIN/STALE) OFF — the fleet state approved 2026-09-18; PROTECT pushed
+# host 0000147 into swap on 2026-09-17. Kill switch:
+# /etc/default/neuravps-mt-freemem-guard. The installer itself exits 0 on
+# non-AX102 hosts; the case below just keeps AX162/EX44 from downloading it.
+case "$(hostname)" in
+  *-AX102*)
+    MTG_TMP="$(mktemp -d /tmp/mt-freemem-guard.XXXXXX)"
+    MTG_BASE=https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/run_remotes
+    if curl -fsSL --retry 3 --retry-delay 5 "$MTG_BASE/neuravps-mt-freemem-guard.py" -o "$MTG_TMP/neuravps-mt-freemem-guard.py" \
+        && curl -fsSL --retry 3 --retry-delay 5 "$MTG_BASE/install-mt-freemem-guard.sh" -o "$MTG_TMP/install-mt-freemem-guard.sh" \
+        && python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); compile(p.read_text(),str(p),"exec")' "$MTG_TMP/neuravps-mt-freemem-guard.py" \
+        && MTG_DRY_RUN=0 bash "$MTG_TMP/install-mt-freemem-guard.sh"; then
+      log "MT free-memory guard installed ($(grep -E '^(DRY_RUN|DECAY_ENABLED|PROTECT_ENABLED)=' /etc/default/neuravps-mt-freemem-guard | tr '\n' ' '))"
+    else
+      FIRST_BOOT_FAILED=1
+      log "WARNING: MT free-memory guard install failed — run run_remotes/install-mt-freemem-guard.sh by hand"
+    fi
+    rm -rf "$MTG_TMP"
+    ;;
+esac
+
 # Put PXE entries FIRST in the permanent BootOrder. install.sh already does
 # this in rescue, but the first REAL boot makes the firmware register fresh
 # entries for the new ESPs and PREPEND them (seen on 0000008: BootOrder became
