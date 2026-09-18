@@ -258,3 +258,48 @@ Encoding the client IPv4 into the NAT46 source (RFC 6052 style, a /96 inside
 the VM's own prefix) would join the two halves and let a VM's own failed-logon
 flood drive blocks at the edge. It is a change to the data path for every
 customer, so it belongs in a planned window, not during an attack.
+
+## Guests are judged only when they go to OUR addresses (2026-09-18)
+
+Since 2026-08-15 every guest's Internet egress crosses the BASE, with source
+`10.64.x.y` (v4) or its identity `2a01:4f9:c01f:e::/64` (v6). The guard looked
+only at the destination PORT, so a guest talking to any Internet service in
+10000-39999 was counted as attacking our forwards: a MetaTrader broker on AWS
+Global Accelerator (214xx/220xx, vm1261), RustDesk 21116, Syncthing 22000, a
+DigitalOcean service on 25060… From 05/09 to 18/09 all 113 guest blocks in the
+journal went to Internet destinations; vm570/vm581 were re-blocked every day.
+While blocked, a guest loses every NEW connection to those ports — its broker
+reconnect. The hot-port and flood detectors had the same bug (they read
+conntrack by port only: 25060 blocked 10.64.4.36/4.113 several times).
+
+A forward only exists on OUR addresses, so:
+
+* `deploy_guest_dst_scope.sh` creates `nuestras4` / `nuestras6` (interval sets:
+  both bases' main IPs, the four VIPs, `10.0.0.0/8`, the guest identity /64,
+  `fd00::/8`) and ONE rule per family right after the existing exemptions:
+
+      ip  saddr 10.64.0.0/16         ip  daddr != @nuestras4 accept
+      ip6 saddr 2a01:4f9:c01f:e::/64 ip6 daddr != @nuestras6 accept
+
+  Live in ONE `nft -f` transaction (no flush, no reload of nftables.conf),
+  persisted scoped to each rdpguard table, checked with `nft -c`.
+* `sweepguard.py` skips any conntrack flow whose ORIGINAL destination is not in
+  that set. If the set is missing (a BASE without this change) it logs it and
+  behaves as before.
+* Both main IPs go in the set on BOTH bases: a guest leaving through b1 towards
+  b0's main IP reaches b0 with b1's main IP as source, which is in `bf_allow` —
+  it can only be seen at the base it leaves through.
+* **When a new address gets forwards** (e.g. the egress-ipv4-pools /26s), add
+  it to the set: `nft add element ip rdpguard nuestras4 '{ a.b.c.d/26 }'` and
+  in `/etc/nftables.conf` (and in the script).
+
+Undo: `rollback_guest_dst_scope.sh` (targeted: deletes the two rules by handle
+and the two sets in one transaction, strips the conf, restores the pre-change
+`.py`). Tested on a netns clone of the tables in both bases (conf restored byte
+for byte, tables identical) and for real on b0.
+
+Also fixed on the way: conntrack prints IPv6 uncompressed and nft compressed,
+so an already-blocked v6 source was "BLOCKED" again every run (210 log lines for
+one Google Cloud scanner). Addresses are now normalised.
+
+Tests: `python3 base/sweepguard/test_sweepguard_dst.py`.

@@ -49,6 +49,26 @@ Safety (this runs at the edge; a mistake blocks paying customers)
   * The v4 family is authoritative for v4 clients: on the ip6 side they all
     arrive SNATed to the BASE's own VIP, so ip6 only judges NATIVE v6 sources
     and explicitly skips the 64:ff9b:1::/96 translation range.
+
+Only connections to OUR addresses count (2026-09-18)
+----------------------------------------------------
+Since 2026-08-15 every guest's Internet egress crosses the BASE with source
+10.64.x.y (v4) or its 2a01:4f9:c01f:e::/64 identity (v6). The detectors only
+looked at the DESTINATION PORT, so a guest talking to an Internet service that
+happens to live in 10000-39999 (a MetaTrader broker on AWS Global Accelerator
+at 214xx/220xx, RustDesk 21116, Syncthing 22000, a DigitalOcean service on
+25060...) was counted as "attacking our forwards". From 05/09 to 18/09 all 113
+guest blocks in the journal were exactly that, and vm570/vm581 were re-blocked
+every day — a blocked guest loses every NEW connection to those ports, i.e.
+its broker reconnect.
+
+A forward only exists on OUR addresses (main IPs of both bases, the VIPs and
+the internal ranges). The chain now records guests only when they go there
+(`ip daddr != @nuestras4 accept`, see deploy_guest_dst_scope.sh), and here the
+conntrack detectors skip any flow whose ORIGINAL destination is outside the
+same set. The set lives in nftables (`nuestras4` / `nuestras6` in each
+rdpguard table) so there is ONE list; if it is missing this script falls back
+to the old behaviour (no destination filter) and says so in the log.
 """
 import ipaddress
 import json
@@ -95,8 +115,26 @@ def vm_slot(port):
 
 def in_range(port):
     return PORT_LO <= port <= PORT_HI
-# src= puede ser v4 (1.2.3.4) o v6 (2a01:...); dport= llega despues en la misma linea
-_CT_RE = re.compile(r"src=([0-9a-fA-F.:]+)\s.*?dport=(\d+)")
+# src= puede ser v4 (1.2.3.4) o v6 (2a01:...); dst= va justo detras y dport=
+# llega despues en la misma linea. Es la tupla ORIGINAL (la primera), o sea el
+# destino antes del DNAT: la VIP / IP principal a la que apunto el cliente.
+_CT_RE = re.compile(r"src=([0-9a-fA-F.:]+)\s+dst=([0-9a-fA-F.:]+)\s.*?dport=(\d+)")
+
+# Set de nftables con NUESTRAS direcciones (bases, VIPs, rangos internos): solo
+# lo que va ahi puede ser un ataque a un forward. Ver deploy_guest_dst_scope.sh.
+GUARDED_SET = {"ip": "nuestras4", "ip6": "nuestras6"}
+
+
+def canon(addr):
+    """Forma canonica de una IP. /proc/net/nf_conntrack escribe la v6 SIN
+    comprimir (2600:1900:...:0000:031a:0000:0000) y nft la devuelve comprimida
+    (2600:1900:...:0:31a::): sin normalizar, `addr in already` no casaba nunca y
+    cada pasada volvia a loguear BLOCKED de una fuente ya bloqueada (210 lineas
+    en b1 del 10/09 al 18/09 para un solo escaner de Google Cloud)."""
+    try:
+        return ipaddress.ip_address(addr).compressed
+    except ValueError:
+        return addr
 
 
 def log(msg):
@@ -168,6 +206,50 @@ def covered_by_lists(family, addr, allow_elems):
     return False
 
 
+def guarded_destinations(family):
+    """Predicate addr->bool for 'this destination is one of ours', built from
+    the `nuestras4`/`nuestras6` set. Returns None when the set does not exist,
+    which means: no destination filter (the behaviour before 2026-09-18)."""
+    name = GUARDED_SET[family]
+    found = False
+    nets, ranges = [], []
+    for obj in nft_json(["list", "set", family, "rdpguard", name]):
+        s = obj.get("set")
+        if not s or s.get("name") != name:
+            continue
+        found = True
+        for e in s.get("elem", []) or []:
+            try:
+                if isinstance(e, str):
+                    nets.append(ipaddress.ip_network(e))
+                elif isinstance(e, dict) and "prefix" in e:
+                    p = e["prefix"]
+                    nets.append(ipaddress.ip_network(f"{p['addr']}/{p['len']}", strict=False))
+                elif isinstance(e, dict) and "range" in e:
+                    lo, hi = e["range"]
+                    ranges.append((ipaddress.ip_address(lo), ipaddress.ip_address(hi)))
+                elif isinstance(e, dict) and "elem" in e:
+                    v = e["elem"].get("val")
+                    if isinstance(v, str):
+                        nets.append(ipaddress.ip_network(v))
+            except (ValueError, KeyError, TypeError):
+                continue
+    if not found:
+        return None
+    if not nets and not ranges:
+        # un set vacio NO debe apagar la deteccion entera (todo seria "ajeno")
+        log(f"{family}: set {name} is EMPTY — destination filter OFF")
+        return None
+
+    def ours(addr):
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return True       # no parseable -> se cuenta, como antes
+        return any(ip in n for n in nets) or any(lo <= ip <= hi for lo, hi in ranges)
+    return ours
+
+
 def sweepers(family, cfg):
     """(addr -> distinct port count) for sources over the threshold."""
     per_src = defaultdict(set)
@@ -201,12 +283,13 @@ def sweepers(family, cfg):
 CONNTRACK = "/proc/net/nf_conntrack"
 
 
-def flooders(family, cfg):
+def flooders(family, cfg, ours=None):
     """(addr -> live RDP connection count) for sources over `maxConns`.
 
     Counts what the source is holding open RIGHT NOW, which needs no state
     between runs and cannot be evaded by going slow — the trick that defeats
-    the port-diversity detector."""
+    the port-diversity detector. `ours` (see guarded_destinations) drops flows
+    that do not go to one of our addresses: a guest's Internet egress."""
     want = "ipv4" if family == "ip" else "ipv6"
     per_src = defaultdict(int)
     try:
@@ -219,9 +302,11 @@ def flooders(family, cfg):
                 m = _CT_RE.search(ln)
                 if not m:
                     continue
-                if not in_range(int(m.group(2))):
+                if not in_range(int(m.group(3))):
                     continue
-                addr = m.group(1)
+                if ours is not None and not ours(m.group(2)):
+                    continue          # va a Internet, no a un forward nuestro
+                addr = canon(m.group(1))
                 if family == "ip6":
                     try:
                         if ipaddress.ip_address(addr) in NAT64:
@@ -237,7 +322,7 @@ def flooders(family, cfg):
     return {a: n for a, n in per_src.items() if n >= cfg["maxConns"]}
 
 
-def hot_port_abusers(family, cfg):
+def hot_port_abusers(family, cfg, ours=None):
     """(addr -> (conns, port)) for sources piling connections onto ONE attacked port.
 
     Detectors 1 and 2 both miss the slow DISTRIBUTED attack on a single VM:
@@ -298,10 +383,12 @@ def hot_port_abusers(family, cfg):
                 m = _CT_RE.search(ln)
                 if not m:
                     continue
-                port = int(m.group(2))
+                port = int(m.group(3))
                 if not in_range(port):
                     continue
-                addr = m.group(1)
+                if ours is not None and not ours(m.group(2)):
+                    continue          # va a Internet, no a un forward nuestro
+                addr = canon(m.group(1))
                 if family == "ip6":
                     try:
                         if ipaddress.ip_address(addr) in NAT64:
@@ -327,19 +414,23 @@ def hot_port_abusers(family, cfg):
 
 
 def run_family(family, cfg):
+    ours = guarded_destinations(family)
+    if ours is None:
+        log(f"{family}: set {GUARDED_SET[family]} not found — conntrack detectors "
+            f"count EVERY destination (guest Internet egress included)")
     # tres detectores independientes; la razon se conserva para el log
     cand = {a: ("ports", n, None) for a, n in sweepers(family, cfg).items()}
-    for a, n in flooders(family, cfg).items():
+    for a, n in flooders(family, cfg, ours).items():
         if a not in cand:                      # diversidad de puertos manda
             cand[a] = ("conns", n, None)
-    for a, (n, port) in hot_port_abusers(family, cfg).items():
+    for a, (n, port) in hot_port_abusers(family, cfg, ours).items():
         if a not in cand:
             cand[a] = ("hotport", n, port)
     if not cand:
         return 0
     allow = set_elements(family, "bf_allow")
     static = set_elements(family, "bf_static")
-    already = plain_addrs(family, "bf_auto")
+    already = {canon(a) for a in plain_addrs(family, "bf_auto")}
 
     picked = []
     for addr, (why, metric, port) in sorted(cand.items(), key=lambda kv: -kv[1][1]):
