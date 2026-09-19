@@ -135,6 +135,43 @@ def test_fleet_never_bypasses_notice_window_but_canaries_work(sbn):
         assert any("7 dias" in n for n in notes)
 
 
+def test_immediate_operator_approval_accepts_cached_iso_timestamp(sbn):
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 9, 19, 15, 24, 36, tzinfo=timezone.utc)
+    approval = {
+        "mode": "immediate_operator",
+        "approvedAt": (now - timedelta(seconds=1)).isoformat(),
+        "reason": "F6 validated; operator authorized immediate rollout.",
+    }
+    raw = cfg(noticeCompletedAt=None, fleetNotBefore=None, fleetActivationApproval=approval)
+    assert sbn._egress_fleet_ready(raw, now=now)
+    assert not sbn._egress_fleet_ready(dict(raw, fleetActivationApproval=None), now=now)
+
+
+@pytest.mark.parametrize("approval", [
+    None,
+    {},
+    {"mode": "immediate_operator", "approvedAt": "2026-09-19T15:24:35", "reason": "approved"},
+    {"mode": "immediate_operator", "approvedAt": "2026-09-19T15:24:35Z", "reason": "  "},
+    {"mode": "immediate_operator", "approvedAt": "2026-09-19T15:24:37Z", "reason": "approved"},
+    {"mode": "noticed", "approvedAt": "2026-09-19T15:24:35Z", "reason": "approved"},
+])
+def test_invalid_immediate_approval_does_not_bypass_notice_gate(sbn, approval):
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 19, 15, 24, 36, tzinfo=timezone.utc)
+    raw = cfg(noticeCompletedAt=None, fleetNotBefore=None, fleetActivationApproval=approval)
+    assert not sbn._egress_fleet_ready(raw, now=now)
+
+
+def test_notice_gate_still_requires_seven_full_days(sbn):
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 9, 19, 15, 24, 36, tzinfo=timezone.utc)
+    assert sbn._egress_fleet_ready(cfg(noticeCompletedAt=(now - timedelta(days=7)).isoformat(),
+                                       fleetNotBefore=now.isoformat()), now=now)
+    assert not sbn._egress_fleet_ready(cfg(noticeCompletedAt=(now - timedelta(days=7) + timedelta(seconds=1)).isoformat(),
+                                           fleetNotBefore=now.isoformat()), now=now)
+
+
 def test_config_cache_used_when_firestore_is_down(sbn):
     sbn.ensure_firebase = lambda: False
     assert sbn.load_egress_config() is None

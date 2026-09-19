@@ -1166,7 +1166,7 @@ def _egress_usable(raw_pool: dict) -> tuple[list, set] | None:
 
 
 def _egress_fleet_ready(raw: dict, now=None) -> bool:
-    """Keep fleet changes behind the completed seven-day customer notice.
+    """Keep fleet changes behind the notice gate or an explicit approval.
 
     Same contract as the API's egress_activation.fleet_activation_ready.
     Stored as ISO UTC strings so Firestore and the local cache agree.
@@ -1180,9 +1180,19 @@ def _egress_fleet_ready(raw: dict, now=None) -> bool:
         if not isinstance(value, datetime) or value.tzinfo is None:
             return None
         return value.astimezone(timezone.utc)
-    notice, start = aware(raw.get("noticeCompletedAt")), aware(raw.get("fleetNotBefore"))
     current = aware(now) if now is not None else datetime.now(timezone.utc)
-    return bool(notice and start and current and current >= start
+    if current is None:
+        return False
+    approval = raw.get("fleetActivationApproval")
+    if isinstance(approval, dict):
+        approved_at = aware(approval.get("approvedAt"))
+        reason = approval.get("reason")
+        if (approval.get("mode") == "immediate_operator"
+                and approved_at is not None and approved_at <= current
+                and isinstance(reason, str) and reason.strip()):
+            return True
+    notice, start = aware(raw.get("noticeCompletedAt")), aware(raw.get("fleetNotBefore"))
+    return bool(notice and start and current >= start
                 and start - notice >= timedelta(days=7))
 
 
