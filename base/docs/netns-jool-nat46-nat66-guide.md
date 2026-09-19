@@ -1,5 +1,11 @@
 # NAT46 + NAT66 Router (Jool + Netns + nftables)
 
+This is the Jool/static topology component, not the whole current BASE build.
+For a new or replacement BASE, start with the
+[current bootstrap checklist](egress-pools-base-bootstrap.md), which also
+covers stable guest routes, outbound pools, sweepguard and boot validation.
+Apply the initial ruleset only on a cold host with no customer traffic.
+
 ## Overview
 
 This guide assumes a **clean install of Debian 13** (trixie) on the router host. It implements:

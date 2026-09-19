@@ -5,6 +5,9 @@ The end-to-end behaviour with real packets lives in test-egress-pools-netns.py.
 import importlib.util
 import json
 import logging
+import re
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -26,6 +29,53 @@ def sbn(tmp_path, monkeypatch):
     mod.EGRESS_CONFIG_CACHE = tmp_path / "egress-pools.json"
     mod.EGRESS_POOLS_FORCE_OFF = False
     return mod
+
+
+def test_bootstrap_config_builds_guest_routes_and_preserves_transit(sbn, monkeypatch):
+    """Exercise the renderer with the config a clean BASE actually receives."""
+    setup = (Path(__file__).parents[1] / "base_setup.sh").read_text()
+    env = setup.split("cat >/etc/default/base-nat <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+    values = {}
+    for line in env.splitlines():
+        words = shlex.split(line, comments=True)
+        if words:
+            key, value = words[0].split("=", 1)
+            values[key] = value
+    for key in ("IDENT_PREFIX", "TRANSIT_PREFIX", "VM_V4_PREFIX"):
+        monkeypatch.setattr(sbn, key, values.get(key, ""))
+    prefix = re.search(r"echo 'TUNNEL_IFACE_PREFIX=([^']+)'", setup).group(1)
+    monkeypatch.setattr(sbn, "TUNNEL_IFACE_PREFIX", prefix)
+    monkeypatch.setattr(sbn, "_iface_exists", lambda _: True)
+    commands = []
+
+    def run(cmd, **_):
+        commands.append(cmd)
+        if cmd == ["ip", "-6", "route", "show"]:
+            return f"2a01:4f9:c01f:e:ffff::e40/127 dev {prefix}p228\n"
+        return ""
+
+    monkeypatch.setattr(sbn, "run", run)
+    sbn.reconcile_vm_routes({1096: {"ipv6": "2a01:4f9:c01f:e::448",
+                                   "ipv4": "10.64.4.72", "nodeId": "0000228-AX162-2-LTD"}})
+    assert ["ip", "-6", "route", "replace", "2a01:4f9:c01f:e::448/128", "dev", "tun-fp228"] in commands
+    assert ["ip", "-4", "route", "replace", "10.64.4.72/32", "dev", "tun-fp228"] in commands
+    assert not any("del" in cmd for cmd in commands), "node transit must survive VM route sync"
+
+
+@pytest.mark.parametrize("download_rc,installer_rc", [(1, 0), (0, 1), (0, 0)])
+def test_bootstrap_stops_when_pool_installation_fails(download_rc, installer_rc):
+    """Run only the real preparation guard with fake commands, never the installer."""
+    setup = (Path(__file__).parents[1] / "base_setup.sh").read_text()
+    block = setup.split("# Pools de IPv4 de salida por VM:", 1)[1].split("# Manual sync examples", 1)[0]
+    # Drop the first comment line's suffix; everything remaining is the real shell block.
+    block = block.split("\n", 1)[1]
+    script = (f"curl() {{ return {download_rc}; }}\n"
+              f"python3() {{ return {installer_rc}; }}\n"
+              "chmod() { :; }\n" + block + "\nprintf 'reached-sync'\n")
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    success = download_rc == installer_rc == 0
+    assert (result.returncode == 0) is success
+    assert ("reached-sync" in result.stdout) is success
 
 
 def cfg(**over):

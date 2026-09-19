@@ -1,5 +1,15 @@
 # Reemplazo de las BASES por hierro con ECC — runbook
 
+**Histórico; no ejecutar como receta actual.** Las bases ECC ya tomaron el
+relevo y el hierro antiguo fue retirado. Desde el 19/09/2026 la salida IPv4
+usa pools /26 por VM: la propuesta de SNAT a la VIP de §0.1 no es la
+configuración vigente. Para reconstruir una base usar
+[el bootstrap actual](egress-pools-base-bootstrap.md); para cambiar su hierro,
+seguir además el
+[procedimiento de sustitución con pools de la aplicación (§8.2)](https://github.com/NeuraVPS/NeuraVPS/blob/master/docs/EGRESS_IPV4_POOLS_ROLLOUT.md).
+Las fases inferiores quedan como contexto histórico, incluidos IDs, recuentos
+y opciones de rollback que ya no están disponibles.
+
 Cambio de las dos BASES (EX44 / i5-13500 / DDR4 **sin ECC**) por servidores con
 **64 GB DDR5 ECC + uplink 10G**. Complementa `dual-region-cutover.md`, que documenta
 el build de b0 del 2026-07-04 y cuyas trampas siguen vigentes.
