@@ -1,5 +1,10 @@
 # BASE bootstrap for dynamic forwarding sync (Jool + static nftables already persistent)
 #
+# Cold-host runbook: adapt the b0 example addresses/region and provision secrets
+# before executing. Never rerun this on a BASE carrying customer traffic: the
+# initial nftables restart replaces its ruleset. Complete installation order,
+# b0/b1 values and pre-cutover gates: docs/egress-pools-base-bootstrap.md.
+#
 # Assumptions:
 # - Base topology is already installed and persistent:
 #   - jool-nat46.service builds netns/Jool plumbing
@@ -7,6 +12,11 @@
 # - This setup only installs runtime sync services that:
 #   - reconcile dynamic VM forwardings in `ip6 nat prerouting` from Firestore
 #   - keep nginx proxmox_nodes map + firewall sync commands
+
+# Set to the reviewed commit SHA when building a replacement BASE, so all
+# downloaded runtime files come from the same revision as this runbook.
+PROVISIONING_REF="${PROVISIONING_REF:-master}"
+PROVISIONING_RAW="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/${PROVISIONING_REF}"
 
 # 0) Interfaces example — current German b0 ECC (2026-09-05).
 # Per-base values: main IPs change; bind ALL failover VIPs with
@@ -81,7 +91,7 @@ pip3 install --break-system-packages --ignore-installed firebase-admin
 # 1b) sshd rate limits for fleet sweeps. node_health_check and run_remotes/*
 # hop through this BASE with bursts of short SSH connections; the default
 # MaxStartups 10:30:100 resets part of each burst (kex_exchange_identification).
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/50-neuravps-maxstartups.conf \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/50-neuravps-maxstartups.conf" \
   -o /etc/ssh/sshd_config.d/50-neuravps-maxstartups.conf
 sshd -t && systemctl reload ssh
 
@@ -115,6 +125,11 @@ SYNC_PVE_NODES_ON_BOOT=auto
 WAIT_FOR_IPS_SEC=120
 # Routed outbound /26 blocks, prepared on both bases (no SNAT activation).
 EGRESS_POOL_CIDRS="95.217.93.0/26 91.98.53.128/26"
+# Stable guest identity and node transit networks. Without IDENT_PREFIX the
+# reconciler deliberately disables per-VM IPv6 routes (legacy mode).
+IDENT_PREFIX=2a01:4f9:c01f:e::/64
+TRANSIT_PREFIX=2a01:4f9:c01f:e:ffff::/112
+VM_V4_PREFIX=10.64.0.0/16
 
 # Firebase + local state.
 FIREBASE_CREDENTIALS_FILE=/etc/firebase-credentials.json
@@ -136,13 +151,17 @@ EOF
 
 # 3) Install Firebase credentials before starting service.
 # install -m 600 firebase-credentials.json /etc/firebase-credentials.json
+if [ ! -s /etc/firebase-credentials.json ]; then
+  echo "ERROR: install /etc/firebase-credentials.json before bootstrapping BASE sync" >&2
+  exit 1
+fi
 
 # 4) Install runtime scripts from this repository.
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/sync-base-nat.py \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/sync-base-nat.py" \
   -o /usr/local/sbin/sync-base-nat.py
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/base-nat-boot.sh \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/base-nat-boot.sh" \
   -o /usr/local/sbin/base-nat-boot.sh
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/base-nat-boot.service \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/base-nat-boot.service" \
   -o /etc/systemd/system/base-nat-boot.service
 chmod +x /usr/local/sbin/base-nat-boot.sh /usr/local/sbin/sync-base-nat.py
 
@@ -184,7 +203,7 @@ for f in nvx-installers.sh nvx-installers.service nvx-installers.timer; do
     *.sh) destino=/usr/local/sbin/$f ;;
     *)    destino=/etc/systemd/system/$f ;;
   esac
-  curl -sSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/$f" -o "$destino"
+  curl -sSL "${PROVISIONING_RAW}/base/snippets/$f" -o "$destino"
 done
 chmod 755 /usr/local/sbin/nvx-installers.sh
 systemctl daemon-reload
@@ -197,9 +216,9 @@ systemctl enable --now nvx-installers.timer
 # `veth-host` netdev pair before nftables.service loads. The flowtable
 # in /etc/nftables.conf references this device; loading the ruleset
 # before it exists fails the entire load. See guide §7.1 + §8.0.
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/veth-host-setup.sh \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/veth-host-setup.sh" \
   -o /usr/local/sbin/veth-host-setup.sh
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/veth-host.service \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/veth-host.service" \
   -o /etc/systemd/system/veth-host.service
 chmod +x /usr/local/sbin/veth-host-setup.sh
 
@@ -208,10 +227,11 @@ chmod +x /usr/local/sbin/veth-host-setup.sh
 # and re-run sync after every (re)start so map elements are always
 # populated. See guide §7.1.
 mkdir -p /etc/systemd/system/nftables.service.d
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/nftables-base-nat.conf \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/nftables-base-nat.conf" \
   -o /etc/systemd/system/nftables.service.d/10-base-nat.conf
 
-# 5) Enable boot-time dynamic sync.
+# 5) Prepare the cold host's nftables runtime. Dynamic sync starts LAST, once
+# tunnels, pool structure and the nginx node map prerequisites are installed.
 # NOTE: /var/lib/base-nat MUST exist before (re)starting nftables — the
 # drop-in's ReadWritePaths references it and the unit dies with
 # status=226/NAMESPACE otherwise.
@@ -219,7 +239,6 @@ mkdir -p /var/lib/base-nat
 systemctl daemon-reload
 systemctl enable --now veth-host.service
 systemctl restart nftables.service
-systemctl enable --now base-nat-boot.service
 
 # 5bis) Tuneles base<->nodo anclados a las VIPs de failover.
 # Cada base levanta DOS tuneles por nodo, uno por VIP, los dos siempre en pie.
@@ -228,12 +247,12 @@ systemctl enable --now base-nat-boot.service
 # unico juego NO vale: al moverse la VIP los paquetes llegan dirigidos a una VIP
 # para la que no hay tunel con ese par (local, remoto) y se caen.
 # Ver docs/egress-failover-e-ipv6-estable.md §15 y §17.
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-base-tunnels.sh \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/neuravps-base-tunnels.sh" \
   -o /usr/local/sbin/neuravps-base-tunnels.sh
 chmod 755 /usr/local/sbin/neuravps-base-tunnels.sh
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-base-tunnels.service \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/neuravps-base-tunnels.service" \
   -o /etc/systemd/system/neuravps-base-tunnels.service
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/zz-neuravps-rpfilter.conf \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/zz-neuravps-rpfilter.conf" \
   -o /etc/sysctl.d/zz-neuravps-rpfilter.conf
 sysctl -p /etc/sysctl.d/zz-neuravps-rpfilter.conf
 
@@ -249,8 +268,8 @@ NODES_FILE=/etc/neuravps/tunnel-nodes.conf
 EOF
 # La tabla de nodos NO se siembra aqui: la genera sync-base-nat.py desde
 # Firestore en cada `sync nodes`, y relanza esta unidad cuando cambia. En el
-# primer arranque el script no encuentra el fichero, sale limpio sin hacer nada,
-# y base-nat-boot lo crea acto seguido con la flota entera. Ver
+# primer arranque el script no encuentra el fichero y sale sin hacer nada;
+# el paso final siembra `sync nodes` ANTES de arrancar base-nat-boot. Ver
 # snippets/tunnel-nodes.conf.example para el formato.
 
 # TUNNEL_IFACE_PREFIX le dice a sync-base-nat.py por que tunel colgar las rutas
@@ -265,17 +284,17 @@ systemctl enable --now neuravps-base-tunnels.service
 # Pools de IPv4 de salida por VM: estructura nft (mapas vacios = inerte). Una
 # base NUEVA la necesita antes de recibir una VIP, o sus invitados saldrian por
 # la IP principal aunque los pools esten encendidos. Idempotente; valida con
-# `nft -c` antes de tocar nada. Ver NeuraVPS docs/EGRESS_IPV4_POOLS_ROLLOUT.md.
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/persist-egress-pools-nft.py \
-  -o /usr/local/sbin/persist-egress-pools-nft.py
+# `nft -c` antes de tocar nada. Ver docs/egress-pools-base-bootstrap.md.
+if ! curl -fsSL "${PROVISIONING_RAW}/base/snippets/persist-egress-pools-nft.py" \
+  -o /usr/local/sbin/persist-egress-pools-nft.py; then
+  echo "ERROR: cannot download outbound pool installer" >&2
+  exit 1
+fi
 chmod +x /usr/local/sbin/persist-egress-pools-nft.py
-python3 /usr/local/sbin/persist-egress-pools-nft.py --apply || echo "AVISO: estructura de pools de salida NO aplicada"
-
-# 6) Validation.
-systemctl status --no-pager jool-nat46.service
-systemctl status --no-pager base-nat-boot.service
-python3 /usr/local/sbin/sync-base-nat.py sync
-nft -a list chain ip6 nat prerouting
+if ! python3 /usr/local/sbin/persist-egress-pools-nft.py --apply; then
+  echo "ERROR: outbound pool structure failed; BASE is not ready for traffic" >&2
+  exit 1
+fi
 
 # Manual sync examples (VM forwardings):
 # /usr/local/sbin/sync-base-nat.py sync
@@ -297,18 +316,18 @@ nft -a list chain ip6 nat prerouting
 
 mkdir -p /var/www/letsencrypt /etc/nginx/njs /opt/pve-set-ticket
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-proxy-map.conf \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/pve-proxy-map.conf" \
   -o /etc/nginx/conf.d/pve-proxy-map.conf
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-proxy-backends.map.conf.example \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/pve-proxy-backends.map.conf.example" \
   -o /etc/nginx/conf.d/pve-proxy-backends.map.conf
 # Host desconocido -> neuravps.com. SIN esto nginx usa el PRIMER bloque como
 # predeterminado, y cualquiera que entrase por la IP de la base --la que los
 # invitados ven como su salida-- se encontraba el navegador de archivos.
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/nginx-00-catchall.conf \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/nginx-00-catchall.conf" \
   -o /etc/nginx/sites-available/00-catchall.conf
 ln -sf /etc/nginx/sites-available/00-catchall.conf /etc/nginx/sites-enabled/00-catchall.conf
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/neuravps-redirects.conf \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/neuravps-redirects.conf" \
   -o /etc/nginx/sites-available/neuravps-redirects.conf
 
 ln -sf /etc/nginx/sites-available/neuravps-redirects.conf /etc/nginx/sites-enabled/neuravps-redirects.conf
@@ -343,7 +362,7 @@ rsync -avz -e ssh root@b1.neuravps.com:/etc/letsencrypt/ /etc/letsencrypt/
 #   server_name trading.neuravps.com sqx.neuravps.com trading-hel.neuravps.com sqx-hel.neuravps.com trading-fsn.neuravps.com sqx-fsn.neuravps.com;
 # (as built on b0, 2026-07-04)
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-set-ticket.py \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/pve-set-ticket.py" \
   -o /opt/pve-set-ticket/pve-set-ticket.py
 chmod 755 /opt/pve-set-ticket/pve-set-ticket.py
 
@@ -353,10 +372,28 @@ REDEEM_FUNCTION_URL=https://.../redeem_pve_ticket_token
 EOF
 chmod 600 /opt/pve-set-ticket/env
 
-curl -sSL https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/base/snippets/pve-set-ticket.service \
+curl -sSL "${PROVISIONING_RAW}/base/snippets/pve-set-ticket.service" \
   -o /etc/systemd/system/pve-set-ticket.service
 systemctl daemon-reload
 systemctl enable --now pve-set-ticket
+
+# Final seed, then boot-time dynamic sync. A fresh host has no tunnel-nodes.conf;
+# sync nodes writes it and the nginx map, and only THEN can VM routes be built.
+# The node sync intentionally tolerates a tunnel restart failure, so check the
+# required input and restart the tunnel unit explicitly before declaring success.
+if ! python3 /usr/local/sbin/sync-base-nat.py sync nodes \
+  || [ ! -s /etc/neuravps/tunnel-nodes.conf ] \
+  || ! systemctl restart neuravps-base-tunnels.service \
+  || ! systemctl enable nftables.service jool-nat46.service nginx.service \
+  || ! systemctl enable --now base-nat-boot.service; then
+  echo "ERROR: BASE bootstrap incomplete; do not move VIPs or egress blocks here" >&2
+  exit 1
+fi
+
+# Check the additional sweepguard, isolation and pre-cutover gates in the
+# runbook before handing over traffic. These checks do not replace that gate.
+systemctl status --no-pager jool-nat46.service base-nat-boot.service
+nft -a list chain ip6 nat prerouting
 
 # Re-sync nodes whenever proxmox_nodes changes (or run on-demand):
 #   /usr/local/sbin/sync-base-nat.py sync nodes

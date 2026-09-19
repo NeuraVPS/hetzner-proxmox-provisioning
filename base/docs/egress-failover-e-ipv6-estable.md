@@ -1,6 +1,14 @@
 # Salida por failover IPs + IPv6 estable por VM
 
-**Estado: DISEÑADO, NO EJECUTADO.** Documento de trabajo para la sesión de
+**Estado vigente (19/09/2026): desplegado, con pools IPv4 activos.** Este
+documento conserva el diseño y las decisiones históricas en orden cronológico;
+no ejecutar las recetas antiguas como una instalación actual. Para nodos y
+bases nuevas, usar [el bootstrap vigente](egress-pools-base-bootstrap.md) y
+[la operación de los pools](egress-pools-readiness-2026-09-19.md).
+Los túneles se anclan a las VIPs; los mapas de salida por VM preceden al SNAT
+general de la base, que se conserva como fallback.
+
+**Estado histórico de agosto: DISEÑADO, NO EJECUTADO.** Documento de trabajo para la sesión de
 prueba (operador + asistente). Todas las cifras de este documento están
 **medidas** el 2026-08-10/11 contra producción, no estimadas — para no volver a
 derivarlas mañana. Nada de lo aquí descrito se ha aplicado.
@@ -2532,7 +2540,10 @@ quedó revertido a 1500.
 
 ---
 
-## 25. Pools de IPv4 de salida por VM (2026-09-13, construido e inerte)
+## 25. Pools de IPv4 de salida por VM (construido el 13/09; activo desde el 19/09)
+
+La versión activa usa el libro `egressAssignments/<vmid>` y su copia operativa
+en `servers.egressIpv4`. [Estado y procedimiento vigentes](egress-pools-readiness-2026-09-19.md).
 
 La salida IPv4 deja de ser UNA IP por región (la principal de la base con la VIP)
 y pasa a un **par por VM**: una dirección de un bloque de Helsinki y otra de uno

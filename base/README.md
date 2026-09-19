@@ -7,12 +7,22 @@ ops tooling to reach the (otherwise firewalled) Proxmox nodes.
 
 | Piece | Where |
 |---|---|
-| Bootstrap runbook (executable) | `base_setup.sh` |
+| **Current BASE bootstrap, including outbound /26 pools** | [`docs/egress-pools-base-bootstrap.md`](docs/egress-pools-base-bootstrap.md) |
+| Runtime bootstrap steps (cold host; adapt addresses and secrets first) | `base_setup.sh` |
+| Outbound pool configuration, activation policy and rollback | [`docs/egress-pools-readiness-2026-09-19.md`](docs/egress-pools-readiness-2026-09-19.md) |
 | NAT46/NAT66 (netns + Jool) guide | `docs/netns-jool-nat46-nat66-guide.md` |
 | nginx PVE proxy / set-ticket / wildcard TLS guide | `docs/pve-proxy-base-server-setup.md` |
 | **Dual-region (DE+FI) cutover runbook** | `docs/dual-region-cutover.md` |
 | **Reemplazo de las BASES por hierro con ECC** | `docs/base-hardware-swap-ecc.md` |
 | Deployed config snippets (curl'd by the runbook) | `snippets/` |
+
+New Proxmox nodes use the root [`install.sh`](../install.sh) and
+[`first_boot.sh`](../first_boot.sh). Their guest routes already go through the
+BASE tunnels; the outbound /26 maps live on the BASEs, not on each node.
+Per-VM address assignments and activation/ownership state live in Firestore;
+the allocator, control plane and customer panel live in the
+[NeuraVPS application repository](https://github.com/NeuraVPS/NeuraVPS/blob/master/docs/EGRESS_IPV4_POOLS_ROLLOUT.md).
+Credentials and customer assignment ledgers must not be committed here.
 
 **`/root/migrate_vm.sh` (+ `migrate_vms_batch.sh`) are BASE-resident but
 NOT built by `base_setup.sh`** — canonical is repo `scripts/migrate_vm.sh`,
@@ -21,6 +31,14 @@ copied to each BASE by hand (backup + `bash -n` + md5 before `mv`). Its
 the BASE set changes (see the cutover runbook).
 
 ## Operational changes log
+
+- **2026-09-19 — Outbound /26 pools active; bootstrap audited.** The deployed
+  sync, boot, tunnel and pool persistence scripts match this repository. The
+  bootstrap now supplies the guest identity prefixes, seeds the tunnel inventory
+  before the first VM route sync, and aborts if pool preparation fails. The
+  current runbook above supersedes historical plans about using a single main
+  IP or moving IPv4 SNAT to the ingress VIP. The two ECC BASEs replaced the
+  legacy hardware, which is retired; it is no longer a rollback target.
 
 - **2026-07-04 — German b0 built as-built + dual-region names + NAT-sync race
   fix.** The new Falkenstein BASE (`b0.neuravps.com`, hostname `0000000-BASE`)
