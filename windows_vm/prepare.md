@@ -342,6 +342,15 @@ Get-AppxPackage -AllUsers |
 
 Then proceed with sysprep as documented in [README.md](README.md):
 
+> **Execution context:** run this `sysprep.exe` command from the elevated,
+> interactive built-in Administrator desktop. Do **not** run Sysprep under
+> Local System, including QGA configured as SYSTEM. Microsoft documents that
+> context as unsupported on Windows Server 2025 and associates it with missing
+> AppX/XAML registration and black screens:
+> [Fix Black Screen After Running Sysprep as System](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/sysprep-as-system-windows-11).
+> The QGA example is for `presysprep_cleanup.ps1`; run Sysprep separately in
+> the Administrator desktop.
+
 ```powershell
 cd C:\Windows\System32\Sysprep
 .\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend.xml
