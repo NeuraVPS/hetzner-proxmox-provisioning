@@ -53,6 +53,13 @@ wait_for_host_ip_addrs() {
 mkdir -p /var/lib/base-nat
 wait_for_host_ip_addrs
 
+# Routed egress subnets must not loop unsolicited traffic back to Hetzner.
+# /32 local test addresses and established conntrack translations still win.
+# Restore on boot on either base, before the per-VM NAT maps can be populated.
+for cidr in ${EGRESS_POOL_CIDRS:-}; do
+  ip -4 route replace blackhole "$cidr" proto static
+done
+
 # Sync dynamic VM forwardings from Firestore -> nftables (ip6 nat prerouting).
 python3 /usr/local/sbin/sync-base-nat.py sync
 

@@ -53,7 +53,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 #                    2a01:4f9:c01f:e::/64 (identidad de invitados), fd00::/8 (jool)
 # ⚠️ Si se añade una IP con forwards (p.ej. los /26 de egress-ipv4-pools cuando
 #    Hetzner los entregue), va AQUÍ y en vivo con `nft add element`.
-NUESTRAS4="116.202.118.221, 95.216.102.179, 94.130.3.118, 77.42.49.79, 10.0.0.0/8"
+NUESTRAS4="116.202.118.221, 95.216.102.179, 94.130.3.118, 77.42.49.79, 10.0.0.0/8, 95.217.93.0/26, 91.98.53.128/26"
 NUESTRAS6="2a01:4f8:2b01:124::/64, 2a01:4f9:2a:2d56::/64, 2a01:4f8:fff2:95::/64, 2a01:4f9:fff1:5f::/64, 2a01:4f9:c01f:e::/64, fd00::/8"
 RED4="10.64.0.0/16"
 RED6="2a01:4f9:c01f:e::/64"

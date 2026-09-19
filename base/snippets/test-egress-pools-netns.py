@@ -248,6 +248,7 @@ def load_sync_module(tmp: Path, inc: Path):
 
 def config(enabled=True, fleet=False, canary=(1096,), hel_owner=MAIN, fsn_owner="192.0.2.250"):
     return {"enabled": enabled, "fleetWide": fleet, "canaryVmids": list(canary),
+            "noticeCompletedAt": "2026-01-01T00:00:00Z", "fleetNotBefore": "2026-01-09T00:00:00Z",
             "pools": {"hel": {"cidrs": [HEL_BLOCK], "kind": "failover", "activeServerIp": hel_owner},
                       "fsn": {"cidrs": [FSN_BLOCK], "kind": "failover", "activeServerIp": fsn_owner}}}
 

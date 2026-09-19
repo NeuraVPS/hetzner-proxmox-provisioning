@@ -113,6 +113,8 @@ NFT_MANAGED_RULE_COMMENT_PREFIX=sync-base-nat
 # Boot behavior.
 SYNC_PVE_NODES_ON_BOOT=auto
 WAIT_FOR_IPS_SEC=120
+# Routed outbound /26 blocks, prepared on both bases (no SNAT activation).
+EGRESS_POOL_CIDRS="95.217.93.0/26 91.98.53.128/26"
 
 # Firebase + local state.
 FIREBASE_CREDENTIALS_FILE=/etc/firebase-credentials.json
