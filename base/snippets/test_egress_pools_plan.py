@@ -143,7 +143,9 @@ def test_immediate_operator_approval_accepts_cached_iso_timestamp(sbn):
         "approvedAt": (now - timedelta(seconds=1)).isoformat(),
         "reason": "F6 validated; operator authorized immediate rollout.",
     }
-    assert sbn._egress_fleet_ready(cfg(fleetActivationApproval=approval), now=now)
+    raw = cfg(noticeCompletedAt=None, fleetNotBefore=None, fleetActivationApproval=approval)
+    assert sbn._egress_fleet_ready(raw, now=now)
+    assert not sbn._egress_fleet_ready(dict(raw, fleetActivationApproval=None), now=now)
 
 
 @pytest.mark.parametrize("approval", [
