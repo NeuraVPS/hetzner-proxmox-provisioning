@@ -30,6 +30,7 @@ def sbn(tmp_path, monkeypatch):
 
 def cfg(**over):
     c = {"enabled": True, "fleetWide": True, "canaryVmids": [],
+         "noticeCompletedAt": "2026-01-01T00:00:00Z", "fleetNotBefore": "2026-01-09T00:00:00Z",
          "pools": {"hel": {"cidrs": ["198.51.100.0/26"], "kind": "failover", "activeServerIp": MAIN},
                    "fsn": {"cidrs": ["203.0.113.64/26"], "kind": "failover", "activeServerIp": OTHER}}}
     c.update(over)
@@ -120,6 +121,18 @@ def test_force_off(sbn):
     sbn.EGRESS_POOLS_FORCE_OFF = True
     d = desired(sbn, vm1096=("198.51.100.5", ""))
     assert sbn.egress_plan(d, cfg(), MAIN)[0] == {"hel": {}, "fsn": {}}
+
+
+def test_fleet_never_bypasses_notice_window_but_canaries_work(sbn):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    d = desired(sbn, vm1096=("198.51.100.5", "203.0.113.69"), vm1097=("198.51.100.6", "203.0.113.70"))
+    for patch in ({"noticeCompletedAt": None}, {"fleetNotBefore": "invalid"},
+                  {"noticeCompletedAt": now.isoformat(), "fleetNotBefore": now.isoformat()},
+                  {"noticeCompletedAt": (now-timedelta(days=8)).isoformat(), "fleetNotBefore": (now+timedelta(days=1)).isoformat()}):
+        plan, notes = sbn.egress_plan(d, cfg(canaryVmids=[1096], **patch), MAIN)
+        assert plan["hel"] == {"10.64.4.72": "198.51.100.5"}
+        assert any("7 dias" in n for n in notes)
 
 
 def test_config_cache_used_when_firestore_is_down(sbn):

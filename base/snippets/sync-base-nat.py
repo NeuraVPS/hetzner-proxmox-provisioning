@@ -50,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import functools
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -1164,6 +1165,27 @@ def _egress_usable(raw_pool: dict) -> tuple[list, set] | None:
     return nets, usable
 
 
+def _egress_fleet_ready(raw: dict, now=None) -> bool:
+    """Keep fleet changes behind the completed seven-day customer notice.
+
+    Same contract as the API's egress_activation.fleet_activation_ready.
+    Stored as ISO UTC strings so Firestore and the local cache agree.
+    """
+    def aware(value):
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            return None
+        return value.astimezone(timezone.utc)
+    notice, start = aware(raw.get("noticeCompletedAt")), aware(raw.get("fleetNotBefore"))
+    current = aware(now) if now is not None else datetime.now(timezone.utc)
+    return bool(notice and start and current and current >= start
+                and start - notice >= timedelta(days=7))
+
+
 def egress_plan(desired: dict[int, dict], raw: dict | None,
                 main_ipv4: str) -> tuple[dict[str, dict[str, str]], list[str]]:
     """Puro. {region: {ipv4 privada: ipv4 publica}} para ESTA base + notas."""
@@ -1186,13 +1208,15 @@ def egress_plan(desired: dict[int, dict], raw: dict | None,
         canary = {int(v) for v in (raw.get("canaryVmids") or [])}
     except (TypeError, ValueError):
         return vacio, ["canaryVmids ilegible: pools apagados"]
-    fleet = raw.get("fleetWide") is True
+    fleet = raw.get("fleetWide") is True and _egress_fleet_ready(raw)
     try:
         main = str(ipaddress.IPv4Address(main_ipv4))
     except ValueError:
         return vacio, [f"MAIN_IPV4 {main_ipv4!r} ilegible: esta base no reclama ningun bloque"]
     propios = [r for r in EGRESS_REGIONS if pools_raw[r].get("activeServerIp") == main]
     notas = [f"bloques enrutados a esta base ({main}): {propios or 'ninguno'}"]
+    if raw.get("fleetWide") is True and not fleet:
+        notas.append("fleetWide pendiente de fecha y aviso completo con 7 dias: solo canarios")
     if not propios:
         return vacio, notas
     try:
