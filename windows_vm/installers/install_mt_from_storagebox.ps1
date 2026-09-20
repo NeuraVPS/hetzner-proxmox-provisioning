@@ -453,6 +453,42 @@ function Update-MtShellIconCache {
     }
 }
 
+function Install-MtLaunchHook {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $programData = 'C:\ProgramData\NeuraVPS'
+    New-Item -ItemType Directory -Path $programData -Force | Out-Null
+    # Pin the launcher source to the reviewed commit. A moving branch would make
+    # an otherwise idempotent app install change behaviour underneath us.
+    $hookUrl = 'https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/1ecfca1bdb5b4e981f9ed9c7f66f471a911611d/windows_vm/hooks/mt_hook_launcher.vbs'
+    $hookPath = Join-Path $programData 'mt_hook_launcher.vbs'
+    $expectedHash = '9B372A41E0A6BB2F910D24C76480D356F9C26485ED7167A0CD006F73E949456B'
+    $tmp = Join-Path $env:TEMP ("neuravps-mt-hook-{0}.vbs" -f [guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-WebRequest -Uri $hookUrl -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw "MetaTrader hook hash mismatch for immutable revision $hookUrl"
+        }
+        Copy-Item -LiteralPath $tmp -Destination $hookPath -Force
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    if ((Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw "MetaTrader hook copy verification failed: $hookPath"
+    }
+
+    $ifeoRoot = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+    foreach ($name in @('terminal64.exe','metaeditor64.exe','terminal.exe','metaeditor.exe')) {
+        $exe = Join-Path $InstallRoot $name
+        if (-not (Test-Path -LiteralPath $exe)) { continue }
+        $ifeo = Join-Path $ifeoRoot $name
+        $debugger = '"' + (Join-Path $env:SystemRoot 'System32\wscript.exe') + '" "' + $hookPath + '"'
+        if (-not (Test-Path -LiteralPath $ifeo)) { New-Item -Path $ifeo | Out-Null }
+        New-ItemProperty -Path $ifeo -Name Debugger -PropertyType String -Value $debugger -Force | Out-Null
+        $actual = (Get-ItemProperty -LiteralPath $ifeo -Name Debugger).Debugger
+        if ($actual -ne $debugger) { throw "MetaTrader IFEO hook verification failed for $name" }
+    }
+    if (-not (Test-Path -LiteralPath $hookPath)) { throw "MetaTrader hook was not installed: $hookPath" }
+}
+
 try {
     Connect-StorageBoxUnc -RemotePath $UncRoot -User $SmbUser -Password $SmbPassword
 
@@ -501,6 +537,8 @@ try {
         }
         Copy-Item -LiteralPath $firstPath -Destination $dest -Recurse -Force
     }
+
+    Install-MtLaunchHook -InstallRoot $firstPath
 
     if ($NoDesktopShortcuts) {
         # Remove any pre-existing desktop shortcuts for this MT version (Public + user desktops).
