@@ -8,7 +8,19 @@ Recommended cleanup steps **before** running sysprep on a Windows template VM, t
 
 Run all commands in **PowerShell as Administrator**. Order matters — do cleanup first, then defrag, then zero free space, **then** sysprep.
 
-> **Canonical script:** [`presysprep_cleanup.ps1`](presysprep_cleanup.ps1) in this directory runs steps 0–17 unattended and logs to `C:\ProgramData\NeuraVPS\presysprep.log`. The sections below explain each step; the script is the executable source of truth. See [Running it remotely via the guest agent](#running-it-remotely-via-the-guest-agent-qga) for the hands-off procedure used on 2026-07-06.
+## Current safe defaults (2026-09-20)
+
+The executable script is intentionally conservative for the Server 2025
+templates. It does not repeat `DISM /ResetBase`, reset `DataStore`/`catroot2` or
+BITS state, defragment by habit, clear Event Logs, or run SDelete unless the
+corresponding explicit switch is supplied after a measurement. It always
+prioritizes `Optimize-Volume -ReTrim`; `-RunSDelete` is a separate, measured
+thin-provisioning fallback. It preserves `C:\Windows\Panther`, does not remove
+AppX packages, and does not invoke Sysprep or modify `unattend.xml`. Guest VSS
+shadows and `hiberfil.sys` are handled only when present. Save Sysprep and
+servicing evidence before any optional log clearing.
+
+> **Canonical script:** [`presysprep_cleanup.ps1`](presysprep_cleanup.ps1) in this directory runs 16 safe-by-default steps and logs to `C:\ProgramData\NeuraVPS\presysprep.log`. It does not run Sysprep. DISM `/ResetBase`, NGEN, defrag, SDelete zero-fill and Event Log clearing require explicit switches; DataStore, catroot2 and BITS job state stay preserved by default. The sections below are historical rationale and the script is the executable source of truth.
 
 ---
 

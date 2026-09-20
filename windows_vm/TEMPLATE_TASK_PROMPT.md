@@ -165,6 +165,29 @@ lanzamiento (el VBS la quita y la repone; si se quedó quitada, algo falló).
 
 ## Reglas de trabajo
 
+### Cleanup pre-Sysprep vigente
+
+Usa `presysprep_cleanup.ps1` con sus valores seguros por defecto. No repitas
+DISM `/ResetBase` por defecto; no resetees `SoftwareDistribution\DataStore`,
+`catroot2` ni el estado BITS; no ejecutes defrag por costumbre; no limpies Event
+Logs hasta copiar la evidencia; y no uses SDelete salvo que una medición
+demuestre que TRIM no recupera `REFER` y se suministre `-RunSDelete` de forma
+explícita. `-RunResetBase`, `-RunNgen`, `-RunDefrag`, `-RunSDelete` y
+`-ClearEventLogs` son switches deliberados. El script preserva Panther, no
+elimina AppX/Feedback Hub/DesktopAppInstaller y no ejecuta Sysprep ni modifica
+`unattend.xml`. VSS y hibernación solo se actúan si existen.
+
+Sysprep se lanza manualmente desde el escritorio interactivo elevado de
+Administrator/Administrador. QGA/SYSTEM sirve para cleanup, pero Microsoft no
+soporta Sysprep bajo LocalSystem en Server 2025. La aceptación exige clonar,
+arrancar y verificar RDP, Explorer/UI, red/DHCP, SSH y fingerprint nueva, SID
+integrada `-500`, AppX CBS/Core/XAML y Feedback Hub, antes de exportar.
+
+Antes de publicar, el config canónico debe contener exactamente un comentario
+`# neuravps-stream-template-key: windows-es-YYYYMMDD` o
+`windows-en-YYYYMMDD`; la publicación debe rechazar marker ausente, duplicado o
+incongruente.
+
 - Rama → PR → self-merge. No toques `master` directamente.
 - No modifiques los `.vbs` existentes salvo que encuentres un fallo real; si lo
   haces, explica por qué en el PR.

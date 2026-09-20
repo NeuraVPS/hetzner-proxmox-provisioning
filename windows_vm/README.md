@@ -187,8 +187,8 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
   > it per VM via `set_user_password`. Note the account name differs per
   > template: **`Administrador` in windows-es, `Administrator` in windows-en**.
 
-- Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). [prepare.md](prepare.md) documents every step (DISM `/ResetBase`, NGEN, SoftwareDistribution, Delivery Optimization, winget caches, SSH host key wipe, defrag/TRIM, SDelete zero-fill) and the remote-run procedure
-- From Linux, remove recovery partition
+- Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). The current script is safe-by-default: it does not repeat DISM `/ResetBase`, reset `DataStore`/`catroot2`/BITS state, defragment, clear Event Logs, or run SDelete unless explicit switches are supplied. It preserves Panther and AppX packages, removes SSH host keys, and prioritizes TRIM. See [prepare.md](prepare.md).
+- Recovery partition removal is a separate, already-completed Linux-side image task; it is not part of the guest cleanup script.
 - **Back up the current templates on the Storage Box before exporting** —
   `OVERWRITE=1` deletes the old streams. The Storage Box does have its own
   daily backups kept for 30 days, so this is a belt-and-braces step that makes
@@ -223,6 +223,21 @@ cd C:\Windows\System32\Sysprep
 cd C:\Windows\System32\Sysprep
 .\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend.xml
 ```
+
+> Sysprep must be started manually from the elevated interactive
+> Administrator/Administrador desktop. Do not invoke it through QGA/SYSTEM,
+> do not modify the existing `unattend.xml`, and do not add `CopyProfile`.
+
+## Export handoff marker
+
+Before exporting, the operator records the immutable template key in the
+canonical config as a comment in the form
+`# neuravps-stream-template-key: windows-es-YYYYMMDD` (or `windows-en-YYYYMMDD`).
+The export/publication consumer must validate this marker and use that exact
+immutable key for all disk and firewall reads. A missing, duplicated, or
+mismatched marker is a publication failure; do not fall back to a mutable
+`windows-es`/`windows-en` alias. Keep the marker normalization lowercase with
+single hyphens and no surrounding quotes.
 
 Disable *automatic* Windows Update (manual updates from Settings still work)
 
