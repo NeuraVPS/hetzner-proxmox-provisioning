@@ -236,6 +236,14 @@ mismatched marker is a publication failure; do not fall back to a mutable
 `windows-es`/`windows-en` alias. Keep the marker normalization lowercase with
 single hyphens and no surrounding quotes.
 
+Publication is a two-part handoff. First validate the staged streams with the
+canary VMs and deploy the verified versioned installer hooks to **both** BASE
+package endpoints (`files-hel` and `files-fsn`). Only after both BASE checks
+pass, update the canonical `windows-es`/`windows-en` `config.conf` with the
+single immutable marker; the canonical directory receives config metadata only
+and never replaces the staged stream files. New restores then read the marker
+and consume the already-verified immutable streams and hook revision together.
+
 Disable *automatic* Windows Update (manual updates from Settings still work)
 
 ```powershell

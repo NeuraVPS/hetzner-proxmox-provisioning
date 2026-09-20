@@ -47,6 +47,9 @@ def main() -> None:
     assert "neuravps-stream-template-key" in SOURCE
     assert "zfs destroy" not in SOURCE
     assert "SNAPSHOT_NAME=\"${SNAPSHOT_NAME:-export-" in SOURCE
+    assert 'if ! REMOTE_EXISTING_STREAMS=$("${SSH_BASE[@]}"' in SOURCE
+    assert "Could not inspect existing template" in SOURCE
+    assert "bash -s -- ${REMOTE_TEMPLATE_KEY} <new_vmid>" in SOURCE
     assert run_snapshot_guard("cpu: x86-64-v4\nscsi0: vm-100-disk-0\n") is False
     assert run_snapshot_guard(
         "cpu: x86-64-v4\nscsi0: vm-100-disk-0\n[snapshot-before]\nsnapname: before\n"
@@ -125,6 +128,32 @@ def main() -> None:
         assert result.returncode != 0
         assert {name: (dest / name).read_text() for name in old} == old
         assert not list(dest.glob(".nvx-*"))
+
+    # The remote preflight must distinguish an existing stream from an SSH /
+    # restricted-shell error. Both cases must stop before mkdir or streaming.
+    guard_start = SOURCE.index("REMOTE_EXISTING_STREAMS=''")
+    guard_end = SOURCE.index("# Create the remote directory", guard_start)
+    guard = SOURCE[guard_start:guard_end]
+    with tempfile.TemporaryDirectory() as td:
+        fake = Path(td) / "ssh"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "case \"$MODE\" in populated) printf 'disk0.stream.zst\\n';; transport) exit 23;; esac\n"
+        )
+        fake.chmod(0o755)
+        for mode in ("populated", "transport"):
+            check = Path(td) / f"check-{mode}.sh"
+            check.write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\n"
+                "SSH_BASE=(ssh)\nREMOTE_BASE=/home/templates/windows-es-20260920\n"
+                "REMOTE_TEMPLATE_KEY=windows-es-20260920\nOVERWRITE=0\n"
+                "die(){ echo \"$*\" >&2; exit 42; }\n"
+                + guard
+            )
+            check.chmod(0o755)
+            env = os.environ.copy(); env.update({"PATH": f"{td}:{env['PATH']}", "MODE": mode})
+            result = subprocess.run([str(check)], env=env, capture_output=True, text=True)
+            assert result.returncode == 42, (mode, result.stdout, result.stderr)
     print("export template fixture checks passed")
 
 

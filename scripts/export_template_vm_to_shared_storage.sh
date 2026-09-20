@@ -357,8 +357,14 @@ REMOTE_BASE="${base}/${REMOTE_TEMPLATE_KEY}"
 echo "Export destination key: ${REMOTE_TEMPLATE_KEY}"
 
 # Refuse to overwrite an existing template unless the explicitly legacy direct
-# workflow is selected. Normal exports use a unique dated staging key.
-if "${SSH_BASE[@]}" "ls -1 '${REMOTE_BASE}'/disk*.stream.zst 2>/dev/null | head -n1" 2>/dev/null | grep -q .; then
+# workflow is selected. Normal exports use a unique dated staging key. Capture
+# the SSH status separately: a transport/restricted-shell error must not look
+# like an empty directory and lead to an overwrite.
+REMOTE_EXISTING_STREAMS=''
+if ! REMOTE_EXISTING_STREAMS=$("${SSH_BASE[@]}" "ls -1 '${REMOTE_BASE}'/disk*.stream.zst 2>/dev/null | head -n1" 2>&1); then
+  die "Could not inspect existing template at ${REMOTE_BASE}; refusing to export"
+fi
+if [[ -n "$REMOTE_EXISTING_STREAMS" ]]; then
   if [[ "$OVERWRITE" != "1" ]]; then
     die "Template '${REMOTE_TEMPLATE_KEY}' already exists at ${REMOTE_BASE} on the storage box. Use a new staging run or the explicit legacy overwrite workflow."
   fi
@@ -460,4 +466,4 @@ echo "  config:       ${REMOTE_BASE}/config.conf"
 [[ -f "$FW_PATH" ]] && echo "  firewall:     ${REMOTE_BASE}/firewall.fw"
 echo
 echo "Restore this template on any node with:"
-echo "  curl -fsSL \"https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=\$(date +%s)\" | bash -s -- ${TEMPLATE_KEY} <new_vmid>"
+echo "  curl -fsSL \"https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/restore_template_vm_from_shared_storage.sh?t=\$(date +%s)\" | bash -s -- ${REMOTE_TEMPLATE_KEY} <new_vmid>"
