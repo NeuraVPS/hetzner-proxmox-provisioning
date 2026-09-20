@@ -329,6 +329,8 @@ fi
 STREAM_KEY="$(sed -n '1s/^# neuravps-stream-template-key:[[:space:]]*//p' "$CONFIG_TMP")"
 if [[ -n "$STREAM_KEY" ]]; then
   [[ "$STREAM_KEY" =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid stream-template marker in ${REMOTE_CONFIG}"
+  [[ "$STREAM_KEY" != "windows-es" && "$STREAM_KEY" != "windows-en" ]] \
+    || die "Stream-template marker must name an immutable release, not a canonical alias"
   REMOTE_BASE="${base}/${STREAM_KEY}"
   REMOTE_CONFIG="${REMOTE_BASE}/config.conf"
   echo "Config pins template streams to immutable key: ${STREAM_KEY}"

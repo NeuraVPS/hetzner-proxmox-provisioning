@@ -349,6 +349,8 @@ if [[ "$LEGACY_DIRECT_EXPORT" == "1" ]]; then
   REMOTE_TEMPLATE_KEY="$TEMPLATE_KEY"
 elif [[ -n "$STAGING_KEY" ]]; then
   [[ "$STAGING_KEY" =~ ^[A-Za-z0-9_-]+$ ]] || die "STAGING_KEY may only contain [A-Za-z0-9_-]"
+  [[ "$STAGING_KEY" != "windows-es" && "$STAGING_KEY" != "windows-en" ]] \
+    || die "STAGING_KEY must name an immutable release, not a canonical alias"
   REMOTE_TEMPLATE_KEY="$STAGING_KEY"
 else
   REMOTE_TEMPLATE_KEY="${TEMPLATE_KEY}-$(date -u +%Y%m%d)"
@@ -356,28 +358,18 @@ fi
 REMOTE_BASE="${base}/${REMOTE_TEMPLATE_KEY}"
 echo "Export destination key: ${REMOTE_TEMPLATE_KEY}"
 
-# Refuse to overwrite an existing template unless the explicitly legacy direct
-# workflow is selected. Normal exports use a unique dated staging key. Capture
-# the SSH status separately: a transport/restricted-shell error must not look
-# like an empty directory and lead to an overwrite.
-REMOTE_EXISTING_STREAMS=''
-if ! REMOTE_EXISTING_STREAMS=$("${SSH_BASE[@]}" "ls -1 '${REMOTE_BASE}'/disk*.stream.zst 2>/dev/null | head -n1" 2>&1); then
-  die "Could not inspect existing template at ${REMOTE_BASE}; refusing to export"
-fi
-if [[ -n "$REMOTE_EXISTING_STREAMS" ]]; then
-  if [[ "$OVERWRITE" != "1" ]]; then
-    die "Template '${REMOTE_TEMPLATE_KEY}' already exists at ${REMOTE_BASE} on the storage box. Use a new staging run or the explicit legacy overwrite workflow."
-  fi
-  echo "WARN: Overwriting existing template at ${REMOTE_BASE}"
-fi
-
-# Create the remote directory; clean previous streams if overwriting (avoids stale disk<N> files
-# from a template that previously had more volumes)
+# Reserve the remote directory before taking snapshots. Normal staging uses an
+# exclusive mkdir (without -p): an existing directory or any SSH/restricted
+# shell error aborts before a stream can overwrite anything. Retries therefore
+# require a new STAGING_KEY. Only the explicitly legacy direct workflow may
+# reuse a directory and clean its files.
 echo "Preparing remote dir: ${REMOTE_BASE}"
-"${SSH_BASE[@]}" "mkdir -p '${REMOTE_BASE}'" || die "Could not create remote dir ${REMOTE_BASE}"
-if [[ "$OVERWRITE" == "1" ]]; then
+if [[ "$LEGACY_DIRECT_EXPORT" == "1" ]]; then
+  "${SSH_BASE[@]}" "mkdir -p '${REMOTE_BASE}'" || die "Could not create remote dir ${REMOTE_BASE}"
   "${SSH_BASE[@]}" "rm -f '${REMOTE_BASE}'/disk*.stream.zst '${REMOTE_BASE}/config.conf' '${REMOTE_BASE}/firewall.fw'" \
     || die "Failed to clean previous template files at ${REMOTE_BASE}"
+else
+  "${SSH_BASE[@]}" "mkdir '${REMOTE_BASE}'" || die "Could not reserve new staging dir ${REMOTE_BASE}; choose a new STAGING_KEY"
 fi
 
 # Take a new, dated snapshot atomically across all the VM's datasets. Existing VM
@@ -417,7 +409,9 @@ done
 # Upload only the effective current config. Snapshot/pending sections from the
 # raw /etc/pve file are deliberately never copied.
 EXPORT_CONF="$(mktemp)"
-printf '# neuravps-stream-template-key: %s\n' "$REMOTE_TEMPLATE_KEY" >"$EXPORT_CONF"
+if [[ "$LEGACY_DIRECT_EXPORT" != "1" ]]; then
+  printf '# neuravps-stream-template-key: %s\n' "$REMOTE_TEMPLATE_KEY" >"$EXPORT_CONF"
+fi
 cat "$CURRENT_CONF" >>"$EXPORT_CONF"
 echo "Uploading current config: qm config --current -> ${REMOTE_BASE}/config.conf"
 "${SCP_BASE[@]}" "$EXPORT_CONF" "${STORAGE_BOX_USER}@${STORAGE_BOX_HOST}:${REMOTE_BASE}/config.conf" \
