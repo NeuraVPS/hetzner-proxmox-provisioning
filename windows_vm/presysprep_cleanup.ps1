@@ -90,7 +90,16 @@ try {
   Step '15. SDelete zero-fill only with explicit switch'
   if ($RunSDelete) { $sdelete = "$env:WINDIR\System32\sdelete64.exe"; if (-not (Test-Path $sdelete)) { throw 'SDelete is absent; stage and verify it before using -RunSDelete' }; & $sdelete -accepteula -nobanner -z C: 2>&1 | Select-Object -Last 3; if ($LASTEXITCODE -ne 0) { throw "SDelete failed: $LASTEXITCODE" } }
   else { Write-Output 'SDelete skipped (use -RunSDelete only after measuring TRIM reclaim)' }
-  Step '16. Final ReTrim'; Optimize-Volume -DriveLetter C -ReTrim -Verbose
+  Step '16. Remove Winlogon DefaultPassword before sealing'
+  $winlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+  if (Get-ItemProperty -LiteralPath $winlogonPath -Name DefaultPassword -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -LiteralPath $winlogonPath -Name DefaultPassword -Force -ErrorAction Stop
+  }
+  if (Get-ItemProperty -LiteralPath $winlogonPath -Name DefaultPassword -ErrorAction SilentlyContinue) {
+    throw 'Winlogon DefaultPassword remains; refusing to seal template'
+  }
+  Write-Output 'Winlogon DefaultPassword absent; existing username/domain and SID500 credentials were not changed'
+  Step 'Final ReTrim'; Optimize-Volume -DriveLetter C -ReTrim -Verbose
   $after = (Get-Volume -DriveLetter C).SizeRemaining; Step ("Free after: {0:N1} GB (in-guest delta {1:+0.0;-0.0} GB)" -f ($after / 1GB), (($after-$before)/1GB))
   Step 'Final policy sanity check'; Get-Service wuauserv | Format-Table Name,Status,StartType | Out-String -Width 100 | Write-Output; Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue | Select-Object NoAutoUpdate,AUOptions | Out-String | Write-Output
   if ((Get-FileHash -LiteralPath $unattendPath -Algorithm SHA256).Hash -ne $unattendHash) { throw 'unattend.xml changed during cleanup' }

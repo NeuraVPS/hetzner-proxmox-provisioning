@@ -77,6 +77,9 @@ AppX, Feedback Hub, `DataStore`, `catroot2`, and BITS state. It clears only
 measured closed caches, removes SSH template identities, handles VSS/hibernation
 only when present, and prioritizes TRIM. DISM `/ResetBase`, NGEN, defrag,
 SDelete, and Event Log clearing require an explicit switch and measurement.
+Before sealing, it removes only the Winlogon `DefaultPassword` value and verifies
+that it is absent; the Administrator/SID500 account, username/domain values,
+policies, LSA and answer XML remain unchanged for per-clone provisioning.
 
 Start Sysprep in the elevated interactive Administrator/Administrador session.
 A self-deleting scheduled task with `Interactive` logon and `Highest` privileges
