@@ -423,9 +423,9 @@ Notes:
 
 ---
 
-## Expected savings
+## Historical measurement (not a current expectation)
 
-Measured 2026-07-06 on the windows-es / windows-en templates (Server 2025, 40 G volsize, ZFS lz4, `discard=on`), right after a Windows Update + winget app refresh. Full unattended run took **~7 min per VM** (both in parallel on p55); DISM `/ResetBase` was 4.5 min of that, sdelete ~1.5 min.
+Measured 2026-07-06 on the windows-es / windows-en templates (Server 2025, 40 G volsize, ZFS lz4, `discard=on`), right after a Windows Update refresh. That historical run used optional DISM `/ResetBase` and SDelete; it does not describe the current safe-default cleanup and must not be used as a promised saving.
 
 | Metric | windows-es (100) | windows-en (101) |
 |--------|------------------|------------------|

@@ -1,206 +1,81 @@
-# Prompt para el agente que actualiza las plantillas de Windows
+# Prompt operativo: actualización de plantillas Windows Server 2025
 
-> ## 🛑 CORRECCIÓN 2026-08-03 — LEE ESTO ANTES QUE NADA
->
-> **La Tarea 2 de abajo está MAL en su mitad de v144. NO cablees
-> `StrategyQuantX.exe`.** Ese hook **fork-bombea**, y no en teoría:
->
-> * En la caja de un cliente (vm 998): **90 `wscript.exe` en 33 segundos y SQX
->   sin arrancar ni una vez.**
-> * Reproducido en condiciones controladas (vm 1350, 2026-08-03): el QEMU del
->   invitado a **764 % de CPU** y el agente sin responder, partiendo de reposo.
->
-> Se ha retirado de las 122 máquinas de la flota. **En las plantillas solo se
-> cablea el hook de v143 (`StrategyQuantX_nocheck.exe`) y los cuatro de
-> MetaTrader.** Si `sqx144_hook_launcher.vbs` acaba en una plantilla, se lo
-> mandamos a cada cliente nuevo.
->
-> La **Tarea 1 (perfil de energía) sigue siendo correcta y es la prioritaria.**
->
-> Lo demás de la Tarea 2 se mantiene tal cual: la detección por CONTENIDO (no
-> por nombre de carpeta) sigue siendo la buena, sirve para saber qué versión
-> lleva la imagen, y el aviso de no hacer `New-Item -Force` sobre una clave
-> IFEO existente sigue vigente.
+Trabaja únicamente sobre `windows-es` y `windows-en` en el repositorio
+`hetzner-proxmox-provisioning`. Lee `README.md`, `POWER_PLAN.md`,
+`hooks/README.md` y `prepare.md` antes de actuar. No ejecutes cambios en VMs de
+clientes ni publiques streams sin canarios y revisión.
 
+## Preparación invitada
 
-> Copia todo lo que hay debajo de la línea y pásalo como prompt. Es autocontenido.
+1. Instala las actualizaciones aprobadas y .NET Framework 3.5. Conserva
+   Feedback Hub y el stub OS-serviced de DesktopAppInstaller/winget con sus
+   source packages. No fuerces la eliminación de AppX no removibles.
+2. Configura OpenSSH, NTP, Samba/firewall, política de contraseñas, UI, perfil,
+   `C:\NeuraData` y `C:\My Servers` según `README.md`.
+3. Aplica High performance y verifica cero núcleos aparcados con
+   `POWER_PLAN.md`.
+4. No dejes credenciales de autologon en la plantilla; provisioning las escribe
+   por VM.
 
----
+## Instaladores de aplicaciones
 
-Trabajas en el repositorio `hetzner-proxmox-provisioning` de NeuraVPS. Tu tarea
-es actualizar **las plantillas de Windows** (las imágenes que se clonan para
-cada VPS nuevo) para que salgan de fábrica con dos cosas que hoy faltan y que
-están costando rendimiento y averías a los clientes.
+Usa solo `windows_vm/installers/install_sqx_from_storagebox.ps1` y
+`install_mt_from_storagebox.ps1`. Descargan los VBS únicamente desde el cache
+verificado `/pkg/hooks/<revision>/` de `files-hel` o `files-fsn` y comprueban
+SHA-256.
 
-Lee primero, sin excepción:
+- SQX headless se configura con `set_java_headless.ps1` en el `.config` de la
+  aplicación. No uses una variable Java global.
+- El instalador puede aplicar IFEO `CpuPriorityClass=6` (AboveNormal) al
+  ejecutable previsto. Nunca cablees `StrategyQuantX.exe`; el launcher v144 fue
+  retirado por el riesgo de fork-bomb en instalaciones duales. No restaures
+  `sqx144_hook_launcher.vbs`.
+- MetaTrader recibe `/portable` solo después de su gate de datos portables.
+  No cambies el modo de datos de una instalación no portable.
+- No edites los VBS existentes sin una reproducción comportamental del defecto.
 
-- `windows_vm/README.md`
-- `windows_vm/POWER_PLAN.md`
-- `windows_vm/hooks/README.md` — **especialmente los cuatro "hard gates"**
-- `windows_vm/prepare.md` (dónde encaja el paso pre-sysprep)
+## Cleanup y Sysprep
 
-Los dos cambios ya están **documentados y validados en la flota viva**. Tu
-trabajo NO es rediseñarlos: es llevarlos a la plantilla para que los clientes
-nuevos no nazcan con el defecto.
+Ejecuta `presysprep_cleanup.ps1` elevado con los valores seguros por defecto.
+No repitas DISM `/ResetBase`, no resetees `DataStore`, `catroot2` o BITS, no
+hagas defrag por costumbre, no borres Event Logs sin copiar evidencia y no uses
+SDelete salvo medición explícita que justifique `-RunSDelete`. El script
+preserva Panther, AppX y Feedback Hub, elimina identidades SSH de plantilla,
+prioriza TRIM, y no modifica `unattend.xml` ni ejecuta Sysprep.
 
-## Tarea 1 — Perfil de energía «Alto rendimiento»
-
-Windows Server arranca en **Equilibrado**, que aparca núcleos en un invitado
-multi-vCPU. En la carga de StrategyQuantX (ráfagas cortas usando todos los
-núcleos a la vez) eso es casi el peor caso posible.
-
-Medido en producción: un VPS E de un cliente daba **69.500 / 93.500**
-estrategias/hora frente a las 100.000 publicadas, con **18 de sus 20 vCPU
-aparcadas**. Tras pasar a Alto rendimiento, la misma máquina dio **102.175 y
-102.031**. El cliente había pedido reembolso y cancelación, y los retiró.
-
-No es un caso aislado: un VPS E creado desde la imagen actual el 2026-08-02 se
-comprobó recién arrancado y venía en Equilibrado con **16 de 22 núcleos
-aparcados**. Afecta a **VPS A–E** (las cajas `mt` de 2 vCPU no aparcan).
-
-**Qué hacer:** aplicar los comandos de `windows_vm/POWER_PLAN.md` dentro de la
-plantilla, antes del pre-sysprep. Sysprep conserva el esquema activo, así que
-no hace falta tocar el primer arranque.
-
-**Criterio de aceptación** (ejecútalo en una VM clonada de la plantilla nueva,
-no en la plantilla): los tres checks de la sección «Verify» de `POWER_PLAN.md`
-deben pasar. El que importa es el segundo — **0 núcleos aparcados** leído del
-contador vivo, no del GUID del esquema: un esquema puede llamarse «Alto
-rendimiento» y seguir aparcando por un valor rancio.
-
-## Tarea 2 — Hooks de lanzamiento en AMBOS ejecutables de SQX
-
-El nombre del ejecutable principal de StrategyQuantX **cambió de versión**:
-
-| versión | ejecutable principal | VBS que le corresponde |
-|---|---|---|
-| SQX **<= 143** | `StrategyQuantX_nocheck.exe` | `sqx_hook_launcher.vbs` |
-| SQX **>= 144** | `StrategyQuantX.exe` | `sqx144_hook_launcher.vbs` |
-
-### 🟢 ANTES DE NADA (2026-08-15): ejecuta `hooks/set_java_headless.ps1`
-
-Añade `option -Djava.awt.headless=true` al `.config` de SQX (el mismo fichero
-donde vive el `-Xmx`). Eso **ya da la protección headless**, en cualquier
-versión, sin interceptar ningún proceso. Con eso, **los hooks de SQX dejan de
-ser necesarios** y el cliente de v144 deja de quedarse sin protección.
-
-Probado en vm1096 (2026-08-15) y desplegado en 732 VMs de la flota. Verificado
-en el log de la propia SQX: `SQApp - Runtime args: -Djava.awt.headless=true`.
-
-**No uses una variable de entorno de máquina** aunque funcione: afecta a todo
-Java y **QuantAnalyzer4** tiene interfaz Java propia, así que headless global
-se la puede dejar sin abrir. Detalle y las dos trampas medidas (esa, y los
-configs sin salto de línea final que rompen el `-Xmx`) en `hooks/README.md`.
-
-**El hook de v143 puede seguir cableado** mientras dure la transición —
-conviven y la variable no se duplica (validado en vm1097). Pero en una
-plantilla nueva **no hace falta cablear ningún hook de SQX**.
-
-Hoy la plantilla solo cablea el de v143. El hook de v144 se retiró el
-2026-08-03 por fork-bomb, y el 2026-08-15 quedó establecido que es
-**inarreglable por diseño en cajas duales**: IFEO va por *nombre* de imagen, y
-el `StrategyQuantX.exe` de **v143 se re-ejecuta a sí mismo**, así que la
-entrada de v144 lo atrapa y re-entra en cada generación. **No lo cablees
-nunca.** Si cableas alguno, que sea solo `StrategyQuantX_nocheck.exe`.
-
-**Los dos VBS ya existen** en `windows_vm/hooks/`. Son idénticos salvo la
-clave IFEO de su guarda anti-recursión. **No los fusiones ni los reescribas**:
-esa duplicación es deliberada.
-
-### Tres cosas que te van a morder si no las respetas
-
-1. **No cablees `StrategyQuantX.exe` en absoluto** (ver la corrección del principio). Y si algún día se rehabilita: **nunca lo apuntes a `sqx_hook_launcher.vbs`.** Ese VBS
-   lleva la clave `StrategyQuantX_nocheck.exe` codificada como guarda: borraría
-   la clave equivocada antes de relanzar, el IFEO se volvería a disparar sobre
-   sí mismo y tendrías el **fork-bomb de wscript/reg del 2026-07-16**. Cada
-   ejecutable con SU VBS.
-
-2. **Detecta v144+ por CONTENIDO, jamás por el nombre de la carpeta.** El gate
-   viejo usaba el regex `SQX.*144|StrategyQuant.*144` sobre el nombre. En un
-   barrido de 826 máquinas eso enganchó `StrategyQuantX.exe` en **15 cajas que
-   corrían v143** y solo tenían una carpeta *vacía* llamada `StrategyQuantX144`
-   de una descarga abandonada → **SQX moría en silencio al doble clic**, que es
-   justo lo que el gate existía para evitar. El test correcto es: una carpeta
-   que contenga `StrategyQuantX.exe` y **no** contenga
-   `StrategyQuantX_nocheck.exe`, buscando en `C:\` **y** en
-   `C:\Users\*\Downloads\*` y `C:\Users\*\Desktop\*` (hay instalaciones reales
-   ahí). Está resuelto en el snippet del paso 3 de `hooks/README.md`.
-
-   En una plantilla recién hecha solo habrá la versión que instales tú, así que
-   el gate es trivial — pero el mismo snippet se reutiliza para remediar cajas
-   existentes, así que déjalo correcto.
-
-3. **Nunca `New-Item -Path <clave IFEO> -Force` sobre una clave que ya existe.**
-   En PowerShell eso *recrea* la clave y borra sus subclaves, incluida
-   `PerfOptions` con `CpuPriorityClass=6` (prioridad alta de SQX). Protege cada
-   creación con `if (-not (Test-Path $k))`.
-
-También hay que cablear los **cuatro ejecutables de MetaTrader** con
-`mt_hook_launcher.vbs` — con el gate 2 de `hooks/README.md` (solo en cajas cuyos
-datos sean portables; en una plantilla nueva siempre lo son).
-
-**Criterio de aceptación:** en una VM clonada de la plantilla nueva,
+Sysprep se inicia manualmente desde el escritorio interactivo elevado de
+Administrator/Administrador, nunca bajo QGA/SYSTEM:
 
 ```powershell
-$k='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
-Get-ChildItem $k | Where-Object { $_.PSChildName -match 'Strategy|terminal|metaeditor' } |
-  ForEach-Object { $_.PSChildName + ' -> ' + (Get-ItemProperty $_.PSPath -Name Debugger -EA SilentlyContinue).Debugger }
+cd C:\Windows\System32\Sysprep
+.\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend.xml
 ```
 
-debe listar **`StrategyQuantX_nocheck.exe` → `sqx_hook_launcher.vbs`** y los
-cuatro de MetaTrader a `mt_hook_launcher.vbs`. **`StrategyQuantX.exe` NO debe
-aparecer**; si aparece, la imagen lleva el fork-bomb.
+No modifiques el XML existente, no añadas `CopyProfile` ni uses un answer file
+alternativo. Tras clonar, verifica RDP, Explorer/UI, red, SSH con fingerprint
+nueva, SID Administrator `-500`, AppX CBS/Core/XAML, Feedback Hub y el plan de
+energía.
 
-Y **la prueba que de verdad vale**: abre SQX en la VM de prueba y comprueba en
-su propio log (`<install>\user\log\*.log`) la línea
+## Proxmox y exportación
 
-```
-Runtime args: -Djava.awt.headless=true
-```
+- La plantilla usa `cpu: x86-64-v4`, nunca `host`. En un reinstall, el código
+  conserva RAM, balloon, cores, sockets, NUMA y todos los discos del cliente;
+  solo adopta la política virtual de la plantilla y baja a v3 si el nodo no
+  soporta AVX-512.
+- Lee `qm config --current` y exporta solo VMs positivamente apagadas. El
+  exportador escribe una clave staging fechada e inmutable; no uses el flujo
+  directo destructivo salvo autorización explícita.
+- El config canónico debe contener exactamente un marker:
+  `# neuravps-stream-template-key: windows-es-YYYYMMDD` o su equivalente
+  `windows-en`. Marker ausente, duplicado, malformado o mutable es fallo de
+  publicación. Restore debe usar ese marker para todos los discos y firewall.
+- Primero valida streams con canarios, después despliega hooks verificados en
+  ambas BASE (`files-hel` y `files-fsn`), y solo entonces actualiza el
+  `config.conf` canónico con el marker. No reemplaces streams inmutables.
 
-Si esa línea no aparece, el hook no está haciendo nada aunque el registro se vea
-bien. Comprueba además que no quedan procesos `wscript`/`reg` acumulándose (eso
-sería el fork-bomb) y que la clave `Debugger` sigue puesta después del
-lanzamiento (el VBS la quita y la repone; si se quedó quitada, algo falló).
+## Historial retirado
 
-## Reglas de trabajo
-
-### Cleanup pre-Sysprep vigente
-
-Usa `presysprep_cleanup.ps1` con sus valores seguros por defecto. No repitas
-DISM `/ResetBase` por defecto; no resetees `SoftwareDistribution\DataStore`,
-`catroot2` ni el estado BITS; no ejecutes defrag por costumbre; no limpies Event
-Logs hasta copiar la evidencia; y no uses SDelete salvo que una medición
-demuestre que TRIM no recupera `REFER` y se suministre `-RunSDelete` de forma
-explícita. `-RunResetBase`, `-RunNgen`, `-RunDefrag`, `-RunSDelete` y
-`-ClearEventLogs` son switches deliberados. El script preserva Panther, no
-elimina AppX/Feedback Hub/DesktopAppInstaller y no ejecuta Sysprep ni modifica
-`unattend.xml`. VSS y hibernación solo se actúan si existen.
-
-Sysprep se lanza manualmente desde el escritorio interactivo elevado de
-Administrator/Administrador. QGA/SYSTEM sirve para cleanup, pero Microsoft no
-soporta Sysprep bajo LocalSystem en Server 2025. La aceptación exige clonar,
-arrancar y verificar RDP, Explorer/UI, red/DHCP, SSH y fingerprint nueva, SID
-integrada `-500`, AppX CBS/Core/XAML y Feedback Hub, antes de exportar.
-
-Antes de publicar, el config canónico debe contener exactamente un comentario
-`# neuravps-stream-template-key: windows-es-YYYYMMDD` o
-`windows-en-YYYYMMDD`; la publicación debe rechazar marker ausente, duplicado o
-incongruente.
-
-- Rama → PR → self-merge. No toques `master` directamente.
-- No modifiques los `.vbs` existentes salvo que encuentres un fallo real; si lo
-  haces, explica por qué en el PR.
-- Si algo de lo documentado no cuadra con lo que ves en la plantilla, **para y
-  pregunta** en vez de improvisar: estos dos cambios ya causaron una regresión
-  con clientes cada uno.
-- Prueba en una VM clonada de la plantilla. No des por bueno el registro sin
-  abrir la aplicación.
-
-## Contexto que quizá necesites
-
-- La flota **ya está remediada** para ambos problemas (826 máquinas barridas,
-  las 802 accesibles verificadas). Esto es solo para que las **plantillas** no
-  vuelvan a producir el defecto en clientes nuevos.
-- El fallo del perfil de energía casi cuesta un cliente (pidió reembolso el día
-  siguiente de contratar). El del hook dejó a 15 clientes sin poder abrir SQX.
+Las instrucciones antiguas para quitar winget/Feedback Hub/AppX o ejecutar
+Sysprep bajo SYSTEM quedan solo como contexto histórico y no son pasos de esta
+tarea. Si una observación nueva contradice estas reglas, detente y documenta
+la evidencia antes de cambiar el procedimiento.
