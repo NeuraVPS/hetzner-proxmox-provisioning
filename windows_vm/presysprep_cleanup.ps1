@@ -92,10 +92,12 @@ try {
   else { Write-Output 'SDelete skipped (use -RunSDelete only after measuring TRIM reclaim)' }
   Step '16. Remove Winlogon DefaultPassword before sealing'
   $winlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-  if (Get-ItemProperty -LiteralPath $winlogonPath -Name DefaultPassword -ErrorAction SilentlyContinue) {
+  $winlogonKey = Get-Item -LiteralPath $winlogonPath -ErrorAction Stop
+  if ($winlogonKey.GetValueNames() -contains 'DefaultPassword') {
     Remove-ItemProperty -LiteralPath $winlogonPath -Name DefaultPassword -Force -ErrorAction Stop
   }
-  if (Get-ItemProperty -LiteralPath $winlogonPath -Name DefaultPassword -ErrorAction SilentlyContinue) {
+  $winlogonKey = Get-Item -LiteralPath $winlogonPath -ErrorAction Stop
+  if ($winlogonKey.GetValueNames() -contains 'DefaultPassword') {
     throw 'Winlogon DefaultPassword remains; refusing to seal template'
   }
   Write-Output 'Winlogon DefaultPassword absent; existing username/domain and SID500 credentials were not changed'
