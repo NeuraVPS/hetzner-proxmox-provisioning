@@ -68,6 +68,7 @@ $ErrorActionPreference = 'Stop'
 # Reviewed hook source revision. Update this single value and the two expected
 # hashes together when a launcher is intentionally replaced.
 $NeuraVpsHookRevision = '1ecfca1bdb5b4e981f9ed9c7f66f471a911611d'
+$NeuraVpsHookBases = @('https://files-hel.neuravps.com/pkg', 'https://files-fsn.neuravps.com/pkg')
 
 $UncRoot = '\\u560363-sub1.your-storagebox.de\u560363-sub1'
 $ZipName = "SQX_$Version.zip"
@@ -314,17 +315,24 @@ function Install-SqxLaunchConfiguration {
 
     # This is an immutable source revision. Do not change this to a moving branch:
     # a template must never silently receive a different launcher implementation.
-    $hookUrl = "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$NeuraVpsHookRevision/windows_vm/hooks/sqx_hook_launcher.vbs"
     $hookPath = Join-Path $programData 'sqx_hook_launcher.vbs'
     $expectedHash = 'ADB3BCCEBD C5B8C850D918E359A8701CF4E984BA55DE238E05F5B2184168ED4A'.Replace(' ','')
     $tmp = Join-Path $env:TEMP ("neuravps-sqx-hook-{0}.vbs" -f [guid]::NewGuid().ToString('N'))
-    try {
+    $downloaded = $false
+    foreach ($base in $NeuraVpsHookBases) {
+      $hookUrl = "$base/hooks/$NeuraVpsHookRevision/sqx_hook_launcher.vbs"
+      try {
         Invoke-WebRequest -Uri $hookUrl -OutFile $tmp -UseBasicParsing -ErrorAction Stop
         if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash -ne $expectedHash) {
-            throw "SQX hook hash mismatch for immutable revision $hookUrl"
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            continue
         }
-        Copy-Item -LiteralPath $tmp -Destination $hookPath -Force
-    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        $downloaded = $true; break
+      } catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not $downloaded) { throw "SQX hook unavailable from either BASE cache" }
+    Copy-Item -LiteralPath $tmp -Destination $hookPath -Force
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     if ((Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash -ne $expectedHash) {
         throw "SQX hook copy verification failed: $hookPath"
     }

@@ -23,6 +23,15 @@ set -u
 BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/windows_vm/installers}"
 DESTINO="${DESTINO:-/var/www/pkg}"
 FICHEROS="install_mt_from_storagebox.ps1 install_sqx_from_storagebox.ps1 install_qa_from_storagebox.ps1"
+# Keep this revision in sync with the two Windows installers and the canonical
+# launcher hashes below. The versioned directory prevents a half-refreshed
+# launcher from being served during an app install.
+HOOK_REVISION="1ecfca1bdb5b4e981f9ed9c7f66f471a911611d"
+HOOK_DIR="$DESTINO/hooks/$HOOK_REVISION"
+declare -A HOOK_HASHES=(
+  [sqx_hook_launcher.vbs]=adb3bccebdc5b8c850d918e359a8701cf4e984ba55de238e05f5b2184168ed4a
+  [mt_hook_launcher.vbs]=9b372a41e0a6bb2f910d24c76480d356f9c26485ed7167a0cd006f73e949456b
+)
 
 mkdir -p "$DESTINO"
 # Restos de una ejecucion cortada a medias: nginx no debe servirlos nunca.
@@ -54,10 +63,34 @@ for f in $FICHEROS; do
   ok=$((ok + 1))
 done
 
+mkdir -p "$HOOK_DIR"
+for f in "${!HOOK_HASHES[@]}"; do
+  tmp="$(mktemp -p "$HOOK_DIR" .nvx-hook.XXXXXX)"
+  url="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$HOOK_REVISION/windows_vm/hooks/$f"
+  if ! curl -fsSL --max-time 60 "$url" -o "$tmp"; then
+    echo "nvx-installers: $f -> descarga fallida; no actualizo hook" >&2
+    rm -f "$tmp"; fallo=$((fallo + 1)); continue
+  fi
+  got="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ "$got" != "${HOOK_HASHES[$f]}" ]]; then
+    echo "nvx-installers: $f -> hash inesperado ($got), NO lo instalo" >&2
+    rm -f "$tmp"; fallo=$((fallo + 1)); continue
+  fi
+  chmod 644 "$tmp"
+  if [[ -f "$HOOK_DIR/$f" ]] && cmp -s "$tmp" "$HOOK_DIR/$f"; then
+    rm -f "$tmp"; igual=$((igual + 1)); continue
+  fi
+  mv -f "$tmp" "$HOOK_DIR/$f"; ok=$((ok + 1))
+done
+
 echo "nvx-installers: $ok actualizado(s), $igual sin cambios, $fallo con problema"
 # Solo se falla si NO hay copia utilizable de alguno: que GitHub no conteste
 # teniendo copia buena no es una averia, es el modo degradado previsto.
 for f in $FICHEROS; do
   [ -s "$DESTINO/$f" ] || { echo "nvx-installers: FALTA $DESTINO/$f" >&2; exit 1; }
+done
+for f in "${!HOOK_HASHES[@]}"; do
+  [ -s "$HOOK_DIR/$f" ] || { echo "nvx-installers: FALTA $HOOK_DIR/$f" >&2; exit 1; }
+  [ "$(sha256sum "$HOOK_DIR/$f" | awk '{print $1}')" = "${HOOK_HASHES[$f]}" ] || exit 1
 done
 exit 0

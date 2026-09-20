@@ -134,6 +134,7 @@ $ErrorActionPreference = 'Stop'
 # Reviewed hook source revision. Update this single value and the expected hash
 # together when the launcher is intentionally replaced.
 $NeuraVpsHookRevision = '1ecfca1bdb5b4e981f9ed9c7f66f471a911611d'
+$NeuraVpsHookBases = @('https://files-hel.neuravps.com/pkg', 'https://files-fsn.neuravps.com/pkg')
 
 $UncRoot = '\\u560363-sub1.your-storagebox.de\u560363-sub1'
 if ($ZipVariant) {
@@ -464,17 +465,24 @@ function Install-MtLaunchHook {
     New-Item -ItemType Directory -Path $programData -Force | Out-Null
     # Pin the launcher source to the reviewed commit. A moving branch would make
     # an otherwise idempotent app install change behaviour underneath us.
-    $hookUrl = "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$NeuraVpsHookRevision/windows_vm/hooks/mt_hook_launcher.vbs"
     $hookPath = Join-Path $programData 'mt_hook_launcher.vbs'
     $expectedHash = '9B372A41E0A6BB2F910D24C76480D356F9C26485ED7167A0CD006F73E949456B'
     $tmp = Join-Path $env:TEMP ("neuravps-mt-hook-{0}.vbs" -f [guid]::NewGuid().ToString('N'))
-    try {
+    $downloaded = $false
+    foreach ($base in $NeuraVpsHookBases) {
+      $hookUrl = "$base/hooks/$NeuraVpsHookRevision/mt_hook_launcher.vbs"
+      try {
         Invoke-WebRequest -Uri $hookUrl -OutFile $tmp -UseBasicParsing -ErrorAction Stop
         if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash -ne $expectedHash) {
-            throw "MetaTrader hook hash mismatch for immutable revision $hookUrl"
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            continue
         }
-        Copy-Item -LiteralPath $tmp -Destination $hookPath -Force
-    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        $downloaded = $true; break
+      } catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not $downloaded) { throw "MetaTrader hook unavailable from either BASE cache" }
+    Copy-Item -LiteralPath $tmp -Destination $hookPath -Force
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     if ((Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash -ne $expectedHash) {
         throw "MetaTrader hook copy verification failed: $hookPath"
     }

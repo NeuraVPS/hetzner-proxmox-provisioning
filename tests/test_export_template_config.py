@@ -36,6 +36,15 @@ def main() -> None:
         "cpu: x86-64-v4\nscsi0: vm-100-disk-0\n[snapshot-before]\nsnapname: before\n"
     ) is True
     assert run_snapshot_guard("cpu: x86-64-v4\npending: cpu: host\n") is True
+    for name in ("install_sqx_from_storagebox.ps1", "install_mt_from_storagebox.ps1"):
+        text = (ROOT / "windows_vm/installers" / name).read_text()
+        assert "files-hel.neuravps.com/pkg" in text
+        assert "files-fsn.neuravps.com/pkg" in text
+        assert "raw.githubusercontent.com" not in text[text.find("function Install-"):]
+        assert "Get-FileHash" in text
+    cache = (ROOT / "base/snippets/nvx-installers.sh").read_text()
+    assert "HOOK_DIR=\"$DESTINO/hooks/$HOOK_REVISION\"" in cache
+    assert "sha256sum" in cache
     print("export template fixture checks passed")
 
 

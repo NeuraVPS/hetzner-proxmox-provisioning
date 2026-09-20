@@ -11,7 +11,10 @@
   that must pass on a new box.
 - **App launch hooks (SQX / MetaTrader)** — see [`hooks/README.md`](hooks/README.md).
   Note gate 4 there: a v144+ engine must be detected **by content**, never by
-  folder name.
+  folder name. The app installers fetch the reviewed VBS launchers from the
+  versioned `/pkg/hooks/<revision>/` cache on either BASE (`files-hel` or
+  `files-fsn`) and verify SHA-256 before installing; they do not fetch hooks
+  directly from GitHub.
 
 ## VM config (Proxmox side, not the guest)
 
