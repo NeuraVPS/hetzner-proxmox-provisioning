@@ -324,6 +324,18 @@ if ! "${SSH_BASE[@]}" "cat '$REMOTE_CONFIG'" >"$CONFIG_TMP"; then
 fi
 [[ -s "$CONFIG_TMP" ]] || die "Empty template config: ${REMOTE_CONFIG}"
 
+# New exports pin config, streams and firewall to one immutable staging key.
+# Legacy templates without the marker continue to use the requested key.
+STREAM_KEY="$(sed -n '1s/^# neuravps-stream-template-key:[[:space:]]*//p' "$CONFIG_TMP")"
+if [[ -n "$STREAM_KEY" ]]; then
+  [[ "$STREAM_KEY" =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid stream-template marker in ${REMOTE_CONFIG}"
+  [[ "$STREAM_KEY" != "windows-es" && "$STREAM_KEY" != "windows-en" ]] \
+    || die "Stream-template marker must name an immutable release, not a canonical alias"
+  REMOTE_BASE="${base}/${STREAM_KEY}"
+  REMOTE_CONFIG="${REMOTE_BASE}/config.conf"
+  echo "Config pins template streams to immutable key: ${STREAM_KEY}"
+fi
+
 mapfile -t REMOTE_TOKENS < <(pve_sorted_disk_tokens "$CONFIG_TMP" | dedupe_tokens_first_seen)
 [[ "${#REMOTE_TOKENS[@]}" -gt 0 ]] || die "No disk tokens in template (scsi|virtio|sata|ide|efidisk0|tpmstate0)"
 

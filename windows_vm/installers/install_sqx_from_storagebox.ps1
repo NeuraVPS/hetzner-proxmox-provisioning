@@ -27,6 +27,11 @@
 .PARAMETER PatchHobbiecodeLoadingScreen
   When specified, downloads and runs customize_sqx_loading_screen.ps1 to add the Hobbiecode logo above the StrategyQuant logo on the SQX loading screen. Defaults to false.
 
+.NOTES
+  The installer also applies the per-installation headless setting and the v142/v143
+  launch hook. SQX v144 is deliberately never wired through IFEO: its executable
+  name collides with the v143 self-relaunching executable on dual installations.
+
 .EXAMPLE
   .\install_sqx_from_storagebox.ps1 -SmbPassword $env:STORAGEBOX_SMB_PASSWORD
 
@@ -59,6 +64,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Reviewed hook source revision. Update this single value and the two expected
+# hashes together when a launcher is intentionally replaced.
+$NeuraVpsHookRevision = '1ecfca1bdb5b4e981f9ed9c7f66f471a911611d'
+$NeuraVpsHookBases = @('https://files-hel.neuravps.com/pkg', 'https://files-fsn.neuravps.com/pkg')
 
 $UncRoot = '\\u560363-sub1.your-storagebox.de\u560363-sub1'
 $ZipName = "SQX_$Version.zip"
@@ -297,6 +307,75 @@ iVBORw0KGgoAAAANSUhEUgAABHYAAALtCAYAAABNQOM6AAAACXBIWXMAACE3AAAhNwEzWJ96AAAgAElE
     Write-Host "Done: Hobbiecode logo injected into $HtmlPath"
 }
 
+function Install-SqxLaunchConfiguration {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $programData = 'C:\ProgramData\NeuraVPS'
+    New-Item -ItemType Directory -Path $programData -Force | Out-Null
+
+    # This is an immutable source revision. Do not change this to a moving branch:
+    # a template must never silently receive a different launcher implementation.
+    $hookPath = Join-Path $programData 'sqx_hook_launcher.vbs'
+    $expectedHash = 'ADB3BCCEBD C5B8C850D918E359A8701CF4E984BA55DE238E05F5B2184168ED4A'.Replace(' ','')
+    $tmp = Join-Path $env:TEMP ("neuravps-sqx-hook-{0}.vbs" -f [guid]::NewGuid().ToString('N'))
+    $downloaded = $false
+    foreach ($base in $NeuraVpsHookBases) {
+      $hookUrl = "$base/hooks/$NeuraVpsHookRevision/sqx_hook_launcher.vbs"
+      try {
+        Invoke-WebRequest -Uri $hookUrl -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash -ne $expectedHash) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        $downloaded = $true; break
+      } catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not $downloaded) { throw "SQX hook unavailable from either BASE cache" }
+    Copy-Item -LiteralPath $tmp -Destination $hookPath -Force
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    if ((Get-FileHash -LiteralPath $hookPath -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw "SQX hook copy verification failed: $hookPath"
+    }
+
+    $configs = @(Get-ChildItem -LiteralPath $InstallRoot -Filter 'StrategyQuantX*.config' -File -ErrorAction SilentlyContinue)
+    if ($configs.Count -eq 0) { throw "No SQX JVM config found under $InstallRoot" }
+    foreach ($cfg in $configs) {
+        $before = @(Get-Content -LiteralPath $cfg.FullName -Encoding UTF8)
+        $bak = "$($cfg.FullName).bak"
+        if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $cfg.FullName -Destination $bak }
+        $xmx = @($before | Where-Object { $_ -match '^\s*option\s+-Xmx\d+g\s*$' })
+        $after = @($before | Where-Object { $_ -notmatch 'java\.awt\.headless' }) + 'option -Djava.awt.headless=true'
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllLines($cfg.FullName, $after, $utf8)
+        $check = @(Get-Content -LiteralPath $cfg.FullName -Encoding UTF8)
+        $checkXmx = @($check | Where-Object { $_ -match '^\s*option\s+-Xmx\d+g\s*$' })
+        if (($check -notcontains 'option -Djava.awt.headless=true') -or (($xmx -join "`n") -ne ($checkXmx -join "`n")) -or ($check | Where-Object { ($_ -split 'option').Count -gt 2 })) {
+            Copy-Item -LiteralPath $bak -Destination $cfg.FullName -Force
+            throw "SQX headless configuration verification failed: $($cfg.FullName)"
+        }
+    }
+
+    # Apply high priority to whichever SQX executable is actually present. The
+    # v142/v143 _nocheck executable is the only safe one-shot interception point;
+    # never add a Debugger value for StrategyQuantX.exe.
+    $nocheck = Join-Path $InstallRoot 'StrategyQuantX_nocheck.exe'
+    foreach ($exeName in @('StrategyQuantX_nocheck.exe', 'StrategyQuantX.exe')) {
+        $exePath = Join-Path $InstallRoot $exeName
+        if (-not (Test-Path -LiteralPath $exePath)) { continue }
+        $ifeo = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$exeName"
+        $perf = Join-Path $ifeo 'PerfOptions'
+        if (-not (Test-Path -LiteralPath $ifeo)) { New-Item -Path $ifeo | Out-Null }
+        if (-not (Test-Path -LiteralPath $perf)) { New-Item -Path $perf | Out-Null }
+        New-ItemProperty -Path $perf -Name CpuPriorityClass -PropertyType DWord -Value 6 -Force | Out-Null
+        if ($exeName -eq 'StrategyQuantX_nocheck.exe') {
+            $debugger = '"' + (Join-Path $env:SystemRoot 'System32\wscript.exe') + '" "' + $hookPath + '"'
+            New-ItemProperty -Path $ifeo -Name Debugger -PropertyType String -Value $debugger -Force | Out-Null
+            $actual = (Get-ItemProperty -LiteralPath $ifeo -Name Debugger).Debugger
+            if ($actual -ne $debugger) { throw "SQX IFEO hook verification failed" }
+        }
+    }
+}
+
 $ExtractRoot = "C:\SQX_$Version"
 $ExeTarget   = Join-Path -Path $ExtractRoot -ChildPath 'StrategyQuantX.exe'
 $DesktopLink = "C:\Users\Public\Desktop\StrategyQuantX v$Version"
@@ -334,6 +413,8 @@ try {
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllLines($xmxConfig, $outLines, $utf8NoBom)
     }
+
+    Install-SqxLaunchConfiguration -InstallRoot $ExtractRoot
 
     New-ShellShortcutLnk -ShortcutPath $DesktopLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
     New-ShellShortcutLnk -ShortcutPath $StartMenuLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
