@@ -30,7 +30,8 @@ not just the fact that a previous checklist mentioned them.
 | 13. Event Logs | Preserve by default. `-ClearEventLogs` is only for an explicit decision after saving evidence. |
 | 14. Storage reclaim | ReTrim C:. `-RunDefrag` requires a measured reason and is not routine SSD cleanup. |
 | 15. Zero-fill | Skip SDelete. `-RunSDelete` is a fallback only if TRIM fails to reclaim space; verify the binary first and allow for temporary full-disk use. |
-| 16. Final check | ReTrim again, record free space/policy, verify the XML hash stayed identical and require `CLEANUP COMPLETE rc=0`. |
+| 16. Winlogon secret | Remove only `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\DefaultPassword` when present, verify it is absent, and fail closed if removal does not stick. `DefaultUserName`, `DefaultDomainName`, the local SID500 account/password, XML, policies and LSA are untouched. |
+| Final check | ReTrim again, record free space/policy, verify the XML hash stayed identical and require `CLEANUP COMPLETE rc=0`. |
 
 Do not repeat recovery-partition removal, install hooks, remove Feedback Hub,
 remove system AppX packages, reset servicing databases, shrink the pagefile,
