@@ -41,16 +41,16 @@ set -euo pipefail
 #
 # Concrete examples:
 #   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | bash -s -- 100 windows-en
-#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | OVERWRITE=1 bash -s -- 100 windows-es
-#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | OVERWRITE=1 bash -s -- 101 windows-en
+#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | bash -s -- 100 windows-es
+#   # Legacy direct-key replacement (destructive; publishing normally happens separately):
+#   curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | LEGACY_DIRECT_EXPORT=1 OVERWRITE=1 bash -s -- 101 windows-en
 #
-# IMPORTANT: env vars (OVERWRITE, ALLOW_RUNNING_VM, REQUIRE_BASELINE_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*) must go
+# IMPORTANT: env vars (LEGACY_DIRECT_EXPORT, OVERWRITE, REQUIRE_BASELINE_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*) must go
 # AFTER the pipe, prefixing `bash`. `VAR=x curl ... | bash` attaches VAR to curl only —
 # bash sees no value. Use `curl ... | VAR=x bash` instead.
 #
-# Pre-requisite: the VM must be SHUT DOWN (post-sysprep state is ideal). Running VMs are
-# refused by default to avoid capturing a torn filesystem state; set ALLOW_RUNNING_VM=1
-# to override (NOT recommended for templates).
+# Pre-requisite: the VM must be positively SHUT DOWN (post-sysprep state is ideal).
+# Running and unknown states are always refused.
 
 die() {
   echo "ERROR: $*" >&2
@@ -141,8 +141,8 @@ Usage:
   export_template_vm_to_shared_storage.sh <vmid> <template_key> [node]
 
   <vmid>          VMID on this node (e.g. 100). Must be SHUT DOWN.
-  <template_key>  Subdirectory under STORAGE_BOX_BASE_PATH (e.g. windows-en, windows-es).
-                  Only [A-Za-z0-9_-] allowed.
+  <template_key>  Logical template name (e.g. windows-en, windows-es). The default
+                  destination is an immutable dated staging key derived from it.
   [node]          Must match a name under /etc/pve/nodes/ (often `hostname -s`).
                   If omitted, picks the first of hostname -s / hostname that has qemu-server/.
 
@@ -154,25 +154,24 @@ always pull the latest master revision):
 
   Concrete examples:
     curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | bash -s -- 100 windows-en
-    curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | OVERWRITE=1 bash -s -- 100 windows-en
+    curl -fsSL "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/scripts/export_template_vm_to_shared_storage.sh?t=$(date +%s)" | bash -s -- 100 windows-en
 
   IMPORTANT 1: you MUST pipe curl into bash with `| bash -s -- args`. If you omit
   the "|", curl treats "bash", "--", "100", "windows-en" as extra URLs to fetch
   and fails with: curl: (6) Could not resolve host: bash
 
-  IMPORTANT 2: env vars (OVERWRITE, ALLOW_RUNNING_VM, REQUIRE_BASELINE_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*)
+  IMPORTANT 2: env vars (LEGACY_DIRECT_EXPORT, OVERWRITE, REQUIRE_BASELINE_CPU, KEEP_SNAPSHOT, STORAGE_BOX_*)
   must go AFTER the pipe, prefixing `bash`. `VAR=x curl ... | bash` attaches VAR
   to curl only — bash sees no value. Use `curl ... | VAR=x bash` instead.
 
 Environment:
   STORAGE_BOX_HOST, STORAGE_BOX_USER, STORAGE_BOX_PORT, STORAGE_BOX_BASE_PATH (default /home/templates)
   ZFS_PARENT          default: rpool/data
-  SNAPSHOT_NAME       default: stable   (the snapshot tag created on each volume before send)
-  ALLOW_RUNNING_VM    default: 0        (set 1 to allow exporting a running VM — NOT recommended)
-  REQUIRE_BASELINE_CPU default: 0       (set 1 to refuse exporting a template on cpu: host/max — only useful
-                                         if the fleet ever mixes CPU vendors again)
-  OVERWRITE           default: 0        (set 1 to replace an existing template under template_key)
-  KEEP_SNAPSHOT       default: 1        (set 0 to destroy the local @<SNAPSHOT_NAME> snapshots after upload)
+  SNAPSHOT_NAME       default: dated export snapshot (never deletes an existing snapshot)
+  REQUIRE_BASELINE_CPU default: 1       (default requires generic x86-64-v4; host/max always refused)
+  LEGACY_DIRECT_EXPORT default: 0       (set 1 only for the old direct-key workflow; staging is the default)
+  OVERWRITE           default: 0        (only valid with LEGACY_DIRECT_EXPORT=1)
+  KEEP_SNAPSHOT       deprecated        (snapshots are always retained)
 EOF
 }
 
@@ -217,9 +216,9 @@ STORAGE_BOX_USER="${STORAGE_BOX_USER:-$DEFAULT_STORAGE_BOX_USER}"
 STORAGE_BOX_PORT="${STORAGE_BOX_PORT:-$DEFAULT_STORAGE_BOX_PORT}"
 STORAGE_BOX_BASE_PATH="${STORAGE_BOX_BASE_PATH:-$DEFAULT_STORAGE_BOX_BASE_PATH}"
 ZFS_PARENT="${ZFS_PARENT:-rpool/data}"
-SNAPSHOT_NAME="${SNAPSHOT_NAME:-stable}"
-ALLOW_RUNNING_VM="${ALLOW_RUNNING_VM:-0}"
-REQUIRE_BASELINE_CPU="${REQUIRE_BASELINE_CPU:-0}"
+SNAPSHOT_NAME="${SNAPSHOT_NAME:-export-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+REQUIRE_BASELINE_CPU="${REQUIRE_BASELINE_CPU:-1}"
+LEGACY_DIRECT_EXPORT="${LEGACY_DIRECT_EXPORT:-0}"
 OVERWRITE="${OVERWRITE:-0}"
 KEEP_SNAPSHOT="${KEEP_SNAPSHOT:-1}"
 
@@ -250,57 +249,46 @@ FW_PATH="/etc/pve/firewall/${VMID}.fw"
 # Refuse to export a running VM — block-level snapshots of a running guest's
 # disk can capture mid-flight filesystem state. Sysprep'd templates are expected
 # to be in the post-shutdown state.
-VM_STATUS=""
-if qm_status_out="$(qm status "$VMID" 2>&1)"; then
-  VM_STATUS="$(awk -F': ' '/^status:/ {print $2}' <<<"$qm_status_out" | tr -d '[:space:]' | head -c 32)"
-fi
-if [[ "$VM_STATUS" == "running" ]]; then
-  if [[ "$ALLOW_RUNNING_VM" != "1" ]]; then
-    die "VM ${VMID} is running. Stop it first (qm shutdown ${VMID}) or set ALLOW_RUNNING_VM=1 (NOT recommended — guest disks may be in inconsistent state)."
-  fi
-  echo "WARN: VM ${VMID} is running but ALLOW_RUNNING_VM=1 — proceeding"
-fi
-echo "VM ${VMID} status: ${VM_STATUS:-unknown}"
+qm_status_out="$(qm status "$VMID" 2>&1)" || die "Could not determine VM ${VMID} status; refusing export"
+VM_STATUS="$(awk -F': ' '/^status:/ {print $2}' <<<"$qm_status_out" | tr -d '[:space:]' | head -c 32)"
+[[ "$VM_STATUS" == "stopped" ]] || die "VM ${VMID} status is '${VM_STATUS:-unknown}', not positively stopped; refusing export"
+echo "VM ${VMID} status: stopped"
 
-# Template CPU model. The fleet standard is `cpu: host` (operator decision
-# 2026-07-30): every remaining node is Zen 4 — EPYC 9454P/9454 on the AX162s,
-# Ryzen 9 7950X3D on the AX102s — and a manual AX102 -> AX162 live migration
-# was verified by hand. host gives the guest the real silicon: measured on one
-# VM, one node, changing only this line, Windows reports
-#   x86-64-v4 -> "QEMU Virtual CPU 2.5+", L2 4 MB, L3 16 MB
-#   host      -> "AMD EPYC 9454P 48-Core", L3 128 MB
-# because PVE's x86-64-v4 is not a model at all: it is qemu64 plus flags, so
-# the guest gets the instructions but a synthetic cache and identity.
-#
-# The cost is real and deliberate: a cpu: host guest can only live-migrate onto
-# a same-vendor, same-or-newer CPU. That is enforced at migration time by the
-# pre-check in migrate_vm.sh (0a), which refuses cross-vendor moves and blocks
-# any destination missing a feature the running guest has — so the failure mode
-# is a refused migration, never the silent resume crash of VMs 708/1670.
-#
-# Set REQUIRE_BASELINE_CPU=1 to go back to demanding a named model, which is
-# what a fleet mixing CPU vendors would need.
-TPL_CPU="$(sed -n 's/^cpu:[[:space:]]*//p' "$CONF_PATH" | head -1 | tr -d '\r')"
+# qm config --current is the effective live configuration. Never copy the raw
+# /etc/pve file: it may contain [snapshot] sections and pending state.
+CURRENT_CONF="$(mktemp)"
+EXPORT_CONF="$CURRENT_CONF"
+trap 'rm -f "$CURRENT_CONF" "${CURRENT_CONF}.err" "$EXPORT_CONF"' EXIT
+qm config "$VMID" --current >"$CURRENT_CONF" 2>"${CURRENT_CONF}.err" \
+  || die "qm config --current failed for VM ${VMID}: $(tr '\n' ' ' <"${CURRENT_CONF}.err")"
+if awk '/^\[[^]]+\]/{bad=1} /^[[:space:]]*(pending|snapshots):[[:space:]]/{bad=1} END{exit bad ? 0 : 1}' "$CURRENT_CONF"; then
+  die "qm config --current returned snapshot/pending sections; refusing export"
+fi
+sed -i 's/\r$//' "$CURRENT_CONF"
+
+# Template CPU model. New generic templates use x86-64-v4 so the exported
+# config is portable across nodes; host/max passthrough is always rejected.
+TPL_CPU="$(sed -n 's/^cpu:[[:space:]]*//p' "$CURRENT_CONF" | head -1 | tr -d '\r')"
 TPL_CPU_MODEL="${TPL_CPU%%,*}"
 TPL_CPU_MODEL="${TPL_CPU_MODEL#cputype=}"
 case "$(printf '%s' "$TPL_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" in
   host | max)
-    if [[ "$REQUIRE_BASELINE_CPU" == "1" ]]; then
-      die "VM ${VMID} has cpu: ${TPL_CPU_MODEL} but REQUIRE_BASELINE_CPU=1 — set a named model first, e.g. qm set ${VMID} --cpu x86-64-v4"
-    fi
-    echo "VM ${VMID} cpu model: ${TPL_CPU} (fleet standard — clones get the real silicon; migration is gated by migrate_vm.sh)"
+    die "VM ${VMID} has cpu: ${TPL_CPU_MODEL}; host/max is forbidden for generic templates"
     ;;
   '')
-    die "VM ${VMID} has no cpu: line — it would inherit the Proxmox default (kvm64), which is far slower than the fleet standard. Fix with: qm set ${VMID} --cpu host   (then re-run)."
+    die "VM ${VMID} has no cpu: line — set the generic model with: qm set ${VMID} --cpu x86-64-v4"
     ;;
   *)
-    echo "WARN: VM ${VMID} cpu model: ${TPL_CPU} — the fleet standard is 'host'. Clones will run on a named model and lose the real cache/identity."
+    if [[ "$REQUIRE_BASELINE_CPU" == "1" && "$(printf '%s' "$TPL_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" != "x86-64-v4" ]]; then
+      die "VM ${VMID} has cpu: ${TPL_CPU}; expected generic x86-64-v4"
+    fi
+    echo "VM ${VMID} cpu model: ${TPL_CPU}"
     ;;
 esac
 
 # Parse disk tokens (same order as restore expects)
-mapfile -t TOKENS < <(pve_sorted_disk_tokens "$CONF_PATH" | dedupe_tokens_first_seen)
-[[ "${#TOKENS[@]}" -gt 0 ]] || die "No disk tokens in VM config: ${CONF_PATH}"
+mapfile -t TOKENS < <(pve_sorted_disk_tokens "$CURRENT_CONF" | dedupe_tokens_first_seen)
+[[ "${#TOKENS[@]}" -gt 0 ]] || die "No disk tokens in current VM config"
 
 n="${#TOKENS[@]}"
 echo "VM ${VMID} has ${n} unique volume(s):"
@@ -343,12 +331,22 @@ SCP_BASE=(
 )
 
 base="${STORAGE_BOX_BASE_PATH%/}"
-REMOTE_BASE="${base}/${TEMPLATE_KEY}"
+if [[ "$OVERWRITE" == "1" && "$LEGACY_DIRECT_EXPORT" != "1" ]]; then
+  die "OVERWRITE=1 is only allowed with explicit LEGACY_DIRECT_EXPORT=1; default exports are immutable staging keys"
+fi
+if [[ "$LEGACY_DIRECT_EXPORT" == "1" ]]; then
+  REMOTE_TEMPLATE_KEY="$TEMPLATE_KEY"
+else
+  REMOTE_TEMPLATE_KEY="${TEMPLATE_KEY}-$(date -u +%Y%m%d)"
+fi
+REMOTE_BASE="${base}/${REMOTE_TEMPLATE_KEY}"
+echo "Export destination key: ${REMOTE_TEMPLATE_KEY}"
 
-# Refuse to overwrite an existing template unless OVERWRITE=1
+# Refuse to overwrite an existing template unless the explicitly legacy direct
+# workflow is selected. Normal exports use a unique dated staging key.
 if "${SSH_BASE[@]}" "ls -1 '${REMOTE_BASE}'/disk*.stream.zst 2>/dev/null | head -n1" 2>/dev/null | grep -q .; then
   if [[ "$OVERWRITE" != "1" ]]; then
-    die "Template '${TEMPLATE_KEY}' already exists at ${REMOTE_BASE} on the storage box. Set OVERWRITE=1 to replace it."
+    die "Template '${REMOTE_TEMPLATE_KEY}' already exists at ${REMOTE_BASE} on the storage box. Use a new staging run or the explicit legacy overwrite workflow."
   fi
   echo "WARN: Overwriting existing template at ${REMOTE_BASE}"
 fi
@@ -362,17 +360,14 @@ if [[ "$OVERWRITE" == "1" ]]; then
     || die "Failed to clean previous template files at ${REMOTE_BASE}"
 fi
 
-# Take snapshots atomically across all the VM's datasets. A single `zfs snapshot`
-# invocation with multiple targets is atomic. We refresh any pre-existing snapshot
-# with the same name first (so re-running export produces a fresh baseline).
+# Take a new, dated snapshot atomically across all the VM's datasets. Existing VM
+# snapshots are never refreshed or destroyed.
 SNAP_LIST=()
-DESTROY_ON_EXIT=()
 for tok in "${TOKENS[@]}"; do
   ds="${ZFS_PARENT}/${tok}"
   snap="${ds}@${SNAPSHOT_NAME}"
   if zfs list -H -o name "$snap" >/dev/null 2>&1; then
-    echo "  Destroying pre-existing ${snap}"
-    zfs destroy "$snap" || die "Could not destroy old snapshot ${snap}"
+    die "Snapshot already exists: ${snap}; choose a new SNAPSHOT_NAME"
   fi
   SNAP_LIST+=("$snap")
 done
@@ -380,13 +375,10 @@ done
 echo "Creating snapshots: ${SNAP_LIST[*]}"
 zfs snapshot "${SNAP_LIST[@]}" || die "zfs snapshot failed"
 
-# On any error after this point, destroy the snapshots we created so re-runs are clean.
-# (If everything succeeds and KEEP_SNAPSHOT=1, we skip the destroy at the end.)
+# Keep the export snapshots even when a later upload step fails, so the source
+# remains recoverable and no existing snapshot is ever removed.
 cleanup_partial() {
-  local s
-  for s in "${SNAP_LIST[@]}"; do
-    zfs destroy "$s" 2>/dev/null || true
-  done
+  echo "ERROR: export failed; retaining source snapshots: ${SNAP_LIST[*]}" >&2
 }
 trap cleanup_partial ERR
 
@@ -402,10 +394,13 @@ for ((i = 0; i < n; i++)); do
     | "${SSH_PIPE[@]}" "dd of='${remote_file}' bs=4M conv=fsync status=none"
 done
 
-# Upload config.conf — keep the source VM's config as-is; restore_template_vm_from_shared_storage.sh
-# rewrites disk tokens and identity fields (vmgenid/smbios1 uuid) at restore time.
-echo "Uploading config: ${CONF_PATH} -> ${REMOTE_BASE}/config.conf"
-"${SCP_BASE[@]}" "$CONF_PATH" "${STORAGE_BOX_USER}@${STORAGE_BOX_HOST}:${REMOTE_BASE}/config.conf" \
+# Upload only the effective current config. Snapshot/pending sections from the
+# raw /etc/pve file are deliberately never copied.
+EXPORT_CONF="$(mktemp)"
+printf '# neuravps-stream-template-key: %s\n' "$REMOTE_TEMPLATE_KEY" >"$EXPORT_CONF"
+cat "$CURRENT_CONF" >>"$EXPORT_CONF"
+echo "Uploading current config: qm config --current -> ${REMOTE_BASE}/config.conf"
+"${SCP_BASE[@]}" "$EXPORT_CONF" "${STORAGE_BOX_USER}@${STORAGE_BOX_HOST}:${REMOTE_BASE}/config.conf" \
   || die "scp of config.conf failed"
 
 # Upload firewall.fw if the VM has one. If OVERWRITE=1 and the source has no firewall,
@@ -440,15 +435,7 @@ fi
 # Clear the ERR trap — we're past the streaming phase, partial-state cleanup no longer applies
 trap - ERR
 
-# Optionally destroy the local snapshots we created
-if [[ "$KEEP_SNAPSHOT" != "1" ]]; then
-  echo "Destroying local snapshots (KEEP_SNAPSHOT=0)..."
-  for s in "${SNAP_LIST[@]}"; do
-    zfs destroy "$s" || echo "WARN: failed to destroy ${s}"
-  done
-else
-  echo "Retaining local snapshots: ${SNAP_LIST[*]}"
-fi
+echo "Retaining local snapshots: ${SNAP_LIST[*]}"
 
 echo
 echo "Export finished:"

@@ -28,7 +28,7 @@
     **v4 is worth roughly +5%** — every warm v4 run beat every v3 run — so it clears the advertised figure with margin where v3 sits just under it. Run-to-run noise within v3 alone is ±4.6%, so treat +5% as the direction rather than a precise number.
   - What v4 actually changes for the JVM: `UseAVX` 2 → 3. It does **not** restore `host`'s vector width — `MaxVectorSize` stays at 16 on both baseline models (only `cpu: host` reports 64), because the JVM cannot identify the microarchitecture behind a generic "QEMU Virtual CPU" and keeps its conservative cap. The gain therefore comes from AVX-512's extra registers and masking, not from wider vectors. A possible free win still unexplored: forcing `-XX:MaxVectorSize=32`.
   - Trade-off accepted 2026-07-26: the guest's Task Manager shows a generic *"QEMU Virtual CPU version 2.5+"* instead of the real model name.
-  - `export_template_vm_to_shared_storage.sh` refuses to upload a template with `cpu: host`/`max` (override: `ALLOW_HOST_CPU=1`), so a future refresh cannot silently revert this.
+  - `export_template_vm_to_shared_storage.sh` reads only `qm config --current`, requires the VM to be positively stopped, refuses `cpu: host`/`max`, and defaults to generic `x86-64-v4`. It exports to an immutable dated staging key; publishing that key is a separate operator step. The old direct-key/overwrite workflow requires explicit `LEGACY_DIRECT_EXPORT=1`.
   - Existing customer VMs keep `cpu: host` — this only applies to VMs created from the templates from now on.
 
 ## Checklist
@@ -56,10 +56,8 @@
     deleted — it runs as part of the unattended pre-sysprep cleanup, so
     there's nothing left to remember by hand.
 
-```powershell
-# Disable WindowsFeedbackHub installation for new users
-Get-AppxProvisionedPackage -Online | Where-Object DisplayName -like "Microsoft.WindowsFeedbackHub" | Remove-AppxProvisionedPackage -Online
-```
+FeedbackHub remains installed and provisioned. Do not remove it from the image;
+the operator explicitly wants it available for template users.
 
 - Install .NET framework legacy for myfxbook installed to work
 - Remove winget for sysprep to work — **NO LONGER APPLICABLE on Server 2025 (verified 2026-08-04); leave it alone**:
@@ -189,27 +187,22 @@ Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "Administrador" -
 
 - Disk cleanup — run [presysprep_cleanup.ps1](presysprep_cleanup.ps1) (unattended, can be pushed+launched via `qm guest exec`; logs to `C:\ProgramData\NeuraVPS\presysprep.log`). The current script is safe-by-default: it does not repeat DISM `/ResetBase`, reset `DataStore`/`catroot2`/BITS state, defragment, clear Event Logs, or run SDelete unless explicit switches are supplied. It preserves Panther and AppX packages, removes SSH host keys, and prioritizes TRIM. See [prepare.md](prepare.md).
 - Recovery partition removal is a separate, already-completed Linux-side image task; it is not part of the guest cleanup script.
-- **Back up the current templates on the Storage Box before exporting** —
-  `OVERWRITE=1` deletes the old streams. The Storage Box does have its own
-  daily backups kept for 30 days, so this is a belt-and-braces step that makes
-  a rollback instant instead of a restore request. One sftp rename is enough
-  and moves no data:
+- **Publish a staged export only after review** — the exporter writes a unique
+  dated staging key and never pre-deletes the current production key. Its
+  `config.conf` carries a `# neuravps-stream-template-key:` marker so consumers
+  pin disks and firewall to the same immutable key. The old
+  direct-key overwrite workflow is an explicit legacy escape hatch; if it is
+  ever required, first rename the current key on the Storage Box (the box also
+  keeps daily backups for 30 days):
   `printf "rename /home/templates/windows-es /home/templates/windows-es.bak-<date>\n" | sftp -P 23 u560363@u560363.your-storagebox.de`
-- Sysprep with unattend_cleanup.xml
-
-> **Sysprep execution context (both commands below):** run from the elevated,
+> **Sysprep execution context:** run from the elevated,
 > interactive built-in Administrator desktop. Never launch `sysprep.exe` under
 > Local System, including QGA configured as SYSTEM. Microsoft documents that
 > context as unsupported on Windows Server 2025 and links it to missing
 > AppX/XAML registration and black screens: [Fix Black Screen After
 > Running Sysprep as System](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/sysprep-as-system-windows-11).
 > The QGA example is for `presysprep_cleanup.ps1`; run Sysprep separately in
-> the Administrator desktop.
-
-```powershell
-cd C:\Windows\System32\Sysprep
-.\sysprep.exe /generalize /oobe /shutdown /unattend:C:\ProgramData\NeuraVPS\unattend_cleanup.xml
-```
+> the Administrator desktop. Keep the existing `unattend.xml` unchanged.
 
 - UI and Edge tweaks
   -- Wizard de Envio de datos, elegir opción Mínima
@@ -217,7 +210,8 @@ cd C:\Windows\System32\Sysprep
   -- Opciones de carpeta: Mostrar extensiones para archivos conocidos
   -- Edge, preconfigurar pantalla de inicio
   -- Edge, desactivar en Sistema opcion de seguir ejecutando aplicaciones en segundo plano
-- Sysprep with unattend.xml
+- Sysprep with the existing `unattend.xml` (do not create or substitute a
+  cleanup answer file)
 
 ```powershell
 cd C:\Windows\System32\Sysprep

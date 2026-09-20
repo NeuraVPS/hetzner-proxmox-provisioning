@@ -65,6 +65,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Reviewed hook source revision. Update this single value and the two expected
+# hashes together when a launcher is intentionally replaced.
+$NeuraVpsHookRevision = '1ecfca1bdb5b4e981f9ed9c7f66f471a911611d'
+
 $UncRoot = '\\u560363-sub1.your-storagebox.de\u560363-sub1'
 $ZipName = "SQX_$Version.zip"
 $ZipUnc  = Join-Path -Path $UncRoot -ChildPath $ZipName
@@ -310,7 +314,7 @@ function Install-SqxLaunchConfiguration {
 
     # This is an immutable source revision. Do not change this to a moving branch:
     # a template must never silently receive a different launcher implementation.
-    $hookUrl = 'https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/1ecfca1bdb5b4e981f9ed9c7f66f471a911611d/windows_vm/hooks/sqx_hook_launcher.vbs'
+    $hookUrl = "https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$NeuraVpsHookRevision/windows_vm/hooks/sqx_hook_launcher.vbs"
     $hookPath = Join-Path $programData 'sqx_hook_launcher.vbs'
     $expectedHash = 'ADB3BCCEBD C5B8C850D918E359A8701CF4E984BA55DE238E05F5B2184168ED4A'.Replace(' ','')
     $tmp = Join-Path $env:TEMP ("neuravps-sqx-hook-{0}.vbs" -f [guid]::NewGuid().ToString('N'))
@@ -330,7 +334,7 @@ function Install-SqxLaunchConfiguration {
     foreach ($cfg in $configs) {
         $before = @(Get-Content -LiteralPath $cfg.FullName -Encoding UTF8)
         $bak = "$($cfg.FullName).bak"
-        Copy-Item -LiteralPath $cfg.FullName -Destination $bak -Force
+        if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $cfg.FullName -Destination $bak }
         $xmx = @($before | Where-Object { $_ -match '^\s*option\s+-Xmx\d+g\s*$' })
         $after = @($before | Where-Object { $_ -notmatch 'java\.awt\.headless' }) + 'option -Djava.awt.headless=true'
         $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -343,19 +347,24 @@ function Install-SqxLaunchConfiguration {
         }
     }
 
-    # v142/v143 use _nocheck as the safe one-shot interception point. Never add
-    # a Debugger value for StrategyQuantX.exe (v144 or the v143 launcher).
+    # Apply high priority to whichever SQX executable is actually present. The
+    # v142/v143 _nocheck executable is the only safe one-shot interception point;
+    # never add a Debugger value for StrategyQuantX.exe.
     $nocheck = Join-Path $InstallRoot 'StrategyQuantX_nocheck.exe'
-    if (Test-Path -LiteralPath $nocheck) {
-        $ifeo = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\StrategyQuantX_nocheck.exe'
+    foreach ($exeName in @('StrategyQuantX_nocheck.exe', 'StrategyQuantX.exe')) {
+        $exePath = Join-Path $InstallRoot $exeName
+        if (-not (Test-Path -LiteralPath $exePath)) { continue }
+        $ifeo = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$exeName"
         $perf = Join-Path $ifeo 'PerfOptions'
         if (-not (Test-Path -LiteralPath $ifeo)) { New-Item -Path $ifeo | Out-Null }
         if (-not (Test-Path -LiteralPath $perf)) { New-Item -Path $perf | Out-Null }
         New-ItemProperty -Path $perf -Name CpuPriorityClass -PropertyType DWord -Value 6 -Force | Out-Null
-        $debugger = '"' + (Join-Path $env:SystemRoot 'System32\wscript.exe') + '" "' + $hookPath + '"'
-        New-ItemProperty -Path $ifeo -Name Debugger -PropertyType String -Value $debugger -Force | Out-Null
-        $actual = (Get-ItemProperty -LiteralPath $ifeo -Name Debugger).Debugger
-        if ($actual -ne $debugger) { throw "SQX IFEO hook verification failed" }
+        if ($exeName -eq 'StrategyQuantX_nocheck.exe') {
+            $debugger = '"' + (Join-Path $env:SystemRoot 'System32\wscript.exe') + '" "' + $hookPath + '"'
+            New-ItemProperty -Path $ifeo -Name Debugger -PropertyType String -Value $debugger -Force | Out-Null
+            $actual = (Get-ItemProperty -LiteralPath $ifeo -Name Debugger).Debugger
+            if ($actual -ne $debugger) { throw "SQX IFEO hook verification failed" }
+        }
     }
 }
 
