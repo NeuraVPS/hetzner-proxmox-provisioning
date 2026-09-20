@@ -114,6 +114,12 @@ pve_sorted_disk_tokens() {
   ' "$f" | LC_ALL=C sort -t $'\t' -k1,1 | cut -f2
 }
 
+normalize_current_config() {
+  # These are runtime breadcrumbs, not portable template state. In particular
+  # snaptime/parent/lock/vmstate can be emitted after a snapshot rollback.
+  awk '!/^[[:space:]]*(parent|lock|vmstate|snaptime):[[:space:]]/' "$1"
+}
+
 # Same volume can appear on multiple config lines; we want one stream per unique volume.
 dedupe_tokens_first_seen() {
   awk '!seen[$0]++'
@@ -170,6 +176,7 @@ Environment:
   SNAPSHOT_NAME       default: dated export snapshot (never deletes an existing snapshot)
   REQUIRE_BASELINE_CPU default: 1       (default requires generic x86-64-v4; host/max always refused)
   LEGACY_DIRECT_EXPORT default: 0       (set 1 only for the old direct-key workflow; staging is the default)
+  STAGING_KEY         optional         (validated immutable key override; use to retry a failed same-day export)
   OVERWRITE           default: 0        (only valid with LEGACY_DIRECT_EXPORT=1)
   KEEP_SNAPSHOT       deprecated        (snapshots are always retained)
 EOF
@@ -219,6 +226,7 @@ ZFS_PARENT="${ZFS_PARENT:-rpool/data}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-export-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 REQUIRE_BASELINE_CPU="${REQUIRE_BASELINE_CPU:-1}"
 LEGACY_DIRECT_EXPORT="${LEGACY_DIRECT_EXPORT:-0}"
+STAGING_KEY="${STAGING_KEY:-}"
 OVERWRITE="${OVERWRITE:-0}"
 KEEP_SNAPSHOT="${KEEP_SNAPSHOT:-1}"
 
@@ -265,6 +273,9 @@ if awk '/^\[[^]]+\]/{bad=1} /^[[:space:]]*(pending|snapshots):[[:space:]]/{bad=1
   die "qm config --current returned snapshot/pending sections; refusing export"
 fi
 sed -i 's/\r$//' "$CURRENT_CONF"
+NORMALIZED_CONF="$(mktemp)"
+normalize_current_config "$CURRENT_CONF" >"$NORMALIZED_CONF"
+mv -f "$NORMALIZED_CONF" "$CURRENT_CONF"
 
 # Template CPU model. New generic templates use x86-64-v4 so the exported
 # config is portable across nodes; host/max passthrough is always rejected.
@@ -336,6 +347,9 @@ if [[ "$OVERWRITE" == "1" && "$LEGACY_DIRECT_EXPORT" != "1" ]]; then
 fi
 if [[ "$LEGACY_DIRECT_EXPORT" == "1" ]]; then
   REMOTE_TEMPLATE_KEY="$TEMPLATE_KEY"
+elif [[ -n "$STAGING_KEY" ]]; then
+  [[ "$STAGING_KEY" =~ ^[A-Za-z0-9_-]+$ ]] || die "STAGING_KEY may only contain [A-Za-z0-9_-]"
+  REMOTE_TEMPLATE_KEY="$STAGING_KEY"
 else
   REMOTE_TEMPLATE_KEY="${TEMPLATE_KEY}-$(date -u +%Y%m%d)"
 fi

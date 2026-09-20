@@ -38,50 +38,61 @@ mkdir -p "$DESTINO"
 rm -f "$DESTINO"/.nvx-inst.* 2>/dev/null
 ok=0; fallo=0; igual=0
 
+# Hooks are a prerequisite for publishing refreshed installers. Reuse an
+# already-valid cache entry when GitHub is unavailable, and never replace it
+# with an unverified response.
+mkdir -p "$HOOK_DIR"
+for f in "${!HOOK_HASHES[@]}"; do
+  if [[ -f "$HOOK_DIR/$f" ]] && [[ "$(sha256sum "$HOOK_DIR/$f" | awk '{print $1}')" == "${HOOK_HASHES[$f]}" ]]; then
+    igual=$((igual + 1)); continue
+  fi
+  tmp="$(mktemp -p "$HOOK_DIR" .nvx-hook.XXXXXX)"
+  url="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$HOOK_REVISION/windows_vm/hooks/$f"
+  if ! curl -fsSL --max-time 60 "$url" -o "$tmp"; then
+    echo "nvx-installers: $f -> descarga fallida y no hay copia valida" >&2
+    rm -f "$tmp"; exit 1
+  fi
+  got="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ "$got" != "${HOOK_HASHES[$f]}" ]]; then
+    echo "nvx-installers: $f -> hash inesperado ($got), NO lo instalo" >&2
+    rm -f "$tmp"; exit 1
+  fi
+  chmod 644 "$tmp"; mv -f "$tmp" "$HOOK_DIR/$f"; ok=$((ok + 1))
+done
+
+STAGE_DIR="$(mktemp -d -p "$DESTINO" .nvx-stage.XXXXXX)"
+stage_failed=0
 for f in $FICHEROS; do
   # El temporal va EN EL DESTINO, no en /tmp: ahi son sistemas de ficheros
   # distintos y `mv` seria copiar+borrar, no un renombrado atomico. Con el
   # temporal al lado, nginx no puede llegar a ver un fichero a medias.
-  tmp="$(mktemp -p "$DESTINO" .nvx-inst.XXXXXX)"
+  tmp="$STAGE_DIR/$f"
   if ! curl -fsSL --max-time 60 "$BASE_URL/$f" -o "$tmp"; then
     echo "nvx-installers: $f -> descarga fallida, conservo la copia anterior" >&2
-    rm -f "$tmp"; fallo=$((fallo + 1)); continue
+    rm -f "$tmp"; fallo=$((fallo + 1)); stage_failed=1; continue
   fi
   # Un .ps1 nuestro nunca baja de 5 KB. Un cuerpo corto es un 429, un 404 o una
   # pagina de error de GitHub, y sobreescribir con eso seria peor que no tocar.
   bytes=$(stat -c %s "$tmp" 2>/dev/null || echo 0)
   if [ "$bytes" -lt 5000 ]; then
     echo "nvx-installers: $f -> solo $bytes bytes, sospechoso; NO lo instalo" >&2
-    rm -f "$tmp"; fallo=$((fallo + 1)); continue
+    rm -f "$tmp"; fallo=$((fallo + 1)); stage_failed=1; continue
   fi
-  if [ -f "$DESTINO/$f" ] && cmp -s "$tmp" "$DESTINO/$f"; then
-    rm -f "$tmp"; igual=$((igual + 1)); continue
-  fi
-  chmod 644 "$tmp"
-  mv -f "$tmp" "$DESTINO/$f"
-  echo "nvx-installers: $f actualizado ($bytes bytes)"
-  ok=$((ok + 1))
 done
 
-mkdir -p "$HOOK_DIR"
-for f in "${!HOOK_HASHES[@]}"; do
-  tmp="$(mktemp -p "$HOOK_DIR" .nvx-hook.XXXXXX)"
-  url="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$HOOK_REVISION/windows_vm/hooks/$f"
-  if ! curl -fsSL --max-time 60 "$url" -o "$tmp"; then
-    echo "nvx-installers: $f -> descarga fallida; no actualizo hook" >&2
-    rm -f "$tmp"; fallo=$((fallo + 1)); continue
-  fi
-  got="$(sha256sum "$tmp" | awk '{print $1}')"
-  if [[ "$got" != "${HOOK_HASHES[$f]}" ]]; then
-    echo "nvx-installers: $f -> hash inesperado ($got), NO lo instalo" >&2
-    rm -f "$tmp"; fallo=$((fallo + 1)); continue
-  fi
-  chmod 644 "$tmp"
-  if [[ -f "$HOOK_DIR/$f" ]] && cmp -s "$tmp" "$HOOK_DIR/$f"; then
-    rm -f "$tmp"; igual=$((igual + 1)); continue
-  fi
-  mv -f "$tmp" "$HOOK_DIR/$f"; ok=$((ok + 1))
-done
+if [[ "$stage_failed" == 0 ]]; then
+  for f in $FICHEROS; do
+    tmp="$STAGE_DIR/$f"
+    if [ -f "$DESTINO/$f" ] && cmp -s "$tmp" "$DESTINO/$f"; then
+      igual=$((igual + 1)); continue
+    fi
+    chmod 644 "$tmp"; mv -f "$tmp" "$DESTINO/$f"
+    echo "nvx-installers: $f actualizado"; ok=$((ok + 1))
+  done
+else
+  echo "nvx-installers: staging de instaladores incompleto; conservo todas las copias actuales" >&2
+fi
+rm -rf "$STAGE_DIR"
 
 echo "nvx-installers: $ok actualizado(s), $igual sin cambios, $fallo con problema"
 # Solo se falla si NO hay copia utilizable de alguno: que GitHub no conteste
