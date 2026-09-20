@@ -8,8 +8,9 @@ clientes ni publiques streams sin canarios y revisión.
 ## Preparación invitada
 
 1. Instala las actualizaciones aprobadas y .NET Framework 3.5. Conserva
-   Feedback Hub y el stub OS-serviced de DesktopAppInstaller/winget con sus
-   source packages. No fuerces la eliminación de AppX no removibles.
+   Feedback Hub y el stub OS-serviced de DesktopAppInstaller. Si Sysprep señala
+   un paquete winget/source instalado para el usuario, retira ese paquete por
+   la vía soportada de ese usuario. No fuerces la eliminación de AppX no removibles.
 2. Configura OpenSSH, NTP, Samba/firewall, política de contraseñas, UI, perfil,
    `C:\NeuraData` y `C:\My Servers` según `README.md`.
 3. Aplica High performance y verifica cero núcleos aparcados con
@@ -24,10 +25,10 @@ Usa solo `windows_vm/installers/install_sqx_from_storagebox.ps1` y
 verificado `/pkg/hooks/<revision>/` de `files-hel` o `files-fsn` y comprueban
 SHA-256.
 
-- SQX headless se configura con `set_java_headless.ps1` en el `.config` de la
-  aplicación. No uses una variable Java global.
+- El instalador SQX configura headless en el `.config` de la aplicación
+  usando la misma regla que `set_java_headless.ps1`. No uses una variable Java global.
 - El instalador puede aplicar IFEO `CpuPriorityClass=6` (AboveNormal) al
-  ejecutable previsto. Nunca cablees `StrategyQuantX.exe`; el launcher v144 fue
+  ejecutable previsto. Nunca añadas IFEO `Debugger` a `StrategyQuantX.exe`; el launcher v144 fue
   retirado por el riesgo de fork-bomb en instalaciones duales. No restaures
   `sqx144_hook_launcher.vbs`.
 - MetaTrader recibe `/portable` solo después de su gate de datos portables.
@@ -43,8 +44,9 @@ SDelete salvo medición explícita que justifique `-RunSDelete`. El script
 preserva Panther, AppX y Feedback Hub, elimina identidades SSH de plantilla,
 prioriza TRIM, y no modifica `unattend.xml` ni ejecuta Sysprep.
 
-Sysprep se inicia manualmente desde el escritorio interactivo elevado de
-Administrator/Administrador, nunca bajo QGA/SYSTEM:
+Sysprep se inicia en la sesión interactiva elevada de Administrator/Administrador,
+directamente o con una tarea `Interactive` / `Highest` que se borre antes de
+lanzarlo. QGA puede registrar esa tarea; Sysprep nunca se ejecuta como SYSTEM:
 
 ```powershell
 cd C:\Windows\System32\Sysprep
@@ -69,13 +71,16 @@ energía.
   `# neuravps-stream-template-key: windows-es-YYYYMMDD` o su equivalente
   `windows-en`. Marker ausente, duplicado, malformado o mutable es fallo de
   publicación. Restore debe usar ese marker para todos los discos y firewall.
-- Primero valida streams con canarios, después despliega hooks verificados en
-  ambas BASE (`files-hel` y `files-fsn`), y solo entonces actualiza el
-  `config.conf` canónico con el marker. No reemplaces streams inmutables.
+- Primero valida streams e instaladores con canarios. Despliega todos los
+  consumidores Google de create/reset/colas y el refresher de caché en ambas
+  BASE; verifica hooks e instaladores publicados. Solo entonces sustituye
+  atómicamente cada `config.conf` canónico por el config staging completo con
+  su marker. Guarda el config anterior para rollback y conserva los streams
+  canónicos antiguos e inmutables para trabajos ya en marcha.
 
 ## Historial retirado
 
-Las instrucciones antiguas para quitar winget/Feedback Hub/AppX o ejecutar
-Sysprep bajo SYSTEM quedan solo como contexto histórico y no son pasos de esta
-tarea. Si una observación nueva contradice estas reglas, detente y documenta
+Quedan retiradas la eliminación forzada de AppX de sistema/Feedback Hub y la
+ejecución de Sysprep como SYSTEM. También queda retirada la afirmación general
+de que winget nunca bloquea Sysprep: depende del paquete instalado al usuario. Si una observación nueva contradice estas reglas, detente y documenta
 la evidencia antes de cambiar el procedimiento.

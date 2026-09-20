@@ -8,8 +8,11 @@ notes before export.
 
 - Apply Windows updates and the required .NET Framework 3.5 feature.
 - Keep Feedback Hub installed and provisioned. Keep the OS-serviced
-  `Microsoft.DesktopAppInstaller`/winget stub and its source packages. Do not
-  remove AppX packages or force removal of non-removable packages.
+  `Microsoft.DesktopAppInstaller` stub. A user-installed winget/source package
+  can block Sysprep: use the actual Sysprep error to identify and uninstall
+  that package through the supported user context. The September images have
+  already had those user packages removed. Never force removal of the
+  non-removable stub or system AppX packages.
 - Configure OpenSSH, Samba firewall rules, NTP, password policy, the NeuraData
   and My Servers directories, UI preferences, and the intended profile state.
   Delete OpenSSH host keys and any template `administrators_authorized_keys`
@@ -27,11 +30,11 @@ cache on either BASE (`files-hel` or `files-fsn`) and verify SHA-256. Hooks are
 application-install behavior; they are not part of the template cleanup or
 export stream.
 
-- SQX headless behavior comes from `set_java_headless.ps1`, which writes
+- The SQX installer applies the same per-app setting as `set_java_headless.ps1`:
   `-Djava.awt.headless=true` to the application `.config`. Do not use a machine
   wide Java environment variable.
 - The SQX installer may set IFEO priority `CpuPriorityClass=6` (AboveNormal)
-  for the intended executable. It must never wire `StrategyQuantX.exe`; that
+  for the intended executable. It must never set an IFEO `Debugger` on `StrategyQuantX.exe`; that
   executable is unsafe on dual v143/v144 installations. The withdrawn
   `sqx144_hook_launcher.vbs` must not be restored.
 - MetaTrader's installer applies `/portable` only after its documented data
@@ -66,8 +69,11 @@ measured closed caches, removes SSH template identities, handles VSS/hibernation
 only when present, and prioritizes TRIM. DISM `/ResetBase`, NGEN, defrag,
 SDelete, and Event Log clearing require an explicit switch and measurement.
 
-Sysprep must be started manually from the elevated interactive
-Administrator/Administrador desktop, never through QGA/SYSTEM:
+Start Sysprep in the elevated interactive Administrator/Administrador session.
+A self-deleting scheduled task with `Interactive` logon and `Highest` privileges
+is also validated; QGA may register that task, but must never run Sysprep as
+SYSTEM. Verify the task SID ends in `-500`, its session is not 0, and it removes
+itself before launching Sysprep. This avoids PowerShell command history:
 
 ```powershell
 cd C:\Windows\System32\Sysprep
@@ -81,25 +87,32 @@ Feedback Hub, and the intended power plan.
 
 ## Export and publication handoff
 
-The canonical config contains exactly one marker comment:
+Each new canonical config contains exactly one marker comment, for example:
 
 ```text
-# neuravps-stream-template-key: windows-es-YYYYMMDD
-# neuravps-stream-template-key: windows-en-YYYYMMDD
+# neuravps-stream-template-key: windows-es-20260920
 ```
 
-The marker must be lowercase, single-hyphen, and point to the immutable staged
-key. Missing, duplicated, malformed, or mutable-alias markers are publication
-failures. Consumers must use that exact key for every disk and firewall read.
+The English config points to its own `windows-en-20260920` release. The value
+contains only letters, digits, `_` or `-` and names an immutable staging key,
+never the mutable `windows-es` / `windows-en` aliases. Consumers read the config
+once and use its key for every disk and firewall read. Legacy configs without
+a marker remain supported only to permit deployment and rollback.
 
-Publication order is strict: validate staged streams with the canaries, deploy
-the verified installer hook cache to both BASE endpoints, then update only the
-canonical `config.conf` marker. The canonical directory receives configuration
-metadata; it does not replace immutable stream files.
+Publication order: validate the staging streams and installers with canaries;
+deploy every Google create/reinstall/queue function that consumes templates;
+deploy the updated `nvx-installers.sh` to both BASEs and run it, verifying hooks
+and installer hashes at both endpoints; then atomically replace each canonical
+`config.conf` with the complete corresponding staging config. Keep a copy of
+the old config for rollback and leave the old canonical disk streams intact.
+Existing jobs can finish on the old streams while new jobs use the pinned
+release. The hourly cache timer refreshes payloads, not its own script: when
+changing hook revisions, deploy the refresher script to both BASEs too.
 
 ## Historical notes
 
-The old checklist asked operators to remove winget, Feedback Hub, or arbitrary
-AppX packages and sometimes ran Sysprep under SYSTEM. Those procedures are
-retired. Server 2025 keeps the DesktopAppInstaller stub by design, and the
-current images have already passed the measured interactive Sysprep path.
+The old blanket claim that winget could never block Sysprep was based on an
+invalid SYSTEM-context test. Check the actual user-package error instead.
+Forced system AppX removal and SYSTEM Sysprep are retired procedures. The
+September release preserves the OS stub and Feedback Hub and passed interactive
+Sysprep plus real desktop logins in both languages.
