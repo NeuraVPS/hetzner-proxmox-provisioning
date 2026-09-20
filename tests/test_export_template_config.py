@@ -96,6 +96,35 @@ def main() -> None:
         env = os.environ.copy(); env.update({"PATH": f"{td}:{env['PATH']}", "DESTINO": str(dest), "TEST_ROOT": str(ROOT)})
         subprocess.run(["bash", str(ROOT / "base/snippets/nvx-installers.sh")], env=env, check=False)
         assert all(path.read_text() == "old-" + path.name for path in old.values())
+
+    # A hook download failure must stop before dependent installers are
+    # published. This exercises the ordering boundary rather than just
+    # checking shell text.
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td) / "pkg"
+        dest.mkdir()
+        old = {}
+        for name in (
+            "install_mt_from_storagebox.ps1",
+            "install_sqx_from_storagebox.ps1",
+            "install_qa_from_storagebox.ps1",
+        ):
+            path = dest / name
+            path.write_text("old-" + name)
+            old[name] = path.read_text()
+        fake = Path(td) / "curl"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in *sqx_hook_launcher.vbs*) exit 1;; esac\n"
+            "out=\"\"; for a in \"$@\"; do [ \"$prev\" = -o ] && out=\"$a\"; prev=\"$a\"; done\n"
+            "head -c 6000 /dev/zero >\"$out\"\n"
+        )
+        fake.chmod(0o755)
+        env = os.environ.copy(); env.update({"PATH": f"{td}:{env['PATH']}", "DESTINO": str(dest)})
+        result = subprocess.run(["bash", str(ROOT / "base/snippets/nvx-installers.sh")], env=env, check=False)
+        assert result.returncode != 0
+        assert {name: (dest / name).read_text() for name in old} == old
+        assert not list(dest.glob(".nvx-*"))
     print("export template fixture checks passed")
 
 

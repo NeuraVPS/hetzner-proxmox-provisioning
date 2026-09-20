@@ -6,7 +6,10 @@ Recommended cleanup steps **before** running sysprep on a Windows template VM, t
 - Reclaim space on thin-provisioned storage (ZFS / qcow2 / LVM-thin on the Proxmox host).
 - Reduce first-boot work on cloned VMs.
 
-Run all commands in **PowerShell as Administrator**. Order matters — do cleanup first, then defrag, then zero free space, **then** sysprep.
+Use the canonical script below in an elevated PowerShell session. Do not run the
+historical snippets in this document individually; they explain the rationale
+and are not the current execution order. Sysprep remains a separate manual
+step from the interactive Administrator desktop.
 
 ## Current safe defaults (2026-09-20)
 
@@ -26,7 +29,8 @@ servicing evidence before any optional log clearing.
 
 ## 0. Pre-flight: no pending reboot
 
-If Windows Update left a reboot pending, `DISM /ResetBase` can fail (`0x800f0806` and friends) or — worse — capture a half-applied servicing state into the template. Check, and reboot first if needed:
+If Windows Update left a reboot pending, cleanup must stop before touching the
+image. Check, and reboot first if needed:
 
 ```powershell
 Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
@@ -34,7 +38,9 @@ Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Up
 # both must be False before proceeding
 ```
 
-The canonical script aborts (exit 2) if either key exists.
+The canonical script aborts (exit 2) if either key exists. `-RunResetBase` is
+optional and irreversible; it is not the default because this template already
+ran it.
 
 ---
 
@@ -42,15 +48,19 @@ The canonical script aborts (exit 2) if either key exists.
 
 Lets DISM / Disk Cleanup operate on staged update files without fighting a running scan.
 
-```powershell
-Stop-Service -Name wuauserv, bits, cryptsvc, msiserver -Force -ErrorAction SilentlyContinue
-```
+The canonical script stops only `wuauserv` and `bits` while removing closed
+files, then restores the previous BITS running state. It does not reset the
+catalog or installer databases, so `cryptsvc` and `msiserver` are left alone.
 
 ---
 
 ## 2. Clean the Component Store (biggest win)
 
-The component store (`C:\Windows\WinSxS`) keeps superseded payloads from every Windows Update ever applied. On a freshly-patched Server 2025 template this can be **5–15 GB**. `/ResetBase` is the irreversible variant — after it, the currently-installed updates can no longer be uninstalled, which is exactly what you want for a template.
+The component store (`C:\Windows\WinSxS`) keeps superseded payloads from every
+Windows Update ever applied. `/ResetBase` is irreversible because installed
+updates can no longer be uninstalled. The canonical script skips it by default;
+use `-RunResetBase` only after a fresh measurement and an explicit operator
+decision.
 
 ```powershell
 Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase
@@ -83,16 +93,16 @@ foreach ($fw in 'Framework64','Framework') {
 
 ---
 
-## 4. Clear staged Windows Update payloads + BITS job database
+## 4. Clear the closed download cache only
 
-`SoftwareDistribution\Download` holds downloaded-but-not-yet-cleaned update installers. `catroot2` holds signature catalogs that get regenerated on next WU scan. The BITS `qmgr.db` holds transfer-job state that is meaningless on a clone.
+`SoftwareDistribution\Download` holds downloaded-but-not-yet-cleaned update
+installers. The canonical script clears that closed cache only. It preserves
+`DataStore`, `catroot2`, and BITS job state because the measured savings do not
+justify resetting servicing metadata on these templates.
 
 ```powershell
-Remove-Item -Path 'C:\Windows\SoftwareDistribution\Download\*'      -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path 'C:\Windows\SoftwareDistribution\DataStore\*'     -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path 'C:\Windows\SoftwareDistribution\ReportingEvents.log' -Force -ErrorAction SilentlyContinue
-Remove-Item -Path 'C:\Windows\System32\catroot2\*'                  -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path 'C:\ProgramData\Microsoft\Network\Downloader\qmgr*' -Force -ErrorAction SilentlyContinue
+Remove-Item -Path 'C:\Windows\SoftwareDistribution\Download\*' -Recurse -Force -ErrorAction Stop
+# Do not remove DataStore, catroot2, ReportingEvents.log, or BITS qmgr state.
 ```
 
 ---
@@ -281,20 +291,25 @@ cleanmgr.exe /sagerun:64
 
 ---
 
-## 16. Defragment and TRIM the C: volume
+## 16. TRIM the C: volume (defrag only when explicitly measured)
 
 On SSD-backed storage this issues TRIM, which lets the underlying storage actually free the blocks you just deleted. Our template VMs have `discard=on` + `virtio-scsi-single`, so in-guest TRIM propagates straight to the ZFS zvol.
 
 ```powershell
-Optimize-Volume -DriveLetter C -Defrag -Verbose
 Optimize-Volume -DriveLetter C -ReTrim -Verbose
+
+The canonical script runs ReTrim by default. `-RunDefrag` is an explicit
+exception for a measured need; do not defragment as routine cleanup.
 ```
 
 ---
 
-## 17. Zero out free space (critical for thin provisioning)
+## 17. Optional zero-fill (SDelete only after measuring TRIM)
 
-This is the step that makes the previous cleanup **actually shrink the image on the Proxmox host**. Without it, the deleted files still occupy blocks from the host's perspective — ZFS/qcow2 only reclaim space that's been explicitly zeroed (or TRIM'd, but in-guest TRIM doesn't always propagate to the host depending on the SCSI controller / discard setting). With ZFS compression enabled, zero blocks are detected at write time and stored as holes, so this is cheap on the host even though the guest writes gigabytes.
+TRIM is the first choice for thin-provisioned storage. SDelete writes the
+entire free space and can temporarily fill C:, so it is not routine cleanup.
+Use it only when a measurement shows that TRIM did not reclaim the expected
+blocks and pass `-RunSDelete` explicitly.
 
 Install Sysinternals **SDelete** once on the template (or copy `sdelete64.exe` into `C:\Windows\System32` — **already installed on windows-es/windows-en** since the 2026-06 refresh):
 
@@ -320,7 +335,8 @@ sdelete64.exe -accepteula -nobanner -z C:
 Optimize-Volume -DriveLetter C -ReTrim
 ```
 
-> `-z` writes zeros to free space (good for thin provisioning).
+> `-z` writes zeros to free space (good for thin provisioning when explicitly
+> justified).
 > `-c` ("clean") writes random data instead — only needed if you care about cryptographic erasure of deleted files, which a template generally doesn't.
 >
 > Expect this to take a while and to **temporarily fill C: to 100%** as it writes the zero file, then delete it. That's normal.

@@ -18,7 +18,7 @@
 # dejarian a los invitados instalando basura, en silencio y solo en las VMs
 # nuevas — que es de las cosas mas caras de descubrir. Si GitHub no contesta se
 # conserva la copia anterior, que es exactamente lo que se quiere.
-set -u
+set -Eeuo pipefail
 
 BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/refs/heads/master/windows_vm/installers}"
 DESTINO="${DESTINO:-/var/www/pkg}"
@@ -33,31 +33,59 @@ declare -A HOOK_HASHES=(
   [mt_hook_launcher.vbs]=9b372a41e0a6bb2f910d24c76480d356f9c26485ed7167a0cd006f73e949456b
 )
 
-mkdir -p "$DESTINO"
+mkdir -p -- "$DESTINO"
+case "$DESTINO" in
+  /*) ;;
+  *) echo "nvx-installers: DESTINO must be an absolute path" >&2; exit 1 ;;
+esac
+STAGE_DIR=''
+HOOK_STAGE_DIR=''
+cleanup_staging() {
+  local d
+  for d in "$STAGE_DIR" "$HOOK_STAGE_DIR"; do
+    [[ -n "$d" ]] || continue
+    [[ "$d" == "$DESTINO"/.nvx-* ]] || {
+      echo "nvx-installers: refusing to clean unexpected staging path: $d" >&2
+      continue
+    }
+    [[ -d "$d" ]] && rm -rf -- "$d"
+  done
+}
+trap cleanup_staging EXIT HUP INT TERM
 # Restos de una ejecucion cortada a medias: nginx no debe servirlos nunca.
-rm -f "$DESTINO"/.nvx-inst.* 2>/dev/null
+rm -f -- "$DESTINO"/.nvx-inst.* 2>/dev/null || true
 ok=0; fallo=0; igual=0
 
 # Hooks are a prerequisite for publishing refreshed installers. Reuse an
 # already-valid cache entry when GitHub is unavailable, and never replace it
 # with an unverified response.
-mkdir -p "$HOOK_DIR"
+HOOK_STAGE_DIR="$(mktemp -d -p "$DESTINO" .nvx-hook-stage.XXXXXX)"
 for f in "${!HOOK_HASHES[@]}"; do
   if [[ -f "$HOOK_DIR/$f" ]] && [[ "$(sha256sum "$HOOK_DIR/$f" | awk '{print $1}')" == "${HOOK_HASHES[$f]}" ]]; then
     igual=$((igual + 1)); continue
   fi
-  tmp="$(mktemp -p "$HOOK_DIR" .nvx-hook.XXXXXX)"
+  tmp="$HOOK_STAGE_DIR/$f"
   url="https://raw.githubusercontent.com/NeuraVPS/hetzner-proxmox-provisioning/$HOOK_REVISION/windows_vm/hooks/$f"
   if ! curl -fsSL --max-time 60 "$url" -o "$tmp"; then
     echo "nvx-installers: $f -> descarga fallida y no hay copia valida" >&2
-    rm -f "$tmp"; exit 1
+    exit 1
   fi
   got="$(sha256sum "$tmp" | awk '{print $1}')"
   if [[ "$got" != "${HOOK_HASHES[$f]}" ]]; then
     echo "nvx-installers: $f -> hash inesperado ($got), NO lo instalo" >&2
-    rm -f "$tmp"; exit 1
+    exit 1
   fi
-  chmod 644 "$tmp"; mv -f "$tmp" "$HOOK_DIR/$f"; ok=$((ok + 1))
+done
+
+# Seed the complete hook set before publishing dependent installers.
+mkdir -p -- "$HOOK_DIR"
+for f in "${!HOOK_HASHES[@]}"; do
+  tmp="$HOOK_STAGE_DIR/$f"
+  if [[ -f "$tmp" ]]; then
+    chmod 644 -- "$tmp"
+    mv -f -- "$tmp" "$HOOK_DIR/$f"
+    ok=$((ok + 1))
+  fi
 done
 
 STAGE_DIR="$(mktemp -d -p "$DESTINO" .nvx-stage.XXXXXX)"
@@ -86,14 +114,12 @@ if [[ "$stage_failed" == 0 ]]; then
     if [ -f "$DESTINO/$f" ] && cmp -s "$tmp" "$DESTINO/$f"; then
       igual=$((igual + 1)); continue
     fi
-    chmod 644 "$tmp"; mv -f "$tmp" "$DESTINO/$f"
+    chmod 644 -- "$tmp"; mv -f -- "$tmp" "$DESTINO/$f"
     echo "nvx-installers: $f actualizado"; ok=$((ok + 1))
   done
 else
   echo "nvx-installers: staging de instaladores incompleto; conservo todas las copias actuales" >&2
 fi
-rm -rf "$STAGE_DIR"
-
 echo "nvx-installers: $ok actualizado(s), $igual sin cambios, $fallo con problema"
 # Solo se falla si NO hay copia utilizable de alguno: que GitHub no conteste
 # teniendo copia buena no es una averia, es el modo degradado previsto.
