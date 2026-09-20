@@ -39,6 +39,7 @@ went unread for 0000235).
 """
 import argparse
 import glob
+import ipaddress
 import json
 import os
 import re
@@ -70,18 +71,33 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def load_ip_to_node(path: str) -> dict:
+def load_ip_to_node(path: str) -> dict | None:
     """nodeId -> ipv6 map (same file base-nat already keeps fresh) reversed
-    to ipv6 -> nodeId. Best-effort: an unreadable/missing map just means
-    nodes show up labeled by their raw IPv6 in the email instead of by name
-    — never a reason to skip the scan or stay silent."""
+    to ipv6 -> nodeId. An unreadable/missing map returns None so the caller
+    scans every log; a valid map is authoritative for live membership."""
     try:
         with open(path) as fh:
             data = json.load(fh)
-        return {v: k for k, v in data.items() if isinstance(v, str)}
+        if not isinstance(data, dict):
+            raise ValueError("node map is not an object")
+        if not data:
+            raise ValueError("node map is empty")
+        ip_to_node = {}
+        for node_id, address in data.items():
+            if not isinstance(node_id, str) or not node_id.strip():
+                raise ValueError("node map has an empty or non-string node ID")
+            if not isinstance(address, str):
+                raise ValueError(f"node map address for {node_id!r} is not a string")
+            parsed = ipaddress.ip_address(address)
+            if parsed.version != 6:
+                raise ValueError(f"node map address for {node_id!r} is not IPv6")
+            ip_to_node[address] = node_id
+        return ip_to_node
     except Exception as e:  # noqa: BLE001
-        log(f"hw-error-scan: node map unavailable ({path}): {e} — will label by IP")
-        return {}
+        # Do not turn a temporary map-read failure into a blind spot.  In that
+        # exceptional case preserve the old behavior and inspect every log.
+        log(f"hw-error-scan: node map unavailable ({path}): {e} — scanning all logs")
+        return None
 
 
 def current_boot_lines(lines: list[str]) -> list[str]:
@@ -133,11 +149,19 @@ def build_report(log_dir: str, nodes_map_path: str) -> list[dict]:
     findings = []
     for path in sorted(glob.glob(os.path.join(log_dir, "*.log"))):
         ip = os.path.basename(path)[: -len(".log")]
+        # Netconsole files outlive the host that wrote them.  Once the live
+        # BASE inventory no longer contains that IPv6, it cannot describe a
+        # current fleet node and must not page hardware operations.  The map
+        # is usable only after full non-empty validation; otherwise None makes
+        # this a conservative scan of every log.
+        if ip_to_node is not None and ip not in ip_to_node:
+            log(f"hw-error-scan: skipping retired/unmapped netconsole log {ip}")
+            continue
         result = scan_file(path)
         if result is None:
             continue
         result["ip"] = ip
-        result["node"] = ip_to_node.get(ip, ip)
+        result["node"] = ip_to_node.get(ip, ip) if ip_to_node is not None else ip
         findings.append(result)
     return findings
 
