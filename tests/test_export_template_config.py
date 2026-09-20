@@ -48,7 +48,7 @@ def main() -> None:
     assert "zfs destroy" not in SOURCE
     assert "SNAPSHOT_NAME=\"${SNAPSHOT_NAME:-export-" in SOURCE
     assert 'mkdir \'${REMOTE_BASE}\'' in SOURCE
-    assert "Could not reserve new staging dir" in SOURCE
+    assert "Could not reserve new template dir" in SOURCE
     assert "STAGING_KEY must name an immutable release" in SOURCE
     assert "LEGACY_DIRECT_EXPORT\" != \"1\"" in SOURCE
     assert "bash -s -- ${REMOTE_TEMPLATE_KEY} <new_vmid>" in SOURCE
@@ -185,6 +185,28 @@ def main() -> None:
         alias.chmod(0o755)
         env["MODE"] = "new"
         assert subprocess.run([str(alias)], env=env, capture_output=True).returncode == 42
+        # A legacy destination is still protected unless OVERWRITE is also
+        # explicit. Simulate an existing directory and record remote writes.
+        calls = Path(td) / "ssh-calls"
+        fake.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+            'case "$*" in "mkdir -p "*) exit 0;; "mkdir "*) exit 1;; "rm -f "*) exit 0;; *) exit 91;; esac\n'
+        )
+        fake.chmod(0o755)
+        env["CALLS"] = str(calls)
+        for overwrite in (0, 1):
+            calls.write_text("")
+            legacy = Path(td) / f"check-legacy-{overwrite}.sh"
+            legacy.write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\n"
+                "SSH_BASE=(ssh)\nbase=/home/templates\nTEMPLATE_KEY=windows-es\n"
+                "STAGING_KEY=''\nREMOTE_TEMPLATE_KEY=''\nREMOTE_BASE=''\n"
+                f"OVERWRITE={overwrite}\nLEGACY_DIRECT_EXPORT=1\n"
+                "die(){ echo \"$*\" >&2; exit 42; }\n" + guard
+            )
+            result = subprocess.run(["bash", str(legacy)], env=env, capture_output=True)
+            assert result.returncode == (0 if overwrite else 42)
+            assert ("rm -f" in calls.read_text()) is bool(overwrite)
     print("export template fixture checks passed")
 
 

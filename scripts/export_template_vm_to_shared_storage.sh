@@ -364,12 +364,12 @@ echo "Export destination key: ${REMOTE_TEMPLATE_KEY}"
 # require a new STAGING_KEY. Only the explicitly legacy direct workflow may
 # reuse a directory and clean its files.
 echo "Preparing remote dir: ${REMOTE_BASE}"
-if [[ "$LEGACY_DIRECT_EXPORT" == "1" ]]; then
+if [[ "$LEGACY_DIRECT_EXPORT" == "1" && "$OVERWRITE" == "1" ]]; then
   "${SSH_BASE[@]}" "mkdir -p '${REMOTE_BASE}'" || die "Could not create remote dir ${REMOTE_BASE}"
   "${SSH_BASE[@]}" "rm -f '${REMOTE_BASE}'/disk*.stream.zst '${REMOTE_BASE}/config.conf' '${REMOTE_BASE}/firewall.fw'" \
     || die "Failed to clean previous template files at ${REMOTE_BASE}"
 else
-  "${SSH_BASE[@]}" "mkdir '${REMOTE_BASE}'" || die "Could not reserve new staging dir ${REMOTE_BASE}; choose a new STAGING_KEY"
+  "${SSH_BASE[@]}" "mkdir '${REMOTE_BASE}'" || die "Could not reserve new template dir ${REMOTE_BASE}; choose a new STAGING_KEY"
 fi
 
 # Take a new, dated snapshot atomically across all the VM's datasets. Existing VM
