@@ -7,6 +7,15 @@ notes before export.
 ## Guest preparation
 
 - Apply Windows updates and the required .NET Framework 3.5 feature.
+- Check [Windows Server release health](https://learn.microsoft.com/en-us/windows/release-health/status-windows-server-2025)
+  for applicable out-of-band fixes as well. Windows Update can report that the
+  machine is current while a relevant fix is available only from the Microsoft
+  Update Catalog. For example, [KB5129235](https://support.microsoft.com/en-gb/servicing/os/windows-server/2026/09/kb5129235-windows-server-2025-update)
+  fixes a September 2026 RDS issue and advances Server 2025 to 26100.33451, but
+  is not offered through Windows Update. Follow the package's checkpoint order,
+  verify its official download hashes, and check the installed KB and full build
+  after reboot. Record the measured build before sealing; do not infer it from
+  an installer exit code or promise that a patch fixes every desktop problem.
 - Keep Feedback Hub installed and provisioned. Keep the OS-serviced
   `Microsoft.DesktopAppInstaller` stub. A user-installed winget/source package
   can block Sysprep: use the actual Sysprep error to identify and uninstall
