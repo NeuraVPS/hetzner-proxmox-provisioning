@@ -11,6 +11,9 @@ clientes ni publiques streams sin canarios y revisión.
    Feedback Hub y el stub OS-serviced de DesktopAppInstaller. Si Sysprep señala
    un paquete winget/source instalado para el usuario, retira ese paquete por
    la vía soportada de ese usuario. No fuerces la eliminación de AppX no removibles.
+   Contrasta también los parches fuera de banda pertinentes en la documentación
+   de Microsoft: pueden no ofrecerse por Windows Update. Sigue sus requisitos,
+   verifica los hashes oficiales y mide KB/build después del reinicio; ver README.
 2. Configura OpenSSH, NTP, Samba/firewall, política de contraseñas, UI, perfil,
    `C:\NeuraData` y `C:\My Servers` según `README.md`.
 3. Aplica High performance y verifica cero núcleos aparcados con
