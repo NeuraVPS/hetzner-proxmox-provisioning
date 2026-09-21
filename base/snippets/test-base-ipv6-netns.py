@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real IPv6 TCP probes in private user/network namespaces; no production I/O."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -124,6 +125,7 @@ except (OSError,TimeoutError):print("CLOSED",flush=True)
             check('2001:db8:1::64',3389,'CLOSED')
             check('2001:db8:1::2',20101,'2a01:4f9:c01f:e::65:3389')
             desired[100]['ipv6Enabled']=True;m.reconcile(desired)
+            sh('nft','flush','set','inet','neura_ipv6','direct_rate6')
             check('2001:db8:1::64',3389,'2a01:4f9:c01f:e::64:3389')
             check('2001:db8:1::64',20101,'2a01:4f9:c01f:e::64:20101')
             # This connection is eligible for the test flowtable. Revoking
@@ -133,9 +135,12 @@ except (OSError,TimeoutError):print("CLOSED",flush=True)
             assert persistent.stdout.readline().strip()=='2a01:4f9:c01f:e::64:3389'
             persistent.stdin.write('ping\n');persistent.stdin.flush()
             assert persistent.stdout.readline().strip()=='PONG'
+            time.sleep(.2)
+            tracked=sh('conntrack','-L','-f','ipv6','--orig-dst','2001:db8:1::64').stdout
+            assert '[OFFLOAD]' in tracked,tracked
             # VM 101's established guest egress must survive VM 100's direct
-            # withdrawal; the revoke guard is limited to original inbound
-            # tuples and must not match a NAT66 reply.
+            # withdrawal; only original inbound destinations are deleted,
+            # never a NAT66 reply tuple of an outgoing guest connection.
             egress=subprocess.Popen(['nsenter','-t',guest,'-n','python3','-c',hold_out,'2a01:4f9:c01f:e::65','2001:db8:1::1','4444'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
             procs.append(egress)
             assert egress.stdout.readline().strip()=='OPEN'
@@ -150,8 +155,26 @@ except (OSError,TimeoutError):print("CLOSED",flush=True)
             check('2001:db8:1::64',3389,'CLOSED')
             check('2001:db8:1::2',20101,'2a01:4f9:c01f:e::65:3389')
             desired[100]['ipv6Enabled']=True;desired[100]['rdp']=False;m.reconcile(desired)
+            sh('nft','flush','set','inet','neura_ipv6','direct_rate6')
             check('2001:db8:1::64',3389,'CLOSED')
             check('2001:db8:1::64',20101,'2a01:4f9:c01f:e::64:20101')
+            # A source repeatedly trying a direct destination is limited.
+            # Reconciliation of an unrelated flag must retain that meter.
+            sh('nft','flush','set','inet','neura_ipv6','direct_rate6')
+            spray='''import socket
+for _ in range(18):
+ s=socket.socket(socket.AF_INET6);s.settimeout(.15)
+ try:s.connect(('2001:db8:1::64',20101))
+ except OSError:pass
+ finally:s.close()
+'''
+            n(internet,'python3','-c',spray)
+            counter=sh('nft','-j','list','counter','inet','neura_ipv6','direct_rate_drops').stdout
+            drops=next(x['counter']['packets'] for x in json.loads(counter)['nftables'] if 'counter' in x)
+            assert drops>0
+            m.reconcile(desired)
+            counter=sh('nft','-j','list','counter','inet','neura_ipv6','direct_rate_drops').stdout
+            assert next(x['counter']['packets'] for x in json.loads(counter)['nftables'] if 'counter' in x)>=drops
             # Disable publishes an inert file before it removes the live
             # table. A later cold nftables load cannot resurrect the old
             # receipt; only a fresh sync below can enable it again.

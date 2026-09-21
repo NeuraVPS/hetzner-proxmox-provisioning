@@ -15,7 +15,6 @@ import subprocess
 import tempfile
 
 TABLE = 'neura_ipv6'
-REVOKE_TABLE = 'neura_ipv6_revoke'
 IDENT = ipaddress.IPv6Network('2a01:4f9:c01f:e::/64')
 SETS = ('public6', 'enabled6', 'no_rdp6', 'no_smb6', 'no_ssh6')
 DISABLED_POLICY = '# Direct IPv6 BASE policy is disabled.\n'
@@ -44,7 +43,7 @@ def plan(desired: dict, main_ipv6: str) -> dict:
                         'rdp': entry.get('rdp', True) is True,
                         'smb': entry.get('samba', True) is True,
                         'ssh': entry.get('ssh', True) is True})
-    return {'main': str(main), 'entries': entries}
+    return {'schemaVersion': 1, 'main': str(main), 'entries': entries}
 
 
 def render(policy: dict, uplink: str = 'enp2s0') -> str:
@@ -83,6 +82,25 @@ def render(policy: dict, uplink: str = 'enp2s0') -> str:
         '  ip6 daddr @no_ssh6 tcp dport 22 counter drop',
         ' }', '}', '']
     return '\n'.join(out)
+
+
+def render_element_update(policy: dict) -> str:
+    """Preserve anti-abuse buckets/counters during unrelated panel changes."""
+    entries = policy['entries']
+    data = [
+        ('map', 'public_to_ident', [f'{e["public"]} : {e["target"]}' for e in entries]),
+        ('set', 'public6', [e['public'] for e in entries]),
+        ('set', 'enabled6', [e['target'] for e in entries if e['enabled']]),
+        ('set', 'no_rdp6', [e['target'] for e in entries if not e['rdp']]),
+        ('set', 'no_smb6', [e['target'] for e in entries if not e['smb']]),
+        ('set', 'no_ssh6', [e['target'] for e in entries if not e['ssh']]),
+    ]
+    lines = []
+    for kind, name, values in data:
+        lines.append(f'flush {kind} inet {TABLE} {name}')
+        if values:
+            lines.append(f'add element inet {TABLE} {name} {{ {", ".join(values)} }}')
+    return '\n'.join(lines) + '\n'
 
 
 def revoked(before: dict, after: dict) -> list[list[str]]:
@@ -142,64 +160,14 @@ def load_receipt(state: Path) -> dict | None:
 
 
 def revoke(commands: list[list[str]]):
-    """Remove selected conntracks and their already-offloaded packets.
+    """Delete selected original inbound conntracks, including their offload.
 
-    A short-lived netdev guard covers the exact original inbound 5-tuples
-    before the shared flowtable. It cannot match a NAT66 reply: source and
-    destination ports are reversed. The conntrack deletion then removes the
-    normal state without touching guest egress or other VM sessions.
+    The kernel tears down the associated flow entries; no shared flowtable
+    reset or pre-conntrack packet filter is needed. Guest-initiated traffic
+    has another ORIGINAL destination and is deliberately never selected.
     """
-    if not commands:
-        return
-    install_revoke_guard(revoked_tuples(commands))
     for command in commands:
         run(command, allowed=(0, 1))  # 1 = no matching connection
-
-
-def revoked_tuples(commands: list[list[str]]) -> dict[str, set[tuple[str, str, str, str]]]:
-    """Read only the original direct tuples that the next delete will target."""
-    wanted: dict[str, set[tuple[str, str]]] = {}
-    for command in commands:
-        public = command[command.index('--orig-dst') + 1]
-        protocol = command[command.index('-p') + 1] if '-p' in command else None
-        port = command[command.index('--dport') + 1] if '--dport' in command else None
-        wanted.setdefault(public, set()).add((protocol or '', port or ''))
-    result = {'tcp': set(), 'udp': set()}
-    pattern = re.compile(r'^(?:ipv6\s+\d+\s+)?(tcp|udp)\s+\d+\s+.*?src=([^\s]+) dst=([^\s]+) sport=(\d+) dport=(\d+)')
-    for public, selectors in wanted.items():
-        listed = run(['conntrack', '-L', '-f', 'ipv6', '--orig-dst', public], allowed=(0, 1))
-        for line in listed.stdout.splitlines():
-            match = pattern.match(line)
-            if not match:
-                continue
-            protocol, source, destination, sport, dport = match.groups()
-            if ('', '') not in selectors and (protocol, dport) not in selectors:
-                continue
-            result[protocol].add((source, destination, sport, dport))
-    return result
-
-
-def install_revoke_guard(tuples: dict[str, set[tuple[str, str, str, str]]]):
-    """Install exact pre-flowtable drops for tuples still cached by flowtable."""
-    present = run(['nft', 'list', 'table', 'netdev', REVOKE_TABLE], allowed=(0, 1)).returncode == 0
-    chunks = [f'delete table netdev {REVOKE_TABLE}\n'] if present else []
-    uplink = os.environ.get('BASE_POLICY_UPLINK', 'enp2s0')
-    if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', uplink):
-        raise ValueError('Invalid uplink interface')
-    chunks += [f'table netdev {REVOKE_TABLE} {{']
-    for protocol in ('tcp', 'udp'):
-        values = tuples[protocol]
-        if values:
-            chunks.append(f' set {protocol}6 {{ type ipv6_addr . ipv6_addr . inet_service . inet_service; flags timeout; timeout 10m; elements = {{ ' +
-                          ', '.join(' . '.join(item) for item in sorted(values)) + ' }; }')
-    chunks += [' chain ingress {', f'  type filter hook ingress device "{uplink}" priority -150; policy accept;']
-    for protocol in ('tcp', 'udp'):
-        if tuples[protocol]:
-            chunks.append(f'  ip6 saddr . ip6 daddr . {protocol} sport . {protocol} dport @{protocol}6 counter drop')
-    chunks += [' }', '}', '']
-    transaction = '\n'.join(chunks)
-    run(['nft', '-c', '-f', '-'], data=transaction)
-    run(['nft', '-f', '-'], data=transaction)
 
 
 def render_disabled_guard(before: dict, uplink: str) -> str:
@@ -246,6 +214,7 @@ def reconcile(desired: dict):
     if os.environ.get('BASE_IPV6_POLICY_ENABLED', '').lower() not in ('1', 'true'):
         return
     policy = plan(desired, os.environ['MAIN_IPV6'])
+    policy['uplink'] = os.environ.get('BASE_POLICY_UPLINK', 'enp2s0')
     path = Path(os.environ.get('BASE_IPV6_POLICY_FILE', '/etc/nftables.d/base-ipv6-policy.nft'))
     state = Path(os.environ.get('BASE_IPV6_POLICY_STATE', '/var/lib/base-nat/ipv6-policy.json'))
     # A corrupt previous receipt must not bypass the targeted revocation step.
@@ -253,9 +222,16 @@ def reconcile(desired: dict):
     rendered = render(policy, os.environ.get('BASE_POLICY_UPLINK', 'enp2s0'))
     old_text = path.read_text() if path.exists() else None
     present = run(['nft', 'list', 'table', 'inet', TABLE], allowed=(0, 1)).returncode == 0
-    revoke_present = run(['nft', 'list', 'table', 'netdev', REVOKE_TABLE], allowed=(0, 1)).returncode == 0
-    transaction = (f'delete table netdev {REVOKE_TABLE}\n' if revoke_present else '') + (
-        f'delete table inet {TABLE}\n' if present else '') + rendered
+    same_structure = (present and before.get('schemaVersion') == policy['schemaVersion']
+                      and before.get('uplink') == policy['uplink'])
+    if same_structure:
+        # A failed disable may leave its deny-only table with the previous
+        # receipt. Reconstruct the full table rather than updating absent maps.
+        same_structure = run(['nft', 'list', 'map', 'inet', TABLE, 'public_to_ident'],
+                             allowed=(0, 1)).returncode == 0
+    transaction = (
+        render_element_update(policy) if same_structure else
+        (f'delete table inet {TABLE}\n' if present else '') + rendered)
     run(['nft', '-c', '-f', '-'], data=transaction)
     # Save boot policy before switching live rules; restore it if the atomic
     # kernel update is rejected. This never reloads the global ruleset.

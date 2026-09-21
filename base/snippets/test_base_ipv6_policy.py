@@ -66,14 +66,12 @@ def test_failed_atomic_apply_restores_boot_file(tmp_path):
     assert not state.exists()
 
 
-def test_offloaded_revoke_guard_is_exact_original_inbound_tuple():
+def test_revoke_never_changes_the_shared_flowtable_or_guest_egress():
     from types import SimpleNamespace
-    commands=[['conntrack','-D','-f','ipv6','--orig-dst','2001:db8:1::64','-p','tcp','--dport','3389']]
-    listing=('ipv6     10 tcp      6 src=2001:db8:1::9 dst=2001:db8:1::64 '
-             'sport=50000 dport=3389 src=2a01:4f9:c01f:e::64 dst=2001:db8:1::9 sport=3389 dport=50000 [OFFLOAD]\n')
-    with patch.object(m,'run',return_value=SimpleNamespace(returncode=0,stdout=listing)):
-        tuples=m.revoked_tuples(commands)
-    assert tuples=={'tcp':{('2001:db8:1::9','2001:db8:1::64','50000','3389')},'udp':set()}
+    command=['conntrack','-D','-f','ipv6','--orig-dst','2001:db8:1::64','-p','tcp','--dport','3389']
+    with patch.object(m,'run',return_value=SimpleNamespace(returncode=0)) as run:
+        m.revoke([command])
+    run.assert_called_once_with(command,allowed=(0,1))
 
 
 def test_disable_keeps_an_inert_boot_file_and_removes_receipt(tmp_path):

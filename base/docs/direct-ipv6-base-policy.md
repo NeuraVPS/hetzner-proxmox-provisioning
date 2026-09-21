@@ -19,6 +19,9 @@ siendo necesario para impedir que una VM evite la BASE.
   para que un puerto alto de una dirección dedicada nunca alcance otra VM.
 - `rdpEnabled`, `sambaEnabled` y `sshEnabled` restringen también sus puertos
   nativos por esta ruta. El cortafuegos de Windows conserva su función.
+- Un límite de SYN por origen/destino protege también la entrada directa
+  (12/minuto, ráfaga6, como el guard IPv6 anterior). Actualizar los permisos
+  conserva estos contadores y límites; no permite eludirlos haciendo toggles.
 - La salida IPv6, las respuestas a conexiones salientes, los pools IPv4 y la
   entrada por VIP/puerto mantienen su funcionamiento independiente.
 - Una desactivación elimina solo conntrack cuyo destino ORIGINAL es la IPv6
@@ -64,7 +67,9 @@ reabrir un permiso con una lectura anterior a un toggle ya aplicado.
 ## Reversión
 
 `python3 /usr/local/sbin/install-base-ipv6-policy.py --disable --apply` retira
-solo esta tabla y su include, y pone la bandera a cero. Restaura la ausencia
+su DNAT/include, neutraliza el archivo persistido y pone la bandera a cero.
+Deja en memoria un bloqueo limitado a destinos originales entrantes anteriores,
+hasta la siguiente activación/arranque, y elimina sus conntracks. Restaura la ausencia
 de acceso IPv6 directo anterior a esta función; no modifica mapas VIP ni
 pools. La versión de aplicación debe revertirse de forma coordinada para no
 presentar como aplicado un control deshabilitado en las BASES. No recargar la
@@ -75,8 +80,10 @@ configuración nft completa de una BASE activa.
 - `pytest base/snippets/test_base_ipv6_policy.py`: identidad, valores por
   defecto, revocación limitada y conservación del archivo ante fallos.
 - `python3 base/snippets/test-base-ipv6-netns.py`: TCP real dentro de namespaces
-  privados, incluidos puertos altos, permisos independientes, recarga en frío
-  y acceso VIP. Requiere `nft`, `ip`, `conntrack`, `unshare` y `nsenter`.
+  privados, incluidos puertos altos, permisos independientes, sesión entrante
+  `[OFFLOAD]` revocada, sesión saliente persistente y VIP conservados, limitación
+  de SYN, contadores que sobreviven a sync, y disable/reenable en frío.
+  Requiere `nft`, `ip`, `conntrack`, `unshare` y `nsenter`.
 - Estas pruebas no sustituyen un ensayo físico de reconstrucción/fallo completo
   de BASE con systemd, Jool y cambios de propiedad Robot.
 
