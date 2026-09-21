@@ -324,7 +324,10 @@ def _candidate_rules(plan: SmbPolicyPlan, action: str) -> list[str]:
     rules: list[str] = []
     for family, guests, allowed in (("ip", "smb_guests_v4", "smb_allowed_v4"), ("ip6", "smb_guests_v6", "smb_allowed_v6")):
         directions = (
-            "tcp dport { 135, 139, 445 }",
+            # Cover every request tuple accepted by the legacy BASE chain,
+            # including uncommon TCP/UDP combinations; changing protocol or
+            # selecting source port 137 must not bypass account permission.
+            "meta l4proto { tcp, udp } th dport { 135, 137, 138, 139, 445 }",
             "tcp sport { 135, 139, 445 } tcp flags & (syn | ack) != syn",
             "udp sport 137 udp dport 137",
             "udp sport 138 udp dport 138",

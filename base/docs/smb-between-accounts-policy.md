@@ -1,10 +1,10 @@
 # Política SMB entre cuentas en BASE
 
-`base/snippets/base_smb_policy.py` es un planificador puro para limitar SMB
+`base/snippets/base_smb_policy.py` contiene un planificador puro para limitar SMB
 entre invitados al mismo titular, a una relación directa entre cuentas o a un
-par de servidores aprobado expresamente. No consulta Firestore ni ejecuta
-`nft`; el sincronizador de BASE debe hacerlo después de una lectura completa y
-fresca, y abortar si cualquiera de esas lecturas falla.
+par de servidores aprobado expresamente, y un reconciliador que consulta
+Firestore con proyecciones, valida la lectura completa y aplica `nft`.
+Una lectura fallida conserva la última política válida.
 
 ## Documento Firestore
 
@@ -69,13 +69,14 @@ dos direcciones registradas de invitados. Así el tráfico SNAT/NAT64 de BASE no
 recibe un permiso genérico ni se bloquea por esta política.
 
 En auditoría los candidatos no permitidos incrementan un contador y siguen al
-firewall actual. En enforcement se descartan. La cobertura es TCP 135/139/445,
-con retorno TCP de esos puertos que no sea un SYN a secas, y NetBIOS UDP
+firewall actual. En enforcement se descartan. La cobertura incluye todos los
+destinos TCP/UDP 135/137/138/139/445 que admite la cadena antigua,
+con retorno TCP 135/139/445 que no sea un SYN a secas, y NetBIOS UDP
 137→137 y 138→138. No se usa `ct state new`, porque las rutas entre bases son
 asimétricas. Un paquete con origen TCP 137 no recibe ningún tratamiento de
 retorno y sigue siendo candidato normal si intenta llegar a 445.
 
-## Integración pendiente de revisión
+## Integración y despliegue gradual
 
 1. Instalar el script y su include. El comando es
    `base_smb_policy.py sync-policy` (el alias `fullsync` existe). La CLI toma
@@ -95,3 +96,17 @@ retorno y sigue siendo candidato normal si intenta llegar a 445.
 4. Para el cambio de modo, pasar el modo instalado a `render_nft_update`; ésta
    regenera de forma atómica la cadena de la tabla propia, conserva los sets y
    no recarga ni vacía el ruleset global.
+
+El bootstrap `base/base_setup.sh` instala el módulo, include y bandera
+`BASE_SMB_POLICY_ENABLED=1`. En una BASE existente se instalan esos mismos
+artefactos y se ejecuta `sync-base-nat.py sync policy`. Un full sync también
+reconcilia la política, bajo el mismo cerrojo. No se añade un sondeo de Windows
+ni una consulta de todas las cuentas en cada toggle del panel.
+
+**El despliegue inicial permanece en auditoría.** Antes de activar enforcement
+hay que clasificar las conexiones entre cuentas observadas, registrar partners
+verificados y conectar los eventos de alta/baja/vinculación/desvinculación al
+refresco de permisos. Hasta entonces, el estado audit no promete aislamiento
+por titular; conserva el filtrado de puertos, el aislamiento de nodo y los
+accesos legítimos existentes. No debe cambiarse sólo el modo en Firestore y
+considerar ese trabajo completado.

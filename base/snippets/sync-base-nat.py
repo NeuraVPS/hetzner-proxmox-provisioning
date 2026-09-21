@@ -333,6 +333,7 @@ def _server_entry(
     internet: bool = True,
     egress_hel: str = "",
     egress_fsn: str = "",
+    ipv6_enabled: bool = False,
 ) -> dict:
     return {
         "ipv6": ipv6,
@@ -343,6 +344,8 @@ def _server_entry(
         # `vm-no-internet` del firewall POR VM del nodo; ahora lo hace la base,
         # que es la única pieza que sigue en pie con el nodo caído.
         "internet": bool(internet),
+        # Explicit opt-in for direct public IPv6 on BASE (UI default: protected).
+        "ipv6Enabled": ipv6_enabled is True,
         # Modelo nuevo (IDENT): la dirección del invitado ya no se deriva del
         # nodo, así que hace falta saber DÓNDE está para enrutar el /128 al
         # túnel correcto. En el modelo viejo estos campos se ignoran.
@@ -595,6 +598,7 @@ def desired_from_state() -> dict[int, dict]:
             internet=bool(net_flag) if isinstance(net_flag, bool) else True,
             egress_hel=d.get("egressHel") or "",
             egress_fsn=d.get("egressFsn") or "",
+            ipv6_enabled=d.get("ipv6Enabled") is True,
         )
     return out
 
@@ -643,6 +647,7 @@ def firestore_list_configured_servers() -> dict[int, dict]:
             samba=_firewall_flag(firewall, "sambaEnabled", True),
             ssh=_firewall_flag(firewall, "sshEnabled", True),
             internet=_firewall_flag(firewall, "internetEnabled", True),
+            ipv6_enabled=_firewall_flag(firewall, "ipv6Enabled", False),
             node_id=d.get("nodeId") or "",
             ipv4=d.get("ipv4") or "",
             egress_hel=egress_hel,
@@ -680,6 +685,7 @@ def firestore_server_for_vmid(vmid: int) -> dict | None:
             samba=_firewall_flag(firewall, "sambaEnabled", True),
             ssh=_firewall_flag(firewall, "sshEnabled", True),
             internet=_firewall_flag(firewall, "internetEnabled", True),
+            ipv6_enabled=_firewall_flag(firewall, "ipv6Enabled", False),
             # Sin estos dos, una VM del modelo nuevo sincronizada de una en una
             # se queda sin nodo conocido y su ruta /128 no se puede mover. El
             # cargador masivo si los pasaba; este se habia quedado atras.
@@ -1337,6 +1343,7 @@ def _state_payload(desired: dict[int, dict]) -> dict:
             "sambaEnabled": bool(desired[k].get("samba", True)),
             "sshEnabled": bool(desired[k].get("ssh", True)),
             "internetEnabled": bool(desired[k].get("internet", True)),
+            "ipv6Enabled": desired[k].get("ipv6Enabled") is True,
             "nodeId": desired[k].get("nodeId", ""),
             "ipv4": desired[k].get("ipv4", ""),
             "egressHel": desired[k].get("egressHel", ""),
@@ -1346,18 +1353,69 @@ def _state_payload(desired: dict[int, dict]) -> dict:
     }
 
 
+def reconcile_base_ipv6_policy(desired):
+    if parse_bool_env("BASE_IPV6_POLICY_ENABLED", False):
+        from base_ipv6_policy import reconcile
+        reconcile(desired)
+
+
+def require_base_ipv6_policy():
+    """Fail before changing maps when the caller relies on BASE enforcement.
+
+    An older/partially deployed BASE must never acknowledge a panel IPv6
+    change now that the Cloud Function no longer writes per-VM PVE rules.
+    """
+    if not parse_bool_env("BASE_IPV6_POLICY_ENABLED", False):
+        raise RuntimeError("BASE IPv6 policy is disabled; refusing required-policy sync")
+    import base_ipv6_policy  # noqa: F401 — also verifies module is installed
+    result = subprocess.run(
+        ["nft", "list", "table", "inet", "neura_ipv6"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode:
+        raise RuntimeError("BASE IPv6 policy is not installed in the running ruleset")
+
+
+def reconcile_base_smb_policy():
+    """Explicit/full sync only; never enumerate all users for a VM toggle."""
+    if not parse_bool_env("BASE_SMB_POLICY_ENABLED", False):
+        return
+    if not ensure_firebase():
+        raise RuntimeError("Firestore unavailable; retaining last-good SMB policy")
+    from base_smb_policy import installed_mode_from_runtime, reconcile_from_firestore
+    include = os.environ.get("BASE_SMB_POLICY_FILE", "/etc/nftables.d/nvx-smb-policy.nft")
+    receipt = os.environ.get("BASE_SMB_POLICY_STATE", "/var/lib/base-nat/smb-policy-last-good.json")
+    mode = installed_mode_from_runtime(receipt)
+
+    def apply(transaction):
+        result = subprocess.run(["nft", "-f", "-"], input=transaction,
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError("SMB policy transaction rejected: " + result.stderr)
+
+    plan = reconcile_from_firestore(firestore.client(), apply, include, receipt,
+                                    installed_mode=mode, logger=logger)
+    logger.info("SMB policy: mode=%s guests=%s/%s allowed pairs=%s",
+                plan.mode, len(plan.guest_v4), len(plan.guest_v6),
+                len(plan.allowed_server_pairs))
+
+
 def sync_full():
-    # Firestore read happens outside the lock because it can take seconds
-    # and we don't want to block per-VM syncs that whole time. The lock
-    # only needs to cover the nft+state critical section.
-    desired = firestore_list_configured_servers()
-    egress_cfg = load_egress_config if not _egress_maps_exist() else load_egress_config()
+    # Take the lock BEFORE the authoritative read. Otherwise a full sync can
+    # queue an old "enabled" snapshot behind a completed customer disable and
+    # silently reopen it after the per-VM trigger has already returned success.
     with state_lock():
+        desired = firestore_list_configured_servers()
+        egress_cfg = load_egress_config if not _egress_maps_exist() else load_egress_config()
         reconcile_dynamic_dnat_rules(desired)
         reconcile_vm_routes(desired)
         reconcile_sin_internet(desired)
         reconcile_egress_pools(desired, egress_cfg)
+        reconcile_base_ipv6_policy(desired)
         write_state(_state_payload(desired))
+        # Persist the NAT state before optional SMB processing: an SMB read
+        # failure must not leave successfully applied NAT maps with stale state.
+        reconcile_base_smb_policy()
     logger.info("Full sync done (%d servers)", len(desired))
 
 
@@ -1417,6 +1475,7 @@ def sync_single_vmid(
                 samba_default = bool(existing.get("samba", True)) if existing else True
                 ssh_default = bool(existing.get("ssh", True)) if existing else True
                 net_default = bool(existing.get("internet", True)) if existing else True
+                ipv6_flag = (existing or {}).get("ipv6Enabled") is True
                 override = flags_override or {}
                 rdp_flag = bool(override["rdp"]) if "rdp" in override else rdp_default
                 samba_flag = bool(override["samba"]) if "samba" in override else samba_default
@@ -1435,6 +1494,7 @@ def sync_single_vmid(
                 samba_flag = bool(server.get("samba", True))
                 ssh_flag = bool(server.get("ssh", True))
                 net_flag = bool(server.get("internet", True))
+                ipv6_flag = server.get("ipv6Enabled") is True
                 ipv4_flag = str(server.get("ipv4") or "")
                 egress_hel = str(server.get("egressHel") or "")
                 egress_fsn = str(server.get("egressFsn") or "")
@@ -1444,6 +1504,7 @@ def sync_single_vmid(
                 samba=samba_flag,
                 ssh=ssh_flag,
                 internet=net_flag,
+                ipv6_enabled=ipv6_flag,
                 ipv4=ipv4_flag,
                 egress_hel=egress_hel,
                 egress_fsn=egress_fsn,
@@ -1475,6 +1536,7 @@ def sync_single_vmid(
                     # es la fuente de verdad porque el disparador escribe ALLI
                     # primero y por eso se ejecuta esto. Si quien llama lo paso
                     # explicitamente, manda quien llama.
+                    ent["ipv6Enabled"] = fresco.get("ipv6Enabled") is True
                     if "internet" not in (flags_override or {}):
                         ent["internet"] = bool(fresco.get("internet", True))
                     if ipv6_override and (fresco.get("egressHel") or fresco.get("egressFsn")):
@@ -1485,6 +1547,7 @@ def sync_single_vmid(
         reconcile_vm_routes(desired)
         reconcile_sin_internet(desired)
         reconcile_egress_pools(desired, load_egress_config)
+        reconcile_base_ipv6_policy(desired)
         write_state(_state_payload(desired))
     logger.info("Sync proxmoxId=%s done (desired=%d)", vmid, len(desired))
 
@@ -2208,6 +2271,7 @@ def main():
             "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1] [internet=0|1]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
             "       sync-base-nat.py sync egress\n"
+            "       sync-base-nat.py sync policy\n"
             "       sync-base-nat.py sync nodes ... (incl. sync-firewall)",
             file=sys.stderr,
         )
@@ -2217,14 +2281,22 @@ def main():
         main_sync_nodes()
         return
 
-    validate_config()
     args = sys.argv[2:]
+    if "--require-ipv6-policy" in args:
+        args.remove("--require-ipv6-policy")
+        require_base_ipv6_policy()
+    validate_config()
     if not args:
         sync_full()
         return
 
     if args[0] == "egress":
         sync_egress()
+        return
+
+    if args[0] == "policy":
+        with state_lock():
+            reconcile_base_smb_policy()
         return
 
     try:

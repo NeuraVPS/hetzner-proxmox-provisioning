@@ -146,7 +146,7 @@ def test_default_mode_is_audit_and_unknown_candidates_are_counted_not_dropped():
 def test_enforce_checks_safe_return_path_without_conntrack_and_keeps_infra_exempt():
     servers, users, config = inputs(mode="enforce")
     rendered = policy.render_nft_bootstrap(policy.build_policy(servers, users, config))
-    assert "tcp dport { 135, 139, 445 }" in rendered
+    assert "meta l4proto { tcp, udp } th dport { 135, 137, 138, 139, 445 }" in rendered
     assert "tcp sport { 135, 139, 445 } tcp flags & (syn | ack) != syn" in rendered
     assert "udp sport 137 udp dport 137" in rendered
     assert "udp sport 138 udp dport 138" in rendered

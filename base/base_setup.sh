@@ -128,6 +128,9 @@ EGRESS_POOL_CIDRS="95.217.93.0/26 91.98.53.128/26"
 # Stable guest identity and node transit networks. Without IDENT_PREFIX the
 # reconciler deliberately disables per-VM IPv6 routes (legacy mode).
 IDENT_PREFIX=2a01:4f9:c01f:e::/64
+BASE_IPV6_POLICY_ENABLED=1
+BASE_SMB_POLICY_ENABLED=1
+BASE_POLICY_UPLINK=enp2s0
 TRANSIT_PREFIX=2a01:4f9:c01f:e:ffff::/112
 VM_V4_PREFIX=10.64.0.0/16
 
@@ -184,6 +187,24 @@ mkdir -p /etc/nftables.d
 # los puebla sync-base-nat). Su include va con COMODIN, asi que la falta del
 # fichero no rompe la carga; se crea igual para que no dependa de eso.
 [ -f /etc/nftables.d/base-nat-egress-pools.nft ] || : > /etc/nftables.d/base-nat-egress-pools.nft
+
+# Direct IPv6 policy is part of the BASE runtime, never the VM image/node.
+for policy_script in base_ipv6_policy.py install-base-ipv6-policy.py base_smb_policy.py; do
+  if ! curl -fsSL "${PROVISIONING_RAW}/base/snippets/${policy_script}" \
+    -o "/usr/local/sbin/${policy_script}"; then
+    echo "ERROR: cannot download ${policy_script}" >&2
+    exit 1
+  fi
+done
+# SMB starts as audit: no new cross-account blocking during bootstrap.
+[ -f /etc/nftables.d/nvx-smb-policy.nft ] || : > /etc/nftables.d/nvx-smb-policy.nft
+if ! grep -qF 'include "/etc/nftables.d/nvx-smb-policy.nft"' /etc/nftables.conf; then
+  printf '\ninclude "/etc/nftables.d/nvx-smb-policy.nft"\n' >> /etc/nftables.conf
+fi
+if ! python3 /usr/local/sbin/install-base-ipv6-policy.py --apply; then
+  echo "ERROR: direct IPv6 policy wiring failed" >&2
+  exit 1
+fi
 
 # --- Instaladores que la base sirve a los invitados --------------------------
 # Cada VM se bajaba su instalador de raw.githubusercontent.com al aprovisionarse
