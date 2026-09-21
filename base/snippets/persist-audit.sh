@@ -37,6 +37,14 @@ else
   # primer sync). Estructura ausente en los dos = pools no instalados, no fallo.
   ok "pools salida: salto vivo/fichero" "$(nft list chain ip nat postrouting 2>/dev/null | grep -c 'jump egress_pools')/$(grep -c 'jump egress_pools' /etc/nftables.conf)"
   ok "pools salida: include en conf" "$(grep -c 'base-nat-egress-pools\*\.nft' /etc/nftables.conf)/1"
+  for policy in base-ipv6-policy nvx-smb-policy; do
+    ok "$policy include" "$(grep -cF "include \"/etc/nftables.d/$policy.nft\"" /etc/nftables.conf)/1"
+    ok "$policy persistido" "$([ -s "/etc/nftables.d/$policy.nft" ] && echo presente || echo ausente)"
+  done
+  ok "IPv6 tabla activa" "$(nft list table inet neura_ipv6 >/dev/null 2>&1 && echo presente || echo ausente)"
+  ok "SMB tabla activa" "$(nft list table inet nvx_smb_policy >/dev/null 2>&1 && echo presente || echo ausente)"
+  ok "IPv6 bandera" "$(grep '^BASE_IPV6_POLICY_ENABLED=' /etc/default/base-nat)"
+  ok "SMB bandera" "$(grep '^BASE_SMB_POLICY_ENABLED=' /etc/default/base-nat)"
   ok "pools salida: elementos vivo/fichero" "$( (nft list map ip nat egress_hel4; nft list map ip nat egress_fsn4) 2>/dev/null | grep -oE '[0-9.]+ : [0-9.]+' | wc -l)/$(grep -c '^add element' /etc/nftables.d/base-nat-egress-pools.nft 2>/dev/null || true)"
   ok "gre_peers en conf" "$(grep -c 'set gre_peers' /etc/nftables.conf)/1"
   ok "forward de tuneles en conf" "$(grep -c 'tun-\*' /etc/nftables.conf)/3"

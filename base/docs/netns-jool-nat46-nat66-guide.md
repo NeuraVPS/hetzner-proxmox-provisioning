@@ -434,12 +434,13 @@ table inet filter {
         # y salida a Internet de lo que llega por los tuneles.
         iifname "veth-host" oifname "tun-*" accept
         iifname "tun-*" oifname "enp6s0" accept
-        # SMB entre VMs del mismo cliente: con el modelo nuevo ese trafico
-        # cruza la base en vez de ir nodo a nodo. Solo los puertos de SMB —
-        # el nodo destino ya limita con el ipset vm-ident, pero duplicarlo
-        # aqui protege a una VM que manana se cree sin firewall.
+        # SMB cruza la BASE. El aislamiento del nodo es GLOBAL, no por VM.
+        # Los permisos por cuenta viven en nvx_smb_policy (audit por defecto).
+        # Retorno asimetrico: nunca permitir cualquier SYN solo por su sport.
         iifname "tun-*" oifname "tun-*" meta l4proto { tcp, udp } th dport { 135, 137, 138, 139, 445 } accept
-        iifname "tun-*" oifname "tun-*" meta l4proto { tcp, udp } th sport { 135, 137, 138, 139, 445 } accept
+        iifname "tun-*" oifname "tun-*" tcp sport { 135, 139, 445 } tcp flags & (syn | ack) != syn accept
+        iifname "tun-*" oifname "tun-*" udp sport 137 udp dport 137 accept
+        iifname "tun-*" oifname "tun-*" udp sport 138 udp dport 138 accept
     }
 }
 

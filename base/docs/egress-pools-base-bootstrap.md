@@ -4,6 +4,7 @@ Esta guía prepara una BASE nueva para participar en la flota que ya usa pools
 IPv4 por VM. Es complementaria a la topología de
 [`netns-jool-nat46-nat66-guide.md`](netns-jool-nat46-nat66-guide.md), la
 protección de destinos de [`../sweepguard/README.md`](../sweepguard/README.md)
+la [política de entrada IPv6](direct-ipv6-base-policy.md)
 y el renderer de [`../snippets/sync-base-nat.py`](../snippets/sync-base-nat.py).
 
 No crea ni modifica `egressAssignments`, `servers.egressIpv4` ni
@@ -125,7 +126,9 @@ varias piezas, pero presupone la topología Jool/nft, las credenciales y valores
 por BASE; no promete una reconstrucción E2E por un único comando.
 
 1. Partir de una revisión fijada del repositorio y revisar los hashes de:
-   `sync-base-nat.py`, `base-nat-boot.sh`, su unidad, los scripts de túnel,
+   `sync-base-nat.py`, `base_ipv6_policy.py`, `install-base-ipv6-policy.py`,
+   `base_smb_policy.py`,
+   `base-nat-boot.sh`, su unidad, los scripts de túnel,
    `persist-egress-pools-nft.py`, `persist-audit.sh` y
    `zz-neuravps-rpfilter.conf`. Fijar `PROVISIONING_REF` al SHA revisado antes
    de ejecutar los pasos de `base_setup.sh`: sus descargas usarán esa revisión
@@ -145,7 +148,12 @@ por BASE; no promete una reconstrucción E2E por un único comando.
    final de rutas por VM. La tabla `/etc/neuravps/tunnel-nodes.conf` se genera
    con `sync-base-nat.py sync nodes`; instalar primero nginx, mapa y certificado
    para que ese sync pueda validarlos. No sembrar la tabla a mano.
-6. Instalar `base-nat-boot.service` y `sync-base-nat.py`. El boot restaura las
+6. Instalar `base-nat-boot.service`, `sync-base-nat.py` y los dos módulos de
+   [IPv6 directa](direct-ipv6-base-policy.md). Ejecutar su instalador con
+   `--apply` para persistir el include y `BASE_IPV6_POLICY_ENABLED=1`.
+   Instalar también el include de [SMB entre cuentas](smb-between-accounts-policy.md),
+   inicialmente vacío, y `BASE_SMB_POLICY_ENABLED=1`; el full sync crea su tabla
+   en auditoría. El boot restaura las
    dos rutas blackhole antes de consultar Firestore. No recargar `nftables` en
    una BASE activa para aplicar pools y nunca vaciar conntrack.
 7. Instalar `persist-egress-pools-nft.py` y ejecutar:
