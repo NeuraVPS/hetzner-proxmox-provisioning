@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+from contextlib import contextmanager
 
 import pytest
 
@@ -287,3 +288,69 @@ def test_first_firestore_install_refuses_explicit_enforce_without_an_audit_insta
     with pytest.raises(policy.PolicyError, match="first SMB policy installation"):
         policy.reconcile_from_firestore(db, lambda _transaction: None, tmp_path / "p.nft", tmp_path / "l.json")
     assert not (tmp_path / "p.nft").exists()
+
+
+def test_installed_mode_readiness_requires_a_consistent_table_and_receipt(tmp_path):
+    servers, users, config = inputs()
+    receipt = tmp_path / "last-good.json"
+    audit = policy.build_policy(servers, users, config)
+    policy.write_last_good(receipt, audit)
+
+    # A reboot can lose the table while keeping an audit receipt: bootstrap is
+    # allowed, but the mode is never inferred from a caller flag.
+    assert policy.installed_mode_from_runtime(receipt, lambda: False) is None
+    assert policy.installed_mode_from_runtime(receipt, lambda: True) == "audit"
+    with pytest.raises(policy.PolicyError, match="missing"):
+        policy.installed_mode_from_runtime(tmp_path / "absent.json", lambda: True)
+
+    enforce = policy.build_policy(servers, users, {**config, "mode": "enforce"})
+    policy.write_last_good(receipt, enforce)
+    with pytest.raises(policy.PolicyError, match="after enforce"):
+        policy.installed_mode_from_runtime(receipt, lambda: False)
+
+
+def test_compatibility_mode_is_an_assertion_not_an_installed_state():
+    assert policy._checked_compatibility_mode("audit", "audit") == "audit"
+    with pytest.raises(policy.PolicyError, match="disagrees"):
+        policy._checked_compatibility_mode("enforce", "audit")
+    with pytest.raises(policy.PolicyError, match="cannot assume"):
+        policy._checked_compatibility_mode("audit", None)
+
+
+def test_cli_holds_shared_lock_and_uses_detected_mode(monkeypatch, tmp_path):
+    servers, users, config = inputs()
+    expected = policy.build_policy(servers, users, config)
+    events = []
+
+    @contextmanager
+    def fake_lock(path):
+        events.append(("lock", str(path)))
+        yield
+        events.append(("unlock", str(path)))
+
+    def fake_reconcile(_db, _apply, _include, _receipt, installed_mode):
+        events.append(("reconcile", installed_mode))
+        return expected
+
+    monkeypatch.setattr(policy, "shared_sync_lock", fake_lock)
+    monkeypatch.setattr(policy, "installed_mode_from_runtime", lambda _receipt: "audit")
+    monkeypatch.setattr(policy, "_runtime_firestore_db", lambda: object())
+    monkeypatch.setattr(policy, "_nft_apply", lambda _transaction: None)
+    monkeypatch.setattr(policy, "reconcile_from_firestore", fake_reconcile)
+
+    assert policy.main(["sync-policy", "--lock-path", str(tmp_path / ".sync.lock")]) == 0
+    assert events == [
+        ("lock", str(tmp_path / ".sync.lock")),
+        ("reconcile", "audit"),
+        ("unlock", str(tmp_path / ".sync.lock")),
+    ]
+
+
+def test_cli_rejects_a_mismatched_compatibility_flag_before_firestore(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(policy, "installed_mode_from_runtime", lambda _receipt: "audit")
+    monkeypatch.setattr(policy, "_runtime_firestore_db", lambda: called.append(True))
+    assert policy.main([
+        "sync-policy", "--lock-path", str(tmp_path / ".sync.lock"), "--installed-mode", "enforce",
+    ]) == 1
+    assert called == []

@@ -77,13 +77,15 @@ retorno y sigue siendo candidato normal si intenta llegar a 445.
 
 ## Integración pendiente de revisión
 
-1. Instalar el script y su include. El primer bootstrap audit es
-   `base_smb_policy.py sync-policy` (sin `--installed-mode`); las
-   reconciliaciones posteriores usan
-   `base_smb_policy.py sync-policy --installed-mode audit`. El alias
-   `fullsync` existe para un llamador de sincronización global. No llamarlo por
-   evento de una sola VM: lee por sí mismo las tres fuentes completas con las
-   proyecciones mínimas y sin secretos en sus logs.
+1. Instalar el script y su include. El comando es
+   `base_smb_policy.py sync-policy` (el alias `fullsync` existe). La CLI toma
+   el mismo `flock` que el full-sync BASE, y dentro del bloqueo lee la presencia
+   de `inet nvx_smb_policy` y el recibo last-good para conocer el modo instalado;
+   no acepta un modo supuesto. El flag compatible `--installed-mode` sólo sirve
+   para comprobar que coincide con el recibo. Una tabla ausente con recibo audit
+   permite reconstruir audit tras boot; con recibo enforce aborta. No llamarlo
+   por evento de una sola VM: lee por sí mismo las tres fuentes completas con
+   las proyecciones mínimas y sin secretos en sus logs.
 2. Instalar primero el bootstrap en modo `audit` y validar `nft -c -f` con los
    elementos reales. A continuación usar `render_nft_update` con el modo
    instalado para conservar los contadores de auditoría en sincronizaciones de

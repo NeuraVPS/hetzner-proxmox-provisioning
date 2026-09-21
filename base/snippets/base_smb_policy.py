@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Plan the BASE guest-to-guest SMB policy from a complete Firestore snapshot.
 
-This module deliberately does not read Firestore or run ``nft``.  Its pure
-``build_policy`` entry point is intended to be called by the existing BASE
-sync path after it has fetched *complete* ``servers``, ``users`` and
-``config/smbPolicy`` snapshots.  Keeping that boundary explicit prevents a
-partial read from turning into an empty allow-list.
+The pure ``build_policy`` entry point accepts complete ``servers``, ``users``
+and ``config/smbPolicy`` snapshots.  The explicit full-sync runtime at the
+bottom of this file reads those snapshots and applies nft; keeping that I/O
+boundary separate prevents a partial read from becoming an empty allow-list.
 
 There are only three sources of permission:
 
@@ -23,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from ipaddress import IPv6Address, ip_address, ip_network
 import argparse
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -550,6 +551,89 @@ def _nft_apply(transaction: str) -> None:
         raise RuntimeError(f"nft rejected SMB policy transaction: {result.stderr.strip()}")
 
 
+@contextlib.contextmanager
+def shared_sync_lock(path: str | Path):
+    """Use BASE's existing full-sync lock for the standalone CLI only.
+
+    ``sync-base-nat`` already holds this lock around its full sync and calls
+    :func:`reconcile_from_firestore` directly, so that function deliberately
+    does not acquire it again.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(target, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _receipt_mode(last_good_path: str | Path) -> str | None:
+    receipt = Path(last_good_path)
+    if not receipt.exists():
+        return None
+    try:
+        data = json.loads(receipt.read_text())
+    except Exception as exc:
+        raise PolicyError("SMB last-good receipt is unreadable") from exc
+    mode = data.get("mode") if isinstance(data, Mapping) else None
+    if mode not in MODES:
+        raise PolicyError("SMB last-good receipt has no valid mode")
+    return mode
+
+
+def nft_policy_table_exists() -> bool:
+    """Return table presence, refusing to mistake an nft failure for absence."""
+    result = subprocess.run(
+        ["nft", "list", "table", "inet", "nvx_smb_policy"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if "No such file or directory" in (result.stderr or ""):
+        return False
+    raise RuntimeError(f"cannot determine SMB policy table state: {result.stderr.strip()}")
+
+
+def installed_mode_from_runtime(
+    last_good_path: str | Path, table_exists: Callable[[], bool] = nft_policy_table_exists
+) -> str | None:
+    """Derive safe installed state from the table and its last-good receipt.
+
+    ``None`` means an audit bootstrap is permitted. A missing table may recover
+    an audit receipt after reboot, but an enforce receipt without its table is
+    intentionally ambiguous and never reconstructed automatically.
+    """
+    receipt_mode = _receipt_mode(last_good_path)
+    table_present = table_exists()
+    if table_present:
+        if receipt_mode is None:
+            raise PolicyError("SMB policy table exists but last-good receipt is missing")
+        return receipt_mode
+    if receipt_mode is None:
+        return None
+    if receipt_mode != DEFAULT_MODE:
+        raise PolicyError("SMB policy table is missing after enforce; refusing to guess state")
+    return None
+
+
+def _checked_compatibility_mode(requested_mode: str | None, detected_mode: str | None) -> str | None:
+    """Keep the old CLI flag only as an assertion, never as state input."""
+    if requested_mode is None:
+        return detected_mode
+    if detected_mode is None:
+        raise PolicyError("--installed-mode cannot assume a missing SMB policy table")
+    if requested_mode != detected_mode:
+        raise PolicyError(
+            f"--installed-mode={requested_mode} disagrees with installed receipt mode {detected_mode}"
+        )
+    return detected_mode
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reconcile BASE guest SMB policy from Firestore")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -557,17 +641,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     sync.add_argument("--installed-mode", choices=sorted(MODES))
     sync.add_argument("--include-path", default="/etc/nftables.d/nvx-smb-policy.nft")
     sync.add_argument("--last-good-path", default="/var/lib/base-nat/smb-policy-last-good.json")
+    sync.add_argument("--lock-path", default="/var/lib/base-nat/.sync.lock")
     args = parser.parse_args(argv)
     if args.command not in {"sync-policy", "fullsync"}:
         return 2
     try:
-        plan = reconcile_from_firestore(
-            _runtime_firestore_db(),
-            _nft_apply,
-            args.include_path,
-            args.last_good_path,
-            args.installed_mode,
-        )
+        with shared_sync_lock(args.lock_path):
+            installed_mode = _checked_compatibility_mode(
+                args.installed_mode,
+                installed_mode_from_runtime(args.last_good_path),
+            )
+            plan = reconcile_from_firestore(
+                _runtime_firestore_db(),
+                _nft_apply,
+                args.include_path,
+                args.last_good_path,
+                installed_mode,
+            )
     except (PolicyError, RuntimeError) as exc:
         logging.error("SMB policy unchanged: %s", exc)
         return 1
