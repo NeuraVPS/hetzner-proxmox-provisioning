@@ -77,8 +77,10 @@ retorno y sigue siendo candidato normal si intenta llegar a 445.
 
 ## Integración pendiente de revisión
 
-1. Instalar el script y su include. El comando explícito de reconciliación es
-   `base_smb_policy.py sync-policy --installed-mode audit`; el alias
+1. Instalar el script y su include. El primer bootstrap audit es
+   `base_smb_policy.py sync-policy` (sin `--installed-mode`); las
+   reconciliaciones posteriores usan
+   `base_smb_policy.py sync-policy --installed-mode audit`. El alias
    `fullsync` existe para un llamador de sincronización global. No llamarlo por
    evento de una sola VM: lee por sí mismo las tres fuentes completas con las
    proyecciones mínimas y sin secretos en sus logs.
