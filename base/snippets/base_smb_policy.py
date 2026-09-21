@@ -21,10 +21,13 @@ safe way to recognise the SMB reply path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+from ipaddress import IPv6Address, ip_address, ip_network
+import argparse
 import json
+import logging
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
@@ -33,6 +36,8 @@ DEFAULT_MODE = "audit"
 MODES = frozenset(("audit", "enforce"))
 TRANSIT_V6 = ip_network("2a01:4f9:c01f:e:ffff::/112")
 SMB_PORT = 445
+SERVER_PROJECTION = ("userId", "proxmoxId", "ipv4", "ipv6", "firewall")
+USER_PROJECTION = ("linkedAccountIds",)
 
 
 class PolicyError(ValueError):
@@ -70,6 +75,7 @@ class SmbPolicyPlan:
     allowed_v4: tuple[tuple[str, str], ...]
     allowed_v6: tuple[tuple[str, str], ...]
     allowed_server_pairs: tuple[tuple[str, str], ...]
+    warnings: tuple[str, ...] = ()
 
     def snapshot(self) -> dict[str, Any]:
         """Stable, non-PII serialisation suitable for a last-good file."""
@@ -82,6 +88,7 @@ class SmbPolicyPlan:
             "allowedV4": [list(pair) for pair in self.allowed_v4],
             "allowedV6": [list(pair) for pair in self.allowed_v6],
             "allowedServerPairs": [list(pair) for pair in self.allowed_server_pairs],
+            "warnings": list(self.warnings),
         }
 
 
@@ -144,14 +151,6 @@ def _normalise_guest_ip(value: Any, family: int, field: str) -> str | None:
     return str(parsed)
 
 
-def _samba_enabled(server: Mapping[str, Any]) -> bool:
-    firewall = server.get("firewall")
-    if not isinstance(firewall, Mapping):
-        return True
-    enabled = firewall.get("sambaEnabled")
-    return enabled if isinstance(enabled, bool) else True
-
-
 def _servers(
     raw_servers: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
     raw_users: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
@@ -199,13 +198,16 @@ def _servers(
         if v6:
             seen_v6.add(v6)
 
-        # A server with Samba disabled cannot need an SMB peer permission.
-        if _samba_enabled(item):
-            result.append(Server(server_id, owner, vmid, v4, v6))
+        # This is an account-bound private-peer policy.  `sambaEnabled` is an
+        # independent public-DNAT/client-firewall preference, so it must not
+        # make a registered guest disappear from the candidate set.
+        result.append(Server(server_id, owner, vmid, v4, v6))
     return tuple(sorted(result)), links
 
 
-def _partner_pairs(config: Mapping[str, Any], servers: Iterable[Server]) -> frozenset[frozenset[str]]:
+def _partner_pairs(
+    config: Mapping[str, Any], servers: Iterable[Server]
+) -> tuple[frozenset[frozenset[str]], tuple[str, ...]]:
     pairs = config.get("partnerPairs", [])
     if pairs is None:
         pairs = []
@@ -213,6 +215,7 @@ def _partner_pairs(config: Mapping[str, Any], servers: Iterable[Server]) -> froz
         raise ConfigValidationError("partnerPairs must be a list")
     by_id = {server.server_id: server for server in servers}
     out: set[frozenset[str]] = set()
+    warnings: list[str] = []
     for index, pair in enumerate(pairs):
         if not isinstance(pair, Mapping):
             raise ConfigValidationError(f"partnerPairs[{index}] must be an object")
@@ -223,17 +226,21 @@ def _partner_pairs(config: Mapping[str, Any], servers: Iterable[Server]) -> froz
         if left_id == right_id:
             raise ConfigValidationError(f"partnerPairs[{index}] cannot name one server twice")
         if by_id.get(left_id) is None or by_id[left_id].owner_uid != left_owner:
-            raise ConfigValidationError(f"partnerPairs[{index}] left server/owner binding is stale")
+            warnings.append(f"partnerPairs[{index}] skipped: left server/owner binding is stale")
+            continue
         if by_id.get(right_id) is None or by_id[right_id].owner_uid != right_owner:
-            raise ConfigValidationError(f"partnerPairs[{index}] right server/owner binding is stale")
+            warnings.append(f"partnerPairs[{index}] skipped: right server/owner binding is stale")
+            continue
         canonical = frozenset((left_id, right_id))
         if canonical in out:
             raise ConfigValidationError(f"partnerPairs[{index}] duplicates a reviewed pair")
         out.add(canonical)
-    return frozenset(out)
+    return frozenset(out), tuple(warnings)
 
 
-def validate_config(config: Mapping[str, Any] | None, servers: Iterable[Server]) -> tuple[int, str, frozenset[frozenset[str]]]:
+def validate_config(
+    config: Mapping[str, Any] | None, servers: Iterable[Server]
+) -> tuple[int, str, frozenset[frozenset[str]], tuple[str, ...]]:
     if config is None:
         raise InputUnavailable("config/smbPolicy is unavailable")
     if not isinstance(config, Mapping):
@@ -246,7 +253,8 @@ def validate_config(config: Mapping[str, Any] | None, servers: Iterable[Server])
     mode = config.get("mode", DEFAULT_MODE)
     if mode not in MODES:
         raise ConfigValidationError(f"mode must be one of {sorted(MODES)}")
-    return version, mode, _partner_pairs(config, servers)
+    partners, warnings = _partner_pairs(config, servers)
+    return version, mode, partners, warnings
 
 
 def _directly_linked(a: Server, b: Server, links: Mapping[str, frozenset[str]]) -> bool:
@@ -263,7 +271,7 @@ def build_policy(
 ) -> SmbPolicyPlan:
     """Return a deterministic, complete policy plan without performing I/O."""
     known, links = _servers(servers, users)
-    version, mode, partners = validate_config(config, known)
+    version, mode, partners, warnings = validate_config(config, known)
     v4: set[tuple[str, str]] = set()
     v6: set[tuple[str, str]] = set()
     allowed_servers: set[tuple[str, str]] = set()
@@ -293,6 +301,7 @@ def build_policy(
         allowed_v4=tuple(sorted(v4)),
         allowed_v6=tuple(sorted(v6)),
         allowed_server_pairs=tuple(sorted(allowed_servers)),
+        warnings=warnings,
     )
 
 
@@ -303,11 +312,23 @@ def _set_elements(values: Iterable[str] | Iterable[tuple[str, str]]) -> str:
     return ", ".join(rendered)
 
 
+def _set_declaration(name: str, set_type: str, values: Iterable[str] | Iterable[tuple[str, str]]) -> str:
+    rendered = _set_elements(values)
+    suffix = f"; elements = {{ {rendered} }}" if rendered else ""
+    return f"  set {name} {{ type {set_type}{suffix}; }}"
+
+
 def _candidate_rules(plan: SmbPolicyPlan, action: str) -> list[str]:
-    """Rules for both requests and safe SMB replies; never use conntrack NEW."""
+    """Rules for SMB/RPC/NetBIOS requests and replies; never use conntrack NEW."""
     rules: list[str] = []
     for family, guests, allowed in (("ip", "smb_guests_v4", "smb_allowed_v4"), ("ip6", "smb_guests_v6", "smb_allowed_v6")):
-        for direction in (f"tcp dport {SMB_PORT}", f"tcp sport {SMB_PORT} tcp flags & (syn | ack) != syn"):
+        directions = (
+            "tcp dport { 135, 139, 445 }",
+            "tcp sport { 135, 139, 445 } tcp flags & (syn | ack) != syn",
+            "udp sport 137 udp dport 137",
+            "udp sport 138 udp dport 138",
+        )
+        for direction in directions:
             base = f'iifname "tun-*" oifname "tun-*" {direction} {family} saddr @{guests} {family} daddr @{guests}'
             rules.append(f'{base} {family} saddr . {family} daddr @{allowed} counter comment "smb-policy known pair"')
             suffix = "counter drop" if action == "drop" else "counter"
@@ -318,9 +339,9 @@ def _candidate_rules(plan: SmbPolicyPlan, action: str) -> list[str]:
 def render_nft_bootstrap(plan: SmbPolicyPlan) -> str:
     """Render a self-contained table.  It is safe to validate with ``nft -c``.
 
-    The policy hook is before the legacy forward accept rule.  Known traffic is
+    The policy hook is before the legacy forward accept rule. Known traffic is
     only counted, never accepted here, so the existing SMB SYN rate limiter and
-    any later BASE policy still run.  In audit mode unknown candidates are also
+    any later BASE policy still run. In audit mode unknown candidates are also
     only counted; in enforce mode they are dropped.
     """
     action = "drop" if plan.mode == "enforce" else "audit"
@@ -328,10 +349,10 @@ def render_nft_bootstrap(plan: SmbPolicyPlan) -> str:
         "# Generated by base_smb_policy.py; do not hand-edit.",
         "# This table is intentionally independent: no flush ruleset.",
         "table inet nvx_smb_policy {",
-        "  set smb_guests_v4 { type ipv4_addr; elements = { " + _set_elements(plan.guest_v4) + " } }",
-        "  set smb_guests_v6 { type ipv6_addr; elements = { " + _set_elements(plan.guest_v6) + " } }",
-        "  set smb_allowed_v4 { type ipv4_addr . ipv4_addr; elements = { " + _set_elements(plan.allowed_v4) + " } }",
-        "  set smb_allowed_v6 { type ipv6_addr . ipv6_addr; elements = { " + _set_elements(plan.allowed_v6) + " } }",
+        _set_declaration("smb_guests_v4", "ipv4_addr", plan.guest_v4),
+        _set_declaration("smb_guests_v6", "ipv6_addr", plan.guest_v6),
+        _set_declaration("smb_allowed_v4", "ipv4_addr . ipv4_addr", plan.allowed_v4),
+        _set_declaration("smb_allowed_v6", "ipv6_addr . ipv6_addr", plan.allowed_v6),
         "  chain forward {",
         "    type filter hook forward priority -5; policy accept;",
     ]
@@ -415,3 +436,152 @@ def reconcile_fresh(
     apply_transaction(render_nft_update(plan, installed_mode))
     write_last_good(last_good_path, plan)
     return plan
+
+
+def _snapshot_data(snapshot: Any, label: str) -> tuple[str, dict[str, Any]]:
+    """Extract one Firestore snapshot without depending on firebase_admin types."""
+    if snapshot is None or not getattr(snapshot, "exists", False):
+        raise InputUnavailable(f"{label} document is unavailable")
+    identifier = _nonempty_string(getattr(snapshot, "id", None), f"{label} id", InputUnavailable)
+    data = snapshot.to_dict()
+    if not isinstance(data, Mapping):
+        raise InputUnavailable(f"{label}/{identifier} is not an object")
+    return identifier, dict(data)
+
+
+def firestore_snapshots(db: Any) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read only the fields required for a full policy reconciliation.
+
+    A failed stream is deliberately allowed to raise: callers must keep the
+    installed policy rather than treating a failed read as an empty fleet.
+    Missing ``config/smbPolicy`` is the explicit, safe initial configuration:
+    audit with no partner exception. A present but malformed document still
+    fails validation.
+    """
+    if db is None:
+        raise InputUnavailable("Firestore client is unavailable")
+    try:
+        server_snaps = db.collection("servers").select(SERVER_PROJECTION).stream()
+        user_snaps = db.collection("users").select(USER_PROJECTION).stream()
+        config_snap = db.collection("config").document("smbPolicy").get()
+        servers = dict(_snapshot_data(snap, "servers") for snap in server_snaps)
+        users = dict(_snapshot_data(snap, "users") for snap in user_snaps)
+    except PolicyError:
+        raise
+    except Exception as exc:
+        raise InputUnavailable("Firestore policy snapshot failed") from exc
+
+    if config_snap is None or not getattr(config_snap, "exists", False):
+        config = default_config()
+    else:
+        try:
+            _config_id, config = _snapshot_data(config_snap, "config/smbPolicy")
+        except PolicyError:
+            raise
+        except Exception as exc:
+            raise InputUnavailable("Firestore smbPolicy snapshot failed") from exc
+    return servers, users, config
+
+
+def _atomic_write_text(path: str | Path, contents: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(contents)
+    os.replace(temporary, target)
+
+
+def reconcile_from_firestore(
+    db: Any,
+    apply_transaction: Callable[[str], None],
+    include_path: str | Path,
+    last_good_path: str | Path,
+    installed_mode: str | None = None,
+    logger: logging.Logger | None = None,
+) -> SmbPolicyPlan:
+    """Perform the one explicit full-sync policy reconciliation on BASE.
+
+    This is intentionally not a per-VM operation. It fetches complete,
+    projected collections, applies one nft transaction, and only after that
+    atomically writes the complete persistent table include and the last-good
+    snapshot. ``installed_mode=None`` bootstraps a new table in audit only;
+    an explicit enforce config cannot silently become the first installation.
+    """
+    servers, users, config = firestore_snapshots(db)
+    plan = build_policy(servers, users, config)
+    log = logger or logging.getLogger(__name__)
+    for warning in plan.warnings:
+        log.warning("SMB policy v%s: %s", plan.config_version, warning)
+
+    if installed_mode is None:
+        if plan.mode != DEFAULT_MODE:
+            raise PolicyError("first SMB policy installation must be audit")
+        transaction = render_nft_bootstrap(plan)
+    else:
+        transaction = render_nft_update(plan, installed_mode)
+
+    # Do not update either durable file until nft accepted the full transaction.
+    # Each replacement is atomic; a cross-filesystem transaction does not exist,
+    # so a persistence failure is surfaced for the caller to retry immediately.
+    apply_transaction(transaction)
+    _atomic_write_text(include_path, render_nft_bootstrap(plan))
+    write_last_good(last_good_path, plan)
+    return plan
+
+
+def _runtime_firestore_db() -> Any:
+    """Initialise the on-BASE Firebase client only for the explicit CLI command."""
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+    except ImportError as exc:
+        raise RuntimeError("firebase_admin is required for sync-policy") from exc
+    if not firebase_admin._apps:
+        credential_path = os.environ.get("FIREBASE_CREDENTIALS", "/etc/firebase-credentials.json")
+        firebase_admin.initialize_app(credentials.Certificate(credential_path))
+    return firestore.client()
+
+
+def _nft_apply(transaction: str) -> None:
+    result = subprocess.run(
+        ["nft", "-f", "-"], input=transaction, text=True, capture_output=True, check=False
+    )
+    if result.returncode:
+        raise RuntimeError(f"nft rejected SMB policy transaction: {result.stderr.strip()}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Reconcile BASE guest SMB policy from Firestore")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    sync = subcommands.add_parser("sync-policy", aliases=["fullsync"])
+    sync.add_argument("--installed-mode", choices=sorted(MODES))
+    sync.add_argument("--include-path", default="/etc/nftables.d/nvx-smb-policy.nft")
+    sync.add_argument("--last-good-path", default="/var/lib/base-nat/smb-policy-last-good.json")
+    args = parser.parse_args(argv)
+    if args.command not in {"sync-policy", "fullsync"}:
+        return 2
+    try:
+        plan = reconcile_from_firestore(
+            _runtime_firestore_db(),
+            _nft_apply,
+            args.include_path,
+            args.last_good_path,
+            args.installed_mode,
+        )
+    except (PolicyError, RuntimeError) as exc:
+        logging.error("SMB policy unchanged: %s", exc)
+        return 1
+    logging.info(
+        "SMB policy reconciled: configVersion=%s mode=%s guests=%s/%s pairs=%s/%s",
+        plan.config_version,
+        plan.mode,
+        len(plan.guest_v4),
+        len(plan.guest_v6),
+        len(plan.allowed_v4),
+        len(plan.allowed_v6),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

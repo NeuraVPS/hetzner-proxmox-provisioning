@@ -29,8 +29,11 @@ El documento previsto es `config/smbPolicy`:
 `mode` omiso es `audit`; los únicos valores aceptados son `audit` y `enforce`.
 `schemaVersion` y `version` son obligatorios. Cada partner fija el ID de ambos
 documentos de servidor y sus propietarios actuales. Si una migración, baja o
-reutilización ya no conserva esa combinación, el documento se rechaza antes de
-modificar nftables. La observación de tráfico nunca añade partners.
+reutilización ya no conserva esa combinación, esa excepción se omite y queda
+una advertencia auditable con su índice. No hereda permiso por VMID ni por la
+dirección nueva. Una estructura partner inválida, una versión no soportada o
+una lectura incompleta sí rechazan toda la reconciliación. La observación de
+tráfico nunca añade partners.
 
 Las cuentas enlazadas se examinan como una arista directa y mutua de
 `linkedAccountIds`: no se calcula cierre transitivo. Por ello revocar A↔B no
@@ -44,6 +47,11 @@ lectura parcial como `None`, que produce `InputUnavailable`; no se convierte en
 una lista vacía. Se validan propietario, VMID único, direcciones de invitado
 únicas y asociaciones partner vigentes. Las direcciones de tránsito de túnel
 BASE no se aceptan como direcciones de invitados.
+
+Todas las direcciones registradas de `servers` entran en los sets de
+invitados, incluso si `firewall.sambaEnabled` es falso. Ese campo sigue siendo
+la preferencia independiente de DNAT público/firewall del cliente; no puede
+abrir un bypass de la política privada entre cuentas.
 
 Una vez validado, el llamador aplica `render_nft_update(plan, installed_mode)`
 en una sola transacción `nft -f` y sólo entonces llama a `write_last_good`.
@@ -61,14 +69,19 @@ dos direcciones registradas de invitados. Así el tráfico SNAT/NAT64 de BASE no
 recibe un permiso genérico ni se bloquea por esta política.
 
 En auditoría los candidatos no permitidos incrementan un contador y siguen al
-firewall actual. En enforcement se descartan. Ambos casos comprueban la ida
-TCP a 445 y la vuelta con origen 445 que no sea un SYN a secas; no se usa
-`ct state new`, porque las rutas entre bases son asimétricas.
+firewall actual. En enforcement se descartan. La cobertura es TCP 135/139/445,
+con retorno TCP de esos puertos que no sea un SYN a secas, y NetBIOS UDP
+137→137 y 138→138. No se usa `ct state new`, porque las rutas entre bases son
+asimétricas. Un paquete con origen TCP 137 no recibe ningún tratamiento de
+retorno y sigue siendo candidato normal si intenta llegar a 445.
 
 ## Integración pendiente de revisión
 
-1. Añadir al sincronizador existente la lectura completa y con timeout de las
-   tres fuentes; no ejecutar una actualización desde un evento de una sola VM.
+1. Instalar el script y su include. El comando explícito de reconciliación es
+   `base_smb_policy.py sync-policy --installed-mode audit`; el alias
+   `fullsync` existe para un llamador de sincronización global. No llamarlo por
+   evento de una sola VM: lee por sí mismo las tres fuentes completas con las
+   proyecciones mínimas y sin secretos en sus logs.
 2. Instalar primero el bootstrap en modo `audit` y validar `nft -c -f` con los
    elementos reales. A continuación usar `render_nft_update` con el modo
    instalado para conservar los contadores de auditoría en sincronizaciones de

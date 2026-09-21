@@ -86,9 +86,27 @@ def test_explicit_partner_is_pinned_to_both_server_and_owner():
     plan = policy.build_policy(servers, users, config)
     assert ("a1", "c1") in pairs(plan)
 
-    servers["c1"]["userId"] = "bob"
-    with pytest.raises(policy.ConfigValidationError, match="stale"):
+    users["dave"] = {"linkedAccountIds": []}
+    servers["c1"]["userId"] = "dave"
+    stale = policy.build_policy(servers, users, config)
+    assert ("a1", "c1") not in pairs(stale)
+    assert stale.warnings == ("partnerPairs[0] skipped: right server/owner binding is stale",)
+
+
+def test_malformed_partner_config_still_fails_the_whole_reconciliation():
+    servers, users, config = inputs()
+    config["partnerPairs"] = [{"serverIdA": "a1"}]
+    with pytest.raises(policy.ConfigValidationError, match="ownerUidA"):
         policy.build_policy(servers, users, config)
+
+
+def test_samba_disabled_is_still_a_registered_private_peer_candidate():
+    servers, users, config = inputs()
+    servers["a1"]["firewall"] = {"sambaEnabled": False}
+    plan = policy.build_policy(servers, users, config)
+    assert "10.64.0.1" in plan.guest_v4
+    assert "2a01:4f9:c01f:e::1" in plan.guest_v6
+    assert ("a1", "a2") in pairs(plan)
 
 
 def test_unknown_owner_fails_without_planning_permissions():
@@ -127,7 +145,11 @@ def test_default_mode_is_audit_and_unknown_candidates_are_counted_not_dropped():
 def test_enforce_checks_safe_return_path_without_conntrack_and_keeps_infra_exempt():
     servers, users, config = inputs(mode="enforce")
     rendered = policy.render_nft_bootstrap(policy.build_policy(servers, users, config))
-    assert "tcp sport 445 tcp flags & (syn | ack) != syn" in rendered
+    assert "tcp dport { 135, 139, 445 }" in rendered
+    assert "tcp sport { 135, 139, 445 } tcp flags & (syn | ack) != syn" in rendered
+    assert "udp sport 137 udp dport 137" in rendered
+    assert "udp sport 138 udp dport 138" in rendered
+    assert "sport 137 tcp" not in rendered
     assert "ct state new" not in rendered
     assert "counter drop" in rendered
     # Enforcement requires both endpoints to be registered guests.  A BASE
@@ -185,3 +207,83 @@ def test_mode_change_replaces_only_its_own_chain_in_the_same_transaction():
     assert "delete chain inet nvx_smb_policy forward" in update
     assert "add chain inet nvx_smb_policy forward" in update
     assert "counter drop" in update
+
+
+class Snapshot:
+    def __init__(self, identifier, data=None, exists=True):
+        self.id = identifier
+        self._data = data
+        self.exists = exists
+
+    def to_dict(self):
+        return self._data
+
+
+class Collection:
+    def __init__(self, snapshots=None, document=None):
+        self.snapshots = snapshots or []
+        self._document = document
+        self.selected = None
+
+    def select(self, fields):
+        self.selected = tuple(fields)
+        return self
+
+    def stream(self):
+        return iter(self.snapshots)
+
+    def document(self, _identifier):
+        return Document(self._document)
+
+
+class Document:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def get(self):
+        return self.snapshot
+
+
+class FakeDb:
+    def __init__(self, servers, users, config):
+        self.server_collection = Collection(servers)
+        self.user_collection = Collection(users)
+        self.config_collection = Collection(document=config)
+
+    def collection(self, name):
+        return {
+            "servers": self.server_collection,
+            "users": self.user_collection,
+            "config": self.config_collection,
+        }[name]
+
+
+def test_reconcile_from_firestore_projects_only_needed_fields_and_missing_config_bootstraps_audit(tmp_path):
+    servers, users, _config = inputs()
+    db = FakeDb(
+        [Snapshot(key, value) for key, value in servers.items()],
+        [Snapshot(key, value) for key, value in users.items()],
+        Snapshot("smbPolicy", exists=False),
+    )
+    applied = []
+    plan = policy.reconcile_from_firestore(
+        db, applied.append, tmp_path / "policy.nft", tmp_path / "last-good.json"
+    )
+    assert plan.mode == "audit"
+    assert "counter drop" not in applied[0]
+    assert db.server_collection.selected == policy.SERVER_PROJECTION
+    assert db.user_collection.selected == policy.USER_PROJECTION
+    assert "table inet nvx_smb_policy" in (tmp_path / "policy.nft").read_text()
+    assert (tmp_path / "last-good.json").exists()
+
+
+def test_first_firestore_install_refuses_explicit_enforce_without_an_audit_install(tmp_path):
+    servers, users, config = inputs(mode="enforce")
+    db = FakeDb(
+        [Snapshot(key, value) for key, value in servers.items()],
+        [Snapshot(key, value) for key, value in users.items()],
+        Snapshot("smbPolicy", config),
+    )
+    with pytest.raises(policy.PolicyError, match="first SMB policy installation"):
+        policy.reconcile_from_firestore(db, lambda _transaction: None, tmp_path / "p.nft", tmp_path / "l.json")
+    assert not (tmp_path / "p.nft").exists()
