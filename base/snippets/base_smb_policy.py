@@ -29,15 +29,26 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
+RUNTIME_SCHEMA_VERSION = 2
 DEFAULT_MODE = "audit"
 MODES = frozenset(("audit", "enforce"))
 TRANSIT_V6 = ip_network("2a01:4f9:c01f:e:ffff::/112")
+IDENT_V6 = ip_network("2a01:4f9:c01f:e::/64")
+VMID_MIN = 100
+VMID_MAX = 9999
+# These are deliberately ranges rather than the addresses returned by the
+# inventory read.  A deleted document, a document being provisioned, and a
+# reused VMID must still be a candidate for enforcement.  Only an explicitly
+# built address pair receives an allow-list entry.
+GUEST_V4_RANGE = "10.64.0.100-10.64.39.15"
+GUEST_V6_RANGE = "2a01:4f9:c01f:e::64-2a01:4f9:c01f:e::270f"
 SMB_PORT = 445
-SERVER_PROJECTION = ("userId", "proxmoxId", "ipv4", "ipv6", "firewall")
+SERVER_PROJECTION = ("userId", "proxmoxId", "ipv4", "ipv6")
 USER_PROJECTION = ("linkedAccountIds",)
 
 
@@ -82,6 +93,7 @@ class SmbPolicyPlan:
         """Stable, non-PII serialisation suitable for a last-good file."""
         return {
             "schemaVersion": self.schema_version,
+            "runtimeSchemaVersion": RUNTIME_SCHEMA_VERSION,
             "configVersion": self.config_version,
             "mode": self.mode,
             "guestV4": list(self.guest_v4),
@@ -152,58 +164,68 @@ def _normalise_guest_ip(value: Any, family: int, field: str) -> str | None:
     return str(parsed)
 
 
+def _canonical_guest_addresses(vmid: int) -> tuple[str, str]:
+    """Return the only routable guest addresses assigned to ``vmid``."""
+    return f"10.64.{vmid // 256}.{vmid % 256}", str(IPv6Address(int(IDENT_V6.network_address) + vmid))
+
+
 def _servers(
     raw_servers: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
     raw_users: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
-) -> tuple[tuple[Server, ...], dict[str, frozenset[str]]]:
+) -> tuple[tuple[Server, ...], dict[str, frozenset[str]], tuple[str, ...]]:
     users = _collection_by_id(raw_users, "users")
     raw = _collection_by_id(raw_servers, "servers")
-    if not raw:
-        raise InputUnavailable("servers snapshot is empty; refusing to erase a fleet policy")
-
     links: dict[str, frozenset[str]] = {}
+    invalid_users: set[str] = set()
+    warnings: list[str] = []
     for uid, user in users.items():
+        if user.get("_smb_incomplete"):
+            invalid_users.add(uid)
+            warnings.append(f"users/{uid} skipped: document is incomplete")
+            continue
         linked = user.get("linkedAccountIds", [])
         if linked is None:
             linked = []
         if not isinstance(linked, list) or not all(isinstance(x, str) for x in linked):
-            raise InventoryValidationError(f"users/{uid}.linkedAccountIds is not a string list")
+            invalid_users.add(uid)
+            warnings.append(f"users/{uid} skipped: linkedAccountIds is incomplete")
+            continue
         links[uid] = frozenset(x for x in linked if x and x != uid)
 
-    seen_vmids: set[int] = set()
-    seen_v4: set[str] = set()
-    seen_v6: set[str] = set()
+    candidates: list[Server] = []
     result: list[Server] = []
     for server_id, item in raw.items():
-        owner = _nonempty_string(item.get("userId"), f"servers/{server_id}.userId", InventoryValidationError)
-        if owner not in users:
-            raise InventoryValidationError(f"servers/{server_id} owner is absent from users snapshot")
         try:
+            if item.get("_smb_incomplete"):
+                raise InventoryValidationError("document is incomplete")
+            owner = _nonempty_string(item.get("userId"), f"servers/{server_id}.userId", InventoryValidationError)
+            if owner not in users or owner in invalid_users:
+                raise InventoryValidationError("owner is absent or incomplete")
             vmid = int(item.get("proxmoxId"))
-        except (TypeError, ValueError) as exc:
-            raise InventoryValidationError(f"servers/{server_id}.proxmoxId is invalid") from exc
-        if vmid < 0 or vmid > 9999 or vmid in seen_vmids:
-            raise InventoryValidationError(f"duplicate or out-of-range VMID {vmid}")
-        seen_vmids.add(vmid)
+            if vmid < VMID_MIN or vmid > VMID_MAX:
+                raise InventoryValidationError(f"VMID is outside {VMID_MIN}..{VMID_MAX}")
+            v4 = _normalise_guest_ip(item.get("ipv4"), 4, f"servers/{server_id}.ipv4")
+            v6 = _normalise_guest_ip(item.get("ipv6"), 6, f"servers/{server_id}.ipv6")
+            expected_v4, expected_v6 = _canonical_guest_addresses(vmid)
+            if (v4, v6) != (expected_v4, expected_v6):
+                raise InventoryValidationError("guest addresses do not match the canonical VMID allocation")
+        except (InventoryValidationError, TypeError, ValueError) as exc:
+            # A document can temporarily lack fields during provisioning, or
+            # be the stale half of a move/reuse.  Omitting it removes any old
+            # permit; the static candidate ranges still cover its packets.
+            warnings.append(f"servers/{server_id} skipped: {exc}")
+            continue
+        candidates.append(Server(server_id, owner, vmid, v4, v6))
 
-        v4 = _normalise_guest_ip(item.get("ipv4"), 4, f"servers/{server_id}.ipv4")
-        v6 = _normalise_guest_ip(item.get("ipv6"), 6, f"servers/{server_id}.ipv6")
-        if not v4 and not v6:
-            raise InventoryValidationError(f"servers/{server_id} has no registered guest address")
-        if v4 and v4 in seen_v4:
-            raise InventoryValidationError(f"duplicate guest IPv4 {v4}")
-        if v6 and v6 in seen_v6:
-            raise InventoryValidationError(f"duplicate guest IPv6 {v6}")
-        if v4:
-            seen_v4.add(v4)
-        if v6:
-            seen_v6.add(v6)
-
-        # This is an account-bound private-peer policy.  `sambaEnabled` is an
-        # independent public-DNAT/client-firewall preference, so it must not
-        # make a registered guest disappear from the candidate set.
-        result.append(Server(server_id, owner, vmid, v4, v6))
-    return tuple(sorted(result)), links
+    by_vmid: dict[int, list[Server]] = {}
+    for candidate in candidates:
+        by_vmid.setdefault(candidate.vmid, []).append(candidate)
+    for vmid, same_vmid in by_vmid.items():
+        if len(same_vmid) != 1:
+            warnings.append(f"VMID {vmid} skipped: duplicate server documents")
+            continue
+        result.extend(same_vmid)
+    return tuple(sorted(result)), links, tuple(warnings)
 
 
 def _partner_pairs(
@@ -271,8 +293,8 @@ def build_policy(
     config: Mapping[str, Any] | None,
 ) -> SmbPolicyPlan:
     """Return a deterministic, complete policy plan without performing I/O."""
-    known, links = _servers(servers, users)
-    version, mode, partners, warnings = validate_config(config, known)
+    known, links, inventory_warnings = _servers(servers, users)
+    version, mode, partners, partner_warnings = validate_config(config, known)
     v4: set[tuple[str, str]] = set()
     v6: set[tuple[str, str]] = set()
     allowed_servers: set[tuple[str, str]] = set()
@@ -297,12 +319,12 @@ def build_policy(
         schema_version=SCHEMA_VERSION,
         config_version=version,
         mode=mode,
-        guest_v4=tuple(sorted(server.ipv4 for server in known if server.ipv4)),
-        guest_v6=tuple(sorted(server.ipv6 for server in known if server.ipv6)),
+        guest_v4=(GUEST_V4_RANGE,),
+        guest_v6=(GUEST_V6_RANGE,),
         allowed_v4=tuple(sorted(v4)),
         allowed_v6=tuple(sorted(v6)),
         allowed_server_pairs=tuple(sorted(allowed_servers)),
-        warnings=warnings,
+        warnings=inventory_warnings + partner_warnings,
     )
 
 
@@ -313,10 +335,14 @@ def _set_elements(values: Iterable[str] | Iterable[tuple[str, str]]) -> str:
     return ", ".join(rendered)
 
 
-def _set_declaration(name: str, set_type: str, values: Iterable[str] | Iterable[tuple[str, str]]) -> str:
+def _set_declaration(name: str, set_type: str, values: Iterable[str] | Iterable[tuple[str, str]], interval: bool = False) -> str:
     rendered = _set_elements(values)
-    suffix = f"; elements = {{ {rendered} }}" if rendered else ""
-    return f"  set {name} {{ type {set_type}{suffix}; }}"
+    fields = [f"type {set_type}"]
+    if interval:
+        fields.append("flags interval")
+    if rendered:
+        fields.append(f"elements = {{ {rendered} }}")
+    return f"  set {name} {{ {'; '.join(fields)}; }}"
 
 
 def _candidate_rules(plan: SmbPolicyPlan, action: str) -> list[str]:
@@ -353,8 +379,8 @@ def render_nft_bootstrap(plan: SmbPolicyPlan) -> str:
         "# Generated by base_smb_policy.py; do not hand-edit.",
         "# This table is intentionally independent: no flush ruleset.",
         "table inet nvx_smb_policy {",
-        _set_declaration("smb_guests_v4", "ipv4_addr", plan.guest_v4),
-        _set_declaration("smb_guests_v6", "ipv6_addr", plan.guest_v6),
+        _set_declaration("smb_guests_v4", "ipv4_addr", plan.guest_v4, interval=True),
+        _set_declaration("smb_guests_v6", "ipv6_addr", plan.guest_v6, interval=True),
         _set_declaration("smb_allowed_v4", "ipv4_addr . ipv4_addr", plan.allowed_v4),
         _set_declaration("smb_allowed_v6", "ipv6_addr . ipv6_addr", plan.allowed_v6),
         "  chain forward {",
@@ -418,6 +444,15 @@ def render_nft_update(plan: SmbPolicyPlan, installed_mode: str) -> str:
     return "\n".join(parts)
 
 
+def render_nft_rebuild(plan: SmbPolicyPlan) -> str:
+    """Replace only our table when the on-disk runtime schema changed."""
+    return "\n".join((
+        "# SMB runtime schema migration; this is not a global ruleset reload.",
+        "delete table inet nvx_smb_policy",
+        render_nft_bootstrap(plan),
+    ))
+
+
 def write_last_good(path: str | Path, plan: SmbPolicyPlan) -> None:
     """Atomically persist a plan only after the caller applied its nft update."""
     target = Path(path)
@@ -425,6 +460,147 @@ def write_last_good(path: str | Path, plan: SmbPolicyPlan) -> None:
     temporary = target.with_name(target.name + ".tmp")
     temporary.write_text(json.dumps(plan.snapshot(), indent=2, sort_keys=True) + "\n")
     os.replace(temporary, target)
+
+
+def _pairs_from_receipt(value: Any, family: str) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list):
+        raise PolicyError(f"SMB last-good receipt has invalid {family}")
+    pairs: list[tuple[str, str]] = []
+    for entry in value:
+        if not isinstance(entry, list) or len(entry) != 2 or not all(isinstance(part, str) for part in entry):
+            raise PolicyError(f"SMB last-good receipt has invalid {family}")
+        pairs.append((entry[0], entry[1]))
+    return tuple(sorted(set(pairs)))
+
+
+def _receipt_plan(path: str | Path) -> SmbPolicyPlan | None:
+    receipt = Path(path)
+    if not receipt.exists():
+        return None
+    try:
+        data = json.loads(receipt.read_text())
+    except Exception as exc:
+        raise PolicyError("SMB last-good receipt is unreadable") from exc
+    if not isinstance(data, Mapping) or data.get("mode") not in MODES:
+        raise PolicyError("SMB last-good receipt has no valid mode")
+    try:
+        return SmbPolicyPlan(
+            schema_version=int(data["schemaVersion"]),
+            config_version=int(data["configVersion"]),
+            mode=data["mode"],
+            guest_v4=tuple(str(value) for value in data.get("guestV4", [])),
+            guest_v6=tuple(str(value) for value in data.get("guestV6", [])),
+            allowed_v4=_pairs_from_receipt(data.get("allowedV4"), "allowedV4"),
+            allowed_v6=_pairs_from_receipt(data.get("allowedV6"), "allowedV6"),
+            allowed_server_pairs=tuple(),
+            warnings=tuple(),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PolicyError("SMB last-good receipt is incomplete") from exc
+
+
+def _receipt_runtime_schema(path: str | Path) -> int | None:
+    receipt = Path(path)
+    try:
+        data = json.loads(receipt.read_text())
+    except Exception as exc:
+        raise PolicyError("SMB last-good receipt is unreadable") from exc
+    return data.get("runtimeSchemaVersion") if isinstance(data, Mapping) else None
+
+
+def _is_candidate_address(value: str, family: int) -> bool:
+    try:
+        address = ip_address(value)
+    except ValueError:
+        return False
+    if address.version != family:
+        return False
+    if family == 4:
+        return int(ip_address("10.64.0.100")) <= int(address) <= int(ip_address("10.64.39.15"))
+    return int(IPv6Address("2a01:4f9:c01f:e::64")) <= int(address) <= int(IPv6Address("2a01:4f9:c01f:e::270f"))
+
+
+_CONNTRACK_TUPLE = re.compile(
+    r"^(?:(?:ipv4|ipv6)\s+\d+\s+)?(tcp|udp)\s+\d+(?:\s+\d+)?(?:\s+[A-Z_]+)?\s+src=(\S+)\s+dst=(\S+)\s+sport=(\d+)\s+dport=(\d+)\b"
+)
+_TCP_SMB_PORTS = frozenset((135, 137, 138, 139, 445))
+_UDP_SMB_DEST_PORTS = frozenset((135, 137, 138, 139, 445))
+
+
+def _smb_conntrack_tuples(listing: str, family: int) -> tuple[tuple[str, str, str, int, int], ...]:
+    """Parse original conntrack tuples only; reply tuples are never guessed."""
+    entries: list[tuple[str, str, str, int, int]] = []
+    for line in listing.splitlines():
+        match = _CONNTRACK_TUPLE.match(line)
+        if not match:
+            continue
+        proto, source, destination, sport, dport = match.groups()
+        try:
+            source, destination = str(ip_address(source)), str(ip_address(destination))
+        except ValueError:
+            continue
+        sport_i, dport_i = int(sport), int(dport)
+        service = (
+            dport_i in (_TCP_SMB_PORTS if proto == "tcp" else _UDP_SMB_DEST_PORTS)
+            or (proto == "tcp" and sport_i in _TCP_SMB_PORTS)
+            or (proto == "udp" and (sport_i, dport_i) in {(137, 137), (138, 138)})
+        )
+        if service and _is_candidate_address(source, family) and _is_candidate_address(destination, family):
+            entries.append((proto, source, destination, sport_i, dport_i))
+    return tuple(entries)
+
+
+def _conntrack_delete_command(family: int, item: tuple[str, str, str, int, int]) -> list[str]:
+    proto, source, destination, sport, dport = item
+    return [
+        "conntrack", "-D", "-f", "ipv4" if family == 4 else "ipv6",
+        "--orig-src", source, "--orig-dst", destination, "-p", proto,
+        "--orig-port-src", str(sport), "--orig-port-dst", str(dport),
+    ]
+
+
+def _conntrack_run(command: list[str]) -> None:
+    result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=30)
+    if result.returncode == 0:
+        return
+    # Exit 1 is also used for a tuple that ended between list and delete.  Any
+    # other exit-1 error means enforcement could leave an offloaded session.
+    if result.returncode == 1 and "0 flow entries have been deleted" in (result.stderr or ""):
+        return
+    raise RuntimeError("SMB conntrack revocation failed: " + (result.stderr or "").strip()[:500])
+
+
+def revoke_removed_smb_conntracks(
+    before: SmbPolicyPlan | None, after: SmbPolicyPlan, *, force: bool = False,
+) -> None:
+    """Delete only live SMB tuples that lost an account permission.
+
+    The selected conntrack entry owns any flowtable offload, so this tears down
+    a persistent session without flushing conntrack or touching the shared
+    flowtable.  On an audit->enforce transition every currently unknown
+    candidate tuple is selected; while already enforcing we run only when a
+    previously allowed pair was removed.
+    """
+    if after.mode != "enforce":
+        return
+    removed = {
+        4: set(before.allowed_v4) - set(after.allowed_v4) if before else set(),
+        6: set(before.allowed_v6) - set(after.allowed_v6) if before else set(),
+    }
+    if not force and before and before.mode == "enforce" and not removed[4] and not removed[6]:
+        return
+    for family in (4, 6):
+        result = subprocess.run(
+            ["conntrack", "-L", "-f", "ipv4" if family == 4 else "ipv6", "-o", "extended"],
+            text=True, capture_output=True, check=False, timeout=30,
+        )
+        if result.returncode:
+            raise RuntimeError("SMB conntrack listing failed: " + (result.stderr or "").strip()[:500])
+        allowed = set(after.allowed_v4 if family == 4 else after.allowed_v6)
+        for item in _smb_conntrack_tuples(result.stdout, family):
+            _proto, source, destination, _sport, _dport = item
+            if (source, destination) not in allowed:
+                _conntrack_run(_conntrack_delete_command(family, item))
 
 
 def reconcile_fresh(
@@ -453,7 +629,23 @@ def _snapshot_data(snapshot: Any, label: str) -> tuple[str, dict[str, Any]]:
     return identifier, dict(data)
 
 
-def firestore_snapshots(db: Any) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+def _collection_snapshot_data(snapshot: Any, label: str) -> tuple[str, dict[str, Any]]:
+    """Keep a present-but-unusable document as an explicit fail-closed entry."""
+    if snapshot is None or not getattr(snapshot, "exists", False):
+        raise InputUnavailable(f"{label} document is unavailable")
+    identifier = _nonempty_string(getattr(snapshot, "id", None), f"{label} id", InputUnavailable)
+    try:
+        data = snapshot.to_dict()
+    except Exception as exc:
+        raise InputUnavailable(f"{label}/{identifier} could not be read") from exc
+    if not isinstance(data, Mapping):
+        return identifier, {"_smb_incomplete": True}
+    return identifier, dict(data)
+
+
+def firestore_snapshots(
+    db: Any, *, missing_config_is_error: bool = False,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
     """Read only the fields required for a full policy reconciliation.
 
     A failed stream is deliberately allowed to raise: callers must keep the
@@ -468,14 +660,16 @@ def firestore_snapshots(db: Any) -> tuple[dict[str, dict[str, Any]], dict[str, d
         server_snaps = db.collection("servers").select(SERVER_PROJECTION).stream()
         user_snaps = db.collection("users").select(USER_PROJECTION).stream()
         config_snap = db.collection("config").document("smbPolicy").get()
-        servers = dict(_snapshot_data(snap, "servers") for snap in server_snaps)
-        users = dict(_snapshot_data(snap, "users") for snap in user_snaps)
+        servers = dict(_collection_snapshot_data(snap, "servers") for snap in server_snaps)
+        users = dict(_collection_snapshot_data(snap, "users") for snap in user_snaps)
     except PolicyError:
         raise
     except Exception as exc:
         raise InputUnavailable("Firestore policy snapshot failed") from exc
 
     if config_snap is None or not getattr(config_snap, "exists", False):
+        if missing_config_is_error:
+            raise InputUnavailable("config/smbPolicy disappeared after enforcement; refusing audit fallback")
         config = default_config()
     else:
         try:
@@ -502,35 +696,68 @@ def reconcile_from_firestore(
     last_good_path: str | Path,
     installed_mode: str | None = None,
     logger: logging.Logger | None = None,
+    required: bool = False,
 ) -> SmbPolicyPlan:
     """Perform the one explicit full-sync policy reconciliation on BASE.
 
     This is intentionally not a per-VM operation. It fetches complete,
     projected collections, applies one nft transaction, and only after that
     atomically writes the complete persistent table include and the last-good
-    snapshot. ``installed_mode=None`` bootstraps a new table in audit only;
-    an explicit enforce config cannot silently become the first installation.
+    snapshot. ``installed_mode=None`` bootstraps a new table in the reviewed
+    configuration mode after the complete authoritative read.  Audit remains
+    the rollout default, while a replacement BASE can safely join an already
+    approved enforce configuration.
     """
-    servers, users, config = firestore_snapshots(db)
+    previous = _receipt_plan(last_good_path)
+    # Missing configuration is only the initial audit bootstrap default.  Once
+    # enforcement has been recorded, a deleted/unreadable config must retain
+    # the live table rather than reopening cross-account SMB in audit mode.
+    servers, users, config = firestore_snapshots(
+        db, missing_config_is_error=required or bool(previous and previous.mode == "enforce"),
+    )
     plan = build_policy(servers, users, config)
     log = logger or logging.getLogger(__name__)
     for warning in plan.warnings:
         log.warning("SMB policy v%s: %s", plan.config_version, warning)
 
     if installed_mode is None:
-        if plan.mode != DEFAULT_MODE:
-            raise PolicyError("first SMB policy installation must be audit")
-        transaction = render_nft_bootstrap(plan)
+        # A cold/replacement BASE receives the reviewed live configuration.
+        # The audit-only rule was an initial rollout control, not a reason to
+        # leave a new BASE unprotected after the global policy is enforce.
+        effective_plan = plan
+        transaction = render_nft_bootstrap(effective_plan)
+    elif previous is None:
+        raise PolicyError("SMB policy table exists without a readable last-good receipt")
+    elif _receipt_runtime_schema(last_good_path) != RUNTIME_SCHEMA_VERSION:
+        # v1 stored enumerated registered addresses.  v2's interval candidate
+        # sets are a different nft type, so update them by replacing only this
+        # table in one nft transaction.
+        effective_plan = plan
+        transaction = render_nft_rebuild(effective_plan)
     else:
-        transaction = render_nft_update(plan, installed_mode)
+        effective_plan = plan
+        transaction = render_nft_update(effective_plan, installed_mode)
 
-    # Do not update either durable file until nft accepted the full transaction.
-    # Each replacement is atomic; a cross-filesystem transaction does not exist,
-    # so a persistence failure is surfaced for the caller to retry immediately.
-    apply_transaction(transaction)
-    _atomic_write_text(include_path, render_nft_bootstrap(plan))
-    write_last_good(last_good_path, plan)
-    return plan
+    # Stage the boot include first: a reboot after the live transaction must
+    # reload at least the same restrictive policy.  A rejected nft transaction
+    # restores the exact old include.  The receipt stays last, after targeted
+    # conntrack teardown, so it never certifies an enforcement change whose
+    # offloaded sessions might still be active.
+    include_target = Path(include_path)
+    include_existed = include_target.exists()
+    previous_include = include_target.read_text() if include_existed else None
+    _atomic_write_text(include_target, render_nft_bootstrap(effective_plan))
+    try:
+        apply_transaction(transaction)
+    except Exception:
+        if include_existed:
+            _atomic_write_text(include_target, previous_include or "")
+        else:
+            include_target.unlink(missing_ok=True)
+        raise
+    revoke_removed_smb_conntracks(previous, effective_plan, force=installed_mode is None)
+    write_last_good(last_good_path, effective_plan)
+    return effective_plan
 
 
 def _runtime_firestore_db() -> Any:
@@ -574,17 +801,8 @@ def shared_sync_lock(path: str | Path):
 
 
 def _receipt_mode(last_good_path: str | Path) -> str | None:
-    receipt = Path(last_good_path)
-    if not receipt.exists():
-        return None
-    try:
-        data = json.loads(receipt.read_text())
-    except Exception as exc:
-        raise PolicyError("SMB last-good receipt is unreadable") from exc
-    mode = data.get("mode") if isinstance(data, Mapping) else None
-    if mode not in MODES:
-        raise PolicyError("SMB last-good receipt has no valid mode")
-    return mode
+    plan = _receipt_plan(last_good_path)
+    return plan.mode if plan else None
 
 
 def nft_policy_table_exists() -> bool:
@@ -607,9 +825,9 @@ def installed_mode_from_runtime(
 ) -> str | None:
     """Derive safe installed state from the table and its last-good receipt.
 
-    ``None`` means an audit bootstrap is permitted. A missing table may recover
-    an audit receipt after reboot, but an enforce receipt without its table is
-    intentionally ambiguous and never reconstructed automatically.
+    ``None`` means a bootstrap is required.  The reconciler renders the
+    reviewed Firestore mode after a complete read, including enforce on a
+    cold/replacement BASE.
     """
     receipt_mode = _receipt_mode(last_good_path)
     table_present = table_exists()
@@ -619,8 +837,6 @@ def installed_mode_from_runtime(
         return receipt_mode
     if receipt_mode is None:
         return None
-    if receipt_mode != DEFAULT_MODE:
-        raise PolicyError("SMB policy table is missing after enforce; refusing to guess state")
     return None
 
 
