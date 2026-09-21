@@ -153,7 +153,11 @@ por BASE; no promete una reconstrucción E2E por un único comando.
    `--apply` para persistir el include y `BASE_IPV6_POLICY_ENABLED=1`.
    Instalar también el include de [SMB entre cuentas](smb-between-accounts-policy.md),
    inicialmente vacío, y `BASE_SMB_POLICY_ENABLED=1`; el full sync crea su tabla
-   en auditoría. El boot restaura las
+   en el modo revisado actual. Durante el despliegue inicial ese modo es
+   auditoría; una BASE nueva no debe dirigir tráfico hasta que
+   `sync-base-nat.py sync policy --require-smb-policy` confirme runtime y
+   recibo, y puede entrar directamente en enforce si ése ya es el modo global
+   aprobado. El boot restaura las
    dos rutas blackhole antes de consultar Firestore. No recargar `nftables` en
    una BASE activa para aplicar pools y nunca vaciar conntrack.
 7. Instalar `persist-egress-pools-nft.py` y ejecutar:

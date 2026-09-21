@@ -18,8 +18,8 @@ def server(server_id, owner, vmid, suffix, **extra):
     data = {
         "userId": owner,
         "proxmoxId": vmid,
-        "ipv4": f"10.64.0.{suffix}",
-        "ipv6": f"2a01:4f9:c01f:e::{suffix:x}",
+        "ipv4": f"10.64.{vmid // 256}.{vmid % 256}",
+        "ipv6": f"2a01:4f9:c01f:e::{vmid:x}",
         "firewall": {"sambaEnabled": True},
     }
     data.update(extra)
@@ -29,10 +29,10 @@ def server(server_id, owner, vmid, suffix, **extra):
 def inputs(mode="audit"):
     servers = dict(
         [
-            server("a1", "alice", 1, 1),
-            server("a2", "alice", 2, 2),
-            server("b1", "bob", 3, 3),
-            server("c1", "carol", 4, 4),
+            server("a1", "alice", 100, 100),
+            server("a2", "alice", 101, 101),
+            server("b1", "bob", 102, 102),
+            server("c1", "carol", 103, 103),
         ]
     )
     users = {
@@ -52,10 +52,10 @@ def test_same_owner_and_direct_link_are_bidirectional_for_both_families():
     plan = policy.build_policy(servers, users, config)
 
     assert pairs(plan) == {("a1", "a2"), ("a1", "b1"), ("a2", "b1"), ("b1", "c1")}
-    assert ("10.64.0.1", "10.64.0.3") in plan.allowed_v4
-    assert ("10.64.0.3", "10.64.0.1") in plan.allowed_v4
-    assert ("2a01:4f9:c01f:e::1", "2a01:4f9:c01f:e::3") in plan.allowed_v6
-    assert ("2a01:4f9:c01f:e::3", "2a01:4f9:c01f:e::1") in plan.allowed_v6
+    assert ("10.64.0.100", "10.64.0.102") in plan.allowed_v4
+    assert ("10.64.0.102", "10.64.0.100") in plan.allowed_v4
+    assert ("2a01:4f9:c01f:e::64", "2a01:4f9:c01f:e::66") in plan.allowed_v6
+    assert ("2a01:4f9:c01f:e::66", "2a01:4f9:c01f:e::64") in plan.allowed_v6
 
 
 def test_plan_is_deterministic_for_unordered_firestore_collections():
@@ -77,6 +77,31 @@ def test_unlink_is_per_edge_and_not_transitive():
     assert ("a2", "b1") not in pairs(plan)
     assert ("a1", "c1") not in pairs(plan)
     assert ("b1", "c1") in pairs(plan)
+
+
+def test_linked_account_clique_allows_each_direct_edge_and_unlink_only_removes_that_edge():
+    servers = dict([
+        server("a1", "alice", 100, 100), server("a2", "alice", 101, 101),
+        server("b1", "bob", 102, 102), server("b2", "bob", 103, 103),
+        server("c1", "carol", 104, 104), server("c2", "carol", 105, 105),
+    ])
+    users = {
+        "alice": {"linkedAccountIds": ["bob", "carol"]},
+        "bob": {"linkedAccountIds": ["alice", "carol"]},
+        "carol": {"linkedAccountIds": ["alice", "bob"]},
+    }
+    config = policy.default_config()
+    plan = policy.build_policy(servers, users, config)
+    # Three owner-pairs × two VMs × two VMs, represented directionally in v4.
+    assert len(plan.allowed_v4) == 30
+    users["alice"]["linkedAccountIds"] = ["carol"]
+    users["bob"]["linkedAccountIds"] = ["carol"]
+    after = policy.build_policy(servers, users, config)
+    assert len(after.allowed_v4) == 22
+    removed = set(plan.allowed_v4) - set(after.allowed_v4)
+    assert len(removed) == 8  # A↔B only: 2×2 in both directions.
+    assert ("a1", "c1") in set(after.allowed_server_pairs)
+    assert ("b1", "c1") in set(after.allowed_server_pairs)
 
 
 def test_explicit_partner_is_pinned_to_both_server_and_owner():
@@ -105,30 +130,32 @@ def test_samba_disabled_is_still_a_registered_private_peer_candidate():
     servers, users, config = inputs()
     servers["a1"]["firewall"] = {"sambaEnabled": False}
     plan = policy.build_policy(servers, users, config)
-    assert "10.64.0.1" in plan.guest_v4
-    assert "2a01:4f9:c01f:e::1" in plan.guest_v6
+    assert plan.guest_v4 == (policy.GUEST_V4_RANGE,)
+    assert plan.guest_v6 == (policy.GUEST_V6_RANGE,)
     assert ("a1", "a2") in pairs(plan)
 
 
-def test_unknown_owner_fails_without_planning_permissions():
+def test_unknown_owner_is_omitted_without_planning_permissions():
     servers, users, config = inputs()
     servers["a1"]["userId"] = "not-in-users"
-    with pytest.raises(policy.InventoryValidationError, match="owner"):
-        policy.build_policy(servers, users, config)
+    plan = policy.build_policy(servers, users, config)
+    assert ("a1", "a2") not in pairs(plan)
+    assert "owner is absent" in " ".join(plan.warnings)
 
 
 def test_vmid_reuse_or_duplicate_guest_ip_fails_instead_of_selecting_one_document():
     servers, users, config = inputs()
-    servers["reuse"] = dict(servers["a1"], userId="bob", ipv4="10.64.0.99", ipv6="2a01:4f9:c01f:e::99")
-    with pytest.raises(policy.InventoryValidationError, match="VMID"):
-        policy.build_policy(servers, users, config)
+    servers["reuse"] = dict(servers["a1"], userId="bob")
+    plan = policy.build_policy(servers, users, config)
+    assert ("a1", "a2") not in pairs(plan)
+    assert "duplicate server documents" in " ".join(plan.warnings)
 
 
 def test_transit_and_missing_input_never_become_guest_addresses():
     servers, users, config = inputs()
     servers["a1"]["ipv6"] = "2a01:4f9:c01f:e:ffff::1"
-    with pytest.raises(policy.InventoryValidationError, match="transit"):
-        policy.build_policy(servers, users, config)
+    plan = policy.build_policy(servers, users, config)
+    assert ("a1", "a2") not in pairs(plan)
     with pytest.raises(policy.InputUnavailable):
         policy.build_policy(None, users, config)
 
@@ -158,6 +185,33 @@ def test_enforce_checks_safe_return_path_without_conntrack_and_keeps_infra_exemp
     assert "ip saddr @smb_guests_v4 ip daddr @smb_guests_v4" in rendered
     assert "ip6 saddr @smb_guests_v6 ip6 daddr @smb_guests_v6" in rendered
     assert "not @smb_guests" not in rendered
+
+
+def test_candidate_ranges_cover_deleted_and_unprovisioned_vmids_without_allowing_them():
+    servers, users, config = inputs(mode="enforce")
+    plan = policy.build_policy(servers, users, config)
+    rendered = policy.render_nft_bootstrap(plan)
+    assert "flags interval" in rendered
+    assert policy.GUEST_V4_RANGE in rendered
+    assert policy.GUEST_V6_RANGE in rendered
+    # A VMID in the live allocation but absent from Firestore is a candidate,
+    # never an implicit same-owner/unknown-IP permission.
+    assert policy._is_candidate_address("10.64.4.72", 4)
+    assert policy._is_candidate_address("2a01:4f9:c01f:e::448", 6)
+    assert not any("10.64.4.72" in pair for pair in plan.allowed_v4)
+    assert not policy._is_candidate_address("10.64.255.1", 4)
+    assert not policy._is_candidate_address("2a01:4f9:c01f:e:ffff::1", 6)
+
+
+def test_incomplete_or_reused_server_document_removes_its_old_permission():
+    servers, users, config = inputs(mode="enforce")
+    before = policy.build_policy(servers, users, config)
+    del servers["a1"]["proxmoxId"]  # queued/provisioning write, not a trusted peer
+    after = policy.build_policy(servers, users, config)
+    assert ("a1", "a2") in pairs(before)
+    assert ("a1", "a2") not in pairs(after)
+    assert ("10.64.0.100", "10.64.0.101") not in after.allowed_v4
+    assert "skipped" in " ".join(after.warnings)
 
 
 def test_last_good_survives_invalid_fresh_config(tmp_path):
@@ -278,16 +332,35 @@ def test_reconcile_from_firestore_projects_only_needed_fields_and_missing_config
     assert (tmp_path / "last-good.json").exists()
 
 
-def test_first_firestore_install_refuses_explicit_enforce_without_an_audit_install(tmp_path):
+def test_cold_enforce_bootstrap_installs_reviewed_enforcement(monkeypatch, tmp_path):
     servers, users, config = inputs(mode="enforce")
     db = FakeDb(
         [Snapshot(key, value) for key, value in servers.items()],
         [Snapshot(key, value) for key, value in users.items()],
         Snapshot("smbPolicy", config),
     )
-    with pytest.raises(policy.PolicyError, match="first SMB policy installation"):
-        policy.reconcile_from_firestore(db, lambda _transaction: None, tmp_path / "p.nft", tmp_path / "l.json")
-    assert not (tmp_path / "p.nft").exists()
+    monkeypatch.setattr(policy, "revoke_removed_smb_conntracks", lambda *_a, **_k: None)
+    plan = policy.reconcile_from_firestore(db, lambda _transaction: None, tmp_path / "p.nft", tmp_path / "l.json")
+    assert plan.mode == "enforce"
+    assert 'counter drop' in (tmp_path / "p.nft").read_text()
+    assert policy._receipt_plan(tmp_path / "l.json").mode == "enforce"
+
+
+def test_rejected_nft_restores_previous_boot_include_and_does_not_write_receipt(tmp_path):
+    servers, users, config = inputs(mode="enforce")
+    include = tmp_path / "p.nft"
+    include.write_text("previous include\n")
+    db = FakeDb(
+        [Snapshot(key, value) for key, value in servers.items()],
+        [Snapshot(key, value) for key, value in users.items()],
+        Snapshot("smbPolicy", config),
+    )
+    with pytest.raises(RuntimeError, match="rejected"):
+        policy.reconcile_from_firestore(
+            db, lambda _transaction: (_ for _ in ()).throw(RuntimeError("rejected")), include, tmp_path / "l.json"
+        )
+    assert include.read_text() == "previous include\n"
+    assert not (tmp_path / "l.json").exists()
 
 
 def test_installed_mode_readiness_requires_a_consistent_table_and_receipt(tmp_path):
@@ -305,8 +378,92 @@ def test_installed_mode_readiness_requires_a_consistent_table_and_receipt(tmp_pa
 
     enforce = policy.build_policy(servers, users, {**config, "mode": "enforce"})
     policy.write_last_good(receipt, enforce)
-    with pytest.raises(policy.PolicyError, match="after enforce"):
-        policy.installed_mode_from_runtime(receipt, lambda: False)
+    assert policy.installed_mode_from_runtime(receipt, lambda: False) is None
+
+
+def test_missing_config_after_enforce_retains_policy_instead_of_defaulting_audit(tmp_path):
+    servers, users, config = inputs(mode="enforce")
+    receipt = tmp_path / "last-good.json"
+    policy.write_last_good(receipt, policy.build_policy(servers, users, config))
+    db = FakeDb(
+        [Snapshot(key, value) for key, value in servers.items()],
+        [Snapshot(key, value) for key, value in users.items()],
+        Snapshot("smbPolicy", exists=False),
+    )
+    with pytest.raises(policy.InputUnavailable, match="disappeared after enforcement"):
+        policy.reconcile_from_firestore(db, lambda _transaction: None, tmp_path / "p.nft", receipt, "enforce")
+
+
+def test_required_sync_rejects_missing_config_even_before_first_enforce(tmp_path):
+    servers, users, _config = inputs()
+    db = FakeDb(
+        [Snapshot(key, value) for key, value in servers.items()],
+        [Snapshot(key, value) for key, value in users.items()],
+        Snapshot("smbPolicy", exists=False),
+    )
+    with pytest.raises(policy.InputUnavailable, match="disappeared after enforcement"):
+        policy.reconcile_from_firestore(
+            db, lambda _transaction: None, tmp_path / "p.nft", tmp_path / "receipt.json", required=True,
+        )
+
+
+def test_conntrack_revocation_is_tuple_scoped_and_preserves_allowed_pair(monkeypatch):
+    servers, users, config = inputs(mode="enforce")
+    before = policy.build_policy(servers, users, config)
+    users["alice"]["linkedAccountIds"] = []
+    users["bob"]["linkedAccountIds"] = ["carol"]
+    after = policy.build_policy(servers, users, config)
+    listing = "\n".join((
+        "ipv4 2 tcp 6 431999 ESTABLISHED src=10.64.0.100 dst=10.64.0.102 sport=50100 dport=445 src=10.64.0.102 dst=10.64.0.100 sport=445 dport=50100 [OFFLOAD]",
+        "ipv4 2 tcp 6 431999 ESTABLISHED src=10.64.0.102 dst=10.64.0.103 sport=50101 dport=445 src=10.64.0.103 dst=10.64.0.102 sport=445 dport=50101 [OFFLOAD]",
+        "ipv4 2 tcp 6 431999 ESTABLISHED src=10.64.0.100 dst=10.64.4.72 sport=50102 dport=445 src=10.64.4.72 dst=10.64.0.100 sport=445 dport=50102 [OFFLOAD]",
+    ))
+    from types import SimpleNamespace
+    commands = []
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if command[:3] == ["conntrack", "-L", "-f"]:
+            return SimpleNamespace(returncode=0, stdout=listing if command[3] == "ipv4" else "", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(policy.subprocess, "run", fake_run)
+    policy.revoke_removed_smb_conntracks(before, after)
+    deletes = [command for command in commands if command[:2] == ["conntrack", "-D"]]
+    assert len(deletes) == 2
+    assert all("--orig-src" in command and "--orig-port-dst" in command for command in deletes)
+    assert not any("10.64.0.103" in command for command in deletes)
+
+
+def test_conntrack_exit_one_is_only_accepted_for_a_race(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(policy.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=1, stderr="permission denied"))
+    with pytest.raises(RuntimeError, match="revocation failed"):
+        policy._conntrack_run(["conntrack", "-D"])
+    monkeypatch.setattr(policy.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=1, stderr="0 flow entries have been deleted"))
+    policy._conntrack_run(["conntrack", "-D"])
+
+
+def test_cold_enforce_force_sweeps_unknown_offloaded_candidate(monkeypatch, tmp_path):
+    servers, users, config = inputs(mode="enforce")
+    db = FakeDb(
+        [Snapshot(key, value) for key, value in servers.items()],
+        [Snapshot(key, value) for key, value in users.items()],
+        Snapshot("smbPolicy", config),
+    )
+    from types import SimpleNamespace
+    commands = []
+    listing = "ipv4 2 tcp 6 431999 ESTABLISHED src=10.64.4.72 dst=10.64.0.100 sport=50102 dport=445 src=10.64.0.100 dst=10.64.4.72 sport=445 dport=50102 [OFFLOAD]"
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if command[:2] == ["conntrack", "-L"]:
+            return SimpleNamespace(returncode=0, stdout=listing if command[3] == "ipv4" else "", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(policy.subprocess, "run", fake_run)
+    policy.reconcile_from_firestore(db, lambda _transaction: None, tmp_path / "p.nft", tmp_path / "receipt.json")
+    delete = next(command for command in commands if command[:2] == ["conntrack", "-D"])
+    assert delete == [
+        "conntrack", "-D", "-f", "ipv4", "--orig-src", "10.64.4.72", "--orig-dst", "10.64.0.100",
+        "-p", "tcp", "--orig-port-src", "50102", "--orig-port-dst", "445",
+    ]
 
 
 def test_compatibility_mode_is_an_assertion_not_an_installed_state():

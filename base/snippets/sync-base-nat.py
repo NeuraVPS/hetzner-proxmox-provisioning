@@ -1376,9 +1376,31 @@ def require_base_ipv6_policy():
         raise RuntimeError("BASE IPv6 policy is not installed in the running ruleset")
 
 
-def reconcile_base_smb_policy():
+def require_base_smb_policy(*, live: bool = True):
+    """Prove the account SMB runtime can enforce before acknowledging a trigger."""
+    if not parse_bool_env("BASE_SMB_POLICY_ENABLED", False):
+        raise RuntimeError("BASE SMB policy is disabled; refusing required-policy sync")
+    try:
+        from base_smb_policy import (  # noqa: F401 - verifies installed module
+            RUNTIME_SCHEMA_VERSION, _receipt_runtime_schema, installed_mode_from_runtime,
+        )
+    except ImportError as exc:
+        raise RuntimeError("BASE SMB policy module is unavailable") from exc
+    if not live:
+        return
+    receipt = os.environ.get("BASE_SMB_POLICY_STATE", "/var/lib/base-nat/smb-policy-last-good.json")
+    mode = installed_mode_from_runtime(receipt)
+    if mode is None:
+        raise RuntimeError("BASE SMB policy is not installed in the running ruleset")
+    if _receipt_runtime_schema(receipt) != RUNTIME_SCHEMA_VERSION:
+        raise RuntimeError("BASE SMB policy runtime schema is stale; refusing required-policy sync")
+
+
+def reconcile_base_smb_policy(required: bool = False):
     """Explicit/full sync only; never enumerate all users for a VM toggle."""
     if not parse_bool_env("BASE_SMB_POLICY_ENABLED", False):
+        if required:
+            raise RuntimeError("BASE SMB policy is disabled; refusing required-policy sync")
         return
     if not ensure_firebase():
         raise RuntimeError("Firestore unavailable; retaining last-good SMB policy")
@@ -1394,7 +1416,9 @@ def reconcile_base_smb_policy():
             raise RuntimeError("SMB policy transaction rejected: " + result.stderr)
 
     plan = reconcile_from_firestore(firestore.client(), apply, include, receipt,
-                                    installed_mode=mode, logger=logger)
+                                    installed_mode=mode, logger=logger, required=required)
+    if required:
+        require_base_smb_policy()
     logger.info("SMB policy: mode=%s guests=%s/%s allowed pairs=%s",
                 plan.mode, len(plan.guest_v4), len(plan.guest_v6),
                 len(plan.allowed_server_pairs))
@@ -2285,6 +2309,15 @@ def main():
     if "--require-ipv6-policy" in args:
         args.remove("--require-ipv6-policy")
         require_base_ipv6_policy()
+    require_smb_policy = "--require-smb-policy" in args
+    if require_smb_policy:
+        args.remove("--require-smb-policy")
+        if args != ["policy"]:
+            raise RuntimeError("--require-smb-policy is only valid with: sync policy")
+        # Check feature availability before starting any sync.  The live table
+        # is checked after reconciliation, which lets a cold audit bootstrap
+        # become concrete but never acknowledge an enforce staging pass.
+        require_base_smb_policy(live=False)
     validate_config()
     if not args:
         sync_full()
@@ -2296,7 +2329,7 @@ def main():
 
     if args[0] == "policy":
         with state_lock():
-            reconcile_base_smb_policy()
+            reconcile_base_smb_policy(required=require_smb_policy)
         return
 
     try:

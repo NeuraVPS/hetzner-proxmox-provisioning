@@ -2,6 +2,8 @@
 import importlib.util
 import logging
 import multiprocessing
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,3 +74,33 @@ def test_required_policy_accepts_installed_table(sync, monkeypatch):
     monkeypatch.setenv('BASE_IPV6_POLICY_ENABLED', '1')
     monkeypatch.setattr(sync.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
     sync.require_base_ipv6_policy()
+
+
+def test_required_smb_policy_refuses_feature_disabled_before_reconcile(sync, monkeypatch):
+    monkeypatch.setenv('BASE_SMB_POLICY_ENABLED', '0')
+    with pytest.raises(RuntimeError, match='SMB policy is disabled'):
+        sync.require_base_smb_policy(live=False)
+
+
+def test_required_smb_policy_requires_current_receipt_and_live_table(sync, monkeypatch, tmp_path):
+    fake = types.ModuleType('base_smb_policy')
+    fake.RUNTIME_SCHEMA_VERSION = 2
+    fake.installed_mode_from_runtime = lambda _receipt: 'enforce'
+    fake._receipt_runtime_schema = lambda _receipt: 2
+    monkeypatch.setitem(sys.modules, 'base_smb_policy', fake)
+    monkeypatch.setenv('BASE_SMB_POLICY_ENABLED', '1')
+    sync.require_base_smb_policy()
+
+    fake.installed_mode_from_runtime = lambda _receipt: None
+    with pytest.raises(RuntimeError, match='not installed'):
+        sync.require_base_smb_policy()
+
+
+def test_sync_policy_required_flag_checks_before_and_after_reconcile(sync, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sync, 'require_base_smb_policy', lambda *, live=True: calls.append(('require', live)))
+    monkeypatch.setattr(sync, 'reconcile_base_smb_policy', lambda required=False: calls.append(('reconcile', required)))
+    monkeypatch.setattr(sync, 'state_lock', __import__('contextlib').nullcontext)
+    monkeypatch.setattr(sys, 'argv', ['sync-base-nat.py', 'sync', 'policy', '--require-smb-policy'])
+    sync.main()
+    assert calls == [('require', False), ('reconcile', True)]
