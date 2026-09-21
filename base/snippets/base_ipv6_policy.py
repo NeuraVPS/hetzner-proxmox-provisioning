@@ -167,7 +167,11 @@ def revoke(commands: list[list[str]]):
     has another ORIGINAL destination and is deliberately never selected.
     """
     for command in commands:
-        run(command, allowed=(0, 1))  # 1 = no matching connection
+        result = run(command, allowed=(0, 1))
+        # conntrack also uses exit 1 for permission/runtime failures, which
+        # must never masquerade as successful revocation.
+        if result.returncode == 1 and '0 flow entries have been deleted' not in result.stderr:
+            raise RuntimeError('Direct IPv6 conntrack revocation failed: ' + result.stderr[:500])
 
 
 def render_disabled_guard(before: dict, uplink: str) -> str:
@@ -202,7 +206,7 @@ def disable_policy(path: Path, state: Path):
     # by conntrack's original public destination, so NAT66 reply traffic from
     # guest-initiated sessions remains untouched.
     transaction = (f'delete table inet {TABLE}\n' if present else '') + render_disabled_guard(
-        before, os.environ.get('BASE_POLICY_UPLINK', 'enp2s0'))
+        before, before.get('uplink') or os.environ.get('BASE_POLICY_UPLINK', 'enp2s0'))
     run(['nft', '-c', '-f', '-'], data=transaction)
     run(['nft', '-f', '-'], data=transaction)
     revoke(revoked(before, {'entries': []}))
@@ -218,17 +222,21 @@ def reconcile(desired: dict):
     path = Path(os.environ.get('BASE_IPV6_POLICY_FILE', '/etc/nftables.d/base-ipv6-policy.nft'))
     state = Path(os.environ.get('BASE_IPV6_POLICY_STATE', '/var/lib/base-nat/ipv6-policy.json'))
     # A corrupt previous receipt must not bypass the targeted revocation step.
-    before = load_receipt(state) or {'entries': []}
+    previous = load_receipt(state)
+    before = previous or {'entries': []}
     rendered = render(policy, os.environ.get('BASE_POLICY_UPLINK', 'enp2s0'))
     old_text = path.read_text() if path.exists() else None
     present = run(['nft', 'list', 'table', 'inet', TABLE], allowed=(0, 1)).returncode == 0
+    map_present = present and run(['nft', 'list', 'map', 'inet', TABLE, 'public_to_ident'],
+                                 allowed=(0, 1)).returncode == 0
+    if map_present and previous is None:
+        raise RuntimeError('Live IPv6 mapping without its receipt; refusing untracked revocation')
     same_structure = (present and before.get('schemaVersion') == policy['schemaVersion']
                       and before.get('uplink') == policy['uplink'])
     if same_structure:
         # A failed disable may leave its deny-only table with the previous
         # receipt. Reconstruct the full table rather than updating absent maps.
-        same_structure = run(['nft', 'list', 'map', 'inet', TABLE, 'public_to_ident'],
-                             allowed=(0, 1)).returncode == 0
+        same_structure = map_present
     transaction = (
         render_element_update(policy) if same_structure else
         (f'delete table inet {TABLE}\n' if present else '') + rendered)

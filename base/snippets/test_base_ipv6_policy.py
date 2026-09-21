@@ -56,7 +56,7 @@ def test_failed_atomic_apply_restores_boot_file(tmp_path):
     config=tmp_path/'policy.nft';config.write_text('old')
     def fake_run(args,**kw):
         if args[:3]==['nft','list','table']:
-            return SimpleNamespace(returncode=0)
+            return SimpleNamespace(returncode=1)
         if args==['nft','-c','-f','-']:
             return SimpleNamespace(returncode=0)
         raise RuntimeError('reject')
@@ -72,6 +72,26 @@ def test_revoke_never_changes_the_shared_flowtable_or_guest_egress():
     with patch.object(m,'run',return_value=SimpleNamespace(returncode=0)) as run:
         m.revoke([command])
     run.assert_called_once_with(command,allowed=(0,1))
+
+
+def test_revoke_does_not_treat_permission_failure_as_no_matching_flow():
+    from types import SimpleNamespace
+    with patch.object(m,'run',return_value=SimpleNamespace(returncode=1,stderr='Operation failed: must be root')):
+        with pytest.raises(RuntimeError,match='revocation failed'):
+            m.revoke([['conntrack','-D']])
+    with patch.object(m,'run',return_value=SimpleNamespace(returncode=1,stderr='conntrack: 0 flow entries have been deleted.')):
+        m.revoke([['conntrack','-D']])
+
+
+def test_live_mapping_without_receipt_cannot_skip_existing_session_revocation(tmp_path):
+    from types import SimpleNamespace
+    config=tmp_path/'policy.nft';config.write_text('previous')
+    with patch.dict(os.environ,{'BASE_IPV6_POLICY_ENABLED':'1','MAIN_IPV6':'2001:db8:1::2',
+                               'BASE_IPV6_POLICY_FILE':str(config),'BASE_IPV6_POLICY_STATE':str(tmp_path/'missing')}), \
+            patch.object(m,'run',return_value=SimpleNamespace(returncode=0)):
+        with pytest.raises(RuntimeError,match='without its receipt'):
+            m.reconcile({100:entry()})
+    assert config.read_text()=='previous'
 
 
 def test_disable_keeps_an_inert_boot_file_and_removes_receipt(tmp_path):
