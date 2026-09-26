@@ -74,9 +74,11 @@ LAST=$(cat "$BACKOFF" 2>/dev/null || echo 0)
 [ $(( NOW - LAST )) -lt 300 ] && exit 0
 echo "$NOW" > "$BACKOFF"
 
+# The arbiter (Cloud Function failover_watchdog, timeout_sec=300) can take
+# ~270 s on a real swap; a shorter wait logged "HTTP 000" on 26/09/2026.
 echo "failover-watchdog: reporting to arbiter (fails=$FAILS)"
 HTTP=$(curl -sS -o /run/failover-watchdog.resp -w '%{http_code}' \
-  --max-time 90 -X POST "$CF_URL" \
+  --max-time 320 -X POST "$CF_URL" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d "{\"reporter\":\"$SELF\",\"peer\":\"$PEER\",\"consecutiveFailures\":$FAILS}" \
   2>/dev/null || echo 000)
