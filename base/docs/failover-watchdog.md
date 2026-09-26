@@ -88,3 +88,24 @@ sessions on the moved VIPs reconnect) — use only as a deliberate rehearsal.
   base liveness, not data-plane correctness (node_health covers deeper checks).
 - Robot POSTs are async: timeouts/409 during the swap are normal; the confirm
   GET decides. VIP propagation is 2–3 min at Hetzner's side.
+
+## First real drill — 26/09/2026 (b0 → b1, `dryRun:false`)
+
+Result: detection → VIPs on b1 in ~6.3 min; new connections via the FSN VIPs
+failed for ~25 s; established sessions through a moved VIP hang (no conntrack
+on the other base); manual fail-back cost ~1 min on FSN v4 and nothing on v6.
+
+Lessons, all fixed or recorded:
+
+- `failover-watchdog-drill.sh` picked the guest-network `…ffff::2` as the
+  base's main v6 on the ECC bases, so the peer's first probe
+  (`https://[PEER_V6]/`) kept succeeding and the drill would never fire. The
+  main v6 is now the default-route source address.
+- The arbiter Cloud Function hit its 120 s timeout (504) during a real swap,
+  and the reporter's curl gave up at 90 s ("HTTP 000"). The CF timeout is now
+  300 s (NeuraVPS `functions/main.py`) and the reporter waits up to 320 s.
+- Robot allows **100 `GET /failover` per hour**. Do not poll it in a loop during
+  a drill; watch where new connections land with `conntrack -E -e NEW` on each
+  base instead, and use one `GET /failover` (list) at the end.
+- Not covered by this drill: the egress path (b0 kept doing NAT) and a real
+  whole-base outage.

@@ -28,7 +28,12 @@ ENV_FILE=/etc/neuravps/failover-watchdog.env
 . "$ENV_FILE"   # PEER_V4 / PEER_V6 = the reporter whose pings we must drop
 
 MAIN_V4=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p')
-MAIN_V6=$(ip -6 addr show scope global 2>/dev/null | sed -n 's/.*inet6 \([0-9a-f:]*::2\)\/.*/\1/p' | head -1)
+# Public v6 = the source the kernel uses for the default route, the address
+# the peer's peer_alive() probes first (https://[PEER_V6]/). The old
+# 'first global ::2' regex picked the guest-network address
+# (2a01:4f9:c01f:e:ffff::2) on the ECC bases, so the drill never fired
+# (26/09/2026 drill) and it briefly blocked 22/443 on the guest network.
+MAIN_V6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9a-f:]*\).*/\1/p')
 CALLER=${SSH_CLIENT%% *}   # exclude the operator's own SSH source (v4 session)
 
 case "${1:-}" in
