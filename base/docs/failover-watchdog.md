@@ -109,3 +109,37 @@ Lessons, all fixed or recorded:
   base instead, and use one `GET /failover` (list) at the end.
 - Not covered by this drill: the egress path (b0 kept doing NAT) and a real
   whole-base outage.
+
+## Second drill — 27/09/2026 (b0 dead in the data plane too, `dryRun:false`)
+
+Method: on b0, `failover-watchdog-drill.sh arm-dataplane` (probe rules plus all
+GRE dropped in and out, so the nodes' ip6gre tunnels see a mute base). Window
+00:58–01:07 UTC, a Saturday night; b0 was mute for 8 min 37 s.
+
+Results (T0 = arm):
+
+- Nodes: the 38 FSN nodes switched by themselves to the HEL tunnel in 21–36 s,
+  egress SNAT'd with each VM's HEL pair IP; they came back ~1 min after the VIP
+  v6 reached b1.
+- Arbiter: peer reported at T+3:10, swap decided 3 s later; the reporter did
+  get its HTTP 200 (fixes #250/#494 hold).
+- Inbound: FSN VIPs cut ~5–6 min (hostnames ~5 min, v4 ~5 min 15 s, v6
+  ~6 min 10 s). Through the HEL VIPs the FSN VMs had **no failures** at all,
+  so a customer can reach the VM via the other region's hostname during a base
+  outage.
+- Fail-back (`vip_return.py`): FSN v4 ~1 min of failures.
+- Not measured: whether established outbound connections survive the nodes'
+  second route change back to the FSN tunnel; `both_down` and a real hardware
+  failure remain untested.
+
+Safeguards used, keep them for the next one:
+
+- Set `config/conncheck.dryRun=true` for the whole window so no conncheck pass
+  can create distress (and with it `guestAutoFix` inside guests); restore after.
+- Avoid the conncheck/maintenance passes at :05/:15/:35/:45.
+- Do not poll Robot in a loop (100 GET/h); one GET before and one at the end.
+
+Correction to the 26/09 notes: "b0 kept doing NAT" was wrong. The tunnels are
+anchored to the VIP v6, so FSN egress had already moved to b1 with the VIP.
+Cutting only the forward path does **not** trigger `neuravps-tunnel-probe`
+(the probe is local TCP/443 through the tunnel); hence the GRE drop.
