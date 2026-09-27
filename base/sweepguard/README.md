@@ -68,6 +68,16 @@ judges NATIVE v6 clients (NAT66).
                   source ever observed)
     maxAddsPerRun cap on blocks per run, bounds the blast radius of a bug
     blockSeconds  how long an automatic block lasts (86400)
+    hotPortMinTotal      LIVE connections on one port = port under attack (10)
+    hotPortMinSrc        LIVE connections from one source on that port (5)
+    hotPortMaxIdle       an ESTABLISHED connection is live if its last packet is
+                         at most this old, in seconds (300 = one pass)
+    sessionMemorySeconds how long a proven RDP session keeps a source out of the
+                         hot-port detector (86400; 0 = only the current one)
+    hotPortBlockSeconds  how long a hot-port block lasts (3600)
+
+No base carries this file today (checked 2026-09-27 on b0 and b1): the
+`DEFAULTS` in `sweepguard.py` are what runs.
 
 **Armed since 2026-07-25** (was dry-run for one day; new BASEs now ship armed).
 
@@ -167,6 +177,12 @@ Two changes came out of it, both in `sweepguard.py`:
 The thresholds were deliberately NOT raised: 6 is already above the measured
 p95 of 4, so no threshold separates these two populations.
 
+It happened twice more (2026-08-30: a stale `.rdp` shortcut retrying against
+another customer's VM; 2026-09-26/27: 27 hourly blocks of a customer holding
+SSH sessions to their own VM), both patched by hand with `bf_allow`. The root
+cause turned out not to be the thresholds but WHAT was counted — fixed on
+2026-09-27, see "Hot-port counts LIVE connections" below.
+
 **Triage, when a customer says "all my servers AND the VNC console died at once,
 and it works from my phone":** that shape is a source-IP block until proven
 otherwise. Check it first, before touching anything else:
@@ -236,6 +252,10 @@ Two conditions must BOTH hold, which is what makes blocking safe here:
 * and the source contributes `hotPortMinSrc` (5) of them — a real client holds
   1-4 (p95 = 4).
 
+(Those were the July numbers, counting every conntrack entry. Since
+2026-09-27 both conditions count only LIVE connections, and `hotPortMinTotal`
+is 10 — see the next-but-one section.)
+
 Armed, it picked exactly the four heaviest of that cluster and nothing else.
 Effect on the attacked VM within four minutes: live connections **67 → 16**,
 failed logons **12.4/min → 4.8/min**.
@@ -303,3 +323,107 @@ so an already-blocked v6 source was "BLOCKED" again every run (210 log lines for
 one Google Cloud scanner). Addresses are now normalised.
 
 Tests: `python3 base/sweepguard/test_sweepguard_dst.py`.
+
+## Hot-port counts LIVE connections and never judges a proven RDP session (2026-09-27)
+
+Third customer blocked by this detector: `79.158.167.228`, owner of VMs
+1634/1741/1742, blocked **27 times, once an hour**, from 2026-09-26 07:43Z,
+losing RDP to 1742 each time. Measured the next morning on b0 and b1 (five
+conntrack samples 3 min apart plus the journal since 13/09), the cause was not
+the thresholds but what the detector counted.
+
+**What the data showed**
+
+* `nf_conntrack_acct` and `nf_conntrack_timestamp` are **0** on both bases, and
+  `nf_conntrack_tcp_timeout_established` is the kernel default **432000 (5 days)**,
+  not the 1h set in July (that sysctl file did not survive the base
+  replacements). No bytes and no age, but the remaining timeout still gives
+  **silence**: the kernel resets it on every packet, so
+  `432000 - remaining` = seconds since the last packet.
+* Everything with traffic sits in the flowtable (`[OFFLOAD]`, evicted after 30 s
+  without packets). Across the samples, **not one** ESTABLISHED entry outside the
+  flowtable had less than 30 min of silence; most had hours to days.
+* The detector counted those dead entries — and **the block manufactures
+  them**: dropping a source's packets freezes its connections in ESTABLISHED
+  for 5 days. Each hour the block expired and the next pass re-blocked on the
+  same corpses. On b0, 3849 hot-port blocks since 13/09 came from **92
+  sources** and 93 % were re-blocks ≤75 min after the previous one (b1: 9555
+  from 3905 sources, 42 %).
+* The customer's 24 SSH connections to 31634 had their last packets between
+  07:19 and 07:43:12Z on 26/09 — the first block was at 07:43:22Z. Every block
+  after that counted connections the first block had killed. At that first
+  block only 7 had traffic in the previous 5 minutes, all his, on his own port.
+* 113 sources had a replied RDP UDP flow (the multitransport leg a client only
+  opens after a completed login). **None** of them was ever blocked by any
+  detector since 05/09 — except this customer.
+
+**The rule** (`hot_port_scan`)
+
+1. Only LIVE connections count, both for the source and for the port total:
+   `[OFFLOAD]`, any state other than ESTABLISHED (SYN_SENT, SYN_RECV, TIME_WAIT,
+   CLOSE… all expire in ≤2 min, i.e. connect/fail/close churn — exactly what
+   brute force leaves), or ESTABLISHED with ≤ `hotPortMaxIdle` (300 s) of
+   silence. If the sysctl cannot be read, every entry counts (old behaviour).
+2. A source with a **proven RDP session** — a UDP flow to a 2xxxx forward that
+   has a reply (`[ASSURED]` or `[OFFLOAD]`, never `[UNREPLIED]`) — is not judged
+   by hot-port; it is logged as `SKIP … RDP session now|in memory`. The session
+   is remembered `sessionMemorySeconds` (24 h) in
+   `/var/lib/neuravps-sweepguard/sessions.json`, which covers the owner of an
+   attacked VM whose session has just died and who is reconnecting (the
+   2026-07-29 case). An unreadable file starts empty: the detector gets
+   stricter, never looser. Rate limits and detectors 1 and 2 still apply.
+3. Thresholds on live connections: `hotPortMinSrc` 5 (unchanged) and
+   `hotPortMinTotal` **10** (was 20 on all entries). Live, no real VM port went
+   above 2 connections and no source above 2 on one port in any sample; 10 keeps
+   a 5x margin and recovers the 31337 pairs (two sources, 13-16 live between
+   them) that 20 would have lost once dead entries stopped padding the total.
+
+Not used, and why: bytes (accounting is off and the data path is not
+accounted here anyway); age (no timestamps — silence is not age); the VM owner.
+The owner was evaluated with the Firestore map: of 157 hot-port-blocked sources
+still visible, exactly one touched ≥2 VMs of the attacked VM's owner — this
+customer, whom rules 1 and 2 already cover — while 270 of 9167 sources touch
+≥2 VMs of one owner. It would add a dependency (the base only has same-owner
+pairs inside `/var/lib/base-nat/smb-policy-last-good.json`) for no measured gain.
+
+**Dry run** (`hotport_dryrun.py`, same samples, bf_allow ignored)
+
+| | b0 | b1 |
+|---|---|---|
+| sources flagged in the 5 samples, old → new | 6 → 0 | 11 → 3 |
+| dropped: dead connections only / proven session | 6 / 0 | 8 / 0 |
+| hot-port blocks in force at 10:56Z | 5 | 25 |
+| … would still be blocked (all SYN floods on 25565, no VM there) | 0 | 18 |
+| … would not (dead connections / session) | 5 / 0 | 6 / 1 |
+| first blocks still reconstructible: new rule also blocks | 2 of 5 | 4 of 10 |
+| `79.158.167.228` | — | old BLOCKS, new does not (0 of 23-24 live; RDP session) |
+
+The new rule never flagged a source the old one did not. The first-block rows
+it does not reproduce are lower bounds (expired SYN/TIME_WAIT entries are no
+longer visible): the customer (7 live, correct), four sources with at most 4
+live connections still visible (`94.26.68.91` and `220.166.134.10` show 0 and
+1: their first block in the window was already on dead connections), and
+**single sources
+bursting 5-9 SSH connections at one port with nobody else on it**
+(`167.172.88.141` →30360, `209.38.19.25` →30537, `20.150.193.0` and
+`74.249.179.215` →31337). Those stay capped by `bf_port` (12 new/min) and
+`bf_src`; lowering `hotPortMinTotal` to 5 would catch them and would also have
+blocked the customer's first 7.
+
+**Deploying** (no nftables change; only the script):
+
+    scp base/sweepguard/{sweepguard.py,hotport_dryrun.py} bX:/root/sgrepo/
+    ssh bX 'python3 /root/sgrepo/sweepguard.py --dry-run'           # logs only, no blocks, no memory
+    ssh bX 'python3 /root/sgrepo/hotport_dryrun.py /proc/net/nf_conntrack'
+    ssh bX 'cp -a /usr/local/sbin/sweepguard.py /usr/local/sbin/sweepguard.py.bak.hotport.$(date +%Y%m%d-%H%M%S) \
+            && install -m 0755 /root/sgrepo/sweepguard.py /usr/local/sbin/sweepguard.py'
+
+The timer picks it up on its next pass (≤5 min); check
+`journalctl -u neuravps-sweepguard.service` for `SKIP … RDP session` and
+`BLOCKED … live connections`. Then remove the hand patch on both bases:
+`nft delete element ip rdpguard bf_allow { 79.158.167.228 }`. Rollback:
+`install -m 0755` the `.bak.hotport.*` copy back. `deploy_sweepguard.sh` (full
+install on a new base) installs `/root/sweepguard.py` the same way.
+
+Tests: `python3 base/sweepguard/test_sweepguard_hotport.py` (cases from the
+samples and the three customers).
