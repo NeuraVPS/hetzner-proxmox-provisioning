@@ -73,8 +73,10 @@ to the old behaviour (no destination filter) and says so in the log.
 import ipaddress
 import json
 import re
+import os
 import subprocess
 import sys
+import time
 from collections import defaultdict
 
 CONFIG = "/etc/neuravps-sweepguard.json"
@@ -83,8 +85,17 @@ DEFAULTS = {
     "dryRun": False,         # validado en vivo 2026-07-25; un BASE nuevo protege desde el minuto 0
     "minPorts": 20,          # 3x el cliente con mas servidores (7)
     "maxConns": 100,         # conexiones RDP VIVAS simultaneas; nada legitimo paso de 30
-    "hotPortMinTotal": 20,   # un puerto de cliente con tantas conexiones esta bajo ataque
-    "hotPortMinSrc": 5,      # y la fuente que aporta tanto a ESE puerto es parte del ataque
+    # Umbrales sobre conexiones VIVAS (27/09/2026, 5 muestras de b0+b1): ningun
+    # puerto de VM real paso de 2 vivas ni ninguna fuente de 2 vivas en un
+    # puerto. Contando tambien las muertas hacian falta 20; en vivas, 10 deja 5x
+    # de margen y recupera los pares de 31337 (14-16 vivas entre dos fuentes).
+    "hotPortMinTotal": 10,   # un puerto de cliente con tantas conexiones VIVAS esta bajo ataque
+    "hotPortMinSrc": 5,      # y la fuente que aporta tantas VIVAS a ESE puerto es parte del ataque
+    # Viva = con trafico en los ultimos hotPortMaxIdle s (una pasada). Ver is_live.
+    "hotPortMaxIdle": 300,
+    # Cuanto se recuerda que una fuente demostro una sesion RDP (UDP con
+    # respuesta a un 2xxxx). 0 = sin memoria (solo cuenta la sesion de ahora).
+    "sessionMemorySeconds": 86400,
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
     # El detector hot-port es el UNICO ambiguo: el dueño legitimo del puerto
@@ -322,98 +333,248 @@ def flooders(family, cfg, ours=None):
     return {a: n for a, n in per_src.items() if n >= cfg["maxConns"]}
 
 
-def hot_port_abusers(family, cfg, ours=None):
-    """(addr -> (conns, port)) for sources piling connections onto ONE attacked port.
+# --- hot-port: solo conexiones VIVAS, y nunca a quien ha demostrado una sesion --
+#
+# Linea de /proc/net/nf_conntrack, cabecera incluida. El timeout y el estado
+# faltan cuando el flujo esta en la flowtable ([OFFLOAD]) y el estado falta
+# siempre en UDP:
+#   ipv4 2 tcp 6 334590 ESTABLISHED src=.. dst=.. sport=.. dport=31634 .. [ASSURED]
+#   ipv4 2 tcp 6 src=.. dst=.. sport=.. dport=21742 .. [OFFLOAD]
+#   ipv4 2 udp 17 src=.. dst=.. sport=.. dport=21742 .. [OFFLOAD]
+_CT_HEAD_RE = re.compile(r"^(ipv4|ipv6)\s+\d+\s+(tcp|udp)\s+\d+\s+(?:(\d+)\s+)?(?:([A-Z_]+)\s+)?src=")
+EST_TIMEOUT_SYSCTL = "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established"
+SESSIONS_FILE = "/var/lib/neuravps-sweepguard/sessions.json"
+SESSIONS_MAX = 50000
+RDP_LO, RDP_HI = 20000, 29999
+
+
+def established_timeout():
+    """Timeout de ESTABLISHED del kernel (s), o None si no se puede leer.
+
+    Hace falta para saber cuanto lleva callada una conexion: el kernel reinicia
+    el timeout con cada paquete, asi que `timeout_established - restante` es el
+    tiempo desde el ultimo paquete. Sin este dato no se puede separar una
+    conexion viva de una muerta y el detector vuelve al criterio viejo."""
+    try:
+        with open(EST_TIMEOUT_SYSCTL) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def parse_ct(ln):
+    """Linea de conntrack -> dict, o None si no es TCP/UDP con puerto destino."""
+    h = _CT_HEAD_RE.match(ln)
+    m = _CT_RE.search(ln) if h else None
+    if not m:
+        return None
+    fam, proto, timeout, state = h.groups()
+    return {"fam": fam, "proto": proto,
+            "timeout": int(timeout) if timeout else None,
+            "state": state or "",
+            "src": m.group(1), "dst": m.group(2), "dport": int(m.group(3)),
+            "offload": "[OFFLOAD]" in ln, "assured": "[ASSURED]" in ln,
+            "unreplied": "[UNREPLIED]" in ln}
+
+
+def is_live(e, est_timeout, max_idle):
+    """¿La conexion ha tenido trafico en los ultimos `max_idle` segundos?
+
+    * [OFFLOAD]: esta en la flowtable, que la echa a los 30 s sin paquetes —
+      tiene trafico ahora mismo.
+    * cualquier estado que no sea ESTABLISHED (SYN_SENT, SYN_RECV, TIME_WAIT,
+      CLOSE, FIN_WAIT...): sus timeouts son de 2 min o menos, asi que es una
+      conexion abierta o cerrada hace nada. Es justo el rastro de la fuerza
+      bruta: conectar, fallar, cerrar, volver a conectar.
+    * ESTABLISHED fuera de la flowtable: callada al menos 30 s. Cuenta solo si
+      el ultimo paquete es de hace `max_idle` o menos.
+    Si falta el dato (sysctl ilegible), cuenta — el comportamiento de antes."""
+    if e["offload"] or e["state"] != "ESTABLISHED":
+        return True
+    if est_timeout is None or e["timeout"] is None:
+        return True
+    return est_timeout - e["timeout"] <= max_idle
+
+
+def proves_rdp_session(e):
+    """Flujo UDP con respuesta hacia un forward RDP (2xxxx).
+
+    El transporte UDP de RDP (MS-RDPEMT) lo abre el cliente cuando el servidor
+    se lo ofrece, y el servidor solo lo ofrece despues de que la conexion haya
+    terminado su secuencia, credenciales incluidas (NLA). Un fuerza-bruta que
+    falla la autenticacion nunca llega ahi. Medido 27/09/2026: 113 fuentes con
+    este flujo en b0+b1 y NINGUNA bloqueada por ningun detector desde el 05/09,
+    salvo el cliente al que el hot-port bloqueaba por error."""
+    return (e["proto"] == "udp" and RDP_LO <= e["dport"] <= RDP_HI
+            and not e["unreplied"] and (e["assured"] or e["offload"]))
+
+
+def load_sessions(path=None):
+    path = path or SESSIONS_FILE
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+        return {str(a): float(t) for a, t in d.items()}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        # sin memoria el detector es MAS estricto, nunca menos: fallo seguro
+        log(f"sessions memory unreadable ({exc}) — starting empty")
+        return {}
+
+
+def save_sessions(sessions, path=None):
+    path = path or SESSIONS_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if len(sessions) > SESSIONS_MAX:          # acota el fichero; caen las mas viejas
+            keep = sorted(sessions.items(), key=lambda kv: -kv[1])[:SESSIONS_MAX]
+            sessions = dict(keep)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(sessions, fh)
+        os.replace(tmp, path)
+    except Exception as exc:
+        log(f"sessions memory not saved ({exc})")
+
+
+def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None):
+    """Nucleo del detector hot-port, sin E/S: lo usan sweepguard y la
+    herramienta de evaluacion en seco (hotport_dryrun.py).
+
+    `entries`: dicts de parse_ct() ya filtrados (familia, rango, destino nuestro).
+    `sessions`: memoria addr -> epoch de la ultima sesion RDP demostrada; se
+    actualiza en sitio con lo que se vea ahora.
+    Devuelve (abusers, skipped):
+      abusers  addr -> (conexiones vivas, puerto)
+      skipped  addr -> (conexiones vivas, puerto, motivo) — pasaban el umbral
+               pero tienen una sesion demostrada
+    """
+    now = time.time() if now is None else now
+    max_idle = cfg["hotPortMaxIdle"]
+    memory = cfg["sessionMemorySeconds"]
+    sessions = {} if sessions is None else sessions
+    pair = defaultdict(int)
+    per_port = defaultdict(int)
+    proven_now = set()
+    for e in entries:
+        if proves_rdp_session(e):
+            proven_now.add(e["src"])
+        if e["proto"] != "tcp" or not is_live(e, est_timeout, max_idle):
+            continue
+        pair[(e["src"], e["dport"])] += 1
+        per_port[e["dport"]] += 1
+    if memory > 0:
+        for a in proven_now:
+            sessions[a] = now
+        for a in [a for a, t in sessions.items() if now - t > memory]:
+            del sessions[a]
+
+    abusers, skipped = {}, {}
+    for (addr, port), n in pair.items():
+        if n < cfg["hotPortMinSrc"] or per_port[port] < cfg["hotPortMinTotal"]:
+            continue
+        if addr in proven_now or (memory > 0 and addr in sessions):
+            why = "RDP session now" if addr in proven_now else "RDP session in memory"
+            prev = skipped.get(addr)
+            if prev is None or n > prev[0]:
+                skipped[addr] = (n, port, why)
+            continue
+        prev = abusers.get(addr)
+        if prev is None or n > prev[0]:
+            abusers[addr] = (n, port)
+    return abusers, skipped
+
+
+def conntrack_entries(family, ours=None):
+    """Entradas de conntrack de la familia, hacia el rango de forwards y hacia
+    NUESTRAS direcciones (ver guarded_destinations). TCP y UDP."""
+    want = "ipv4" if family == "ip" else "ipv6"
+    out = []
+    with open(CONNTRACK) as fh:
+        for ln in fh:
+            if not ln.startswith(want) or "dport=" not in ln:
+                continue
+            e = parse_ct(ln)
+            if e is None or not in_range(e["dport"]):
+                continue
+            if ours is not None and not ours(e["dst"]):
+                continue          # va a Internet, no a un forward nuestro
+            e["src"] = canon(e["src"])
+            if family == "ip6":
+                try:
+                    if ipaddress.ip_address(e["src"]) in NAT64:
+                        continue
+                except ValueError:
+                    continue
+            out.append(e)
+    return out
+
+
+def hot_port_abusers(family, cfg, ours=None, sessions=None):
+    """(addr -> (conns, port)) for sources piling LIVE connections onto ONE attacked port.
 
     Detectors 1 and 2 both miss the slow DISTRIBUTED attack on a single VM:
     six sources at ~2 conns/min each touch one port (invisible to minPorts),
     hold ~12 connections each (invisible to maxConns) and stay far under the
-    per-source rate limit. Measured on b1: the VM behind port 21845 had 17936
-    failed logons in 24h and ZERO successful ones.
+    per-source rate limit. Measured on b1 (2026-07): the VM behind port 21845
+    had 17936 failed logons in 24h and ZERO successful ones.
 
-    Rate limiting cannot fix that case at all — the auth attempts ride INSIDE
-    connections already open, so no new SYN is ever sent and nothing is there
-    to rate limit. Only a block drops packets on an established connection.
+    Two conditions must BOTH hold: the port carries `hotPortMinTotal` live
+    connections and this source contributes `hotPortMinSrc` of them.
 
-    Two conditions must BOTH hold, which is what keeps it safe:
-      * the port itself carries `hotPortMinTotal` connections — no real
-        customer VM does (measured: 472 ports at 1-4, 422 at 5-9);
-      * and this source contributes `hotPortMinSrc` of them — a real client
-        holds 1-4 (measured p95 = 4).
+    Tres clientes reales bloqueados (29/07, 30/08, 26-27/09) y lo que se midio
+    el 27/09/2026 en b0+b1 cambiaron QUE se cuenta, no los umbrales:
 
-    Ese "p95 = 4" es lo unico que separaba al cliente del atacante, y NO basta:
-    el dueño del puerto atacado esta SIEMPRE entre las fuentes apiladas en el,
-    y al reconectar contra un servidor que no responde acumula intentos. Caso
-    real 2026-07-29: un cliente con 4 servidores llego a 6 conexiones sobre su
-    propio puerto durante un ataque y quedo bloqueado 24h — sin poder entrar a
-    NINGUNO de sus servidores ni a la consola VNC, porque el bloqueo es por IP
-    de origen en la VIP compartida. Diez horas de corte y cinco correos de
-    soporte sin diagnostico, porque el log no decia ni que puerto era.
+    1. Solo conexiones VIVAS (`is_live`). Con el timeout de ESTABLISHED en el
+       valor del kernel (5 dias), conntrack guarda durante dias conexiones sin
+       un solo paquete. El detector las contaba, y el bloqueo las fabrica: al
+       tirar los paquetes de una fuente, sus conexiones se quedan congeladas
+       en ESTABLISHED. Cada hora caducaba el bloqueo y la pasada siguiente
+       volvia a bloquear por esas mismas conexiones muertas. En b0, los 1681
+       bloqueos hot-port del 20 al 27/09 fueron 34 fuentes; ninguna conexion
+       ESTABLISHED fuera de la flowtable tenia menos de 30 min de silencio. El
+       cliente del 27/09 (24 SSH a su propia VM) fue bloqueado 27 veces por
+       conexiones cuyo ultimo paquete era de 1 minuto antes del PRIMER bloqueo.
+       La fuerza bruta real deja rastro vivo por definicion: conexiones en la
+       flowtable, SYN, TIME_WAIT. Un atacante que vuelve cuando caduca su
+       bloqueo se detecta en la pasada siguiente, igual que antes.
 
-    NO hay forma fiable de separarlos desde la BASE. Conviene no engañarse: se
-    probaron cuatro discriminantes con medidas reales sobre b1 (2026-07-29) y
-    los cuatro fallan.
-      * bytes en conntrack — el camino de datos no se contabiliza aqui: maximo
-        medido 1767 bytes, atacante y cliente indistinguibles;
-      * estado/antiguedad TCP — atacantes p90 64006 vs resto p90 307405, pero
-        solapan hasta el maximo del rango;
-      * memoria de "fuentes habituales" del puerto — aprendia como habituales
-        a 88.214.25.121/124 y 91.238.181.94, los mismos clusters que este
-        detector existe para cazar: mantienen 1-4 conexiones sobre pocas VMs,
-        exactamente el perfil de un cliente;
-      * el invitado como arbitro — no sirve: todo llega SNATeado a la VIP de la
-        BASE, asi que en los 4624/4625 de Windows solo se ve la BASE.
+    2. Nunca a una fuente con una sesion RDP demostrada (`proves_rdp_session`):
+       un flujo UDP con respuesta hacia un 2xxxx solo existe despues de un
+       inicio de sesion correcto. Es el arbitro que faltaba ("correlacionar el
+       4624 con la fuente") y la base lo ve sin mirar dentro del invitado. Se
+       recuerda `sessionMemorySeconds` (24 h) para cubrir al dueño que
+       reconecta cuando su VM, atacada, deja de responder (caso 29/07): en ese
+       momento su UDP ya no esta, pero la sesion de hace un rato si. La
+       fuente sigue sometida a los limites de ritmo y a los detectores 1 y 2.
 
-    Mientras no exista un arbitro de verdad (correlacionar el 4624 del invitado
-    con la fuente que tenia la conexion en ese instante), este detector se
-    asume AMBIGUO y se le acotan los daños: bloqueo corto
-    (`hotPortBlockSeconds` — al atacante se le vuelve a detectar en la pasada
-    siguiente, 5 min despues; al cliente mal bloqueado se le devuelve el
-    servicio en 1h en vez de en 24h), y el puerto y la VM SIEMPRE en el log,
-    para que soporte responda en dos minutos y no en diez horas.
+    Los discriminantes que fallaron el 29/07 siguen descartados: bytes (el
+    camino de datos no se contabiliza aqui; nf_conntrack_acct esta a 0),
+    antiguedad TCP como umbral (sin nf_conntrack_timestamp no hay edad; lo
+    que se mide aqui es SILENCIO, que es otra cosa) y memoria de fuentes
+    "habituales" (aprendia a los atacantes). La memoria de sesiones no aprende
+    atacantes porque exige el UDP de RDP, que un atacante no alcanza.
     """
-    want = "ipv4" if family == "ip" else "ipv6"
-    pair = defaultdict(int)
-    per_port = defaultdict(int)
     try:
-        with open(CONNTRACK) as fh:
-            for ln in fh:
-                if not ln.startswith(want) or " tcp " not in ln or "dport=" not in ln:
-                    continue
-                m = _CT_RE.search(ln)
-                if not m:
-                    continue
-                port = int(m.group(3))
-                if not in_range(port):
-                    continue
-                if ours is not None and not ours(m.group(2)):
-                    continue          # va a Internet, no a un forward nuestro
-                addr = canon(m.group(1))
-                if family == "ip6":
-                    try:
-                        if ipaddress.ip_address(addr) in NAT64:
-                            continue
-                    except ValueError:
-                        continue
-                pair[(addr, port)] += 1
-                per_port[port] += 1
+        entries = conntrack_entries(family, ours)
     except FileNotFoundError:
         return {}
     except Exception as exc:
         log(f"{family}: conntrack unreadable ({exc}) — hot-port detector skipped")
         return {}
+    est = established_timeout()
+    if est is None:
+        log(f"{family}: {EST_TIMEOUT_SYSCTL} unreadable — hot-port counts every "
+            f"ESTABLISHED connection, live or not")
+    abusers, skipped = hot_port_scan(entries, cfg, est, sessions)
+    for addr, (n, port, why) in sorted(skipped.items()):
+        log(f"{family}: SKIP {addr} ({n} live connections onto port {port}, "
+            f"VM {vm_slot(port)}) — {why}: not judged by hot-port")
+    return abusers
 
-    out = {}
-    for (addr, port), n in pair.items():
-        if n < cfg["hotPortMinSrc"] or per_port[port] < cfg["hotPortMinTotal"]:
-            continue
-        prev = out.get(addr)
-        if prev is None or n > prev[0]:
-            out[addr] = (n, port)
-    return out
 
-
-def run_family(family, cfg):
+def run_family(family, cfg, sessions=None):
     ours = guarded_destinations(family)
     if ours is None:
         log(f"{family}: set {GUARDED_SET[family]} not found — conntrack detectors "
@@ -423,7 +584,7 @@ def run_family(family, cfg):
     for a, n in flooders(family, cfg, ours).items():
         if a not in cand:                      # diversidad de puertos manda
             cand[a] = ("conns", n, None)
-    for a, (n, port) in hot_port_abusers(family, cfg, ours).items():
+    for a, (n, port) in hot_port_abusers(family, cfg, ours, sessions).items():
         if a not in cand:
             cand[a] = ("hotport", n, port)
     if not cand:
@@ -456,7 +617,7 @@ def run_family(family, cfg):
         # la maquina, que es exactamente lo que costo 10h de corte el 2026-07-29.
         what = {"ports": "%d distinct ports" % metric,
                 "conns": "%d live connections" % metric,
-                "hotport": "%d connections onto ONE attacked port (port %s, VM %s)"
+                "hotport": "%d live connections onto ONE attacked port (port %s, VM %s)"
                            % (metric, port, vm_slot(port) if port else "?")}[why]
         secs = cfg["hotPortBlockSeconds"] if why == "hotport" else cfg["blockSeconds"]
         if cfg["dryRun"]:
@@ -469,8 +630,9 @@ def run_family(family, cfg):
         if r.returncode == 0:
             log(f"{family}: BLOCKED {addr} ({what}) for {secs}s")
             if why == "hotport":
-                log(f"{family}: NOTE {addr} was blocked by the AMBIGUOUS detector "
-                    f"on VM {vm_slot(port) if port else '?'} — if this is that "
+                log(f"{family}: NOTE {addr} was blocked by the hot-port detector "
+                    f"on VM {vm_slot(port) if port else '?'} (no RDP session seen "
+                    f"from it in {cfg['sessionMemorySeconds']}s) — if this is a "
                     f"customer they just lost ALL their servers and the VNC "
                     f"console; check before assuming it is an attacker")
         else:
@@ -495,7 +657,8 @@ def report_smb_rate_limit():
             return
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     cfg = dict(DEFAULTS)
     try:
         with open(CONFIG) as fh:
@@ -505,16 +668,23 @@ def main():
     except Exception as exc:
         log(f"config unreadable ({exc}) — refusing to act")
         return 0
+    if "--dry-run" in argv:
+        # para probar una version nueva en una base sin bloquear nada; tampoco
+        # escribe la memoria de sesiones
+        cfg["dryRun"] = True
     if not cfg.get("enabled"):
         log("disabled by config — nothing to do")
         return 0
 
+    sessions = load_sessions()
     total = 0
     for family in ("ip", "ip6"):
         try:
-            total += run_family(family, cfg)
+            total += run_family(family, cfg, sessions)
         except Exception as exc:            # nunca romper el timer
             log(f"{family}: ERROR {exc}")
+    if not cfg["dryRun"]:
+        save_sessions(sessions)
     if total:
         log(f"done: {total} sweeper(s) {'identified' if cfg['dryRun'] else 'blocked'}")
     report_smb_rate_limit()
