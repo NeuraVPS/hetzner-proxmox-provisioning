@@ -62,7 +62,7 @@ preflight() {
 # arm_deadman UNIT DELAY TABLE: must be confirmed active BEFORE any rule is added.
 arm_deadman() {
   systemd-run --unit="$1" --on-active="$2" /usr/sbin/nft delete table inet "$3" >/dev/null 2>&1 || true
-  systemctl is-active --quiet "$1.timer" || { echo "dead-man $1 NOT created: aborting, no rules added"; return 1; }
+  systemctl is-active --quiet "$1.timer" || { echo "dead-man $1 NOT created: aborting, no rules added (a leftover failed unit? systemctl reset-failed $1.service $1.timer)"; return 1; }
 }
 arm_probe_rules() {
   nft add table inet fwtest
