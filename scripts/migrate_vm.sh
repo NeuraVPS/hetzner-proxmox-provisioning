@@ -822,7 +822,7 @@ PY
 # timeout y cada flujo conserva su marca mientras viva. Si el túnel viejo cae,
 # la tabla 111/112 se queda sin ruta y el flujo sigue por la 101: muere, como
 # habría muerto sin la regla.
-GRACE_CROSS_REGION="${GRACE_CROSS_REGION:-1}"
+GRACE_CROSS_REGION="${GRACE_CROSS_REGION:-0}"  # OFF hasta validar HEL<->FSN en laboratorio (01/10: X1 bloqueada); activar con GRACE_CROSS_REGION=1
 GRACE_TTL_S="${GRACE_TTL_S:-86400}"
 SRC_TUN=""; DST_TUN=""; GRACE_ON=0
 read -r -d '' _GRACE_NODE_SH <<'SH' || true
