@@ -730,6 +730,13 @@ NVPS_BRIDGE_MAC="02:${NVPS_BRIDGE_MAC_HEX:0:2}:${NVPS_BRIDGE_MAC_HEX:2:2}:${NVPS
   # La 10.0.0.1/16 se queda: no cuesta nada y da puerta de enlace a cualquier
   # invitado viejo que apareciera; el rango ya no lo usa ninguna VM.
   echo "    address 10.0.0.1/16"
+  # Sin inundación de unicast desconocido hacia las VMs (01/10/2026). Proxmox
+  # lee esta línea en cada tap_plug y deja cada tap con una entrada FDB
+  # ESTÁTICA de la MAC de su VM, learning 0 y unicast_flood 0: la entrega nunca
+  # depende de inundar, y el tráfico que aún llega para una VM que se fue del
+  # nodo (migración) ya no sale por los tap de las demás. ARP/ND (difusión y
+  # multidifusión) no cambian. Ver run_remotes/neuravps-bridge-no-flood.py.
+  echo "    bridge-disable-mac-learning 1"
   echo "    bridge-ports none"
   echo "    bridge-stp off"
   echo "    bridge-fd 0"

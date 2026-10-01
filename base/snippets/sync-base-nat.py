@@ -14,10 +14,13 @@ Commands:
       then reconcile managed dynamic DNAT rules.
 
   sync-base-nat.py sync <proxmoxId> <publicVMIPv6> [rdp=0|1] [samba=0|1] [ssh=0|1]
-                                                  [internet=0|1]
+                                                  [internet=0|1] [node=<nodeId>]
       Single VM override without Firestore read. Optional rdp/samba/ssh/internet
       flags force the matching service on/off; flags not passed are
       preserved from on-disk state (or default enabled for new VMs).
+      `node=<nodeId>` fixes the node the VM's /128 and /32 routes point to,
+      instead of re-reading `nodeId` from Firestore (migrate_vm.sh passes the
+      destination: during a migration Firestore still names the OLD node).
 
   sync-base-nat.py sync <proxmoxId> del
       Remove one VM from local desired map, reconcile rules.
@@ -1566,6 +1569,13 @@ def sync_single_vmid(
                     if ipv6_override and (fresco.get("egressHel") or fresco.get("egressFsn")):
                         ent["egressHel"] = fresco.get("egressHel") or ""
                         ent["egressFsn"] = fresco.get("egressFsn") or ""
+            # Quien migra sabe mejor que Firestore dónde está la VM: el script
+            # de migración llama aquí ANTES de escribir el `nodeId` nuevo, y
+            # releerlo dejaba la ruta en el túnel del nodo viejo (VM 243,
+            # 01/10/2026: `Sync proxmoxId=243 done` y la ruta sin mover).
+            node_override = (flags_override or {}).get("node")
+            if ipv6_override and node_override:
+                ent["nodeId"] = node_override
 
         reconcile_dynamic_dnat_rules(desired)
         reconcile_vm_routes(desired)
@@ -2259,6 +2269,9 @@ _FLAG_TRUE = {"1", "true", "yes", "on"}
 _FLAG_FALSE = {"0", "false", "no", "off"}
 
 
+_NODE_ID_ARG_RE = re.compile(r"^[0-9]+-[A-Za-z0-9-]+$")
+
+
 def _parse_flag_args(extra: list[str]) -> dict:
     """Parse `key=value` args into a flag override dict.
 
@@ -2273,9 +2286,16 @@ def _parse_flag_args(extra: list[str]) -> dict:
             sys.exit(2)
         k, _, v = arg.partition("=")
         k = k.strip().lower()
+        if k == "node":
+            node = v.strip()
+            if not _NODE_ID_ARG_RE.match(node):
+                logger.error("Invalid node id %r", node)
+                sys.exit(2)
+            out["node"] = node
+            continue
         v = v.strip().lower()
         if k not in ("rdp", "samba", "ssh", "internet"):
-            logger.error("Unknown flag %r (allowed: rdp, samba, ssh, internet)", k)
+            logger.error("Unknown flag %r (allowed: rdp, samba, ssh, internet, node)", k)
             sys.exit(2)
         if v in _FLAG_TRUE:
             out[k] = True
@@ -2292,7 +2312,7 @@ def main():
         print(
             "Usage: sync-base-nat.py sync\n"
             "       sync-base-nat.py sync <proxmoxId>\n"
-            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1] [internet=0|1]\n"
+            "       sync-base-nat.py sync <proxmoxId> <ipv6> [rdp=0|1] [samba=0|1] [ssh=0|1] [internet=0|1] [node=<nodeId>]\n"
             "       sync-base-nat.py sync <proxmoxId> del\n"
             "       sync-base-nat.py sync egress\n"
             "       sync-base-nat.py sync policy\n"
