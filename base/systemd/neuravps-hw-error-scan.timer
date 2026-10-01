@@ -1,5 +1,5 @@
 [Unit]
-Description=Run neuravps-hw-error-scan daily at 05:15 UTC (ahead of explorer-sweep 03:40 and defrag 06:30 -- no real overlap risk, just keeping the off-peak block ordered)
+Description=Run neuravps-hw-error-scan daily at 05:15 UTC (after explorer-sweep 03:40; salud sweeps run 06:00 and 22:00, defrag 22:10 -- no real overlap risk, just keeping the off-peak block ordered)
 
 [Timer]
 OnCalendar=*-*-* 05:15:00 UTC

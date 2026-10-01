@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """neuravps-defrag — daily automatic fleet reorganization (operator-approved
-2026-07-12: "todo diario 06:30 UTC, directo en real").
+2026-07-12: "todo diario 06:30 UTC, directo en real"; moved to 22:10 UTC on 2026-10-01,
+just after the New York close / start of the Asian session, the quietest hour
+for trading VMs).
 
-Runs ON a BASE (b0) via systemd timer at 06:30 UTC, after the 06:00 salud
+Runs ON a BASE (b0) via systemd timer at 22:10 UTC, after the 22:00 salud
 sweep has reconciled counters. Two phases, corrections first:
 
   1. CORRECTION — nodes over their placement limits:
@@ -36,7 +38,7 @@ The beneficios panel computes fullness live from the counters, which this
 script re-aggregates for every touched node at the end of the run.
 
 RELIEF MODE (--relief, hourly timer): the harm-targeted intra-day pass. The
-daily 06:30 run plans from Firestore counters, but balloon-reconciler floors
+daily 22:10 run plans from Firestore counters, but balloon-reconciler floors
 DRIFT during the day (raises consume budget), so a node can become
 floor-starved with a thrashing guest hours before the next daily run (seen
 live: node 0000053 vm 808, 2026-07-17 — reconciler logging "NO BUDGET —
