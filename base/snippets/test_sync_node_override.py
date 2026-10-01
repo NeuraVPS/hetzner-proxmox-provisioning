@@ -48,6 +48,16 @@ def test_node_override_wins_over_stale_firestore(sync):
     assert ent['ipv4'] == '10.64.0.243'  # the rest still comes from Firestore
 
 
+def test_node_override_with_state_skips_firestore(sync, monkeypatch):
+    run(sync, None)  # deja la VM en state.json (como en producción)
+    def boom(vmid):
+        raise AssertionError('no debe leer Firestore en el corte')
+    monkeypatch.setattr(sync, 'firestore_server_for_vmid', boom)
+    ent = run(sync, {'node': '0000245-AX102-3-LTD'})
+    assert ent['nodeId'] == '0000245-AX102-3-LTD'
+    assert ent['ipv4'] == '10.64.0.243'  # conservado del estado en disco
+
+
 def test_parse_node_flag(sync):
     assert sync._parse_flag_args(['node=0000245-AX102-3-LTD', 'rdp=1']) == {
         'node': '0000245-AX102-3-LTD', 'rdp': True}

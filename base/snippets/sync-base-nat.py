@@ -1488,6 +1488,7 @@ def sync_single_vmid(
         if server_loader is not None:
             server = server_loader()
         desired = desired_from_state()
+        previo = desired.get(vmid)
         if delete_only:
             desired.pop(vmid, None)
             logger.info("proxmoxId=%s removed from desired map", vmid)
@@ -1547,8 +1548,14 @@ def sync_single_vmid(
         # apuntando al tunel del nodo anterior y la VM quedaba inalcanzable
         # aunque su DNAT estuviera perfecto. Medido con la vm 1096 el 2026-08-14.
         ent = desired.get(vmid)
+        node_override = (flags_override or {}).get("node") if ipv6_override else None
         if ent and _is_ident(ent.get("ipv6") or ""):
-            if ipv6_override or not ent.get("nodeId"):
+            if node_override and previo:
+                # Corte de una migración: el nodo lo dice quien migra y el resto
+                # (ipv4, internet, par de salida) ya está en disco. Sin Firestore:
+                # aquí cuenta cada décima, y Firestore aún nombra el nodo viejo.
+                pass
+            elif ipv6_override or not ent.get("nodeId"):
                 # El camino de override salta Firestore a proposito (es el
                 # rapido), pero sin el nodo no hay ruta que calcular. Se lee
                 # SOLO para las VMs del rango de identidad: las unicas con ruta.
@@ -1573,8 +1580,7 @@ def sync_single_vmid(
             # de migración llama aquí ANTES de escribir el `nodeId` nuevo, y
             # releerlo dejaba la ruta en el túnel del nodo viejo (VM 243,
             # 01/10/2026: `Sync proxmoxId=243 done` y la ruta sin mover).
-            node_override = (flags_override or {}).get("node")
-            if ipv6_override and node_override:
+            if node_override:
                 ent["nodeId"] = node_override
 
         reconcile_dynamic_dnat_rules(desired)

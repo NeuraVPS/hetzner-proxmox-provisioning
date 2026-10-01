@@ -898,6 +898,23 @@ _blackhole_cmd() {
   printf '%s' "$add"
 }
 
+# Conntrack de la VM en un nodo. Al TRAERLA a un nodo donde ya estuvo, sus
+# flujos largos pueden tener allí una entrada de hace días (ESTABLISHED dura
+# 5 d) con secuencias viejas: los paquetes nuevos salen INVALID y el cortafuegos
+# de Proxmox (PVEFW-FORWARD … --ctstate INVALID -j DROP) los tira — medido en
+# laboratorio el 01/10: tcpbin murió 20 s después de volver la VM al nodo 242
+# con la red perfecta. Sin entrada, el nodo recoge el flujo a mitad
+# (nf_conntrack_tcp_loose=1) y sigue. Se borra en el destino antes de traerla
+# (aún no hay nada vivo suyo allí) y en el origen al cortar (ya no está).
+_ct_flush_cmd() {
+  local c="command -v conntrack >/dev/null 2>&1 || exit 0;"
+  if [[ -n "$CUR_VM_IPV4" ]]; then
+    c+=" conntrack -D -s ${CUR_VM_IPV4} >/dev/null 2>&1; conntrack -D -d ${CUR_VM_IPV4} >/dev/null 2>&1;"
+  fi
+  c+=" conntrack -D -f ipv6 -s ${EXPECTED_VM_IPV6} >/dev/null 2>&1; conntrack -D -f ipv6 -d ${EXPECTED_VM_IPV6} >/dev/null 2>&1; true"
+  printf '%s' "$c"
+}
+
 # Ruta de ESTA base al túnel del destino, ya. Mismo nombre que da sync-base-nat
 # (`<TUNNEL_IFACE_PREFIX>p<N>`). La otra base la mueve el disparador.
 _route_local_to_dst() {
@@ -920,13 +937,22 @@ _cut_now() { date -u +%H:%M:%S.%3N; }
 _cutover_commit() (
   set +e
   [[ -n "$CUT_DIR" && ! -e "$CUT_DIR/commit.done" ]] || exit 0
-  local t0 r
+  local t0 r pp
   t0=$(_cut_now)
   r=$(_route_local_to_dst 2>&1)
   : >"$CUT_DIR/fs.go"
+  # La ruta puesta a mano la desharía el siguiente sync de CUALQUIER VM en esta
+  # base (reconcilia todas desde state.json, que aún dice el nodo viejo):
+  # medido en laboratorio, rebotó 1,5 s al nodo viejo. Se persiste ya con
+  # node=; un sync-base-nat sin ese parámetro sale con rc=2 y queda el disparador.
+  ( "$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" "node=${DST_NODE}" >/dev/null 2>&1; echo "$?" >"$CUT_DIR/persist.rc" ) &
+  pp=$!
   if [[ "$SRC_BLACKHOLE_TTL_S" != "0" ]]; then
     src_ssh "$(_blackhole_cmd add)" >/dev/null 2>&1 && r+=" BLACKHOLE_SRC" || r+=" BLACKHOLE_SRC_FAIL"
   fi
+  src_ssh "$(_ct_flush_cmd)" >/dev/null 2>&1
+  wait "$pp"
+  r+=" PERSIST_RC=$(cat "$CUT_DIR/persist.rc" 2>/dev/null)"
   # Si la VM tenía gracia en el nodo que deja (llegó de otra región hace poco),
   # se retira allí: ese nodo ya no la aloja.
   [[ -n "$CUR_VM_IPV4" ]] && src_ssh "bash -s -- clear '' '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1
@@ -952,6 +978,7 @@ _cutover_arm() {
   # Si la VM salió de este destino hace menos de SRC_BLACKHOLE_TTL_S, su
   # blackhole seguiría ahí: fuera antes de traerla.
   dst_ssh "$(_blackhole_cmd del)" >/dev/null 2>&1 || true
+  dst_ssh "$(_ct_flush_cmd)" >/dev/null 2>&1 || true
   _grace_prepare
   VM_MAC=$(src_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^net0:.*=\(\([0-9A-Fa-f]\{2\}:\)\{5\}[0-9A-Fa-f]\{2\}\).*/\1/p' | head -1 | tr -d '\r' || true)
   if [[ -n "$VM_MAC" ]]; then
