@@ -1,4 +1,8 @@
 # Daily defrag (runs on a BASE, currently b0)
+Schedule: **22:10 UTC** (since 2026-10-01; was 06:30). Right after the New York close / start of
+the Asian session, so non-urgent customer-VM migrations stay out of the trading session. It plans
+from the Firestore counters that the salud sweep (`node_health_check`) reconciles, which therefore
+runs at **06:00 and 22:00 UTC**: keep a salud sweep right before the defrag if either moves.
 Reinstall after a base rebuild:
 ```
 install -m755 run_remotes/neuravps-defrag.py /usr/local/sbin/neuravps-defrag.py

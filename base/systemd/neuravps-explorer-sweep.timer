@@ -1,5 +1,5 @@
 [Unit]
-Description=Run neuravps-explorer-sweep daily at 03:40 UTC (off-peak, ahead of the 06:00 salud sweep and 06:30 defrag)
+Description=Run neuravps-explorer-sweep daily at 03:40 UTC (off-peak; salud sweeps run 06:00 and 22:00, defrag 22:10)
 
 [Timer]
 OnCalendar=*-*-* 03:40:00 UTC
