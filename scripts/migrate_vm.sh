@@ -19,7 +19,8 @@
 # original power state is preserved.
 #
 # For ONLINE migrations the cutover-downtime budget is STAGED (2026-07-31):
-# start at MIGRATE_DOWNTIME_INITIAL (default 15 s), and a background escalator
+# start at MIGRATE_DOWNTIME_INITIAL (default 1 s since 2026-10-01; it was 15 s,
+# which froze every converging VM ~15 s), and a background escalator
 # raises it toward the MIGRATE_DOWNTIME ceiling (default 90 s) only while QEMU's
 # "dirty sync count" shows pre-copy failing to converge. QEMU cuts over as soon
 # as remaining/bandwidth fits the budget, so the old flat 90 didn't just allow
@@ -129,7 +130,8 @@ SYNC_BASE_NAT="${SYNC_BASE_NAT:-/usr/local/sbin/sync-base-nat.py}"
 TARGET_STORAGE="${TARGET_STORAGE:-local-zfs}"
 RDP_BASE_PORT="${RDP_BASE_PORT:-20000}"
 MIGRATE_DOWNTIME="${MIGRATE_DOWNTIME:-90}"  # CEILING cutover freeze (s) for ONLINE migrations. Empirically derived: a ~108s blackout survived (19GiB-state VM) but a ~175s one killed the dest QEMU on resume (31GiB-state VM) — there is a hard dest-exit/tunnel-timeout threshold in (108,175]. 90 keeps the worst-case blackout safely under it AND forces real pre-copy so large VMs don't go straight to one giant blackout. Too-high (e.g. 300) makes Proxmox skip pre-copy → multi-min blackout → dest dies; too-low → never converges → efidisk0 reap (now a SAFE rollback via the verification gate). 0 = leave VM default AND disable the staged escalation below.
-MIGRATE_DOWNTIME_INITIAL="${MIGRATE_DOWNTIME_INITIAL:-15}"  # STARTING cutover budget (s). QEMU cuts over as soon as remaining_dirty/bandwidth <= budget, so a 90s budget doesn't just ALLOW a 90s freeze — it CAUSES one: QEMU stops the guest with up to 90s of data still to copy instead of pre-copying it hot. Measured on 25 defrag migrations 2026-07-31: every single cutover froze the guest 12-90s (median ~38s) under the flat 90. Starting at 15s makes a converging guest freeze <=15s (typically 2-5s: it pre-copies until ~15s of data remain); guests whose dirty rate outruns the link are caught by the escalator below, which walks the budget back up to MIGRATE_DOWNTIME — so the worst case equals the old behaviour instead of failure mode (a). 0 = no staging (set the ceiling up front, old behaviour).
+MIGRATE_DOWNTIME_INITIAL="${MIGRATE_DOWNTIME_INITIAL:-1}"  # STARTING cutover budget (s). 15 → 1 on 2026-10-01: measured on a lab VM, the guest froze 14.9 / 11.6 / 13.2 s with 15 and 0.73 s with 1 — QEMU does not freeze "the minimum", it cuts over as soon as what is left fits the budget, so 15 s × ~110 MiB/s froze any VM with ≥1.6 GB of RAM ~15 s, enough to kill MetaTrader's broker sessions (memory/neuravps-migracion-corta-sesiones-2026-10-01.md). Original rationale, still valid: QEMU cuts over as soon as remaining_dirty/bandwidth <= budget, so a 90s budget doesn't just ALLOW a 90s freeze — it CAUSES one: QEMU stops the guest with up to 90s of data still to copy instead of pre-copying it hot. Measured on 25 defrag migrations 2026-07-31: every single cutover froze the guest 12-90s (median ~38s) under the flat 90. Starting at 15s makes a converging guest freeze <=15s (typically 2-5s: it pre-copies until ~15s of data remain); guests whose dirty rate outruns the link are caught by the escalator below, which walks the budget back up to MIGRATE_DOWNTIME — so the worst case equals the old behaviour instead of failure mode (a). 0 = no staging (set the ceiling up front, old behaviour).
+DOWNTIME_ESCALATE_POLL_S="${DOWNTIME_ESCALATE_POLL_S:-10}"  # escalator cadence (s); was 20 — with a 1 s start the ladder has more, smaller steps.
 DOWNTIME_ESCALATE_HARD_S="${DOWNTIME_ESCALATE_HARD_S:-600}"  # RAM-phase seconds after which the escalator jumps straight to the MIGRATE_DOWNTIME ceiling — bounds the RAM pre-copy time (the efidisk0-reap window, failure mode (a)) to roughly what the flat 90s produced. Counted from the first poll that shows RAM stats, NOT from launch: the preceding disk mirror legitimately runs 10-25+ min and must not burn this budget.
 TOKEN_NAME_PREFIX="${TOKEN_NAME_PREFIX:-migrate-full}"
 HOOKSCRIPT="${HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
@@ -249,6 +251,17 @@ import json, os, sys
 try:
     s = json.load(open(os.environ["STATE_FILE"]))
     sys.stdout.write(((s.get(os.environ["VMID"]) or {}).get("ipv6") or "").strip())
+except Exception:
+    pass
+' 2>/dev/null || true)
+# La IPv4 privada (10.64.x.y) sale de la misma fuente; la usa el corte temprano
+# (ruta /32 de la BASE, ARP dirigido, blackhole en el nodo viejo). Vacía = solo IPv6.
+CUR_VM_IPV4=$(VMID="$VMID" STATE_FILE="$STATE_FILE" python3 -c '
+import ipaddress, json, os, sys
+try:
+    s = json.load(open(os.environ["STATE_FILE"]))
+    v = ((s.get(os.environ["VMID"]) or {}).get("ipv4") or "").strip()
+    sys.stdout.write(str(ipaddress.IPv4Address(v)) if v else "")
 except Exception:
     pass
 ' 2>/dev/null || true)
@@ -560,6 +573,12 @@ p.add_argument("--vmid", type=int, required=True)
 p.add_argument("--maintenance", choices=("true", "false"))
 p.add_argument("--node-id", default=None)
 p.add_argument("--ipv6", default=None)
+# Escritor PRE-ARMADO (corte temprano, 01/10/2026): hace todas las lecturas y
+# la inicialización de Firebase por adelantado y escribe en cuanto aparece este
+# fichero. Arrancar Python + Firebase cuesta 1-2 s, y en el corte cada segundo
+# cuenta: la otra BASE solo mueve la ruta cuando el disparador ve el `nodeId`.
+p.add_argument("--wait-file", default=None)
+p.add_argument("--wait-timeout", type=float, default=0)
 # --connection-url REMOVED 2026-07-07: legacy field, URL is generated everywhere.
 args = p.parse_args()
 
@@ -604,8 +623,21 @@ if args.ipv6 is not None:           patch["ipv6"]        = args.ipv6
 if not patch:
     sys.exit(0)
 
+if args.wait_file:
+    import time
+    print("FS_ARMED", flush=True)
+    deadline = time.monotonic() + args.wait_timeout
+    while not os.path.exists(args.wait_file):
+        if time.monotonic() > deadline:
+            print("FS_WAIT_TIMEOUT", flush=True)
+            sys.exit(4)
+        time.sleep(0.05)
+
 for d in docs:
     db.collection("servers").document(d.id).update(patch)
+if args.wait_file:
+    from datetime import datetime, timezone
+    print("FS_WRITTEN " + datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3], flush=True)
 sys.exit(0)
 PY
 }
@@ -696,6 +728,329 @@ _ensure_running_dst() {
   return 1
 }
 
+# ----- Corte temprano (01/10/2026) ---------------------------------------------
+# Medido en laboratorio: con todo al final, una migración en vivo dejaba la VM
+# 25-35 s sin red útil también DENTRO de la región, y MetaTrader perdía el
+# bróker. Aparte de la pausa de QEMU, el hueco lo hacían dos cosas nuestras:
+#   1. La MAC de la puerta de enlace (`vmbr0`) es distinta en cada nodo. Al
+#      reanudar, Windows sigue mandando a la del nodo viejo ~8 s, hasta que su
+#      caché ARP caduca. El RARP de QEMU actualiza switches, no al invitado.
+#   2. Las BASE mueven la ruta /128 y /32 de la VM al túnel del nodo nuevo solo
+#      cuando el disparador ve el `nodeId` nuevo en Firestore — y este script lo
+#      escribía al final: 12-18 s después de reanudar. Mientras tanto la vuelta
+#      llegaba al nodo viejo, que la INUNDABA a todas las VMs de su `vmbr0`
+#      (16-34 VMs ajenas en cada migración medida).
+# Ahora, en las migraciones en vivo, un vigía en el nodo destino espera el RARP
+# con el que QEMU anuncia la VM al terminar y, en ese mismo instante:
+#   - le manda a la VM (solo a su MAC) un ARP gratuito de 10.64.255.1 y un NA de
+#     fe80::1 con la MAC de este `vmbr0` → sale por la puerta nueva en ~20 ms;
+#   - avisa a esta BASE, que mueve SU ruta al túnel del destino al momento,
+#     suelta el escritor de Firestore ya armado (→ el disparador mueve la otra
+#     BASE en 3-5 s) y pone un `blackhole` temporal de las direcciones de la VM
+#     en el nodo viejo, que descarta la vuelta tardía en vez de inundarla.
+# Si el vigía no llega a ver el RARP, se hace lo mismo en cuanto la verificación
+# confirma que la VM está en destino (respaldo). EARLY_CUTOVER=0 lo apaga todo.
+EARLY_CUTOVER="${EARLY_CUTOVER:-1}"
+RESUME_WATCH_TTL_S="${RESUME_WATCH_TTL_S:-14400}"   # tope del vigía (disco grande + RAM)
+SRC_BLACKHOLE_TTL_S="${SRC_BLACKHOLE_TTL_S:-300}"   # el blackhole del nodo viejo se retira solo; 0 = no ponerlo
+BASE_NAT_ENV="${BASE_NAT_ENV:-/etc/default/base-nat}"
+CUT_DIR=""; _CUT_WATCH_PID=""; _CUT_FS_PID=""; _CUT_LOOP_PID=""; VM_MAC=""
+CUT_COMMITTED=0
+
+# Corre en el nodo DESTINO. argv: nvx-resume-watch <vmid> <mac> <ipv4|""> <ttl>
+read -r -d '' _RESUME_WATCH_PY <<'PY' || true
+import os, select, socket, struct, sys, time
+from datetime import datetime, timezone
+VM_MAC = bytes.fromhex(sys.argv[3].replace(':', ''))
+VM_IP = sys.argv[4]
+TTL = float(sys.argv[5])
+BR_NAME = os.environ.get('NVX_BRIDGE', 'vmbr0')
+GW4 = socket.inet_aton(os.environ.get('NVX_GW4', '10.64.255.1'))
+GW6 = socket.inet_pton(socket.AF_INET6, os.environ.get('NVX_GW6', 'fe80::1'))
+BR = bytes.fromhex(open(f'/sys/class/net/{BR_NAME}/address').read().strip().replace(':', ''))
+def ts(): return datetime.now(timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+def arp(op, tha, tpa):
+    return VM_MAC + BR + b'\x08\x06' + struct.pack('!HHBBH', 1, 0x0800, 6, 4, op) + BR + GW4 + tha + tpa
+def csum(b):
+    if len(b) % 2: b += b'\0'
+    s = sum(struct.unpack('!%dH' % (len(b) // 2), b))
+    while s >> 16: s = (s & 0xffff) + (s >> 16)
+    return (~s) & 0xffff
+def na():
+    dst = socket.inet_pton(socket.AF_INET6, 'ff02::1')
+    body = struct.pack('!BBHI', 136, 0, 0, 0xA0000000) + GW6 + struct.pack('!BB', 2, 1) + BR
+    pseudo = GW6 + dst + struct.pack('!I3xB', len(body), 58)
+    body = body[:2] + struct.pack('!H', csum(pseudo + body)) + body[4:]
+    return VM_MAC + BR + b'\x86\xdd' + struct.pack('!IHBB', 0x60000000, len(body), 58, 255) + GW6 + dst + body
+socks = []
+for proto in (0x8035, 0x0806):          # RARP de QEMU; ARP por si lo anuncia el invitado
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(proto))
+    s.bind((BR_NAME, 0)); socks.append(s)
+tx = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); tx.bind((BR_NAME, 0))
+print('ARMED', ts(), BR.hex(':'), flush=True)
+end = time.time() + TTL
+seen = None
+while seen is None and time.time() < end:
+    for s in select.select(socks, [], [], 1.0)[0]:
+        f = s.recv(2048)
+        if f[6:12] == VM_MAC:
+            seen = 'rarp' if f[12:14] == b'\x80\x35' else 'arp'
+            break
+if seen is None:
+    print('TIMEOUT', ts(), flush=True); sys.exit(3)
+print('RESUMED', ts(), seen, flush=True)
+for i in range(4):
+    if VM_IP:
+        vip = socket.inet_aton(VM_IP)
+        tx.send(arp(2, VM_MAC, vip)); tx.send(arp(1, b'\0' * 6, GW4))
+    tx.send(na())
+    if i == 0: print('ANNOUNCED', ts(), flush=True)
+    time.sleep(0.4)
+PY
+
+# ----- Regla de gracia entre regiones (01/10/2026) -----------------------------
+# Entre regiones morían TODAS las conexiones aunque el corte fuera instantáneo:
+# el nodo destino saca a la VM por el túnel de SU región (tabla 101), así que los
+# flujos viejos llegan a una BASE que no tiene su conntrack (otra IP de salida) y
+# las respuestas siguen volviendo por la vieja. La regla: en el destino, durante
+# GRACE_TTL_S, un TCP de la VM que el nodo recoge A MITAD (sin SYN: es de antes
+# de la migración) se marca con `ct mark` y sale por el túnel de la región VIEJA;
+# esa BASE lo reconoce, lo traduce con la IP de siempre y devuelve las respuestas
+# al nodo nuevo, porque su ruta /32 ya apunta allí. Los SYN nuevos no se marcan:
+# salen por la tabla 101 con la IP de la región nueva. Solo TCP (UDP no se
+# distingue) y solo IPv4 (la IPv6 IDENT no lleva NAT). Caduca sola: el set tiene
+# timeout y cada flujo conserva su marca mientras viva. Si el túnel viejo cae,
+# la tabla 111/112 se queda sin ruta y el flujo sigue por la 101: muere, como
+# habría muerto sin la regla.
+GRACE_CROSS_REGION="${GRACE_CROSS_REGION:-1}"
+GRACE_TTL_S="${GRACE_TTL_S:-86400}"
+SRC_TUN=""; DST_TUN=""; GRACE_ON=0
+read -r -d '' _GRACE_NODE_SH <<'SH' || true
+set -e
+op="$1"; old="${2:-}"; ip4="${3:-}"; ttl="${4:-86400}"
+if [ "$op" = clear ]; then
+  nft delete element inet nvxgrace hel4 "{ $ip4 }" 2>/dev/null || true
+  nft delete element inet nvxgrace fsn4 "{ $ip4 }" 2>/dev/null || true
+  echo "GRACE_CLEAR $ip4"; exit 0
+fi
+case "$old" in
+  tun-hel) mark=0x4e5601; tbl=111; set=hel4 ;;
+  tun-fsn) mark=0x4e5602; tbl=112; set=fsn4 ;;
+  *) echo "GRACE_BAD_TUN $old"; exit 1 ;;
+esac
+ip link show "$old" >/dev/null 2>&1 || { echo "GRACE_NO_TUN $old"; exit 1; }
+ip route replace default dev "$old" table "$tbl"
+ip rule show | grep -q "fwmark $mark lookup $tbl" || ip rule add pref 99 iif vmbr0 fwmark "$mark" lookup "$tbl"
+nft list table inet nvxgrace >/dev/null 2>&1 || nft -f - <<'NFT'
+table inet nvxgrace {
+  set hel4 { type ipv4_addr; flags timeout; }
+  set fsn4 { type ipv4_addr; flags timeout; }
+  set privada4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 100.64.0.0/10, 172.16.0.0/12, 192.168.0.0/16 } }
+  chain pre {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "vmbr0" ip saddr @hel4 ip daddr != @privada4 tcp flags & syn == 0 ct state new counter ct mark set 0x4e5601
+    iifname "vmbr0" ip saddr @fsn4 ip daddr != @privada4 tcp flags & syn == 0 ct state new counter ct mark set 0x4e5602
+    iifname "vmbr0" ct mark { 0x4e5601, 0x4e5602 } meta mark set ct mark
+  }
+}
+NFT
+nft delete element inet nvxgrace hel4 "{ $ip4 }" 2>/dev/null || true
+nft delete element inet nvxgrace fsn4 "{ $ip4 }" 2>/dev/null || true
+nft add element inet nvxgrace "$set" "{ $ip4 timeout ${ttl}s }"
+echo "GRACE_ON $set $ip4 mark=$mark table=$tbl"
+SH
+
+_egress_tun() {   # <ssh_fn> → túnel de la tabla 101 del nodo (tun-hel|tun-fsn)
+  "$1" "ip route show table 101" 2>/dev/null | sed -n 's/^default dev \([^ ]*\).*/\1/p' | head -1 | tr -d '\r'
+}
+
+# Antes de remote_migrate, en el destino: activa la gracia si cambia la región
+# de salida; si no, borra cualquier resto de esta VM (vuelta a casa).
+_grace_prepare() {
+  [[ -n "$CUR_VM_IPV4" ]] || return 0
+  SRC_TUN=$(_egress_tun src_ssh || true); DST_TUN=$(_egress_tun dst_ssh || true)
+  local out
+  if [[ "$GRACE_CROSS_REGION" == "1" && -n "$SRC_TUN" && -n "$DST_TUN" && "$SRC_TUN" != "$DST_TUN" ]]; then
+    out=$(dst_ssh "bash -s -- on '${SRC_TUN}' '${CUR_VM_IPV4}' '${GRACE_TTL_S}'" <<<"$_GRACE_NODE_SH" 2>&1 || true)
+    if [[ "$out" == *GRACE_ON* ]]; then
+      GRACE_ON=1
+      _ok "Gracia entre regiones: en ${DST_NODE} los TCP ya abiertos de ${CUR_VM_IPV4} saldrán por ${SRC_TUN} durante ${GRACE_TTL_S}s (${out##*GRACE_ON })."
+    else
+      _warn "No se pudo activar la gracia entre regiones en ${DST_NODE} (${out:-sin salida}); las conexiones abiertas de la VM se cortarán al cambiar de región."
+    fi
+  else
+    dst_ssh "bash -s -- clear '' '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1 || true
+  fi
+}
+
+# Orden de shell para el nodo viejo/destino: blackhole de las direcciones de la VM.
+_blackhole_cmd() {
+  local del="ip -6 route del blackhole ${EXPECTED_VM_IPV6}/128 2>/dev/null;"
+  [[ -n "$CUR_VM_IPV4" ]] && del+=" ip route del blackhole ${CUR_VM_IPV4}/32 2>/dev/null;"
+  del+=" true"
+  if [[ "$1" == "del" ]]; then printf '%s' "$del"; return 0; fi
+  local add="ip -6 route replace blackhole ${EXPECTED_VM_IPV6}/128;"
+  [[ -n "$CUR_VM_IPV4" ]] && add+=" ip route replace blackhole ${CUR_VM_IPV4}/32;"
+  # Retirada programada con systemd-run (no ata la sesión SSH); si faltara, un
+  # subshell con TODOS sus descriptores a /dev/null, que si no la dejaría colgada.
+  add+=" systemd-run --quiet --collect --unit=nvx-unbh-${VMID}-\$(date +%s) --on-active=${SRC_BLACKHOLE_TTL_S} /bin/sh -c '${del}' >/dev/null 2>&1"
+  add+=" || { (sleep ${SRC_BLACKHOLE_TTL_S}; ${del}) </dev/null >/dev/null 2>&1 & }"
+  printf '%s' "$add"
+}
+
+# Conntrack de la VM en un nodo. Al TRAERLA a un nodo donde ya estuvo, sus
+# flujos largos pueden tener allí una entrada de hace días (ESTABLISHED dura
+# 5 d) con secuencias viejas: los paquetes nuevos salen INVALID y el cortafuegos
+# de Proxmox (PVEFW-FORWARD … --ctstate INVALID -j DROP) los tira — medido en
+# laboratorio el 01/10: tcpbin murió 20 s después de volver la VM al nodo 242
+# con la red perfecta. Sin entrada, el nodo recoge el flujo a mitad
+# (nf_conntrack_tcp_loose=1) y sigue. Se borra en el destino antes de traerla
+# (aún no hay nada vivo suyo allí) y en el origen al cortar (ya no está).
+_ct_flush_cmd() {
+  local c="command -v conntrack >/dev/null 2>&1 || exit 0;"
+  if [[ -n "$CUR_VM_IPV4" ]]; then
+    c+=" conntrack -D -s ${CUR_VM_IPV4} >/dev/null 2>&1; conntrack -D -d ${CUR_VM_IPV4} >/dev/null 2>&1;"
+  fi
+  c+=" conntrack -D -f ipv6 -s ${EXPECTED_VM_IPV6} >/dev/null 2>&1; conntrack -D -f ipv6 -d ${EXPECTED_VM_IPV6} >/dev/null 2>&1; true"
+  printf '%s' "$c"
+}
+
+# Ruta de ESTA base al túnel del destino, ya. Mismo nombre que da sync-base-nat
+# (`<TUNNEL_IFACE_PREFIX>p<N>`). La otra base la mueve el disparador.
+_route_local_to_dst() {
+  local pfx iface
+  pfx=$(sed -n 's/^[[:space:]]*TUNNEL_IFACE_PREFIX=//p' "$BASE_NAT_ENV" 2>/dev/null | tail -1 | tr -d "\"' \r")
+  pfx="${pfx:-tun-}"
+  iface="${pfx}p$((10#$NEW_NODE_NUM))"
+  if [[ ! -e "/sys/class/net/${iface}" ]]; then
+    echo "NO_IFACE ${iface}"; return 1
+  fi
+  ip -6 route replace "${EXPECTED_VM_IPV6}/128" dev "$iface" || return 1
+  if [[ -n "$CUR_VM_IPV4" ]]; then ip route replace "${CUR_VM_IPV4}/32" dev "$iface" || return 1; fi
+  echo "ROUTE ${iface}"
+}
+
+_cut_now() { date -u +%H:%M:%S.%3N; }
+
+# El corte en sí. Idempotente (marca commit.done). $1 = rarp|arp|respaldo.
+# Cuerpo en subshell: el `set +e` no debe escaparse al script principal.
+_cutover_commit() (
+  set +e
+  [[ -n "$CUT_DIR" && ! -e "$CUT_DIR/commit.done" ]] || exit 0
+  local t0 r pp
+  t0=$(_cut_now)
+  r=$(_route_local_to_dst 2>&1)
+  : >"$CUT_DIR/fs.go"
+  # La ruta puesta a mano la desharía el siguiente sync de CUALQUIER VM en esta
+  # base (reconcilia todas desde state.json, que aún dice el nodo viejo):
+  # medido en laboratorio, rebotó 1,5 s al nodo viejo. Se persiste ya con
+  # node=; un sync-base-nat sin ese parámetro sale con rc=2 y queda el disparador.
+  ( "$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" "node=${DST_NODE}" >/dev/null 2>&1; echo "$?" >"$CUT_DIR/persist.rc" ) &
+  pp=$!
+  if [[ "$SRC_BLACKHOLE_TTL_S" != "0" ]]; then
+    src_ssh "$(_blackhole_cmd add)" >/dev/null 2>&1 && r+=" BLACKHOLE_SRC" || r+=" BLACKHOLE_SRC_FAIL"
+  fi
+  src_ssh "$(_ct_flush_cmd)" >/dev/null 2>&1
+  wait "$pp"
+  r+=" PERSIST_RC=$(cat "$CUT_DIR/persist.rc" 2>/dev/null)"
+  # Si la VM tenía gracia en el nodo que deja (llegó de otra región hace poco),
+  # se retira allí: ese nodo ya no la aloja.
+  [[ -n "$CUR_VM_IPV4" ]] && src_ssh "bash -s -- clear '' '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1
+  printf '%s %s %s → %s\n' "$1" "$t0" "$r" "$(_cut_now)" >"$CUT_DIR/commit.done"
+)
+
+_cutover_loop() {
+  set +e
+  while :; do
+    if grep -q '^RESUMED' "$CUT_DIR/watch.out" 2>/dev/null; then
+      _cutover_commit "$(awk '/^RESUMED/{print $3; exit}' "$CUT_DIR/watch.out")"
+      return 0
+    fi
+    [[ -e "$CUT_DIR/migrate.returned" ]] && return 0
+    sleep 0.05
+  done
+}
+
+# Antes de remote_migrate. Nunca aborta: si algo no arma, queda el respaldo.
+_cutover_arm() {
+  [[ "$EARLY_CUTOVER" == "1" && -n "$ONLINE_FLAG" ]] || return 0
+  CUT_DIR="$SSH_CTL_DIR/cut"; mkdir -p "$CUT_DIR"
+  # Si la VM salió de este destino hace menos de SRC_BLACKHOLE_TTL_S, su
+  # blackhole seguiría ahí: fuera antes de traerla.
+  dst_ssh "$(_blackhole_cmd del)" >/dev/null 2>&1 || true
+  dst_ssh "$(_ct_flush_cmd)" >/dev/null 2>&1 || true
+  _grace_prepare
+  VM_MAC=$(src_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^net0:.*=\(\([0-9A-Fa-f]\{2\}:\)\{5\}[0-9A-Fa-f]\{2\}\).*/\1/p' | head -1 | tr -d '\r' || true)
+  if [[ -n "$VM_MAC" ]]; then
+    dst_ssh "python3 - nvx-resume-watch '${VMID}' '${VM_MAC}' '${CUR_VM_IPV4}' '${RESUME_WATCH_TTL_S}'" \
+      <<<"$_RESUME_WATCH_PY" >"$CUT_DIR/watch.out" 2>&1 &
+    _CUT_WATCH_PID=$!
+    local i
+    for ((i=0; i<100; i++)); do grep -q '^ARMED' "$CUT_DIR/watch.out" 2>/dev/null && break; sleep 0.1; done
+    if grep -q '^ARMED' "$CUT_DIR/watch.out" 2>/dev/null; then
+      _ok "Vigía de reanudación armado en ${DST_NODE} (MAC ${VM_MAC}): ARP/NA y corte de rutas al reanudar."
+    else
+      _warn "El vigía de reanudación no armó en ${DST_NODE} ($(head -c 300 "$CUT_DIR/watch.out" 2>/dev/null | tr '\n' ' ')); el corte se hará al confirmar la migración (respaldo)."
+    fi
+  else
+    _warn "No se pudo leer la MAC de net0 de la VM ${VMID}; sin vigía, el corte se hará al confirmar la migración (respaldo)."
+  fi
+  _firestore_update_servers --vmid "$VMID" --node-id "$DST_NODE" \
+    --wait-file "$CUT_DIR/fs.go" --wait-timeout "$RESUME_WATCH_TTL_S" >"$CUT_DIR/fs.out" 2>&1 &
+  _CUT_FS_PID=$!
+  _cutover_loop &
+  _CUT_LOOP_PID=$!
+}
+
+# Tras remote_migrate (vaya bien o mal): para el bucle y el vigía.
+_cutover_settle() {
+  [[ -n "$CUT_DIR" ]] || return 0
+  : >"$CUT_DIR/migrate.returned"
+  if [[ -n "$_CUT_LOOP_PID" ]]; then wait "$_CUT_LOOP_PID" 2>/dev/null || true; _CUT_LOOP_PID=""; fi
+  if [[ -n "$_CUT_WATCH_PID" ]]; then
+    # Deja terminar los anuncios (1,6 s) si ya reanudó; si no, lo para.
+    local i; for ((i=0; i<30; i++)); do kill -0 "$_CUT_WATCH_PID" 2>/dev/null || break; sleep 0.1; done
+    dst_ssh "pkill -f 'nvx-resume-watc[h] ${VMID} '" >/dev/null 2>&1 || true
+    kill "$_CUT_WATCH_PID" 2>/dev/null || true; wait "$_CUT_WATCH_PID" 2>/dev/null || true
+    _CUT_WATCH_PID=""
+  fi
+  local line
+  line=$(grep -E '^(RESUMED|ANNOUNCED|TIMEOUT)' "$CUT_DIR/watch.out" 2>/dev/null | tr '\n' ' ' || true)
+  [[ -n "$line" ]] && _info "Vigía: ${line}"
+  if [[ -e "$CUT_DIR/commit.done" ]]; then
+    CUT_COMMITTED=1
+    _ok "Corte temprano: $(cat "$CUT_DIR/commit.done")"
+  fi
+}
+
+# Espera al escritor de Firestore ya soltado (o lo mata si nunca se soltó).
+_cutover_fs_reap() {
+  [[ -n "$_CUT_FS_PID" ]] || return 0
+  local i
+  if [[ -e "$CUT_DIR/fs.go" ]]; then
+    for ((i=0; i<300; i++)); do kill -0 "$_CUT_FS_PID" 2>/dev/null || break; sleep 0.1; done
+  fi
+  kill "$_CUT_FS_PID" 2>/dev/null || true; wait "$_CUT_FS_PID" 2>/dev/null || true
+  _CUT_FS_PID=""
+  if grep -q '^FS_WRITTEN' "$CUT_DIR/fs.out" 2>/dev/null; then
+    _ok "Firestore (corte temprano): nodeId=${DST_NODE} escrito a las $(awk '/^FS_WRITTEN/{print $2}' "$CUT_DIR/fs.out")."
+  elif [[ -e "$CUT_DIR/fs.go" ]]; then
+    _warn "El escritor temprano de Firestore no confirmó ($(tr '\n' ' ' <"$CUT_DIR/fs.out" | head -c 300)); lo reintenta la escritura final."
+  fi
+}
+
+# Para la vuelta atrás y la salida: que no quede nada colgando.
+_cutover_cleanup() {
+  set +e
+  [[ -n "$_CUT_LOOP_PID" ]] && { kill "$_CUT_LOOP_PID" 2>/dev/null; wait "$_CUT_LOOP_PID" 2>/dev/null; }
+  [[ -n "$_CUT_FS_PID" && ! -e "${CUT_DIR}/fs.go" ]] && { kill "$_CUT_FS_PID" 2>/dev/null; wait "$_CUT_FS_PID" 2>/dev/null; }
+  if [[ -n "$_CUT_WATCH_PID" ]]; then
+    dst_ssh "pkill -f 'nvx-resume-watc[h] ${VMID} '" >/dev/null 2>&1
+    kill "$_CUT_WATCH_PID" 2>/dev/null; wait "$_CUT_WATCH_PID" 2>/dev/null
+  fi
+  _CUT_LOOP_PID=""; _CUT_WATCH_PID=""
+}
+
 
 # ----- Cleanup / rollback state machine ----------------------------------------
 TOKEN_CREATED=0
@@ -717,11 +1072,18 @@ DEGRADED_REASON=""
 _rollback() {
   local rc=$?
   set +e
+  _cutover_cleanup
   if (( MIGRATION_DONE == 1 )); then
     _ssh_close
     return
   fi
   _warn "Aborting (rc=${rc}); rolling back transient state…"
+  if [[ -n "$CUT_DIR" && -e "$CUT_DIR/commit.done" ]]; then
+    # El vigía vio a la VM anunciarse EN EL DESTINO, así que la memoria ya pasó
+    # y la ruta y Firestore apuntan allí. No se revierte: devolver la ruta al
+    # origen dejaría sin red a una VM que corre en destino.
+    _warn "OJO: la VM ${VMID} se anunció en ${DST_NODE} ($(cat "$CUT_DIR/commit.done")): rutas y Firestore YA apuntan al destino y no se revierten. Comprobar 'qm status ${VMID}' en ${SRC_NODE} y ${DST_NODE}."
+  fi
   if (( HOOKSCRIPT_DETACHED == 1 )); then
     _info "Re-attaching hookscript on source…"
     src_ssh "qm set '${VMID}' --hookscript '${HOOKSCRIPT}'" >/dev/null 2>&1 || true
@@ -1057,26 +1419,44 @@ PY
   # ceiling only when the guest's dirty rate keeps pre-copy from converging.
   # Convergence signal = QEMU's "dirty sync count" (memory iterations): a calm
   # guest cuts over during rounds 1-2 and never meets the escalator; a churner
-  # accumulates rounds and earns a bigger budget stepwise (3→30s, 5→60s,
-  # 8→ceiling). DOWNTIME_ESCALATE_HARD_S bounds total pre-copy time — the
+  # accumulates rounds and earns a bigger budget stepwise (see _downtime_ladder:
+  # 3→2s … 12→ceiling). DOWNTIME_ESCALATE_HARD_S bounds total pre-copy time — the
   # efidisk0-reap window (failure mode (a)) — by jumping to the ceiling
   # outright, so the worst case degrades to exactly the old flat-90 behaviour.
   # HMP `migrate_set_parameter downtime-limit` takes MILLISECONDS and applies
   # to the RUNNING migration (validated on PVE 9.2.5). Self-terminates when
   # the migration leaves the active states or the source VM disappears
   # (remote_migrate --delete); the parent also reaps it after pvesh returns.
+  # Escalones (01/10/2026, con la pausa inicial bajada de 15 s a 1 s): en vez de
+  # saltar de golpe a 30 s en la tercera ronda, se sube por pasos pequeños, para
+  # que una VM que solo necesita un par de rondas más se congele 2-8 s y no 30.
+  # Las que de verdad no convergen llegan igual al techo: por rondas (12) o por
+  # el reloj duro.
+  _downtime_ladder() {   # <dirty_sync_count> → presupuesto (s) que le toca
+    local d="${1:-0}"
+    if   (( d >= 12 )); then echo "$MIGRATE_DOWNTIME"
+    elif (( d >= 10 )); then echo 60
+    elif (( d >= 8 ));  then echo 30
+    elif (( d >= 6 ));  then echo 15
+    elif (( d >= 5 ));  then echo 8
+    elif (( d >= 4 ));  then echo 4
+    elif (( d >= 3 ));  then echo 2
+    else echo "$MIGRATE_DOWNTIME_INITIAL"
+    fi
+  }
   _downtime_escalator() {
     set +e   # parent runs -euo pipefail; in here a failed poll must never kill the loop
-    local ram_ts cur target dirty status out elapsed
+    local ram_ts cur target dirty status out elapsed live_ms want_ms
     ram_ts=""   # set when the RAM phase is first observed — the hard timer
                 # counts from THERE, not from launch: the disk mirror that
                 # precedes it ran 10-25 min on today's defrag jobs, and
                 # counting it would jump every big VM straight to the ceiling
                 # before a single RAM round had run.
     cur="$MIGRATE_DOWNTIME_INITIAL"
-    for _ in $(seq 1 540); do   # ~3 h self-cap at 20 s cadence (covers the
-      # disk phase of a full zvol; must outlive it to see the RAM rounds)
-      sleep 20
+    for _ in $(seq 1 $(( 10800 / DOWNTIME_ESCALATE_POLL_S ))); do   # ~3 h
+      # self-cap (covers the disk phase of a full zvol; must outlive it to see
+      # the RAM rounds)
+      sleep "$DOWNTIME_ESCALATE_POLL_S"
       # qm monitor adds a greeting even when QEMU returns an empty result
       # during block mirroring. Use the monitor API's JSON string to keep
       # that empty result distinct from an actual migration status.
@@ -1098,25 +1478,41 @@ PY
       [[ -z "$ram_ts" ]] && continue   # still in the disk phase: nothing to escalate
       dirty=$(grep -oE 'dirty sync count: [0-9]+' <<<"$out" | grep -oE '[0-9]+$')
       elapsed=$(( $(date +%s) - ram_ts ))
-      target="$cur"
-      if [[ "$elapsed" -ge "$DOWNTIME_ESCALATE_HARD_S" ]] || [[ -n "$dirty" && "$dirty" -ge 8 ]]; then
+      target=$(_downtime_ladder "${dirty:-0}")
+      if [[ "$elapsed" -ge "$DOWNTIME_ESCALATE_HARD_S" ]]; then
         target="$MIGRATE_DOWNTIME"
-      elif [[ -n "$dirty" && "$dirty" -ge 5 ]]; then
-        target=60
-      elif [[ -n "$dirty" && "$dirty" -ge 3 ]]; then
-        target=30
       fi
+      [[ "$target" -lt "$cur" ]] && target="$cur"
       [[ "$target" -gt "$MIGRATE_DOWNTIME" ]] && target="$MIGRATE_DOWNTIME"
-      if [[ "$target" -gt "$cur" ]]; then
-        if src_ssh "timeout 10 pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/monitor' --command 'migrate_set_parameter downtime-limit $(( target * 1000 ))' --output-format json" 2>/dev/null \
+      # El bucle de fase 2 de Proxmox (QemuMigrate.pm) lleva SU propia copia del
+      # límite, que arranca en el migrate_downtime de la VM y DUPLICA cuando lo
+      # pendiente crece seis veces — y la escribe en QEMU sin mirar la nuestra.
+      # Puede BAJAR un presupuesto que subimos (con 1 s de partida: 1→2→4 por
+      # debajo de nuestros 15) o pasarse del techo (1→…→128 s, y un apagón de
+      # ~175 s mató el QEMU destino). Así que en cada vuelta se lee el valor VIVO
+      # y se encaja en [nuestro escalón, techo]: si Proxmox lo subió sin pasarse,
+      # se respeta.
+      live_ms=$(src_ssh "timeout 10 pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/monitor' --command 'info migrate_parameters' --output-format json" 2>/dev/null \
+        | python3 -c 'import json,re,sys; m=re.search(r"downtime-limit: ([0-9]+)", json.load(sys.stdin)); print(m.group(1) if m else "")' 2>/dev/null)
+      want_ms=$(( target * 1000 ))
+      if [[ -n "$live_ms" ]] && (( live_ms > want_ms )); then
+        want_ms="$live_ms"
+        (( want_ms > MIGRATE_DOWNTIME * 1000 )) && want_ms=$(( MIGRATE_DOWNTIME * 1000 ))
+        target=$(( want_ms / 1000 ))
+      fi
+      if [[ "$target" -gt "$cur" ]] || [[ -n "$live_ms" && "$live_ms" != "$want_ms" ]]; then
+        if src_ssh "timeout 10 pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/monitor' --command 'migrate_set_parameter downtime-limit ${want_ms}' --output-format json" 2>/dev/null \
           | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin) == "" else 1)' >/dev/null 2>&1; then
-          _info "downtime-escalator: budget ${cur}s → ${target}s (dirty rounds=${dirty:-?}, elapsed=${elapsed}s — guest dirties memory faster than the link drains it)."
+          if [[ "$target" -gt "$cur" ]]; then
+            _info "downtime-escalator: budget ${cur}s → ${target}s (dirty rounds=${dirty:-?}, elapsed=${elapsed}s — guest dirties memory faster than the link drains it)."
+          else
+            _info "downtime-escalator: Proxmox había dejado el límite en ${live_ms} ms; reafirmado a ${want_ms} ms."
+          fi
           cur="$target"
         fi
       fi
-      if [[ "$cur" -ge "$MIGRATE_DOWNTIME" ]]; then
-        return 0   # at ceiling: nothing left to do
-      fi
+      # Ya no se sale al llegar al techo: hay que seguir vigilando que Proxmox
+      # no lo rebase hasta que la migración termine.
     done
   }
 
@@ -1135,6 +1531,7 @@ PY
     _ESC_PID=$!
     _info "downtime-escalator armed (pid ${_ESC_PID}): start ${MIGRATE_DOWNTIME_INITIAL}s, ceiling ${MIGRATE_DOWNTIME}s, hard-escalate at ${DOWNTIME_ESCALATE_HARD_S}s."
   fi
+  _cutover_arm
   _migrate_rc=0
   src_ssh "pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate' \
             --target-bridge=1 \
@@ -1147,6 +1544,7 @@ PY
     kill "$_ESC_PID" 2>/dev/null || true
     wait "$_ESC_PID" 2>/dev/null || true
   fi
+  _cutover_settle
   [[ "$_migrate_rc" -eq 0 ]] || _die "pvesh remote_migrate failed."
   _ok "remote_migrate command returned."
 
@@ -1173,6 +1571,17 @@ PY
   # actually migrated, but a long cutover kept them in `inmigrate` past the old
   # hard 120s gate, so the wrapper "rolled back" and left routing on the source.
   MIGRATION_DONE=1
+
+  # Corte temprano de respaldo: si el vigía no vio el RARP (o no armó), se
+  # mueven aquí las rutas y Firestore — aún antes de esperar a `running`, el
+  # hookscript y el NAT local, que antes iban primero.
+  if [[ -n "$CUT_DIR" ]]; then
+    if (( CUT_COMMITTED == 0 )); then
+      _cutover_commit respaldo
+      [[ -e "$CUT_DIR/commit.done" ]] && { CUT_COMMITTED=1; _warn "Corte hecho por el respaldo, no al reanudar: $(cat "$CUT_DIR/commit.done")"; }
+    fi
+    _cutover_fs_reap
+  fi
 
   if [[ -n "$ONLINE_FLAG" ]]; then
     # After "migration finished successfully" the dest VM stays in `inmigrate`
@@ -1339,10 +1748,24 @@ dst_ssh "qm set '${VMID}' --hookscript '${HOOKSCRIPT}'" >/dev/null 2>&1 \
 # (sync <vmid> <ipv6>) so this works WITHOUT Firestore being updated yet —
 # Firestore is the very last step, so a Ctrl-C between here and the Firestore
 # update doesn't leave the doc claiming the VM lives on a node it isn't on.
+#
+# `node=<destino>` (01/10/2026): sin él, esta vía releía `nodeId` de Firestore
+# para calcular la ruta /128 — y Firestore aún decía el nodo VIEJO, así que la
+# ruta de esta BASE se quedaba en el túnel viejo hasta que llegaba el
+# disparador (medido: `Sync proxmoxId=243 done` sin mover nada). Un
+# sync-base-nat anterior a ese parámetro lo rechaza con rc=2: entonces se
+# repite sin él, como antes.
 NAT_OK=0
 if [[ -x "$SYNC_BASE_NAT" ]]; then
-  _info "Reconciling local NAT via $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6}…"
-  if "$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" >/dev/null 2>&1; then
+  _info "Reconciling local NAT via $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6} node=${DST_NODE}…"
+  _nat_rc=0
+  "$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" "node=${DST_NODE}" >/dev/null 2>&1 || _nat_rc=$?
+  if [[ "$_nat_rc" -eq 2 ]]; then
+    _info "sync-base-nat sin soporte de node= (rc=2); repito sin él."
+    _nat_rc=0
+    "$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" >/dev/null 2>&1 || _nat_rc=$?
+  fi
+  if [[ "$_nat_rc" -eq 0 ]]; then
     _ok "Local NAT reconciled."
     NAT_OK=1
   else
