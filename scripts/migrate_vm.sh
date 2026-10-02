@@ -822,7 +822,7 @@ PY
 # timeout y cada flujo conserva su marca mientras viva. Si el túnel viejo cae,
 # la tabla 111/112 se queda sin ruta y el flujo sigue por la 101: muere, como
 # habría muerto sin la regla.
-GRACE_CROSS_REGION="${GRACE_CROSS_REGION:-0}"  # OFF hasta validar HEL<->FSN en laboratorio (01/10: X1 bloqueada); activar con GRACE_CROSS_REGION=1
+GRACE_CROSS_REGION="${GRACE_CROSS_REGION:-1}"  # ON desde 02/10: validada en real (VM749 240→248→240, 0 cortes, marcas arrastradas); apagar con GRACE_CROSS_REGION=0
 GRACE_TTL_S="${GRACE_TTL_S:-86400}"
 SRC_TUN=""; DST_TUN=""; GRACE_ON=0
 # Marcas que ARRASTRA la VM (02/10/2026, tras la X1 real de la VM749 240→248):
