@@ -825,61 +825,178 @@ PY
 GRACE_CROSS_REGION="${GRACE_CROSS_REGION:-0}"  # OFF hasta validar HEL<->FSN en laboratorio (01/10: X1 bloqueada); activar con GRACE_CROSS_REGION=1
 GRACE_TTL_S="${GRACE_TTL_S:-86400}"
 SRC_TUN=""; DST_TUN=""; GRACE_ON=0
+# Marcas que ARRASTRA la VM (02/10/2026, tras la X1 real de la VM749 240→248):
+# una VM que ya saltó de región trae flujos marcados en su nodo actual (nacidos
+# en la región vieja). La versión del 01/10 los trataba en el siguiente salto
+# como nacidos en el ORIGEN (o borraba la gracia en un salto dentro de región):
+# en la vuelta 248→240 los nacidos en HEL antes de la X1 habrían salido por
+# tun-fsn hacia b0, que no tiene su conntrack, y habrían muerto. Ahora se leen
+# los flujos marcados en el origen y se llevan al destino por 4-tupla:
+#   - nacidos en la región del destino → @homeflows: sin marca, tabla 101;
+#   - nacidos en la otra región → @helflows/@fsnflows: marca de su región;
+#   - el resto de TCP recogido a mitad → región del origen (solo si cambia).
+# La clave lleva la IP de la VM para no mezclar VMs del mismo nodo y para que
+# `clear` pueda vaciar solo lo suyo.
 read -r -d '' _GRACE_NODE_SH <<'SH' || true
 set -e
-op="$1"; old="${2:-}"; ip4="${3:-}"; ttl="${4:-86400}"
-if [ "$op" = clear ]; then
-  nft delete element inet nvxgrace hel4 "{ $ip4 }" 2>/dev/null || true
-  nft delete element inet nvxgrace fsn4 "{ $ip4 }" 2>/dev/null || true
-  echo "GRACE_CLEAR $ip4"; exit 0
-fi
-case "$old" in
-  tun-hel) mark=0x4e5601; tbl=111; set=hel4 ;;
-  tun-fsn) mark=0x4e5602; tbl=112; set=fsn4 ;;
-  *) echo "GRACE_BAD_TUN $old"; exit 1 ;;
-esac
-ip link show "$old" >/dev/null 2>&1 || { echo "GRACE_NO_TUN $old"; exit 1; }
-ip route replace default dev "$old" table "$tbl"
-ip rule show | grep -q "fwmark $mark lookup $tbl" || ip rule add pref 99 iif vmbr0 fwmark "$mark" lookup "$tbl"
-nft list table inet nvxgrace >/dev/null 2>&1 || nft -f - <<'NFT'
+op="$1"; ip4="${2:-}"; ttl="${3:-86400}"; old="${4:-}"; dst_tun="${5:-}"; flows="${6:-}"
+mark_of() { case "$1" in hel) echo 0x4e5601 ;; fsn) echo 0x4e5602 ;; *) return 1 ;; esac; }
+tbl_of()  { case "$1" in hel) echo 111 ;; fsn) echo 112 ;; *) return 1 ;; esac; }
+ensure_region() {   # tabla 111/112 y su ip rule; falla si el túnel no existe
+  local r="$1" m t
+  m=$(mark_of "$r") && t=$(tbl_of "$r") || return 1
+  ip link show "tun-$r" >/dev/null 2>&1 || { echo "GRACE_NO_TUN tun-$r"; return 1; }
+  ip route replace default dev "tun-$r" table "$t"
+  ip rule show | grep -q "fwmark $m lookup $t" || ip rule add pref 99 iif vmbr0 fwmark "$m" lookup "$t"
+}
+ensure_table() {
+  nft list table inet nvxgrace >/dev/null 2>&1 || nft -f - <<'NFT'
 table inet nvxgrace {
   set hel4 { type ipv4_addr; flags timeout; }
   set fsn4 { type ipv4_addr; flags timeout; }
   set privada4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 100.64.0.0/10, 172.16.0.0/12, 192.168.0.0/16 } }
+  set homeflows { type ipv4_addr . ipv4_addr . inet_service . inet_service; flags timeout; }
+  set helflows { type ipv4_addr . ipv4_addr . inet_service . inet_service; flags timeout; }
+  set fsnflows { type ipv4_addr . ipv4_addr . inet_service . inet_service; flags timeout; }
   chain pre {
     type filter hook prerouting priority mangle; policy accept;
-    iifname "vmbr0" ip saddr @hel4 ip daddr != @privada4 tcp flags & syn == 0 ct state new counter ct mark set 0x4e5601
-    iifname "vmbr0" ip saddr @fsn4 ip daddr != @privada4 tcp flags & syn == 0 ct state new counter ct mark set 0x4e5602
+    iifname "vmbr0" ip saddr . ip daddr . tcp dport . tcp sport @homeflows ct state new counter return comment "nvx-home"
+    iifname "vmbr0" ip saddr . ip daddr . tcp dport . tcp sport @helflows ct state new counter ct mark set 0x4e5601 meta mark set 0x4e5601 return comment "nvx-flow-hel"
+    iifname "vmbr0" ip saddr . ip daddr . tcp dport . tcp sport @fsnflows ct state new counter ct mark set 0x4e5602 meta mark set 0x4e5602 return comment "nvx-flow-fsn"
+    iifname "vmbr0" ip saddr @hel4 ip daddr != @privada4 tcp flags & syn == 0 ct state new counter ct mark set 0x4e5601 comment "nvx-gen-hel"
+    iifname "vmbr0" ip saddr @fsn4 ip daddr != @privada4 tcp flags & syn == 0 ct state new counter ct mark set 0x4e5602 comment "nvx-gen-fsn"
     iifname "vmbr0" ct mark { 0x4e5601, 0x4e5602 } meta mark set ct mark
   }
 }
 NFT
-nft delete element inet nvxgrace hel4 "{ $ip4 }" 2>/dev/null || true
-nft delete element inet nvxgrace fsn4 "{ $ip4 }" 2>/dev/null || true
-nft add element inet nvxgrace "$set" "{ $ip4 timeout ${ttl}s }"
-echo "GRACE_ON $set $ip4 mark=$mark table=$tbl"
+  # Tabla creada por la versión del 01/10 (sin flujos): se amplía en caliente.
+  # `insert` pone la regla al PRINCIPIO, así que van en orden inverso para que
+  # queden home, hel, fsn y después las genéricas.
+  if ! nft list set inet nvxgrace homeflows >/dev/null 2>&1; then
+    for s in homeflows helflows fsnflows; do
+      nft add set inet nvxgrace "$s" '{ type ipv4_addr . ipv4_addr . inet_service . inet_service; flags timeout; }'
+    done
+    nft insert rule inet nvxgrace pre iifname "vmbr0" ip saddr . ip daddr . tcp dport . tcp sport @fsnflows ct state new counter ct mark set 0x4e5602 meta mark set 0x4e5602 return comment '"nvx-flow-fsn"'
+    nft insert rule inet nvxgrace pre iifname "vmbr0" ip saddr . ip daddr . tcp dport . tcp sport @helflows ct state new counter ct mark set 0x4e5601 meta mark set 0x4e5601 return comment '"nvx-flow-hel"'
+    nft insert rule inet nvxgrace pre iifname "vmbr0" ip saddr . ip daddr . tcp dport . tcp sport @homeflows ct state new counter return comment '"nvx-home"'
+  fi
+}
+clear_vm() {   # todo lo de esta VM en este nodo: dirección y flujos
+  nft delete element inet nvxgrace hel4 "{ $ip4 }" 2>/dev/null || true
+  nft delete element inet nvxgrace fsn4 "{ $ip4 }" 2>/dev/null || true
+  local s e
+  for s in homeflows helflows fsnflows; do
+    e=$(nft -j list set inet nvxgrace "$s" 2>/dev/null | python3 -c '
+import json, sys
+ip, out = sys.argv[1], []
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = {}
+for it in data.get("nftables", []):
+    for e in (it.get("set") or {}).get("elem") or []:
+        v = e.get("elem", {}).get("val") if isinstance(e, dict) and "elem" in e else e
+        c = v.get("concat") if isinstance(v, dict) else None
+        if c and str(c[0]) == ip:
+            out.append(" . ".join(str(x) for x in c))
+print(", ".join(out))
+' "$ip4") || true
+    [ -n "$e" ] && nft delete element inet nvxgrace "$s" "{ $e }" 2>/dev/null || true
+  done
+}
+if [ "$op" = clear ]; then
+  clear_vm; echo "GRACE_CLEAR $ip4"; exit 0
+fi
+dreg="${dst_tun#tun-}"
+mark_of "$dreg" >/dev/null || { echo "GRACE_BAD_TUN $dst_tun"; exit 1; }
+ensure_table
+clear_vm
+gen="-"
+if [ -n "$old" ]; then
+  oreg="${old#tun-}"
+  mark_of "$oreg" >/dev/null || { echo "GRACE_BAD_TUN $old"; exit 1; }
+  ensure_region "$oreg" || exit 1
+  nft add element inet nvxgrace "${oreg}4" "{ $ip4 timeout ${ttl}s }"
+  gen="$oreg"
+fi
+home=""; hel=""; fsn=""; nh=0; nl=0; nf=0; skipped=0
+IFS=',' read -ra F <<< "$flows"
+for f in "${F[@]}"; do
+  IFS=':' read -r reg da dp sp <<< "$f"
+  echo "$da" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || continue
+  case "$dp$sp" in *[!0-9]*|"") continue ;; esac
+  el="$ip4 . $da . $dp . $sp timeout ${ttl}s"
+  if [ "$reg" = "$dreg" ]; then home="${home:+$home, }$el"; nh=$((nh+1))
+  elif [ "$reg" = hel ]; then hel="${hel:+$hel, }$el"; nl=$((nl+1))
+  elif [ "$reg" = fsn ]; then fsn="${fsn:+$fsn, }$el"; nf=$((nf+1))
+  fi
+done
+[ -n "$home" ] && nft add element inet nvxgrace homeflows "{ $home }"
+for r in hel fsn; do
+  eval "els=\$$r"
+  [ -n "$els" ] || continue
+  if ensure_region "$r"; then nft add element inet nvxgrace "${r}flows" "{ $els }"
+  else skipped=$((skipped + $([ "$r" = hel ] && echo $nl || echo $nf))); fi
+done
+echo "GRACE_ON ip=$ip4 generica=$gen home=$nh hel=$nl fsn=$nf sin_tunel=$skipped destino=$dreg"
 SH
+
+# Salida de `conntrack -L -p tcp -s <ip4>` en el ORIGEN → flujos que la VM trae
+# marcados de un salto anterior, como "hel:<daddr>:<dport>:<sport>,…". conntrack
+# imprime la marca en DECIMAL (0x4e5601 = 5133825); se aceptan ambas formas.
+# Solo la tupla ORIGINAL (la primera src/dst/sport/dport) y solo si sale de la VM.
+_grace_flows_from_conntrack() {   # <ip4> < salida de conntrack
+  awk -v ip="$1" '
+    $1 != "tcp" { next }
+    / TIME_WAIT | CLOSE / { next }
+    {
+      src = dst = sp = dp = mk = ""
+      for (i = 1; i <= NF; i++) {
+        split($i, kv, "=")
+        if (kv[1] == "src"   && src == "") src = kv[2]
+        else if (kv[1] == "dst"   && dst == "") dst = kv[2]
+        else if (kv[1] == "sport" && sp  == "") sp  = kv[2]
+        else if (kv[1] == "dport" && dp  == "") dp  = kv[2]
+        else if (kv[1] == "mark") mk = tolower(kv[2])
+      }
+      if (src != ip) next
+      if (mk == "5133825" || mk == "0x4e5601" || mk == "0x004e5601") reg = "hel"
+      else if (mk == "5133826" || mk == "0x4e5602" || mk == "0x004e5602") reg = "fsn"
+      else next
+      if (dst !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || sp !~ /^[0-9]+$/ || dp !~ /^[0-9]+$/) next
+      key = reg ":" dst ":" dp ":" sp
+      if (!(key in seen)) { seen[key] = 1; out = out (out == "" ? "" : ",") key }
+    }
+    END { print out }'
+}
 
 _egress_tun() {   # <ssh_fn> → túnel de la tabla 101 del nodo (tun-hel|tun-fsn)
   "$1" "ip route show table 101" 2>/dev/null | sed -n 's/^default dev \([^ ]*\).*/\1/p' | head -1 | tr -d '\r'
 }
 
-# Antes de remote_migrate, en el destino: activa la gracia si cambia la región
-# de salida; si no, borra cualquier resto de esta VM (vuelta a casa).
+# Antes de remote_migrate, en el destino. Con GRACE_CROSS_REGION=1: si cambia la
+# región de salida, gracia genérica para lo recogido a mitad; y SIEMPRE (también
+# dentro de región) se llevan los flujos que la VM ya trae marcados del origen.
+# Sin nada que llevar, o con la gracia apagada, se borra cualquier resto de esta
+# VM en el destino (vuelta a casa), como antes.
 _grace_prepare() {
   [[ -n "$CUR_VM_IPV4" ]] || return 0
   SRC_TUN=$(_egress_tun src_ssh || true); DST_TUN=$(_egress_tun dst_ssh || true)
-  local out
-  if [[ "$GRACE_CROSS_REGION" == "1" && -n "$SRC_TUN" && -n "$DST_TUN" && "$SRC_TUN" != "$DST_TUN" ]]; then
-    out=$(dst_ssh "bash -s -- on '${SRC_TUN}' '${CUR_VM_IPV4}' '${GRACE_TTL_S}'" <<<"$_GRACE_NODE_SH" 2>&1 || true)
+  local out old="" flows=""
+  if [[ "$GRACE_CROSS_REGION" == "1" && -n "$DST_TUN" ]]; then
+    flows=$(src_ssh "conntrack -L -p tcp -s '${CUR_VM_IPV4}' 2>/dev/null" | _grace_flows_from_conntrack "$CUR_VM_IPV4" || true)
+    [[ -n "$SRC_TUN" && "$SRC_TUN" != "$DST_TUN" ]] && old="$SRC_TUN"
+  fi
+  if [[ -n "$old" || -n "$flows" ]]; then
+    out=$(dst_ssh "bash -s -- on '${CUR_VM_IPV4}' '${GRACE_TTL_S}' '${old}' '${DST_TUN}' '${flows}'" <<<"$_GRACE_NODE_SH" 2>&1 || true)
     if [[ "$out" == *GRACE_ON* ]]; then
       GRACE_ON=1
-      _ok "Gracia entre regiones: en ${DST_NODE} los TCP ya abiertos de ${CUR_VM_IPV4} saldrán por ${SRC_TUN} durante ${GRACE_TTL_S}s (${out##*GRACE_ON })."
+      _ok "Gracia en ${DST_NODE}: ${out##*GRACE_ON } (TTL ${GRACE_TTL_S}s)."
     else
-      _warn "No se pudo activar la gracia entre regiones en ${DST_NODE} (${out:-sin salida}); las conexiones abiertas de la VM se cortarán al cambiar de región."
+      _warn "No se pudo preparar la gracia en ${DST_NODE} (${out:-sin salida}); las conexiones abiertas de la VM nacidas en otra región se cortarán."
     fi
   else
-    dst_ssh "bash -s -- clear '' '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1 || true
+    dst_ssh "bash -s -- clear '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1 || true
   fi
 }
 
@@ -955,7 +1072,7 @@ _cutover_commit() (
   r+=" PERSIST_RC=$(cat "$CUT_DIR/persist.rc" 2>/dev/null)"
   # Si la VM tenía gracia en el nodo que deja (llegó de otra región hace poco),
   # se retira allí: ese nodo ya no la aloja.
-  [[ -n "$CUR_VM_IPV4" ]] && src_ssh "bash -s -- clear '' '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1
+  [[ -n "$CUR_VM_IPV4" ]] && src_ssh "bash -s -- clear '${CUR_VM_IPV4}'" <<<"$_GRACE_NODE_SH" >/dev/null 2>&1
   printf '%s %s %s → %s\n' "$1" "$t0" "$r" "$(_cut_now)" >"$CUT_DIR/commit.done"
 )
 
