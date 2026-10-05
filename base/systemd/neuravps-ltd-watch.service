@@ -1,0 +1,9 @@
+[Unit]
+Description=NeuraVPS: watch Hetzner's public Robot order page for LTD stock and email soporte@ (read-only, cannot order)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-ltd-watch.py --base-id %H
+TimeoutStartSec=3m
+SyslogIdentifier=neuravps-ltd-watch

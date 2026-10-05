@@ -1,0 +1,10 @@
+[Unit]
+Description=Run neuravps-ltd-watch every 10 minutes (b1 only: one base is enough, two would send every email twice)
+
+[Timer]
+OnCalendar=*:0/10
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target
