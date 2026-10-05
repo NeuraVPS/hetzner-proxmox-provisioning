@@ -46,13 +46,20 @@ sys.exit(0)
 FAKE_IP = r'''#!/bin/sh
 echo "$*" >> "$STATE/ip.log"
 case "$*" in "link show tun-"*) [ -n "$NOTUN" ] && [ "$3" = "$NOTUN" ] && exit 1 ;; esac
+# Reglas ya presentes, en el formato real de iproute2 6.15 (el iif va entre fwmark y lookup).
+case "$*" in "rule show") [ -f "$STATE/rules" ] && cat "$STATE/rules" ;; esac
+case "$*" in "rule add "*) for m in 0x4e5601 0x4e5602; do
+    case "$*" in *"fwmark $m"*) grep -q "fwmark $m" "$STATE/rules" 2>/dev/null && { echo "RTNETLINK answers: File exists" >&2; exit 2; } ;; esac
+  done ;; esac
 exit 0
 '''
 
 
-def run_node(args, *, table='0', homeset='0', sets=None, notun=''):
+def run_node(args, *, table='0', homeset='0', sets=None, notun='', rules=''):
     with tempfile.TemporaryDirectory() as t:
         p = Path(t)
+        if rules:
+            (p / 'rules').write_text(rules)
         for name, body in (('nft', FAKE_NFT), ('ip', FAKE_IP)):
             (p / name).write_text(body); (p / name).chmod(0o755)
         (p / 'sets.json').write_text(json.dumps(sets or {}))
@@ -155,6 +162,29 @@ class NodeScriptTests(unittest.TestCase):
         self.assertIn('delete element inet nvxgrace helflows { 10.64.2.237 . 1.1.1.1 . 443 . 5000, '
                       '10.64.2.237 . 2.2.2.2 . 1950 . 6000 }', dels)
         self.assertFalse([l for l in dels if '10.64.2.238' in l])
+
+class RuleIdempotencyTests(unittest.TestCase):
+    """05/10/2026: la 2.ª VM FSN→HEL hacia el mismo nodo se quedaba sin gracia
+    («RTNETLINK answers: File exists») porque la regla ya existía y no se reconocía."""
+    RULE = '99:\tfrom all fwmark 0x4e5602 iif vmbr0 lookup 112\n'
+
+    def test_existing_rule_in_real_format_is_not_added_again(self):
+        r, nft, ip = run_node(['on', VM, '86400', 'tun-fsn', 'tun-hel', ''], table='1', homeset='1', rules=self.RULE)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn('GRACE_ON', r.stdout)
+        self.assertFalse([l for l in ip if l.startswith('rule add')], ip)
+        self.assertIn(f'add element inet nvxgrace fsn4 {{ {VM} timeout 86400s }}', nft)
+
+    def test_other_region_rule_does_not_hide_a_missing_one(self):
+        rules = '99:\tfrom all fwmark 0x4e5601 iif vmbr0 lookup 111\n'
+        r, nft, ip = run_node(['on', VM, '86400', 'tun-fsn', 'tun-hel', ''], table='1', homeset='1', rules=rules)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn('rule add pref 99 iif vmbr0 fwmark 0x4e5602 lookup 112', ip)
+
+    def test_table_1120_is_not_table_112(self):
+        rules = '99:\tfrom all fwmark 0x4e5602 iif vmbr0 lookup 1120\n'
+        r, nft, ip = run_node(['on', VM, '86400', 'tun-fsn', 'tun-hel', ''], table='1', homeset='1', rules=rules)
+        self.assertIn('rule add pref 99 iif vmbr0 fwmark 0x4e5602 lookup 112', ip)
 
 
 if __name__ == '__main__':

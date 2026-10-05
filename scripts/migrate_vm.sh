@@ -847,7 +847,10 @@ ensure_region() {   # tabla 111/112 y su ip rule; falla si el túnel no existe
   m=$(mark_of "$r") && t=$(tbl_of "$r") || return 1
   ip link show "tun-$r" >/dev/null 2>&1 || { echo "GRACE_NO_TUN tun-$r"; return 1; }
   ip route replace default dev "tun-$r" table "$t"
-  ip rule show | grep -q "fwmark $m lookup $t" || ip rule add pref 99 iif vmbr0 fwmark "$m" lookup "$t"
+  # `ip rule show` imprime "from all fwmark 0x4e5602 iif vmbr0 lookup 112": el iif va
+  # ENTRE fwmark y lookup. Buscar "fwmark M lookup T" seguido no casaba nunca, y el
+  # segundo VM hacia el mismo nodo repetía el add → "File exists" → set -e → sin gracia.
+  ip rule show | grep -Eq "fwmark $m( .*)? lookup $t([[:space:]]|\$)" || ip rule add pref 99 iif vmbr0 fwmark "$m" lookup "$t"
 }
 ensure_table() {
   nft list table inet nvxgrace >/dev/null 2>&1 || nft -f - <<'NFT'
