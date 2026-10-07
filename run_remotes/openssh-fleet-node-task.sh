@@ -18,24 +18,75 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 qm list 2>/dev/null | tail -n +2 | awk '$3=="running" {print $1}' \
   | grep -vE '^(100|101)$' > "$tmp/vms" || true
 
-run_one() {
-  vmid="$1"
-  out=$(qm guest exec "$vmid" --timeout "$GTMO" -- powershell -NoProfile -EncodedCommand "$PSB64" 2>&1)
-  res=$(printf '%s\n' "$out" | python3 -c '
-import json, sys
-raw = sys.stdin.read()
+# qemu-ga guarda el resultado de cada proceso terminado hasta que alguien lo
+# pide por PID, y Windows reutiliza PID: `exec-status <pid>` puede devolver
+# primero la entrada vieja de OTRO proceso (vm749, 04/10/2026: exit 0 y la
+# salida del script SMB). Y `qm guest exec` sincrono se queda con el primer
+# `exited` que le den. Por eso: --synchronous 0, el script imprime
+# NV-RUN-<nonce> como primera linea, y se sondea ESE PID hasta verla. Lo
+# ajeno se descarta y se vuelve a preguntar; a la tercera, FAIL. NUNCA se
+# relanza: el instalador escribe. Mismo patron que functions/guest_run_nonce.py
+# y el bloque nv_* de neuravps-egresscheck.py (PR #261).
+NV_PY=$(cat <<'PY'
+import base64, json, os, subprocess, sys, time
+vmid, psb64, gtmo = sys.argv[1], sys.argv[2], int(sys.argv[3])
+nonce = os.urandom(16).hex()
+
+def una_linea(raw, n=120):
+    return " ".join((raw or "").split())[:n]
+
+def qm(*args):
+    r = subprocess.run(["qm", "guest", *args], stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=60)
+    return (r.stdout or "") + (r.stderr or "")
+
+def js(raw):
+    try:
+        return json.loads(raw[raw.index("{"):raw.rindex("}") + 1], strict=False)
+    except Exception:
+        return None
+
+# La cola repite lo que hace powershell.exe con la ultima sentencia: el codigo
+# de salida no cambia; un `exit N` explicito se la salta (sin marca final).
+ps = base64.b64decode(psb64).decode("utf-16-le")
+ps = f"'NV-RUN-{nonce}';{ps}\n;$nvok=$?;'NV-END-{nonce}';if(-not $nvok){{exit 1}}"
+b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
 try:
-    start = raw.index("{")
-    d = json.loads(raw[start:raw.rindex("}") + 1], strict=False)
-except Exception:
-    print("FAIL exec-error " + raw.strip().replace("\n", " ")[:120])
-    raise SystemExit
-if "exitcode" not in d and "exited" not in d:
-    # qm devolvio solo el pid: timeout del guest exec (estado desconocido)
-    print("FAIL guest-timeout pid=" + str(d.get("pid", "")))
-    raise SystemExit
-o = d.get("out-data") or ""
-for l in o.splitlines():
+    raw = qm("exec", vmid, "--synchronous", "0", "--",
+             "powershell", "-NoProfile", "-EncodedCommand", b64)
+except Exception as e:
+    print("FAIL exec-error " + una_linea(str(e))); sys.exit()
+d = js(raw)
+pid = d.get("pid") if isinstance(d, dict) else None
+if not pid:
+    print("FAIL exec-error " + una_linea(raw)); sys.exit()
+
+fin = time.monotonic() + gtmo
+ajenos = 0
+while True:
+    if time.monotonic() > fin:
+        # estado desconocido: puede seguir corriendo en el invitado
+        print(f"FAIL guest-timeout pid={pid}"); sys.exit()
+    try:
+        raw = qm("exec-status", vmid, str(pid))
+    except subprocess.TimeoutExpired:
+        continue
+    d = js(raw)
+    if not isinstance(d, dict):
+        print(f"FAIL exec-status-error pid={pid} " + una_linea(raw)); sys.exit()
+    if not d.get("exited"):
+        time.sleep(2); continue
+    cuerpo = (d.get("out-data") or "").lstrip("﻿ \t\r\n")
+    primera, _, resto = cuerpo.partition("\n")
+    if primera.strip() != "NV-RUN-" + nonce:
+        ajenos += 1
+        if ajenos >= 3:
+            print(f"FAIL foreign-result pid={pid} (qemu-ga devolvio el de otro proceso con el mismo PID)")
+            sys.exit()
+        continue
+    break
+
+for l in resto.splitlines():
     if l.startswith("RESULT:OK"):
         print("OK")
         break
@@ -44,7 +95,16 @@ for l in o.splitlines():
         break
 else:
     print("FAIL no-result exitcode=" + str(d.get("exitcode")))
-')
+PY
+)
+
+run_one() {
+  vmid="$1"
+  res=$(python3 -c "$NV_PY" "$vmid" "$PSB64" "$GTMO" 2>&1 | tail -n 1)
+  case "$res" in
+    OK|FAIL\ *) ;;
+    *) res="FAIL node-error ${res:0:120}" ;;
+  esac
   echo "VMRES $vmid $res"
 }
 
