@@ -64,11 +64,24 @@ remote_task() {
   # On any non-success path, sets _PS_LAST_ERROR to a single-line description
   # (exitcode + truncated stdout/stderr from agent exec-status, or the agent
   # error reason) so the caller can include it in RUNREMOTES_FAIL log lines.
+  #
+  # qemu-ga keeps every exited process's result until someone asks for it by
+  # PID, and Windows reuses PIDs: exec-status can hand back an OLD entry of
+  # ANOTHER process first (measured on vm749, 04/10/2026: exit 0 and someone
+  # else's stdout). An exit 0 here means "configured" and writes Firestore, so
+  # the script prints NV-RUN-<nonce> as its first stdout line and a result
+  # without it is discarded; the same PID is polled again, nothing is re-run.
+  # After 3 foreign results it fails. Same as functions/guest_run_nonce.py.
   _PS_LAST_ERROR=""
   _run_ps_via_agent() {
     _PS_LAST_ERROR=""
     local _vmid="$1" _ps="$2" _timeout="${3:-60}"
-    local _b64
+    local _nonce _b64 _foreign=0
+    _nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    [[ ${#_nonce} -eq 32 ]] || { _PS_LAST_ERROR="nonce generation failed"; return 1; }
+    # The tail repeats what powershell.exe does with the last statement, so the
+    # exit code is unchanged; an explicit `exit N` skips it.
+    _ps="'NV-RUN-${_nonce}';${_ps}"$'\n'";\$nvok=\$?;'NV-END-${_nonce}';if(-not \$nvok){exit 1}"
     _b64=$(printf '%s' "$_ps" | iconv -t UTF-16LE | base64 -w0)
     [[ -n "$_b64" ]] || { _PS_LAST_ERROR="iconv/base64 failed"; return 1; }
 
@@ -105,12 +118,21 @@ remote_task() {
       if echo "$_st" | grep -qE '"exited"\s*:\s*1'; then
         # Parse exitcode + out-data + err-data robustly (JSON has escapes).
         local _parsed
-        _parsed=$(echo "$_st" | python3 -c '
-import json, re, sys
+        _parsed=$(echo "$_st" | NV_NONCE="$_nonce" python3 -c '
+import json, os, re, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
-    print("0||||"); sys.exit(0)
+    print("UNPARSEABLE"); sys.exit(0)
+nonce = os.environ["NV_NONCE"]
+body = (d.get("out-data") or "").lstrip("\ufeff \t\r\n")
+first, _, rest = body.partition("\n")
+if first.strip() != "NV-RUN-" + nonce:
+    print("FOREIGN"); sys.exit(0)
+end = rest.rfind("NV-END-" + nonce)
+if end >= 0 and not rest[end + len("NV-END-" + nonce):].strip():
+    rest = rest[:end]
+d["out-data"] = rest
 ec = d.get("exitcode", 0) or 0
 def clean(s):
     s = (s or "")
@@ -132,6 +154,18 @@ od = clean(d.get("out-data"))
 ed = clean(d.get("err-data"))
 print(f"{ec}||||{od}||||{ed}")
 ' 2>/dev/null)
+        if [[ "$_parsed" == "UNPARSEABLE" || -z "$_parsed" ]]; then
+          _PS_LAST_ERROR="unreadable exec-status: ${_st:0:200}"
+          return 1
+        fi
+        if [[ "$_parsed" == "FOREIGN" ]]; then
+          (( _foreign++ )) || true
+          if (( _foreign >= 3 )); then
+            _PS_LAST_ERROR="guest agent kept returning another process's result for pid ${_pid} (reused PID); not ours, not trusted"
+            return 1
+          fi
+          continue
+        fi
         local _ec="${_parsed%%\|\|\|\|*}"
         local _rest="${_parsed#*\|\|\|\|}"
         local _out_data="${_rest%%\|\|\|\|*}"
