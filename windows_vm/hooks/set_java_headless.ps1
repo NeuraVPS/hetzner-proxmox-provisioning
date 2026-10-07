@@ -28,39 +28,92 @@
 # Pasó de verdad en la vm1309 (2026-08-15). Por eso aquí se lee, se filtra y
 # se reescribe entero con `Set-Content`, que siempre separa bien.
 #
+# DÓNDE BUSCA (07/10/2026). Antes solo miraba `C:\SQX_<n>`; hay clientes que
+# instalan SQX en `C:\SQX144`, `C:\Apps\SQX`… (VM623: crash de modo A en una
+# copia que nadie veía). Ahora usa la misma regla que `SQX_INSTALLS_PS` de
+# `functions/sqx_installs.py` (repo NeuraVPS): toda carpeta de primer o segundo
+# nivel de C:\ que contenga `StrategyQuantX.exe` o `StrategyQuantX_nocheck.exe`.
+# NUNCA atraviesa un reparse point (atributo 1024): `C:\My Servers\VM<n> - …`
+# son enlaces SMB al c$ de OTRAS VMs del cliente; seguirlos tocaría la config
+# de otra máquina y, si esa VM está parada, cada Test-Path se cuelga ~21 s.
+# Tampoco rutas UNC.
+#
+# QUÉ .config TOCA: los dos que lee el lanzador según versión, si existen —
+# `StrategyQuantX.config` (v144) y `StrategyQuantX_nocheck.config` (v142/v143).
+# Poner la línea en el que esa versión no lee es inocuo. Si falta el que le
+# corresponde (hay `StrategyQuantX_nocheck.exe` ⇒ v142/v143 ⇒ `_nocheck.config`;
+# si no, `StrategyQuantX.config`), se informa `=FALTA` y no se crea nada.
+#
+# IDEMPOTENTE: si ya está `option -Djava.awt.headless=true` no se toca (`=ya`).
+# Si hay otra línea headless (`=false`, pegada a otro `option`), tampoco:
+# `=DISTINTO`, para revisarla a mano.
+#
+# SIMULACIÓN: `-DryRun` no escribe nada (ni .bak); informa `=PONDRIA`.
+#   Por stdin con QGA: `& ([scriptblock]::Create($s)) -DryRun`.
+#
+# Salida: una línea `ruta\fichero.config=ESTADO; …` o `SINSQX`.
+# ESTADO: ya | PUESTO | REVERTIDO | PONDRIA | FALTA | DISTINTO.
+#
 # Verificación real: SQX registra sus argumentos en
 # `user\log\StrategyQuant\log_<fecha>.log` como
 # `SQApp - Runtime args: -Djava.awt.headless=true`.
 
+param([switch]$DryRun)
+
 $ErrorActionPreference = 'SilentlyContinue'
 $linea = 'option -Djava.awt.headless=true'
+$skip = 'Windows', '$Recycle.Bin', 'System Volume Information', 'Recovery', 'PerfLogs'
+$rp = 1024   # [IO.FileAttributes]::ReparsePoint
 $res = @()
 
-foreach ($dir in (Get-ChildItem C:\ -Directory -EA 0 |
-                  Where-Object { $_.Name -match '^SQX_\d+$' })) {
-    foreach ($cfg in (Get-ChildItem $dir.FullName -Filter 'StrategyQuantX*.config' -EA 0)) {
-        if (Select-String -Path $cfg.FullName -Pattern 'java\.awt\.headless' -Quiet) {
-            $res += ($dir.Name + '=ya'); continue
+$top = Get-ChildItem -LiteralPath 'C:\' -Directory -EA 0 |
+       Where-Object { ($skip -notcontains $_.Name) -and -not ($_.Attributes -band $rp) }
+$cand = foreach ($t in $top) {
+    $t.FullName
+    Get-ChildItem -LiteralPath $t.FullName -Directory -EA 0 |
+        Where-Object { -not ($_.Attributes -band $rp) } | ForEach-Object { $_.FullName }
+}
+$installs = $cand | Where-Object {
+    $_ -and $_ -notmatch '^\\\\' -and
+    ((Test-Path -LiteralPath (Join-Path $_ 'StrategyQuantX.exe')) -or
+     (Test-Path -LiteralPath (Join-Path $_ 'StrategyQuantX_nocheck.exe')))
+} | Sort-Object -Unique
+
+foreach ($dir in $installs) {
+    $nocheckExe = Test-Path -LiteralPath (Join-Path $dir 'StrategyQuantX_nocheck.exe')
+    $suyo = if ($nocheckExe) { 'StrategyQuantX_nocheck.config' } else { 'StrategyQuantX.config' }
+    if (-not (Test-Path -LiteralPath (Join-Path $dir $suyo))) { $res += ((Join-Path $dir $suyo) + '=FALTA') }
+
+    foreach ($n in 'StrategyQuantX.config', 'StrategyQuantX_nocheck.config') {
+        $f = Join-Path $dir $n
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+        $antes = @(Get-Content -LiteralPath $f -EA 0)
+        if ($antes | Where-Object { $_ -match '^\s*option\s+-Djava\.awt\.headless=true\s*$' }) {
+            $res += ($f + '=ya'); continue
         }
-        $antes = @(Get-Content $cfg.FullName -EA 0)
-        Copy-Item $cfg.FullName ($cfg.FullName + '.bak') -Force -EA 0
+        # Otra línea headless (`=false`, o pegada a otro `option`): no es
+        # nuestra, no se toca; se informa para mirarla a mano.
+        if ($antes | Where-Object { $_ -match 'java\.awt\.headless' }) {
+            $res += ($f + '=DISTINTO'); continue
+        }
+        if ($DryRun) { $res += ($f + '=PONDRIA'); continue }
 
-        $nuevo = @($antes | Where-Object { $_ -notmatch 'java\.awt\.headless' }) + $linea
-        Set-Content -Path $cfg.FullName -Value $nuevo -Encoding ascii
+        Copy-Item -LiteralPath $f -Destination ($f + '.bak') -Force -EA 0
+        $nuevo = @($antes) + $linea
+        Set-Content -LiteralPath $f -Value $nuevo -Encoding ascii
 
-        # Aceptación: una línea más, ningún `option` pegado a otro, y el -Xmx
-        # tal cual estaba. Si algo no cuadra, se repone el respaldo.
-        $fin = @(Get-Content $cfg.FullName -EA 0)
-        $pegadas = $fin | Where-Object { ($_ -split 'option').Count -gt 2 }
-        $xmxAntes = ($antes | Where-Object { $_ -match '^option -Xmx' }) -join ','
-        $xmxFin = ($fin | Where-Object { $_ -match '^option -Xmx' }) -join ','
-        if ($pegadas -or $fin.Count -ne ($antes.Count + 1) -or $xmxAntes -ne $xmxFin) {
-            Copy-Item ($cfg.FullName + '.bak') $cfg.FullName -Force -EA 0
-            $res += ($dir.Name + '=REVERTIDO')
+        # Aceptación: el fichero releído es exactamente lo que había más la
+        # nuestra al final: ningún `option` pegado, el
+        # -Xmx intacto y nada convertido a `?` por la codificación. Si no
+        # cuadra, se repone el respaldo.
+        $fin = @(Get-Content -LiteralPath $f -EA 0)
+        if (($fin -join "`n") -cne ($nuevo -join "`n")) {
+            Copy-Item -LiteralPath ($f + '.bak') -Destination $f -Force -EA 0
+            $res += ($f + '=REVERTIDO')
         } else {
-            $res += ($dir.Name + '=PUESTO')
+            $res += ($f + '=PUESTO')
         }
     }
 }
 
-if ($res.Count -eq 0) { 'SINSQX' } else { $res -join ' ' }
+if ($res.Count -eq 0) { 'SINSQX' } else { $res -join '; ' }

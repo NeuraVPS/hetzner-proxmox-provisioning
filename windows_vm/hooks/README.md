@@ -6,6 +6,11 @@
 > `.config` de cada instalación de SQX — el mismo fichero donde ya vive el
 > `-Xmx`, que es de donde el lanzador nativo lee sus argumentos de JVM.
 >
+> **Desde el 07/10/2026 busca SQX como `get_sqx_installs`**: carpetas de primer
+> y segundo nivel de C:\ con `StrategyQuantX.exe` o `StrategyQuantX_nocheck.exe`
+> (no solo `C:\SQX_<n>`), sin atravesar reparse points (`C:\My Servers`) ni
+> rutas UNC. `-DryRun` informa sin escribir nada.
+>
 > Probado en vm1096 (2026-08-15). Tres arranques el mismo día, los tres con
 > el flag: **18:34** vía hook IFEO, **19:36** vía variable de máquina, **19:47**
 > **solo con el .config, sin hook y sin variable**. Confirmado en el log de la
