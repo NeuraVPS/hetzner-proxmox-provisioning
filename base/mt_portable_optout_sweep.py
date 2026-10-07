@@ -71,6 +71,7 @@ ones keep running, and the change takes effect at their next launch.
 import argparse
 import base64
 import json
+import secrets
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -130,13 +131,111 @@ def _encoded(ps: str) -> str:
     return base64.b64encode(ps.encode("utf-16-le")).decode()
 
 
+# --- Solo vale la salida que trae NUESTRO nonce --------------------------------
+# qemu-ga guarda el resultado de cada proceso terminado hasta que alguien lo pide
+# por PID, y Windows reutiliza PID a menudo: `exec-status <pid>` puede devolver
+# primero la entrada vieja de OTRO proceso (medido en la vm749 el 04/10/2026: una
+# sonda `Write-Error` recibio el texto del script SMB con exit 0). `qm guest
+# exec` sincrono se queda con esa primera respuesta. Por eso se lanza con
+# `--synchronous 0`, el nodo sondea ESE PID hasta ver `NV-RUN-<nonce>` (una
+# entrada ajena se descarta y se vuelve a preguntar, sin relanzar nada; a la
+# tercera se deja) y aqui solo se acepta la salida que lo trae. Mismo patron que
+# functions/guest_run_nonce.py (PR #517). Este bloque es identico en
+# neuravps-egresscheck.py, mt_portable_optout_sweep.py y vmtool.py.
+NV_RUN, NV_END = "NV-RUN-", "NV-END-"
+NV_MAX_AJENOS = 3
+NV_SEP = "@@NV-AJENO@@"
+
+
+def nv_marca(ps: str, nonce: str) -> str:
+    """El script con el nonce como primera linea de stdout y otra al final.
+    La cola repite lo que powershell.exe hace con la ultima sentencia, asi que
+    el codigo de salida no cambia; un `exit N` explicito se salta la cola."""
+    return (f"'{NV_RUN}{nonce}';{ps}\n"
+            f";$nvok=$?;'{NV_END}{nonce}';if(-not $nvok){{exit 1}}")
+
+
+def nv_lee(salida: str, nonce: str):
+    """(propia, salida sin marcas). Propia = la primera linea es nuestro nonce."""
+    cuerpo = (salida or "").lstrip("\ufeff \t\r\n")
+    primera, _, resto = cuerpo.partition("\n")
+    if primera.strip() != NV_RUN + nonce:
+        return False, salida or ""
+    fin = resto.rfind(NV_END + nonce)
+    if fin >= 0 and not resto[fin + len(NV_END + nonce):].strip():
+        resto = resto[:fin]
+    return True, resto
+
+
+def nv_orden_nodo(vmid, timeout: int, nonce: str, argv: str) -> str:
+    """Lo que se ejecuta EN EL NODO: lanza `argv` en el invitado y sondea su PID
+    hasta el resultado con nuestro nonce. Imprime cada resultado terminado,
+    separados por NV_SEP; si no hay PID, lo que dijo `qm`; si vence el plazo,
+    `{"pid": N}` como el `qm guest exec` sincrono."""
+    return (
+        f"o=$(qm guest exec {vmid} --synchronous 0 -- {argv} 2>&1); "
+        "p=$(printf '%s' \"$o\" | tr -d ' \\r\\n' | sed -n 's/.*\"pid\":\\([0-9][0-9]*\\).*/\\1/p'); "
+        "if [ -z \"$p\" ]; then printf '%s\\n' \"$o\"; exit 0; fi; "
+        f"f=0; e=$(( $(date +%s) + {int(timeout)} )); "
+        "while [ \"$(date +%s)\" -lt \"$e\" ]; do "
+        f"s=$(qm guest exec-status {vmid} \"$p\" 2>&1) || {{ printf '%s\\n' \"$s\"; exit 0; }}; "
+        "case \"$(printf '%s' \"$s\" | tr -d ' \\r\\n')\" in *'\"exited\":1'*) "
+        "printf '%s\\n' \"$s\"; "
+        f"case \"$s\" in *'{NV_RUN}{nonce}'*) exit 0;; esac; "
+        f"f=$((f+1)); [ \"$f\" -ge {NV_MAX_AJENOS} ] && exit 0; "
+        f"printf '%s\\n' '{NV_SEP}'; continue;; esac; "
+        "sleep 1; done; "
+        "printf '{\"pid\":%s}\\n' \"$p\""
+    )
+
+
+def nv_resultado(stdout: str, nonce: str):
+    """('propio', estado) con `out-data` ya sin marcas, ('ajeno', None) si solo
+    llegaron resultados de otros procesos, o ('sin_resultado', None)."""
+    ajenos = 0
+    for trozo in (stdout or "").split(NV_SEP):
+        trozo = trozo.strip()
+        if '"exited"' not in trozo:
+            continue
+        try:
+            d = json.loads(trozo)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or not d.get("exited"):
+            continue
+        propia, texto = nv_lee(d.get("out-data") or "", nonce)
+        if propia:
+            return "propio", dict(d, **{"out-data": texto})
+        ajenos += 1
+    return ("ajeno" if ajenos else "sin_resultado"), None
+
+
+NV_AJENO_MSG = "resultado ajeno: qemu-ga devolvio el de otro proceso con el mismo PID"
+
+
+class ResultadoAjeno(RuntimeError):
+    """qemu-ga kept answering with another process's result (same PID)."""
+
+
 def guest_exec(node_ip: str, vmid: str, ps: str, timeout: int = 150):
-    """Run PowerShell in the guest through the BASE we are already on."""
+    """Run PowerShell in the guest through the BASE we are already on.
+
+    Returns the exec-status dict with `out-data` already stripped of the
+    nonce markers. Raises ResultadoAjeno when only other processes' results
+    came back: nothing is re-run, the caller reports the VM as not assessed."""
+    nonce = secrets.token_hex(16)
+    orden = nv_orden_nodo(vmid, timeout, nonce,
+                          f"powershell -EncodedCommand {_encoded(nv_marca(ps, nonce))}")
     cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=8",
-           "-o", "BatchMode=yes", f"root@{node_ip}",
-           f"qm guest exec {vmid} --timeout {timeout} -- "
-           f"powershell -EncodedCommand {_encoded(ps)} 2>/dev/null"]
+           "-o", "BatchMode=yes", f"root@{node_ip}", orden]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 60)
+    estado, d = nv_resultado(out.stdout, nonce)
+    if estado == "propio":
+        return d
+    if estado == "ajeno":
+        raise ResultadoAjeno(NV_AJENO_MSG)
+    # As before: a timeout leaves `{"pid": N}` (read as an incomplete probe),
+    # anything else is not JSON and raises.
     return json.loads(out.stdout)
 
 
@@ -262,7 +361,11 @@ if ($done.Count -eq 0) { 'no-mt-hook-present' } else { $done -join ' ' }
 
 def unhook(node_ip: str, vmid: str) -> str:
     """Remove our MT hook from this VM's launch path. Never touches terminals."""
-    return (guest_exec(node_ip, vmid, UNHOOK_PS).get("out-data") or "").strip()
+    try:
+        return (guest_exec(node_ip, vmid, UNHOOK_PS).get("out-data") or "").strip()
+    except ResultadoAjeno:
+        # Never a silent "clean": main() counts UNREADABLE as needing a look.
+        return f"UNREADABLE ({NV_AJENO_MSG})"
 
 
 def main() -> int:
@@ -286,6 +389,8 @@ def main() -> int:
         try:
             data = guest_exec(ip, vmid, COLLECT_PS)
             payload = json.loads(data.get("out-data") or "{}")
+        except ResultadoAjeno:
+            return vmid, ip, email, None, NV_AJENO_MSG
         except Exception as exc:
             return vmid, ip, email, None, f"{type(exc).__name__}"
         # `complete` is emitted last, so its absence means the probe died
@@ -358,7 +463,7 @@ def main() -> int:
     failures = 0
     for vmid, ip, email, _payload, _opts in affected:
         res = unhook(ip, vmid)
-        if "FOREIGN" in res or not res:
+        if "FOREIGN" in res or "UNREADABLE" in res or not res:
             failures += 1
         print(f"  vm{vmid:<6} {email:<38} {res or '(no output)'}")
     print(f"\ndone: {len(affected) - failures} clean, {failures} needing a look")

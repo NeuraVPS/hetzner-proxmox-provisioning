@@ -9,6 +9,7 @@ Uso:  vmtool.py inspect <vmid>
 """
 import base64
 import json
+import secrets
 import subprocess
 import sys
 import convert_mode
@@ -42,21 +43,105 @@ def _enc(ps: str) -> str:
     return base64.b64encode(ps.encode("utf-16-le")).decode()
 
 
+# --- Solo vale la salida que trae NUESTRO nonce --------------------------------
+# qemu-ga guarda el resultado de cada proceso terminado hasta que alguien lo pide
+# por PID, y Windows reutiliza PID a menudo: `exec-status <pid>` puede devolver
+# primero la entrada vieja de OTRO proceso (medido en la vm749 el 04/10/2026: una
+# sonda `Write-Error` recibio el texto del script SMB con exit 0). `qm guest
+# exec` sincrono se queda con esa primera respuesta. Por eso se lanza con
+# `--synchronous 0`, el nodo sondea ESE PID hasta ver `NV-RUN-<nonce>` (una
+# entrada ajena se descarta y se vuelve a preguntar, sin relanzar nada; a la
+# tercera se deja) y aqui solo se acepta la salida que lo trae. Mismo patron que
+# functions/guest_run_nonce.py (PR #517). Este bloque es identico en
+# neuravps-egresscheck.py, mt_portable_optout_sweep.py y vmtool.py.
+NV_RUN, NV_END = "NV-RUN-", "NV-END-"
+NV_MAX_AJENOS = 3
+NV_SEP = "@@NV-AJENO@@"
+
+
+def nv_marca(ps: str, nonce: str) -> str:
+    """El script con el nonce como primera linea de stdout y otra al final.
+    La cola repite lo que powershell.exe hace con la ultima sentencia, asi que
+    el codigo de salida no cambia; un `exit N` explicito se salta la cola."""
+    return (f"'{NV_RUN}{nonce}';{ps}\n"
+            f";$nvok=$?;'{NV_END}{nonce}';if(-not $nvok){{exit 1}}")
+
+
+def nv_lee(salida: str, nonce: str):
+    """(propia, salida sin marcas). Propia = la primera linea es nuestro nonce."""
+    cuerpo = (salida or "").lstrip("\ufeff \t\r\n")
+    primera, _, resto = cuerpo.partition("\n")
+    if primera.strip() != NV_RUN + nonce:
+        return False, salida or ""
+    fin = resto.rfind(NV_END + nonce)
+    if fin >= 0 and not resto[fin + len(NV_END + nonce):].strip():
+        resto = resto[:fin]
+    return True, resto
+
+
+def nv_orden_nodo(vmid, timeout: int, nonce: str, argv: str) -> str:
+    """Lo que se ejecuta EN EL NODO: lanza `argv` en el invitado y sondea su PID
+    hasta el resultado con nuestro nonce. Imprime cada resultado terminado,
+    separados por NV_SEP; si no hay PID, lo que dijo `qm`; si vence el plazo,
+    `{"pid": N}` como el `qm guest exec` sincrono."""
+    return (
+        f"o=$(qm guest exec {vmid} --synchronous 0 -- {argv} 2>&1); "
+        "p=$(printf '%s' \"$o\" | tr -d ' \\r\\n' | sed -n 's/.*\"pid\":\\([0-9][0-9]*\\).*/\\1/p'); "
+        "if [ -z \"$p\" ]; then printf '%s\\n' \"$o\"; exit 0; fi; "
+        f"f=0; e=$(( $(date +%s) + {int(timeout)} )); "
+        "while [ \"$(date +%s)\" -lt \"$e\" ]; do "
+        f"s=$(qm guest exec-status {vmid} \"$p\" 2>&1) || {{ printf '%s\\n' \"$s\"; exit 0; }}; "
+        "case \"$(printf '%s' \"$s\" | tr -d ' \\r\\n')\" in *'\"exited\":1'*) "
+        "printf '%s\\n' \"$s\"; "
+        f"case \"$s\" in *'{NV_RUN}{nonce}'*) exit 0;; esac; "
+        f"f=$((f+1)); [ \"$f\" -ge {NV_MAX_AJENOS} ] && exit 0; "
+        f"printf '%s\\n' '{NV_SEP}'; continue;; esac; "
+        "sleep 1; done; "
+        "printf '{\"pid\":%s}\\n' \"$p\""
+    )
+
+
+def nv_resultado(stdout: str, nonce: str):
+    """('propio', estado) con `out-data` ya sin marcas, ('ajeno', None) si solo
+    llegaron resultados de otros procesos, o ('sin_resultado', None)."""
+    ajenos = 0
+    for trozo in (stdout or "").split(NV_SEP):
+        trozo = trozo.strip()
+        if '"exited"' not in trozo:
+            continue
+        try:
+            d = json.loads(trozo)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or not d.get("exited"):
+            continue
+        propia, texto = nv_lee(d.get("out-data") or "", nonce)
+        if propia:
+            return "propio", dict(d, **{"out-data": texto})
+        ajenos += 1
+    return ("ajeno" if ajenos else "sin_resultado"), None
+
+
+NV_AJENO_MSG = "resultado ajeno: qemu-ga devolvio el de otro proceso con el mismo PID"
+
+
 def por_agente(node_ip: str, vmid: int, ps: str, t=45):
-    """(ok, salida). ok=False si el agente no puede ejecutar."""
+    """(ok, salida). ok=False si el agente no puede ejecutar, o si solo
+    devolvio resultados de otro proceso (no se relanza: `convert` cambia la red)."""
+    nonce = secrets.token_hex(16)
+    orden = nv_orden_nodo(vmid, t, nonce,
+                          f"powershell.exe -NoProfile -EncodedCommand {_enc(nv_marca(ps, nonce))}")
     r = subprocess.run(
         ["ssh", "-n", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-         f"root@{node_ip}",
-         f"qm guest exec {vmid} --timeout {t} -- powershell.exe -NoProfile -EncodedCommand {_enc(ps)}"],
+         f"root@{node_ip}", orden],
         capture_output=True, text=True, timeout=t + 30)
-    s = r.stdout.strip()
-    if '"exitcode"' not in s:
-        return False, " ".join((s + " " + r.stderr).split())[:120]
-    try:
-        d = json.loads(s)
+    estado, d = nv_resultado(r.stdout, nonce)
+    if estado == "propio":
         return True, (d.get("out-data") or d.get("err-data") or "").strip()
-    except Exception:
-        return False, " ".join(s.split())[:120]
+    if estado == "ajeno":
+        return False, NV_AJENO_MSG
+    s = r.stdout.strip()
+    return False, " ".join((s + " " + r.stderr).split())[:120]
 
 
 def por_ssh(ipv6: str, user: str, pwd: str, ps: str, t=45):
