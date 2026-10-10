@@ -290,6 +290,78 @@ class ExitCodeWiring(unittest.TestCase):
         self.assertEqual(tok[0], "FAIL")
         self.assertEqual(re.findall(r"FAIL\s+vmid=(\d+)", line), ["12"])
 
+    def test_exit_86_files_the_event_before_exiting(self):
+        exit86 = SCRIPT.index('exit "$EXIT_GUEST_REBOOTED"')
+        block = SCRIPT[SCRIPT.index("if (( GUEST_REBOOTED == 1 )); then\n  # Not _die"):exit86]
+        self.assertIn("\n  _report_guest_rebooted\n", block)
+
+
+FAKE_FIREBASE = textwrap.dedent("""\
+    import json, os
+    _apps = {}
+    def initialize_app(cred):
+        _apps["x"] = cred
+    """)
+FAKE_CREDENTIALS = "def Certificate(path):\n    return path\n"
+FAKE_FIRESTORE = textwrap.dedent("""\
+    import json, os
+    SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
+    class _Doc:
+        def __init__(self, col): self.col = col
+        def set(self, data):
+            if os.environ.get("FAKE_FS_FAIL"):
+                raise RuntimeError("boom")
+            with open(os.environ["FAKE_FS_OUT"], "a") as f:
+                f.write(json.dumps({"col": self.col, "data": data}) + "\\n")
+    class _Col:
+        def __init__(self, name): self.name = name
+        def document(self): return _Doc(self.name)
+    class _Client:
+        def collection(self, name): return _Col(name)
+    def client(): return _Client()
+    """)
+
+
+class GuestRebootedEvent(unittest.TestCase):
+    """The exit-86 path files ONE `migration_guest_rebooted` doc, whoever ran
+    the script, so node_liveness can mail soporte@ (11/10/2026)."""
+
+    def _run(self, fail=False):
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d, "firebase_admin")
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text(FAKE_FIREBASE)
+            (pkg / "credentials.py").write_text(FAKE_CREDENTIALS)
+            (pkg / "firestore.py").write_text(FAKE_FIRESTORE)
+            out = Path(d, "out.jsonl")
+            env = {"PYTHONPATH": d, "FAKE_FS_OUT": str(out)}
+            if fail:
+                env["FAKE_FS_FAIL"] = "1"
+            r = run_bash(_fn("_report_guest_rebooted")
+                         + 'GUEST_REBOOT_DETAIL="boot time A before, B after"\n'
+                         + "_report_guest_rebooted\necho RC=$?\n", env)
+            rows = [json.loads(l) for l in out.read_text().splitlines()] if out.exists() else []
+        return r, rows
+
+    def test_writes_one_doc_with_vmid_nodes_and_detail(self):
+        r, rows = self._run()
+        self.assertIn("RC=0", r.stdout, r.stderr)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["col"], "migration_guest_rebooted")
+        self.assertEqual(rows[0]["data"]["vmid"], 777)
+        self.assertEqual(rows[0]["data"]["src"], "0000238-AX162-2-LTD")
+        self.assertEqual(rows[0]["data"]["dest"], "0000263-EX131-2-LTD")
+        self.assertEqual(rows[0]["data"]["detail"], "boot time A before, B after")
+        self.assertEqual(rows[0]["data"]["at"], "SERVER_TIMESTAMP")
+
+    def test_firestore_failure_warns_and_never_aborts(self):
+        r, rows = self._run(fail=True)
+        self.assertEqual(rows, [])
+        self.assertIn("RC=0", r.stdout, r.stderr)   # set -e did not kill the caller
+        self.assertIn("WARN: Could not file migration_guest_rebooted", r.stderr)
+
+
+class Parses(unittest.TestCase):
     def test_script_parses(self):
         r = subprocess.run(["bash", "-n", str(ROOT / "scripts/migrate_vm.sh")],
                            capture_output=True, text=True)

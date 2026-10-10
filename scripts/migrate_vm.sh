@@ -125,10 +125,11 @@
 #   86  GUEST_REBOOTED: the VM IS on dest, routing and Firestore point there,
 #       but Windows rebooted after the live migration (its boot time changed).
 #       Do NOT retry or roll back: the move is done. Look at the guest (BugCheck
-#       in the System log) and tell the customer if needed. 2026-10-10: two
-#       live AMD→Intel moves with cpu x86-64-v4 bugchecked (0xA) ~20 s after
-#       resuming and the script still said rc=0 and "reachable" — RDP came
-#       back after the reboot.
+#       in the System log) and tell the customer if needed. Files a
+#       `migration_guest_rebooted` doc → ONE mail to soporte@ (since 11/10).
+#       2026-10-10: two live AMD→Intel moves with cpu x86-64-v4 bugchecked
+#       (0xA) ~20 s after resuming and the script still said rc=0 and
+#       "reachable" — RDP came back after the reboot.
 #
 # ----- Cross-vendor LIVE migrations are refused -------------------------------
 # AMD↔Intel live migration is refused for EVERY cpu model, both directions
@@ -638,6 +639,32 @@ _guest_reboot_postcheck() {
   else
     _ok "Windows did not reboot: boot time unchanged on dest ($(date -u -d "@${post}" +%FT%TZ 2>/dev/null || echo "$post"))."
   fi
+}
+
+# Files ONE `migration_guest_rebooted` doc for an exit-86 move, whoever ran the
+# script (defrag, batch or a human at a shell). The 5-minute liveness sweep
+# (functions/node_liveness.py: check_migration_guest_rebooted) turns it into a
+# single mail to soporte@ with the customer's email, and stamps `alertedAt`; the
+# defrag failure mail leaves these VMIDs to that mail instead of repeating them.
+# Same pattern as migration_degraded. Best-effort: never masks the exit 86.
+_report_guest_rebooted() {
+  python3 - "$VMID" "$SRC_NODE" "$DST_NODE" "$GUEST_REBOOT_DETAIL" <<'PYREB' || _warn "Could not file migration_guest_rebooted for VM ${VMID}: nobody will be mailed — tell soporte@ by hand."
+import os, sys, socket
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    creds = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(credentials.Certificate(creds))
+    firestore.client().collection("migration_guest_rebooted").document().set({
+        "vmid": int(sys.argv[1]), "src": sys.argv[2], "dest": sys.argv[3],
+        "detail": sys.argv[4], "host": socket.gethostname(),
+        "at": firestore.SERVER_TIMESTAMP,
+    })
+except Exception as e:  # noqa: BLE001
+    sys.stderr.write(f"guest-rebooted event failed: {e}\n")
+    sys.exit(1)
+PYREB
 }
 
 # rc 0 = Windows rebooted between the two readings: the boot time moved later
@@ -2252,6 +2279,7 @@ if (( GUEST_REBOOTED == 1 )); then
   # Not _die: that is exit 1, which means "may still be on source". Here the
   # move is COMMITTED (routing + Firestore on dest); callers must not retry.
   _log_to_file ERROR "GUEST_REBOOTED vm=${VMID} ${SRC_NODE} → ${DST_NODE}: exit ${EXIT_GUEST_REBOOTED}"
+  _report_guest_rebooted
   printf '❌ %s\n' "GUEST_REBOOTED vm=${VMID}: la VM ya está en el destino ${DST_NODE} (rutas y Firestore apuntan allí), pero Windows se reinició tras la migración en caliente — ${GUEST_REBOOT_DETAIL}. NO reintentar ni devolverla: la migración está hecha. Revisar el registro System del invitado (BugCheck / Kernel-Power 41) y avisar al cliente si perdió trabajo." >&2
   exit "$EXIT_GUEST_REBOOTED"
 fi
