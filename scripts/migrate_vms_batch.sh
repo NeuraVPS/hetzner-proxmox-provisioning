@@ -833,11 +833,16 @@ while (( ${#pending[@]} > 0 || ${#pid_meta[@]} > 0 )); do
       log "OK       vmid=$jvmid src=$jsrc dst=$jdst rc=0  log=$jlog"
     else
       fail_count=$((fail_count + 1))
-      log "FAIL     vmid=$jvmid src=$jsrc dst=$jdst rc=$jrc log=$jlog"
+      # rc 86 = migrate_vm.sh GUEST_REBOOTED: the VM IS on dest (committed),
+      # but Windows rebooted after the live move. A failure for the operator,
+      # never something to retry or roll back.
+      jnote=""
+      (( jrc == 86 )) && jnote=" note=guest-rebooted-vm-on-dest"
+      log "FAIL     vmid=$jvmid src=$jsrc dst=$jdst rc=$jrc log=$jlog$jnote"
       {
         echo
         echo "========================================================================"
-        echo "FAIL  vmid=$jvmid  src=$jsrc → dst=$jdst  rc=$jrc  $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        echo "FAIL  vmid=$jvmid  src=$jsrc → dst=$jdst  rc=$jrc  $(date -u +'%Y-%m-%dT%H:%M:%SZ')$jnote"
         echo "      log=$jlog"
         echo "------------------------------------ output ------------------------------------"
         cat "$jlog" 2>/dev/null || echo "(could not read $jlog)"
