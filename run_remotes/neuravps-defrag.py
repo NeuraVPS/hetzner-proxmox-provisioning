@@ -151,6 +151,28 @@ def disk_ok(n):
     return pct is None or pct < DISK_REAL_MAX_PCT
 
 
+def cpu_vendor(node_id):
+    """CPU vendor from the Hetzner product in the node id: AX* = AMD, EX* =
+    Intel (0000263-EX131-2-LTD, the EX44s). None = unknown."""
+    product = node_id.split("-", 1)[1] if "-" in node_id else ""
+    if product.startswith("AX"):
+        return "AMD"
+    if product.startswith("EX"):
+        return "Intel"
+    return None
+
+
+def same_cpu_vendor(dst_id, source_ids):
+    """A destination must share the CPU vendor of the node(s) it relieves.
+    migrate_vm.sh refuses every LIVE AMD<->Intel move since 2026-10-10 (an
+    x86-64-v4 Windows guest bugchecked ~20 s after resuming on Intel), and a
+    cold one changes the SQX Hardware ID — neither is the defrag's to do.
+    Unknown vendor on either side = not the same."""
+    dst = cpu_vendor(dst_id)
+    srcs = {cpu_vendor(s) for s in source_ids}
+    return dst is not None and srcs == {dst}
+
+
 def base_ram(data):
     values = [float(data[k]) for k in ('max_base_ram', 'gbRam')
               if data.get(k) and float(data[k]) > 0]
@@ -520,6 +542,8 @@ def main():
         best = None
         for did, dn in nodes.items():
             if dn["model"] != model or did in exclude or not placeable(dn):
+                continue
+            if not same_cpu_vendor(did, exclude):
                 continue
             if not disk_ok(dn):
                 continue
@@ -1192,6 +1216,7 @@ def main():
     record_recent_moves([v for v, *_ in verified])
 
     failed_vmids = []
+    rebooted = []
     if fail:
         import glob
         el = sorted(glob.glob(f"{LOG_DIR}/errors-*.log"))
@@ -1201,12 +1226,21 @@ def main():
         with open(SKIP_FILE, "a") as f:
             for v in failed_vmids:
                 f.write(f"{v}\n")
+        # Not every failure is on source: MIGRATION_DEGRADED and rc=86
+        # (GUEST_REBOOTED, Windows rebooted after the live move) are COMMITTED
+        # on dest with Firestore already pointing there. Either way: skip-list,
+        # no retry.
+        rebooted = sorted({int(m) for m in re.findall(
+            r"FAIL\s+vmid=(\d+)\s.*note=guest-rebooted", open(el[-1]).read())}) if el else []
         log(f"ESCALACIÓN: {fail} migración(es) FAILED (vmids {failed_vmids}) — "
-            f"VMs a salvo en origen (rollback), añadidas a skip-list; la cadena "
-            f"CONTINÚA con el resto (operador 2026-07-13)")
+            f"añadidas a skip-list; la cadena CONTINÚA con el resto (operador "
+            f"2026-07-13). Casi siempre siguen en origen (rollback); las "
+            f"MIGRATION_DEGRADED y las rc=86 ya están en destino"
+            + (f" — Windows se REINICIÓ tras migrar en: {rebooted}" if rebooted else ""))
     db.collection("defrag_runs").document(run_id).update(
         {"executed": len(verified), "ok": ok, "fail": fail,
          "failedVmids": failed_vmids,
+         "guestRebootedVmids": rebooted,
          "status": "done-with-failures" if fail else "done"})
     return 0
 

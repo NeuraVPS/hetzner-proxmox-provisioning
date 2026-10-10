@@ -116,6 +116,29 @@
 #                                    successful jobs land here too)
 #
 # Batch exits 0 if every job succeeded, 1 if any failed, 2 on usage error.
+#
+# ----- Exit codes (this script) -----------------------------------------------
+#   0   migrated (or already on dest) and nothing wrong was seen.
+#   1   failure (_die). Before the commit point the VM stays on source; after it
+#       (MIGRATION_DEGRADED) the VM is on dest and a human must finish it.
+#   2   usage error.
+#   86  GUEST_REBOOTED: the VM IS on dest, routing and Firestore point there,
+#       but Windows rebooted after the live migration (its boot time changed).
+#       Do NOT retry or roll back: the move is done. Look at the guest (BugCheck
+#       in the System log) and tell the customer if needed. 2026-10-10: two
+#       live AMD→Intel moves with cpu x86-64-v4 bugchecked (0xA) ~20 s after
+#       resuming and the script still said rc=0 and "reachable" — RDP came
+#       back after the reboot.
+#
+# ----- Cross-vendor LIVE migrations are refused -------------------------------
+# AMD↔Intel live migration is refused for EVERY cpu model, both directions
+# (not only cpu=host): a named model such as x86-64-v4 does not hide the vendor,
+# the guest keeps seeing the vendor of the node it booted on. Measured
+# 2026-10-10 (memory/neuravps-ex131-prueba-sqx-2026-10-10.md). Cross-vendor
+# moves are OFFLINE only (stop the VM; the SQX Hardware ID changes with the
+# vendor, so the customer is warned first — cold-move runbook).
+# LAB ONLY: NV_LAB_ALLOW_CROSS_VENDOR_LIVE=<vmid> lets that single VMID through,
+# to reproduce the crash on a lab VM. Never on a customer VM.
 
 set -euo pipefail
 
@@ -146,6 +169,19 @@ CONNECTIVITY_TIMEOUT="${CONNECTIVITY_TIMEOUT:-420}"  # seconds — RDP listener 
 # whoever reads it to skip the real ones.
 POST_MIGRATE_RUN_TIMEOUT="${POST_MIGRATE_RUN_TIMEOUT:-300}"  # seconds — after a COMMITTED online migration, how long to wait for the dest VM to reach `running` before downgrading to a warning + fix-forward. On a slow/degraded cutover the dest can sit in `inmigrate` for minutes; the old hard 120s here false-rolled-back migrations that had actually landed (VMs 1785/1790/1791, 2026-07-01). A timeout now NEVER rolls back — the VM is already on dest.
 ERROR_LOG="${ERROR_LOG:-/var/log/migrate_vm/errors.log}"
+# Guest-reboot check after a LIVE migration of a Windows VM (see exit 86 above).
+# The boot time is read over QGA before the move and again once the guest has
+# been running on dest for GUEST_REBOOT_SETTLE_S (the 2026-10-10 bugchecks hit
+# ~20 s after resume; keep this >= 60). If QGA does not answer, retry until
+# GUEST_REBOOT_DEADLINE_S after resume, then only WARN (unknown is not failure).
+GUEST_REBOOT_CHECK="${GUEST_REBOOT_CHECK:-1}"
+GUEST_REBOOT_SETTLE_S="${GUEST_REBOOT_SETTLE_S:-90}"
+GUEST_REBOOT_DEADLINE_S="${GUEST_REBOOT_DEADLINE_S:-300}"
+# LastBootUpTime is derived from the clock, so it shifts by the seconds the
+# guest clock is corrected after the pause; a real reboot moves it by the
+# whole migration (minutes) or more.
+GUEST_REBOOT_TOLERANCE_S="${GUEST_REBOOT_TOLERANCE_S:-120}"
+EXIT_GUEST_REBOOTED=86
 
 # Controller state uses a non-blocking lock shared with the reconciler.
 # Retry before copying, or after routing has recovered; never in the cutover.
@@ -461,6 +497,155 @@ _node_cpu_sig() {
 _node_cpu_flags() {
   local ssh_fn="$1"
   "$ssh_fn" 'grep -m1 "^flags" /proc/cpuinfo | cut -d: -f2' 2>/dev/null
+}
+
+# LIVE migrations only: refuse AMD<->Intel for ANY cpu model. Args: source and
+# dest "vendor|family|model" (from _node_cpu_sig) and the running cpu model
+# (for the message). Returns 0 when both vendors are the same; dies otherwise,
+# and also when a signature is unreadable (refuse to guess). The single escape
+# hatch is the lab override NV_LAB_ALLOW_CROSS_VENDOR_LIVE=<this VMID>.
+_live_cross_vendor_guard() {
+  local src_sig="$1" dst_sig="$2" cpu_model="$3" src_vendor dst_vendor
+  [[ "$src_sig" == *"|"*"|"* ]] || _die "Could not read source ${SRC_NODE} CPU signature (got: '${src_sig}'), so a cross-vendor LIVE migration cannot be ruled out. Stop the VM and migrate OFFLINE, or retry. Aborting before any VM state is touched."
+  [[ "$dst_sig" == *"|"*"|"* ]] || _die "Could not read dest ${DST_NODE} CPU signature (got: '${dst_sig}'), so a cross-vendor LIVE migration cannot be ruled out. Stop the VM and migrate OFFLINE, or retry. Aborting before any VM state is touched."
+  src_vendor="${src_sig%%|*}"; dst_vendor="${dst_sig%%|*}"
+  [[ -n "$src_vendor" && -n "$dst_vendor" ]] || _die "Empty CPU vendor (source '${src_sig}', dest '${dst_sig}'). Refusing to guess. Aborting before any VM state is touched."
+  [[ "$src_vendor" == "$dst_vendor" ]] && return 0
+  if [[ -n "${NV_LAB_ALLOW_CROSS_VENDOR_LIVE:-}" && "${NV_LAB_ALLOW_CROSS_VENDOR_LIVE}" == "${VMID}" ]]; then
+    _warn "LAB OVERRIDE NV_LAB_ALLOW_CROSS_VENDOR_LIVE=${VMID}: letting a LIVE ${src_vendor} → ${dst_vendor} migration through (cpu=${cpu_model}). Expect Windows to crash (BugCheck 0xA) ~20 s after resume. Lab VMs only."
+    return 0
+  fi
+  _die "CPU vendor mismatch — refusing LIVE migration. Source ${SRC_NODE} is ${src_vendor}, dest ${DST_NODE} is ${dst_vendor}; VM ${VMID} runs cpu=${cpu_model}. This is refused for EVERY cpu model, x86-64-v4/v3 included: a named model does not hide the vendor (the guest keeps the one it booted on), and on 2026-10-10 a live AMD→Intel move with x86-64-v4 crashed Windows (BugCheck 0xA) ~20 s after resume, 2 of 2. Changing the cpu model does not fix it. The only way across vendors is OFFLINE: stop the VM (customer warned first — the SQX Hardware ID changes with the vendor) and re-run. Aborting before any VM state is touched."
+}
+
+# Reads Windows' boot time over the guest agent, on whichever node holds the VM
+# (ssh fn = src_ssh before the move, dst_ssh after). Prints
+# "OK <boot_epoch> <guest_now_epoch> <node_now_epoch>" or "FAIL <reason>"; never
+# fails the script. Guest epochs come from the guest clock.
+# qemu-ga can hand back ANOTHER process's output under a reused PID
+# (memory/neuravps-qga-pid-reutilizado-nonce-2026-10-04.md), so this follows the
+# fleet pattern (PR #261/#262): --synchronous 0, the command prints
+# NV-RUN-<nonce> first, the SAME pid is polled until that line shows up, a
+# foreign result is discarded and polled again, and after 3 it gives up. Never
+# relaunches. Short -Command line on purpose (no -EncodedCommand: Defender).
+_GUEST_BOOT_PY=$(cat <<'PY'
+import json, os, subprocess, sys, time
+vmid, budget = sys.argv[1], float(sys.argv[2])
+nonce = os.urandom(16).hex()
+end = time.monotonic() + budget
+
+def qm(*args):
+    left = max(5.0, end - time.monotonic())
+    r = subprocess.run(["qm", "guest", *args], stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=min(60.0, left))
+    return (r.stdout or "") + (r.stderr or "")
+
+def js(raw):
+    try:
+        return json.loads(raw[raw.index("{"):raw.rindex("}") + 1], strict=False)
+    except Exception:
+        return None
+
+def short(raw):
+    return " ".join((raw or "").split())[:160]
+
+ps = ("'NV-RUN-%s';$o=Get-CimInstance Win32_OperatingSystem;"
+      "'BOOT:'+([DateTimeOffset]$o.LastBootUpTime).ToUnixTimeSeconds();"
+      "'NOW:'+([DateTimeOffset](Get-Date)).ToUnixTimeSeconds();'NV-END-%s'") % (nonce, nonce)
+try:
+    raw = qm("exec", vmid, "--synchronous", "0", "--",
+             "powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+except Exception as e:
+    print("FAIL exec-error " + short(str(e))); sys.exit()
+d = js(raw)
+pid = d.get("pid") if isinstance(d, dict) else None
+if not pid:
+    print("FAIL exec-error " + short(raw)); sys.exit()
+foreign = 0
+while True:
+    if time.monotonic() > end:
+        print("FAIL guest-timeout pid=%s" % pid); sys.exit()
+    try:
+        raw = qm("exec-status", vmid, str(pid))
+    except subprocess.TimeoutExpired:
+        continue
+    d = js(raw)
+    if not isinstance(d, dict):
+        print("FAIL exec-status-error pid=%s %s" % (pid, short(raw))); sys.exit()
+    if not d.get("exited"):
+        time.sleep(1); continue
+    body = (d.get("out-data") or "").lstrip("﻿ \t\r\n")
+    first, _, rest = body.partition("\n")
+    if first.strip() != "NV-RUN-" + nonce:
+        foreign += 1
+        if foreign >= 3:
+            print("FAIL foreign-result pid=%s" % pid); sys.exit()
+        continue
+    break
+vals = {}
+for line in rest.splitlines():
+    k, _, v = line.strip().partition(":")
+    if k in ("BOOT", "NOW") and v.strip().lstrip("-").isdigit():
+        vals[k] = int(v.strip())
+if "NV-END-" + nonce not in rest or "BOOT" not in vals or "NOW" not in vals:
+    print("FAIL unreadable exitcode=%s %s" % (d.get("exitcode"), short(rest))); sys.exit()
+print("OK %d %d %d" % (vals["BOOT"], vals["NOW"], int(time.time())))
+PY
+)
+_guest_boot_read() {
+  local ssh_fn="$1" budget="${2:-45}" out
+  out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${budget}'" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+  case "$out" in
+    "OK "*|"FAIL "*) printf '%s\n' "$out" ;;
+    *) printf 'FAIL node-error %s\n' "${out:0:120}" ;;
+  esac
+}
+
+# After a LIVE move: wait until the guest has run GUEST_REBOOT_SETTLE_S on dest,
+# read the boot time again (retrying while QGA is silent, up to
+# GUEST_REBOOT_DEADLINE_S after resume) and compare. Sets GUEST_REBOOTED=1 and
+# GUEST_REBOOT_DETAIL; a reading that never arrives is only a warning.
+_guest_reboot_postcheck() {
+  [[ -n "$PRE_GUEST_BOOT" && -n "$RESUMED_AT" ]] || return 0
+  local wait_s res="" post="" guest_now="" node_now="" boot_vs_resume
+  wait_s=$(( GUEST_REBOOT_SETTLE_S - (SECONDS - RESUMED_AT) ))
+  if (( wait_s > 0 )); then
+    _info "Waiting ${wait_s}s so the guest has run ${GUEST_REBOOT_SETTLE_S}s on dest before re-reading Windows' boot time…"
+    sleep "$wait_s"
+  fi
+  while :; do
+    res=$(_guest_boot_read dst_ssh 45)
+    if [[ "$res" == "OK "* ]]; then
+      read -r _ post guest_now node_now <<< "$res"
+      break
+    fi
+    (( SECONDS - RESUMED_AT < GUEST_REBOOT_DEADLINE_S )) || break
+    sleep 10
+  done
+  if [[ -z "$post" ]]; then
+    _warn "Could not re-read Windows' boot time on dest ${GUEST_REBOOT_DEADLINE_S}s after resume (${res}). Whether VM ${VMID} rebooted after the migration is UNKNOWN — not treated as a failure; check its System log (BugCheck/Kernel-Power 41) if the customer reports a restart."
+    return 0
+  fi
+  if _guest_boot_changed "$PRE_GUEST_BOOT" "$post"; then
+    GUEST_REBOOTED=1
+    # Guest clock → BASE clock via the node's clock at the same reading.
+    boot_vs_resume="?"
+    if [[ -n "$RESUMED_EPOCH" && "$guest_now" =~ ^[0-9]+$ && "$node_now" =~ ^[0-9]+$ ]]; then
+      boot_vs_resume=$(( post - guest_now + node_now - RESUMED_EPOCH ))
+    fi
+    GUEST_REBOOT_DETAIL="boot time $(date -u -d "@${PRE_GUEST_BOOT}" +%FT%TZ 2>/dev/null || echo "$PRE_GUEST_BOOT") before the move, $(date -u -d "@${post}" +%FT%TZ 2>/dev/null || echo "$post") after it (booted ${boot_vs_resume}s after the VM was seen running on dest)"
+    _log_to_file ERROR "GUEST_REBOOTED vm=${VMID} dest=${DST_NODE}: ${GUEST_REBOOT_DETAIL}"
+  else
+    _ok "Windows did not reboot: boot time unchanged on dest ($(date -u -d "@${post}" +%FT%TZ 2>/dev/null || echo "$post"))."
+  fi
+}
+
+# rc 0 = Windows rebooted between the two readings: the boot time moved later
+# by more than the clock-correction tolerance. Args: pre_boot post_boot [tol].
+_guest_boot_changed() {
+  local pre="$1" post="$2" tol="${3:-$GUEST_REBOOT_TOLERANCE_S}"
+  [[ "$pre" =~ ^[0-9]+$ && "$post" =~ ^[0-9]+$ ]] || return 1
+  (( post - pre > tol ))
 }
 
 # ----- Pre-migration node package convergence ---------------------------------
@@ -1188,6 +1373,11 @@ WAS_STOPPED=0  # 1 if the source VM was stopped pre-migration (we started it tem
 # unreachable with every layer reporting success.
 MIGRATION_DEGRADED=0
 DEGRADED_REASON=""
+PRE_GUEST_BOOT=""   # Windows boot epoch read before a live move ("" = unknown)
+RESUMED_AT=""       # $SECONDS when the dest VM was seen running after it
+RESUMED_EPOCH=""    # same instant, epoch (BASE clock)
+GUEST_REBOOTED=0
+GUEST_REBOOT_DETAIL=""
 
 _rollback() {
   local rc=$?
@@ -1347,13 +1537,17 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   # don't block blindly (older→newer is the SAFE direction): we compare the actual
   # CPU feature FLAGS — if dest is missing any non-trivial flag the source has it's
   # a DOWNGRADE → block; otherwise it's an upgrade/lateral → allow (with a warning;
-  # the guest keeps presenting the source CPU until it's rebooted on dest). Cross-
-  # vendor (AMD<->Intel) and unreadable flags → block. Offline (stopped) source
-  # skips all of this — a cold boot on dest picks up dest's features in any
-  # direction. Named/baseline cpu models (kvm64, x86-64-v2/-v3/-v4, qemu64,
-  # EPYC-*, etc.) also skip — QEMU pins their feature set regardless of host, so
-  # they're migration-safe by design; only `host`/`max` carry the live guest's
-  # real CPU features and need the check.
+  # the guest keeps presenting the source CPU until it's rebooted on dest).
+  # Unreadable flags → block. Offline (stopped) source skips all of this — a
+  # cold boot on dest picks up dest's features in any direction.
+  #
+  # CROSS-VENDOR (AMD<->Intel) is refused for EVERY cpu model, in both
+  # directions, before the host/max branch (2026-10-10). The old belief that
+  # named/baseline models (kvm64, x86-64-v2/-v3/-v4, …) are migration-safe "by
+  # design" holds for the feature set, NOT for the vendor: the guest keeps the
+  # vendor of the node it booted on, and two live AMD→Intel moves of an
+  # x86-64-v4 Windows VM bugchecked (0xA) ~20 s after resume. Within one
+  # vendor, named models still skip the flag comparison below.
   if [[ -n "$ONLINE_FLAG" ]]; then
     CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
     CPU_MODEL=""
@@ -1373,27 +1567,28 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
                | grep -A1 -x -- '-cpu' | tail -1 | tr -d '\r' || true)
     if [[ -n "$_run_cpu" && "$_run_cpu" != "-cpu" ]]; then
       _run_model="${_run_cpu%%,*}"
+      # PVE runs its x86-64-v2/-v3/-v4 models as `-cpu qemu64,+flags…`, so
+      # "qemu64" on the cmdline of a v-model VM is that same model, not a
+      # pending change (the 2026-10-10 log warned about it on every move).
+      if [[ "$_run_model" == "qemu64" && "$CPU_MODEL" == x86-64-v* ]]; then
+        _run_model="$CPU_MODEL"
+      fi
       if [[ -n "$_run_model" && "$_run_model" != "$CPU_MODEL" ]]; then
         _warn "VM config says cpu=${CPU_MODEL:-<proxmox default>} but the RUNNING guest was started with '${_run_model}' (pending change, applies on its next reboot) — the compatibility check follows what is actually running."
         CPU_MODEL="$_run_model"
       fi
     fi
     _cpu_lc=$(printf '%s' "$CPU_MODEL" | tr '[:upper:]' '[:lower:]')
+    SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
+    DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
+    _live_cross_vendor_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
     if [[ "$_cpu_lc" == "host" || "$_cpu_lc" == "max" ]]; then
       _info "VM uses cpu=${CPU_MODEL} (host passthrough) on a LIVE migration — verifying source/dest CPU compatibility…"
-      SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
-      DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
-      [[ "$SRC_CPU_SIG" == *"|"*"|"* ]] || _die "Could not read source ${SRC_NODE} CPU signature for the cpu=host compatibility check (got: '${SRC_CPU_SIG}'). Aborting before any VM state is touched."
-      [[ "$DST_CPU_SIG" == *"|"*"|"* ]] || _die "Could not read dest ${DST_NODE} CPU signature for the cpu=host compatibility check (got: '${DST_CPU_SIG}'). Aborting before any VM state is touched."
       if [[ "$SRC_CPU_SIG" == "$DST_CPU_SIG" ]]; then
         _ok "CPU identical — source and dest are both [${SRC_CPU_SIG//|/ }] (vendor family model); live cpu=host migration is safe."
       else
-        # CPUs differ. Cross-vendor is never compatible; otherwise decide
+        # CPUs differ, same vendor (cross-vendor already refused above): decide
         # upgrade-vs-downgrade by comparing actual feature flags.
-        SRC_VENDOR="${SRC_CPU_SIG%%|*}"; DST_VENDOR="${DST_CPU_SIG%%|*}"
-        if [[ "$SRC_VENDOR" != "$DST_VENDOR" ]]; then
-          _die "CPU mismatch (cross-vendor) — refusing live cpu=host migration. Source ${SRC_NODE} is ${SRC_VENDOR}, dest ${DST_NODE} is ${DST_VENDOR}; a guest started on one vendor cannot resume on the other. Stop the VM and migrate offline, or use a baseline cpu model. Aborting before any VM state is touched."
-        fi
         _info "CPUs differ (src [${SRC_CPU_SIG//|/ }] → dst [${DST_CPU_SIG//|/ }]); comparing feature flags to tell an upgrade from a downgrade…"
         SRC_FLAGS=$(_node_cpu_flags src_ssh || true)
         DST_FLAGS=$(_node_cpu_flags dst_ssh || true)
@@ -1431,7 +1626,7 @@ PY
         _warn "Cross-generation UPGRADE: dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is a feature superset of source ${SRC_NODE} [${SRC_CPU_SIG//|/ }]${_gained:+ (dest adds:${_gained})} — live cpu=host migration permitted. NOTE: VM ${VMID} keeps presenting the SOURCE CPU until it is rebooted on dest, so it won't use the new features until then."
       fi
     else
-      _info "VM cpu model=${CPU_MODEL:-<proxmox default>} (not host passthrough) — CPU compatibility pre-check not required."
+      _info "VM cpu model=${CPU_MODEL:-<proxmox default>} (not host passthrough), same CPU vendor (${SRC_CPU_SIG%%|*}) — feature-flag check not required."
     fi
   fi
 
@@ -1636,6 +1831,22 @@ PY
     done
   }
 
+  # 4c) Windows boot time BEFORE a live move, to tell afterwards whether the
+  # guest rebooted (exit 86). Read-only; a missing reading only disables the
+  # check, it never blocks the migration.
+  if [[ -n "$ONLINE_FLAG" && "$GUEST_REBOOT_CHECK" == "1" ]]; then
+    _src_ostype=$(src_ssh "qm config '${VMID}'" 2>/dev/null | awk -F': ' '/^ostype:/{print $2; exit}' | tr -d '\r' || true)
+    if [[ "${_src_ostype:-}" == win* ]]; then
+      _boot_res=$(_guest_boot_read src_ssh 45)
+      if [[ "$_boot_res" == "OK "* ]]; then
+        read -r _ PRE_GUEST_BOOT _ _ <<< "$_boot_res"
+        _info "Windows boot time before the move: $(date -u -d "@${PRE_GUEST_BOOT}" +%FT%TZ 2>/dev/null || echo "$PRE_GUEST_BOOT") (guest agent)."
+      else
+        _warn "Could not read Windows' boot time over the guest agent before the move (${_boot_res}); a guest reboot after the migration will NOT be detected for VM ${VMID}."
+      fi
+    fi
+  fi
+
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   BALLOON_HISTORY=""
   if [[ "$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162* ]]; then
@@ -1711,6 +1922,7 @@ PY
     # regardless, and routing is committed to dest below (gated on NAT, not on
     # the guest being up).
     if _ensure_running_dst "$POST_MIGRATE_RUN_TIMEOUT"; then
+      RESUMED_AT=$SECONDS; RESUMED_EPOCH=$(date +%s)
       _ok "VM ${VMID} is running on dest ${DST_NODE}."
     else
       _post_run=$(dst_ssh "qm status '${VMID}'" 2>/dev/null | awk -F': ' '/status:/{print $2; exit}' | tr -d '\r' || true)
@@ -1999,6 +2211,14 @@ fi
 # le fuerza ningun cortafuegos ni hay que apagarla luego. El bloque que hacia
 # `qm shutdown` + restaurar `vm-no-internet` se elimino con el encendido.)
 
+# Did Windows survive the live move? (exit 86 below; never a rollback)
+if [[ "$DST_STATUS" == "running" ]]; then
+  _guest_reboot_postcheck
+fi
+if (( GUEST_REBOOTED == 1 && MIGRATION_DEGRADED == 1 )); then
+  DEGRADED_REASON="${DEGRADED_REASON}; Windows also REBOOTED after the move (${GUEST_REBOOT_DETAIL})"
+fi
+
 if (( MIGRATION_DEGRADED == 1 )); then
   # MIGRATION_DONE is already 1, so the EXIT trap only closes SSH — nothing is
   # rolled back and the VM stays where it is. We exit non-zero purely to tell
@@ -2026,6 +2246,14 @@ except Exception as e:  # noqa: BLE001
     sys.stderr.write(f"degraded-page failed: {e}\n")
 PYDEG
   _die "MIGRATION_DEGRADED vm=${VMID} dest=${DST_NODE}: ${DEGRADED_REASON}. The VM is running on the destination but the CUSTOMER CANNOT REACH IT. Manual fix: re-run 'migrate_vm.sh ${VMID} ${NEW_NODE_NUM}' (idempotent — it retries the in-guest rebind), or apply the netsh reconfig via 'qm guest exec ${VMID}' once the guest agent answers."
+fi
+
+if (( GUEST_REBOOTED == 1 )); then
+  # Not _die: that is exit 1, which means "may still be on source". Here the
+  # move is COMMITTED (routing + Firestore on dest); callers must not retry.
+  _log_to_file ERROR "GUEST_REBOOTED vm=${VMID} ${SRC_NODE} → ${DST_NODE}: exit ${EXIT_GUEST_REBOOTED}"
+  printf '❌ %s\n' "GUEST_REBOOTED vm=${VMID}: la VM ya está en el destino ${DST_NODE} (rutas y Firestore apuntan allí), pero Windows se reinició tras la migración en caliente — ${GUEST_REBOOT_DETAIL}. NO reintentar ni devolverla: la migración está hecha. Revisar el registro System del invitado (BugCheck / Kernel-Power 41) y avisar al cliente si perdió trabajo." >&2
+  exit "$EXIT_GUEST_REBOOTED"
 fi
 
 _ok "Migration complete: VMID=${VMID}  ${SRC_NODE} → ${DST_NODE}  ipv6=${EXPECTED_VM_IPV6}"
