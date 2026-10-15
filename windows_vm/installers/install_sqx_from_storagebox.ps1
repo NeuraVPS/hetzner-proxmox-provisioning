@@ -376,6 +376,106 @@ function Install-SqxLaunchConfiguration {
     }
 }
 
+function Install-SqxUiGpuSandboxFix {
+    <#
+    .NOTES
+      SQX 142/143 ship Electron 28.1.0. On Windows 26100.33650+ (KB5126646,
+      2026-10-14) its sandboxed GPU process dies at start-up and the SQX window
+      closes ("GPU process isn't usable"); the engine stays alive without a
+      window (NeuraVPS VM718, 2026-10-15). The UI takes no flags and Electron
+      loads resources\app.asar before resources\app\, so: extract the asar to
+      resources\app\ (every file checked against the SHA-256 in the asar
+      header), add one line after require('electron') in main.js, and rename
+      app.asar to app.asar.orig-nv<tag>. Same fix as the support agent's
+      fix_sqx_ui_gpu_sandbox (NeuraVPS repo, functions/sqx_ui_gpu.py).
+      Revert: with SQX closed, rename app\ away and app.asar.orig-nv* back.
+      Never fails the install: on any doubt it leaves the original in place.
+    #>
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $rs = Join-Path $InstallRoot 'internal\electron\resources'
+    $asar = Join-Path $rs 'app.asar'
+    $appDir = Join-Path $rs 'app'
+    $tag = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $tmp = Join-Path $rs ('app.nvtmp-' + $tag)
+    $bakName = 'app.asar.orig-nv' + $tag
+    $bak = Join-Path $rs $bakName
+    $line = "app.commandLine.appendSwitch('disable-gpu-sandbox');"
+    $renamed = $false
+    try {
+        if (-not (Test-Path -LiteralPath $asar -PathType Leaf)) {
+            if ((Test-Path -LiteralPath (Join-Path $appDir 'main.js')) -and (Select-String -LiteralPath (Join-Path $appDir 'main.js') -SimpleMatch -Pattern $line -Quiet)) {
+                Write-Host 'SQX UI GPU sandbox fix already in place.'
+            } else {
+                Write-Warning "SQX UI GPU sandbox fix skipped: no $asar"
+            }
+            return
+        }
+        if (Test-Path -LiteralPath (Join-Path $rs 'app.asar.unpacked')) { Write-Warning 'SQX UI GPU sandbox fix skipped: app.asar.unpacked present'; return }
+        if (Test-Path -LiteralPath $appDir) {
+            # A re-run of this installer over a fixed install re-extracts
+            # app.asar; our previous folder is set aside (never deleted).
+            if ((Test-Path -LiteralPath (Join-Path $appDir 'main.js')) -and (Select-String -LiteralPath (Join-Path $appDir 'main.js') -SimpleMatch -Pattern $line -Quiet)) {
+                Rename-Item -LiteralPath $appDir -NewName ('app.prev-nv' + $tag)
+            } else {
+                Write-Warning "SQX UI GPU sandbox fix skipped: $appDir exists and is not ours"
+                return
+            }
+        }
+        $b = [IO.File]::ReadAllBytes($asar)
+        $sha0 = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash
+        $hs = [BitConverter]::ToUInt32($b, 12)
+        $base = 8 + [BitConverter]::ToUInt32($b, 4)
+        $hdr = [Text.Encoding]::UTF8.GetString($b, 16, $hs) | ConvertFrom-Json
+        $sha = [Security.Cryptography.SHA256]::Create()
+        function Expand-NvAsarNode($node, [string]$dir) {
+            foreach ($pr in $node.files.PSObject.Properties) {
+                $name = $pr.Name; $v = $pr.Value
+                if ($name -notmatch '^[A-Za-z0-9 ._@+=,~#-]+$' -or $name -eq '.' -or $name -eq '..') { throw "unsafe asar entry name: $name" }
+                $fp = Join-Path $dir $name
+                $names = $v.PSObject.Properties.Name
+                if ($names -contains 'files') { New-Item -ItemType Directory -Path $fp -Force | Out-Null; Expand-NvAsarNode $v $fp; continue }
+                if ($names -contains 'link' -or ($names -contains 'unpacked' -and $v.unpacked)) { throw "unsupported asar entry: $name" }
+                $n = [int]$v.size; $o = $base + [int64]$v.offset
+                if ($n -lt 0 -or $o + $n -gt $b.Length) { throw "asar entry out of range: $name" }
+                $buf = New-Object byte[] $n
+                [Array]::Copy($b, $o, $buf, 0, $n)
+                if ($v.integrity -and $v.integrity.hash) {
+                    $h = -join ($sha.ComputeHash($buf) | ForEach-Object { $_.ToString('x2') })
+                    if ($h -ne $v.integrity.hash.ToLower()) { throw "integrity mismatch: $name" }
+                }
+                [IO.File]::WriteAllBytes($fp, $buf)
+            }
+        }
+        New-Item -ItemType Directory -Path $tmp | Out-Null
+        Expand-NvAsarNode $hdr $tmp
+        $pkg = Get-Content -LiteralPath (Join-Path $tmp 'package.json') -Raw | ConvertFrom-Json
+        if ($pkg.main -and $pkg.main -ne 'main.js' -and $pkg.main -ne './main.js') { throw "unexpected main entry: $($pkg.main)" }
+        $mj = Join-Path $tmp 'main.js'
+        $m = [IO.File]::ReadAllText($mj)
+        $nl = $m.IndexOf("`n")
+        if ($nl -lt 0) { throw 'unexpected main.js' }
+        $first = $m.Substring(0, $nl).TrimEnd("`r")
+        if ($first -notmatch "^const \{[^}]*\bapp\b[^}]*\} = require\('electron'\);$") { throw "unexpected main.js first line: $first" }
+        $inj = "// NeuraVPS sqx-ui-gpu-sandbox $tag`: after Windows 26100.33650 (KB5126646) the sandboxed GPU process dies and Electron 28 closes the UI. Original: resources\$bakName`n" + $line + "`n"
+        [IO.File]::WriteAllText($mj, $m.Substring(0, $nl + 1) + $inj + $m.Substring($nl + 1), (New-Object Text.UTF8Encoding($false)))
+        Rename-Item -LiteralPath $asar -NewName $bakName
+        $renamed = $true
+        Rename-Item -LiteralPath $tmp -NewName 'app'
+        if ((Get-FileHash -LiteralPath $bak -Algorithm SHA256).Hash -ne $sha0) { throw 'backup hash mismatch' }
+        Write-Host "SQX UI GPU sandbox fix applied (original: $bak)."
+    } catch {
+        Write-Warning "SQX UI GPU sandbox fix not applied: $($_.Exception.Message)"
+        if ($renamed -and -not (Test-Path -LiteralPath $asar) -and (Test-Path -LiteralPath $bak)) {
+            if (Test-Path -LiteralPath $appDir) { Rename-Item -LiteralPath $appDir -NewName ('app.failed-nv' + $tag) -ErrorAction SilentlyContinue }
+            Rename-Item -LiteralPath $bak -NewName 'app.asar' -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Versions whose SQX window is Electron 28.1.0 (see Install-SqxUiGpuSandboxFix).
+$SqxUiGpuSandboxVersions = @('142', '143')
+
 $ExtractRoot = "C:\SQX_$Version"
 $ExeTarget   = Join-Path -Path $ExtractRoot -ChildPath 'StrategyQuantX.exe'
 $DesktopLink = "C:\Users\Public\Desktop\StrategyQuantX v$Version"
@@ -415,6 +515,10 @@ try {
     }
 
     Install-SqxLaunchConfiguration -InstallRoot $ExtractRoot
+
+    if ($Version -in $SqxUiGpuSandboxVersions) {
+        Install-SqxUiGpuSandboxFix -InstallRoot $ExtractRoot
+    }
 
     New-ShellShortcutLnk -ShortcutPath $DesktopLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
     New-ShellShortcutLnk -ShortcutPath $StartMenuLink -TargetPath $ExeTarget -WorkingDirectory $ExtractRoot
