@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch Hetzner's public Robot order page for LTD stock and email soporte@.
+"""Watch Hetzner's public Robot order page for LTD stock and email soporte@ and ivan@.
 
 Why this exists (2026-10-05): the Robot *webservice* API does not list LTD
 products at all (GET /order/server/product has none; GET
@@ -23,6 +23,8 @@ Behaviour, one run (systemd timer, every 10 min, b1 only):
 - the page cannot be fetched or a watched model is missing from it for
   FAIL_EMAIL_AFTER consecutive runs -> one email, then at most one every
   FAIL_EMAIL_EVERY_H hours while it lasts (the page layout may have changed).
+Stock emails ("disponible"/"agotado") go to soporte@ and ivan@ (operator's ask,
+2026-10-16: a window can close in hours); the "sin datos" one only to soporte@.
 State lives in /var/lib/neuravps/ltd-watch/state.json. SMTP is the same
 authenticated Gmail path as neuravps-hw-error-scan (SMTP_PASSWORD in
 /etc/neuravps/hw-error-scan.env, mode 600).
@@ -45,7 +47,8 @@ DEFAULT_WATCH = ["AX102-3-LTD", "AX162-2-LTD"]
 DEFAULT_STATE = "/var/lib/neuravps/ltd-watch/state.json"
 DEFAULT_ENV_FILE = "/etc/neuravps/hw-error-scan.env"
 SMTP_LOGIN = "soporte@neuravps.com"
-SMTP_TO = "soporte@neuravps.com"
+SMTP_TO = ["soporte@neuravps.com"]
+STOCK_TO = ["soporte@neuravps.com", "ivan@neuravps.com"]
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 VAT = 1.19
@@ -118,9 +121,9 @@ def load_smtp_password(env_file):
     return None
 
 
-def send_email(subject, body, env_file, dry_run):
+def send_email(subject, body, env_file, dry_run, to=SMTP_TO):
     if dry_run:
-        print(f"--- DRY RUN email ---\nSubject: {subject}\n\n{body}\n---")
+        print(f"--- DRY RUN email ---\nTo: {', '.join(to)}\nSubject: {subject}\n\n{body}\n---")
         return True
     password = load_smtp_password(env_file)
     if not password:
@@ -129,12 +132,12 @@ def send_email(subject, body, env_file, dry_run):
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = "Soporte NeuraVPS <soporte@neuravps.com>"
-        msg["To"] = SMTP_TO
+        msg["To"] = ", ".join(to)
         msg["Subject"] = subject
         server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
         server.starttls()
         server.login(SMTP_LOGIN, password)
-        server.sendmail(SMTP_LOGIN, [SMTP_TO], msg.as_string())
+        server.sendmail(SMTP_LOGIN, list(to), msg.as_string())
         server.quit()
         return True
     except Exception as e:  # noqa: BLE001
@@ -222,7 +225,7 @@ def main():
                     f"modelos LTD. Hay que pedirlo desde la web.\n\n"
                     f"Estado de los modelos vigilados:\n{summary(seen, args.watch)}\n")
             if send_email(f"[NeuraVPS] Stock LTD: {model} disponible", body,
-                          args.env_file, args.dry_run):
+                          args.env_file, args.dry_run, to=STOCK_TO):
                 cur["notifiedAt"] = now
             else:
                 cur["status"] = prev_status  # retry the alert on the next run
@@ -232,7 +235,7 @@ def main():
                     f"Estuvo disponible unas {hours:.1f} h desde el aviso.\n\n"
                     f"Estado de los modelos vigilados:\n{summary(seen, args.watch)}\n")
             send_email(f"[NeuraVPS] Stock LTD: {model} agotado", body,
-                       args.env_file, args.dry_run)
+                       args.env_file, args.dry_run, to=STOCK_TO)
         else:
             cur["notifiedAt"] = prev.get("notifiedAt")
         models[model] = cur

@@ -12,11 +12,11 @@ an `Order product` submit button, one out of stock a disabled `Not available` bu
 Prices on that page include German VAT (19 %).
 
 **What it does:** every 10 min on **b1 only** (`0000001-BASE`), fetch that page, parse
-the product boxes, and email `soporte@neuravps.com`:
+the product boxes, and email:
 - `[NeuraVPS] Stock LTD: <model> disponible` when a watched model becomes orderable
-  (once per stock window);
-- `[NeuraVPS] Stock LTD: <model> agotado` when it stops being orderable;
-- `[NeuraVPS] Vigilante LTD sin datos` after 6 consecutive runs (1 h) unable to read the
+  (once per stock window) — to `soporte@neuravps.com` and `ivan@neuravps.com`;
+- `[NeuraVPS] Stock LTD: <model> agotado` when it stops being orderable — same two;
+- `[NeuraVPS] Vigilante LTD sin datos` (only `soporte@`) after 6 consecutive runs (1 h) unable to read the
   page or find a watched model, then at most once a day while it lasts.
 
 Watched by default: `AX102-3-LTD` (MT5) and `AX162-2-LTD` (SQX); change with `--watch`.
