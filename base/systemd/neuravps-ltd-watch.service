@@ -1,5 +1,5 @@
 [Unit]
-Description=NeuraVPS: watch Hetzner's public Robot order page for LTD stock and email soporte@ (read-only, cannot order)
+Description=NeuraVPS: watch Hetzner's public Robot order page for LTD stock and email soporte@/ivan@ (read-only, cannot order)
 After=network-online.target
 
 [Service]
