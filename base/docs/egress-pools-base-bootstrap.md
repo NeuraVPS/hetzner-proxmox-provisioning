@@ -176,7 +176,9 @@ por BASE; no promete una reconstrucción E2E por un único comando.
    `nuestras4`; para hierro nuevo actualizar también sus IPs principales en
    `nuestras4/6` y las listas permitidas. Confirmar reglas y sets en vivo y
    persistidos. El endurecimiento de aislamiento se aplica después de construir
-   los forwards que modifica, antes de recibir tráfico.
+   los forwards que modifica, antes de recibir tráfico. Con las dos bases en
+   pie, lanzar desde el puesto de operador `base/sweepguard/setup_session_peer.sh
+   b0 b1` (memoria de sesiones compartida; sin él, cada base usa solo la suya).
 9. Ejecutar `systemctl enable --now neuravps-base-tunnels.service` y
    `systemctl enable --now base-nat-boot.service`, seguido de:
 

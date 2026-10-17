@@ -69,6 +69,15 @@ conntrack detectors skip any flow whose ORIGINAL destination is outside the
 same set. The set lives in nftables (`nuestras4` / `nuestras6` in each
 rdpguard table) so there is ONE list; if it is missing this script falls back
 to the old behaviour (no destination filter) and says so in the log.
+
+A proven RDP session also exempts from port diversity (2026-10-17)
+------------------------------------------------------------------
+A partner who logs into many customers' VPS touched 20 machines from one IP and
+was blocked 24h on b1, half an hour after proving an RDP session on b0. Port
+diversity now spares a source with a proven session in the last
+`sessionMemorySeconds` (30 days) below `sweepMaxWithSession` machines (150),
+and b0/b1 share that memory (see fetch_peer_sessions). 30 days of journal on
+both bases: of 9521 port blocks, that one was the only one it would have saved.
 """
 import ipaddress
 import json
@@ -95,7 +104,18 @@ DEFAULTS = {
     "hotPortMaxIdle": 300,
     # Cuanto se recuerda que una fuente demostro una sesion RDP (UDP con
     # respuesta a un 2xxxx). 0 = sin memoria (solo cuenta la sesion de ahora).
-    "sessionMemorySeconds": 86400,
+    # 30 dias desde el 17/10/2026: un socio que entra en VPS de clientes de vez
+    # en cuando debe seguir contando como sesion probada (ver sweep_with_session).
+    "sessionMemorySeconds": 30 * 86400,
+    # Una fuente con sesion probada no se bloquea por diversidad de puertos
+    # salvo que toque al menos tantas MAQUINAS. 30 dias b0+b1: 7975 bloqueos en
+    # 20-29, 757 en 50-149 y 19 en 150+; el unico con sesion, 20.
+    "sweepMaxWithSession": 150,
+    # Base par con la que se comparte la memoria de sesiones (pull por SSH con
+    # orden forzada, ver fetch_peer_sessions). None = PEER_V4 de PEER_ENV;
+    # "" = no compartir.
+    "sessionPeer": None,
+    "sessionPeerTimeout": 15,
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
     # El detector hot-port es el UNICO ambiguo: el dueño legitimo del puerto
@@ -433,9 +453,120 @@ def save_sessions(sessions, path=None):
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(sessions, fh)
-        os.replace(tmp, path)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)       # la base par lee este fichero: nunca a medias
     except Exception as exc:
         log(f"sessions memory not saved ({exc})")
+
+
+# --- memoria compartida entre b0 y b1 (17/10/2026) ----------------------------
+#
+# Un cliente entra por la base que le toque, y puede cambiar de una pasada a
+# otra. El 17/10 un socio demostro sesion en b0 a las 09:34Z y b1, que no lo
+# sabia, le bloqueo 24 h a las 10:04Z. Cada pasada LEE el fichero de la otra
+# base y fusiona por la marca mas reciente; nunca escribe en ella. El canal es
+# una clave propia (PEER_KEY) que en la otra base solo puede ejecutar
+# `cat sessions.json` (command= forzado, restrict, from=), con la clave de host
+# de la otra base fijada en PEER_KNOWN_HOSTS. Cualquier fallo deja solo la
+# memoria local, que es lo de antes: el detector nunca queda mas laxo.
+PEER_ENV = "/etc/neuravps/failover-watchdog.env"
+PEER_KEY = "/root/.ssh/sweepguard_peer"
+PEER_KNOWN_HOSTS = "/var/lib/neuravps-sweepguard/peer_known_hosts"
+PEER_MAX_BYTES = 16 * 1024 * 1024
+
+
+def session_peer(cfg):
+    """Direccion de la base par, o None si no hay que compartir."""
+    peer = cfg.get("sessionPeer")
+    if peer is not None:
+        return peer or None
+    try:
+        with open(PEER_ENV) as fh:
+            for ln in fh:
+                k, _, v = ln.strip().partition("=")
+                if k == "PEER_V4" and v.strip():
+                    return v.strip().strip('"')
+    except OSError:
+        pass
+    return None
+
+
+def parse_peer_sessions(raw, now):
+    """JSON de la base par -> {addr: epoch} validado. Lanza ValueError si no es
+    un objeto; las entradas raras se descartan una a una (direccion que no es
+    IP, marca no numerica o del futuro)."""
+    d = json.loads(raw)
+    if not isinstance(d, dict):
+        raise ValueError("not a JSON object")
+    out = {}
+    for a, t in d.items():
+        try:
+            addr = ipaddress.ip_address(str(a)).compressed
+            t = float(t)
+        except (ValueError, TypeError):
+            continue
+        if t != t or t > now + 300:              # NaN o reloj de la otra base adelantado
+            continue
+        out[addr] = t
+    return out
+
+
+def merge_sessions(local, peer):
+    """Fusiona en sitio por la marca maxima. Devuelve cuantas fuentes no
+    estaban en la memoria local."""
+    new = 0
+    for a, t in peer.items():
+        prev = local.get(a)
+        if prev is None:
+            new += 1
+        if prev is None or t > prev:
+            local[a] = t
+    return new
+
+
+def fetch_peer_sessions(cfg, now=None):
+    """Memoria de sesiones de la base par, o None si no se pudo leer (y se dice
+    en el log). Nunca lanza."""
+    peer = session_peer(cfg)
+    if not peer:
+        return None
+    now = time.time() if now is None else now
+    tmo = cfg["sessionPeerTimeout"]
+    cmd = ["ssh", "-i", PEER_KEY, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+           "-o", f"ConnectTimeout={max(1, tmo // 3)}", "-o", "StrictHostKeyChecking=yes",
+           "-o", f"UserKnownHostsFile={PEER_KNOWN_HOSTS}", "-o", "LogLevel=ERROR",
+           f"root@{peer}", "sessions"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=tmo)
+        if r.returncode != 0:
+            raise RuntimeError(f"ssh rc={r.returncode}: "
+                               f"{' '.join(r.stderr.decode(errors='replace').split())[:200]}")
+        if len(r.stdout) > PEER_MAX_BYTES:
+            raise RuntimeError(f"{len(r.stdout)} bytes, over {PEER_MAX_BYTES}")
+        return parse_peer_sessions(r.stdout.decode(), now)
+    except Exception as exc:
+        log(f"sessions: peer {peer} unreadable ({exc}) — local memory only")
+        return None
+
+
+def sweep_with_session(addr, metric, sessions, cfg, now=None):
+    """¿Se perdona a esta fuente el bloqueo por diversidad de puertos?
+
+    Si demostro una sesion RDP (`proves_rdp_session`) en esta base o en la par
+    dentro de `sessionMemorySeconds`, no es un barredor: es alguien que entra en
+    muchas maquinas con credenciales buenas (un socio que administra VPS de
+    clientes, una oficina tras un NAT). Un barredor no llega al UDP de RDP. Por
+    encima de `sweepMaxWithSession` maquinas se bloquea igual: con una sesion
+    buena tambien se puede barrer. Devuelve (perdonada, epoch de la sesion)."""
+    memory = cfg["sessionMemorySeconds"]
+    t = sessions.get(canon(addr)) if sessions else None
+    if memory <= 0 or t is None:
+        return False, None
+    now = time.time() if now is None else now
+    if now - t > memory or metric >= cfg["sweepMaxWithSession"]:
+        return False, t
+    return True, t
 
 
 def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None):
@@ -544,10 +675,11 @@ def hot_port_abusers(family, cfg, ours=None, sessions=None):
        un flujo UDP con respuesta hacia un 2xxxx solo existe despues de un
        inicio de sesion correcto. Es el arbitro que faltaba ("correlacionar el
        4624 con la fuente") y la base lo ve sin mirar dentro del invitado. Se
-       recuerda `sessionMemorySeconds` (24 h) para cubrir al dueño que
+       recuerda `sessionMemorySeconds` (30 dias) para cubrir al dueño que
        reconecta cuando su VM, atacada, deja de responder (caso 29/07): en ese
        momento su UDP ya no esta, pero la sesion de hace un rato si. La
-       fuente sigue sometida a los limites de ritmo y a los detectores 1 y 2.
+       fuente sigue sometida a los limites de ritmo, al detector 2 y al 1 a
+       partir de `sweepMaxWithSession` maquinas.
 
     Los discriminantes que fallaron el 29/07 siguen descartados: bytes (el
     camino de datos no se contabiliza aqui; nf_conntrack_acct esta a 0),
@@ -579,12 +711,26 @@ def run_family(family, cfg, sessions=None):
     if ours is None:
         log(f"{family}: set {GUARDED_SET[family]} not found — conntrack detectors "
             f"count EVERY destination (guest Internet egress included)")
-    # tres detectores independientes; la razon se conserva para el log
-    cand = {a: ("ports", n, None) for a, n in sweepers(family, cfg).items()}
+    # tres detectores independientes; la razon se conserva para el log.
+    # hot-port va primero porque es el que anota en `sessions` las sesiones RDP
+    # que se ven ahora, y diversidad de puertos las consulta.
+    hot = hot_port_abusers(family, cfg, ours, sessions)
+    cand = {}
+    for a, n in sweepers(family, cfg).items():
+        spared, t = sweep_with_session(a, n, sessions, cfg)
+        if spared:
+            log(f"{family}: SKIP {a} ({n} ports) — RDP session proven "
+                f"{int((time.time() - t) // 60)} min ago (b0/b1 memory): "
+                f"not judged by port diversity under {cfg['sweepMaxWithSession']}")
+            continue
+        if t is not None and n >= cfg["sweepMaxWithSession"]:
+            log(f"{family}: NOTE {a} has a proven RDP session but touches {n} "
+                f"machines (>= sweepMaxWithSession) — judged as usual")
+        cand[a] = ("ports", n, None)
     for a, n in flooders(family, cfg, ours).items():
         if a not in cand:                      # diversidad de puertos manda
             cand[a] = ("conns", n, None)
-    for a, (n, port) in hot_port_abusers(family, cfg, ours, sessions).items():
+    for a, (n, port) in hot.items():
         if a not in cand:
             cand[a] = ("hotport", n, port)
     if not cand:
@@ -677,6 +823,11 @@ def main(argv=None):
         return 0
 
     sessions = load_sessions()
+    peer = fetch_peer_sessions(cfg)
+    if peer is not None:
+        new = merge_sessions(sessions, peer)
+        log(f"sessions: {len(peer)} from peer {session_peer(cfg)}, {new} new here, "
+            f"{len(sessions)} in shared memory")
     total = 0
     for family in ("ip", "ip6"):
         try:
