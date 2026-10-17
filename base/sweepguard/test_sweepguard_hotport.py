@@ -171,8 +171,8 @@ def test_customer_20260729_owner_reconnecting_remembered_session():
     lines = [syn(ip, 20509) for _ in range(6)] + attackers_on(20509)
     abusers, skipped = scan(lines, sessions, now=NOW)
     assert ip not in abusers and skipped[ip][2] == "RDP session in memory"
-    # la memoria caduca: 25 h despues ya no le protege
-    abusers, _ = scan(lines, sessions, now=NOW - 3600 + 25 * 3600)
+    # la memoria caduca: 31 dias despues ya no le protege (30 desde el 17/10/2026)
+    abusers, _ = scan(lines, sessions, now=NOW - 3600 + 31 * 86400)
     assert ip in abusers and ip not in sessions
 
 

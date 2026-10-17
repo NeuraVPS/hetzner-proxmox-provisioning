@@ -73,7 +73,14 @@ judges NATIVE v6 clients (NAT66).
     hotPortMaxIdle       an ESTABLISHED connection is live if its last packet is
                          at most this old, in seconds (300 = one pass)
     sessionMemorySeconds how long a proven RDP session keeps a source out of the
-                         hot-port detector (86400; 0 = only the current one)
+                         hot-port detector, and out of port diversity below
+                         sweepMaxWithSession (30 days since 2026-10-17, was
+                         86400; 0 = no memory and no port-diversity exemption)
+    sweepMaxWithSession  machines at which a source with a proven session IS
+                         blocked by port diversity anyway (150)
+    sessionPeer          the other BASE to share the session memory with (null =
+                         PEER_V4 from /etc/neuravps/failover-watchdog.env; "" = off)
+    sessionPeerTimeout   seconds for the whole read from the other BASE (15)
     hotPortBlockSeconds  how long a hot-port block lasts (3600)
 
 No base carries this file today (checked 2026-09-27 on b0 and b1): the
@@ -427,3 +434,61 @@ install on a new base) installs `/root/sweepguard.py` the same way.
 
 Tests: `python3 base/sweepguard/test_sweepguard_hotport.py` (cases from the
 samples and the three customers).
+
+## A proven session also counts for port diversity, and b0/b1 share it (2026-10-17)
+
+`90.249.134.23`, a partner who logs into many customers' VPS, proved an RDP
+session on b0 at 09:34Z and was blocked for 24h on b1 at 10:04Z with
+`20 distinct ports` — the threshold exactly. Two holes: port diversity ignored
+the session memory, and each BASE had its own.
+
+**Rule** (`sweep_with_session`, called from `run_family`). A source with a
+proven RDP session (`proves_rdp_session`, the same evidence hot-port uses) in
+the last `sessionMemorySeconds` is not blocked by port diversity unless it
+touches `sweepMaxWithSession` (150) machines or more. It is logged:
+
+    ip: SKIP <addr> (20 ports) — RDP session proven 31 min ago (b0/b1 memory): not judged by port diversity under 150
+    ip: NOTE <addr> has a proven RDP session but touches 160 machines (>= sweepMaxWithSession) — judged as usual
+
+Hot-port now runs first in each pass so a session seen right now is already in
+memory when port diversity looks. The flood detector (`maxConns`) and the rate
+limits are unchanged and still apply to a spared source.
+
+**Shared memory.** Each pass reads the other BASE's `sessions.json` over SSH
+(`fetch_peer_sessions`), validates it (IP addresses, numeric timestamps, none
+in the future, ≤16 MiB), merges by the most recent timestamp and saves locally
+with an atomic, fsynced replace — so the file the other BASE reads is never
+half-written. It never writes to the other BASE. The channel
+(`setup_session_peer.sh b0 b1`, idempotent, from the operator box):
+
+* a dedicated key `/root/.ssh/sweepguard_peer` on each BASE;
+* on the other BASE, `from="<its main IP>",restrict,command="cat
+  /var/lib/neuravps-sweepguard/sessions.json"` — that key can do nothing else;
+* the other BASE's host key pinned in
+  `/var/lib/neuravps-sweepguard/peer_known_hosts` (`StrictHostKeyChecking=yes`),
+  checked against the one the operator sees. A forged file could only spare a
+  source from port diversity below 150 machines, but it is still not accepted
+  from an unverified host.
+
+If the read fails (peer down, BASE replaced and host key no longer matching,
+timeout) the pass logs `sessions: peer <ip> unreadable (...) — local memory
+only` and carries on with the local memory: exactly the behaviour before this
+change. A successful pass logs `sessions: N from peer <ip>, M new here, T in
+shared memory`. **When a BASE is replaced, rerun `setup_session_peer.sh`.**
+There was no SSH trust between the bases before this (both refused each
+other's keys, checked 2026-10-17); `/root/peers.sh` only repoints the watchdog.
+
+**Size.** On 2026-10-17 the 24h memory held 92 sources on b0 and 402 on b1.
+Thirty days without a single repeat would be ~15000 entries (~0.6 MB);
+`SESSIONS_MAX` (50000, oldest dropped) caps it at ~2 MB.
+
+**Replay** of 30 days of journal on both bases (2026-09-17 → 10-17) against
+`sessions.json` of both bases plus every hot-port `SKIP … RDP session` line:
+9521 port-diversity blocks (b0 4415, b1 5106); 482 sources with session
+evidence; **exactly one block would have been avoided — `90.249.134.23`**, and
+no blocked source had evidence only after its block or above the cap. Sizes of
+those 9521 blocks: 7975 at 20-29 machines, 770 at 30-49, 757 at 50-149, 19 at
+150+. Caveat: before this change the memory lasted 24h, so older sessions are
+not in the evidence; the replay is a lower bound on what 30 days would spare.
+
+Tests: `python3 base/sweepguard/test_sweepguard_sessions.py`.
