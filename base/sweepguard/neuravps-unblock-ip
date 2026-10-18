@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Quita UNA direccion de los bloqueos AUTOMATICOS de sweepguard (18/10/2026).
+
+Lo llama el boton «Desbloquear mi IP» del panel de cliente (Cloud Function
+`unblock_my_ip`) por SSH, con una clave propia que en /root/.ssh/authorized_keys
+solo puede ejecutar este fichero:
+
+    restrict,command="/usr/local/sbin/neuravps-unblock-ip" ssh-ed25519 AAAA... neuravps-unblock-ip@functions
+
+La peticion llega en SSH_ORIGINAL_COMMAND y solo se acepta exactamente
+`unblock <ip>`, con una direccion IPv4 o IPv6 global. Todo lo demas se rechaza
+sin tocar nada. Para probar a mano: `neuravps-unblock-ip unblock 203.0.113.7`.
+
+Que hace, y nada mas:
+  1. Si la direccion esta en `bf_static` (bloqueo manual) no toca nada y
+     contesta `static`: eso lo decide una persona.
+  2. Si esta en `bf_auto`, la quita, borra sus entradas de `bf_seen` y sus
+     conexiones de conntrack, y contesta `unblocked`. Si no esta, `not_blocked`.
+
+Por que tambien `bf_seen`: el detector de diversidad de puertos cuenta los
+puertos distintos que esa fuente dejo en `bf_seen` (6 h). Mientras dura el
+bloqueo no se anota nada nuevo, pero lo de antes sigue ahi: sin vaciarlo, la
+pasada siguiente (<= 5 min) volveria a bloquear a la misma fuente por los
+mismos puertos. Las conexiones de conntrack, por lo mismo para los detectores
+de flood y hot-port (el bloqueo congela sus conexiones en ESTABLISHED).
+
+Nunca toca `bf_allow`, `bf_static`, las reglas ni la memoria de sesiones.
+
+Salida: una linea JSON. Codigo 0 si se atendio (sea cual sea el resultado),
+2 si la peticion no es valida, 1 si algo fallo en la base.
+"""
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import syslog
+
+TABLE = "rdpguard"
+LOCK = "/run/neuravps-unblock-ip.lock"
+# Nada de comillas, espacios de mas ni otros caracteres: el resto se rechaza.
+REQUEST_RE = re.compile(r"\Aunblock ([0-9A-Fa-f:.]{2,45})\Z")
+NFT_TIMEOUT = 20
+
+
+class BadRequest(ValueError):
+    pass
+
+
+def parse_request(raw):
+    """`unblock <ip>` -> ipaddress normalizado. Lanza BadRequest."""
+    m = REQUEST_RE.match(raw or "")
+    if not m:
+        raise BadRequest("expected: unblock <ip>")
+    try:
+        ip = ipaddress.ip_address(m.group(1))
+    except ValueError:
+        raise BadRequest("not an IP address")
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if not ip.is_global:
+        raise BadRequest("not a global address")
+    return ip
+
+
+def family_of(ip):
+    return "ip" if ip.version == 4 else "ip6"
+
+
+def run(cmd, stdin=None):
+    return subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                          timeout=NFT_TIMEOUT)
+
+
+def set_exists(fam, name):
+    # -t: sin elementos (bf_static tiene ~14.000 en v4)
+    return run(["nft", "-t", "list", "set", fam, TABLE, name]).returncode == 0
+
+
+def in_set(fam, name, addr):
+    """True/False si la direccion esta en el set. Solo se llama con sets que
+    existen: un error que no sea «no esta» se propaga."""
+    r = run(["nft", "get", "element", fam, TABLE, name, "{ %s }" % addr])
+    if r.returncode == 0:
+        return True
+    if "No such file or directory" in r.stderr:
+        return False
+    raise RuntimeError(f"nft get element {name}: {' '.join(r.stderr.split())[:160]}")
+
+
+def seen_ports(fam, addr):
+    """Puertos que `bf_seen` tiene anotados para esta fuente."""
+    r = run(["nft", "-j", "list", "set", fam, TABLE, "bf_seen"])
+    if r.returncode != 0:
+        return []
+    ports = []
+    for obj in json.loads(r.stdout).get("nftables", []):
+        for e in (obj.get("set") or {}).get("elem", []) or []:
+            val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
+            concat = val.get("concat") if isinstance(val, dict) else None
+            if not concat or len(concat) != 2:
+                continue
+            try:
+                same = ipaddress.ip_address(str(concat[0])) == addr
+            except ValueError:
+                continue
+            if same and isinstance(concat[1], int):
+                ports.append(concat[1])
+    return ports
+
+
+def forget_seen(fam, addr):
+    """Borra las entradas (addr . puerto) de bf_seen. Devuelve cuantas."""
+    ports = seen_ports(fam, addr)
+    if not ports:
+        return 0
+    batch = "".join(f"delete element {fam} {TABLE} bf_seen {{ {addr} . {p} }}\n"
+                    for p in ports)
+    if run(["nft", "-f", "-"], stdin=batch).returncode == 0:
+        return len(ports)
+    # Alguna caduco entre la lectura y el borrado: la transaccion entera falla.
+    done = 0
+    for p in ports:
+        if run(["nft", "delete", "element", fam, TABLE, "bf_seen",
+                "{ %s . %d }" % (addr, p)]).returncode == 0:
+            done += 1
+    return done
+
+
+def flush_conntrack(fam, addr):
+    r = run(["conntrack", "-D", "-f", "ipv4" if fam == "ip" else "ipv6",
+             "-s", str(addr)])
+    m = re.search(r"(\d+) flow entr", r.stderr + r.stdout)
+    return int(m.group(1)) if m else 0
+
+
+def unblock(ip):
+    fam = family_of(ip)
+    addr = str(ip)
+    out = {"ip": addr, "family": fam}
+    if set_exists(fam, "bf_static") and in_set(fam, "bf_static", addr):
+        out["result"] = "static"
+        return out
+    if not in_set(fam, "bf_auto", addr):
+        out["result"] = "not_blocked"
+        return out
+    r = run(["nft", "delete", "element", fam, TABLE, "bf_auto", "{ %s }" % addr])
+    if r.returncode != 0 and in_set(fam, "bf_auto", addr):
+        raise RuntimeError(f"nft delete bf_auto: {' '.join(r.stderr.split())[:160]}")
+    out["result"] = "unblocked"
+    out["seenForgotten"] = forget_seen(fam, ip)
+    out["conntrackDeleted"] = flush_conntrack(fam, addr)
+    return out
+
+
+def main(argv):
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if raw is None:                      # a mano: neuravps-unblock-ip unblock <ip>
+        raw = " ".join(argv[1:])
+    via = "ssh" if "SSH_ORIGINAL_COMMAND" in os.environ else "local"
+    syslog.openlog("neuravps-unblock-ip")
+    try:
+        ip = parse_request(raw)
+    except BadRequest as exc:
+        syslog.syslog(syslog.LOG_WARNING, f"rejected ({via}): {exc}: {raw[:80]!r}")
+        print(json.dumps({"ok": False, "error": "bad_request", "detail": str(exc)}))
+        return 2
+    try:
+        with open(LOCK, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            out = unblock(ip)
+    except Exception as exc:  # noqa: BLE001
+        syslog.syslog(syslog.LOG_ERR, f"{ip} ({via}): error {exc}")
+        print(json.dumps({"ok": False, "ip": str(ip), "error": "internal",
+                          "detail": str(exc)[:200]}))
+        return 1
+    out["ok"] = True
+    syslog.syslog(syslog.LOG_NOTICE, f"{ip} ({via}): {json.dumps(out, sort_keys=True)}")
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

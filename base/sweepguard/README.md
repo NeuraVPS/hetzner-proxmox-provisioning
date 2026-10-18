@@ -492,3 +492,55 @@ those 9521 blocks: 7975 at 20-29 machines, 770 at 30-49, 757 at 50-149, 19 at
 not in the evidence; the replay is a lower bound on what 30 days would spare.
 
 Tests: `python3 base/sweepguard/test_sweepguard_sessions.py`.
+
+## «Desbloquear mi IP» desde el panel de cliente (2026-10-18)
+
+Casos que lo motivaron: Diogo (13/10) y Paul (17/10), clientes legítimos en
+`bf_auto` 24 h, sin acceso a NINGUNO de sus VPS ni a la consola VNC, mientras
+la web les funcionaba. Hasta ahora se arreglaba a mano en las dos bases.
+
+**Ojo, `bf_auto` corta TODO lo de esa IP hacia la base**, no solo los forwards
+10000-39999: la regla `ip saddr @bf_auto drop` de `pre` no mira el puerto. Por
+eso una IP bloqueada pierde también el SSH a la base (si no está en
+`bf_allow`, que va antes).
+
+**Cómo funciona.** El panel llama a la Cloud Function `unblock_my_ip` (usuario
+con al menos un servidor activo, 1 por minuto y 5 al día; la IP es el ÚLTIMO
+elemento de `X-Forwarded-For`, el que añade Google). La función entra en cada
+base con una clave propia (secreto `BASE_UNBLOCK_SSH_KEY`, no la de root de la
+flota) que en `authorized_keys` lleva
+`restrict,command="/usr/local/sbin/neuravps-unblock-ip"`, y fija la clave de
+host de cada base. El script (`neuravps-unblock-ip`, en este directorio):
+
+* solo acepta `unblock <ip>` con una dirección global (ni privadas, ni
+  `64:ff9b:1::/96`, ni nada más en la línea);
+* si la IP está en `bf_static` contesta `static` y no toca nada: los
+  bloqueos manuales los quita una persona;
+* si está en `bf_auto`, la quita, **borra sus entradas de `bf_seen`** y sus
+  conexiones de conntrack, y contesta `unblocked`; si no, `not_blocked`.
+
+Lo de `bf_seen` no es un extra: el detector de diversidad de puertos cuenta los
+puertos que la fuente dejó ahí (6 h). Mientras dura el bloqueo no se anota nada
+nuevo, pero lo anterior sigue, y sin vaciarlo la pasada siguiente (≤5 min) la
+volvería a bloquear por los mismos puertos. Conntrack, por lo mismo para flood
+y hot-port. Nunca toca `bf_allow`, `bf_static`, las reglas ni `sessions.json`.
+
+**Lo que NO hace, a propósito:** marcar la IP como «sesión probada». La memoria
+de sesiones solo se alimenta del UDP de RDP, que exige un inicio de sesión
+correcto; un botón que la escribiera dejaría a cualquiera con un VPS de pago
+eximir su IP de dos detectores durante días sin demostrar nada. Tampoco hace
+falta: en cuanto el cliente entra de verdad, sweepguard ve su UDP y lo anota
+(30 días, compartido entre b0 y b1).
+
+Registro: en la base, `journalctl -t neuravps-unblock-ip`; en Firestore,
+`ip_unblock_log` (uid, email, IP, resultado por base).
+
+Instalar o reinstalar (también **al sustituir una base**):
+
+    base/sweepguard/setup_unblock_ip.sh <BASE_UNBLOCK_SSH_KEY.pub> b0 b1
+
+Imprime la clave de host ed25519 de cada base: si cambió, hay que actualizar
+`BASE_HOST_KEYS` en `functions/ip_unblock.py` (repo NeuraVPS) y redesplegar
+`unblock_my_ip`; hasta entonces esa base sale como «no se pudo comprobar».
+
+Tests: `python3 base/sweepguard/test_unblock_ip.py`.
