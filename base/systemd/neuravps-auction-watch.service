@@ -1,0 +1,9 @@
+[Unit]
+Description=NeuraVPS: watch Hetzner's server auction for boxes useful for SQX and email soporte@/ivan@ (read-only, cannot order)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/neuravps-auction-watch.py --base-id %H
+TimeoutStartSec=3m
+SyslogIdentifier=neuravps-auction-watch
