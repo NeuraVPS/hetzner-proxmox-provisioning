@@ -54,6 +54,9 @@ SMTP_PORT = 587
 VAT = 1.19
 FAIL_EMAIL_AFTER = 6          # consecutive failed runs (= 1 h at 10 min)
 FAIL_EMAIL_EVERY_H = 24
+CONFIRM_SECONDS = 60          # re-read the page before announcing new stock (Hetzner page flickers)
+PAGES_DIR = "/var/lib/neuravps/ltd-watch/pages"   # page saved on every status change
+PAGES_KEEP = 60
 
 ORDERABLE, NOT_AVAILABLE = "orderable", "not_available"
 
@@ -164,6 +167,20 @@ def summary(seen, watch):
     return "\n".join(lines)
 
 
+def save_page(page, tag):
+    """Keep the HTML of every status change so we can tell real stock from a flicker."""
+    try:
+        os.makedirs(PAGES_DIR, exist_ok=True)
+        name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + re.sub(r"[^A-Za-z0-9_.-]", "_", tag) + ".html"
+        with open(os.path.join(PAGES_DIR, name), "w", encoding="utf-8") as fh:
+            fh.write(page)
+        files = sorted(os.listdir(PAGES_DIR))
+        for old in files[:-PAGES_KEEP]:
+            os.remove(os.path.join(PAGES_DIR, old))
+    except OSError as e:
+        log(f"ltd-watch: no se pudo guardar la página ({e})")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--watch", nargs="+", default=DEFAULT_WATCH)
@@ -184,6 +201,23 @@ def main():
     try:
         page = open(args.html_file, encoding="utf-8").read() if args.html_file else fetch(ORDER_URL)
         seen = parse(page)
+        changed = [m for m in args.watch if m in seen
+                   and seen[m]["status"] != (models.get(m) or {}).get("status")]
+        if changed:
+            save_page(page, "+".join(f"{m}-{seen[m]['status']}" for m in changed))
+        fresh = [m for m in changed if seen[m]["status"] == ORDERABLE]
+        if fresh and not args.html_file:
+            # Confirm before announcing: on 21/10 the page showed both LTDs orderable for <8 min.
+            time.sleep(CONFIRM_SECONDS)
+            page2 = fetch(ORDER_URL)
+            seen2 = parse(page2)
+            for m in fresh:
+                if (seen2.get(m) or {}).get("status") != ORDERABLE:
+                    log(f"ltd-watch: {m} parecía disponible pero a los {CONFIRM_SECONDS} s ya no (parpadeo o agotado al momento)")
+                    save_page(page2, f"{m}-flicker")
+                    seen[m] = dict(seen[m], status=(models.get(m) or {}).get("status") or seen2.get(m, {}).get("status") or seen[m]["status"])
+                else:
+                    seen[m] = dict(seen2[m], confirmedAfter=CONFIRM_SECONDS)
         missing = [m for m in args.watch if m not in seen]
         if missing:
             error = f"la página no muestra {', '.join(missing)} (¿ha cambiado el diseño?)"
@@ -218,7 +252,9 @@ def main():
         cur = {"status": info["status"], "gross": info["gross"], "lastSeen": now,
                "since": prev.get("since") if prev_status == info["status"] else now}
         if info["status"] == ORDERABLE and prev_status != ORDERABLE:
-            body = (f"{model} está DISPONIBLE en Hetzner ({stamp}).\n\n"
+            body = (f"{model} está DISPONIBLE en Hetzner ({stamp}"
+                    + (f", confirmado {info['confirmedAfter']} s después" if info.get("confirmedAfter") else "")
+                    + ").\n\n"
                     f"Precio: {price_line(info)}; instalación aparte.\n"
                     f"Pedir en: {ORDER_URL} (producto {info['productId']}, '{info['title']}').\n\n"
                     f"El comprador automático NO puede comprarlo: la API de Robot no ofrece "
