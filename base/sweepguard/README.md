@@ -82,6 +82,12 @@ judges NATIVE v6 clients (NAT66).
                          PEER_V4 from /etc/neuravps/failover-watchdog.env; "" = off)
     sessionPeerTimeout   seconds for the whole read from the other BASE (15)
     hotPortBlockSeconds  how long a hot-port block lasts (3600)
+    connsMaxVmsWithSession  a source with a proven session whose connections go
+                         to at most this many VMs is judged by the flood
+                         detector on LIVE connections only (10, since
+                         2026-10-22)
+    maxConnsWithSession  live connections at which such a source IS blocked by
+                         the flood detector anyway (300)
 
 No base carries this file today (checked 2026-09-27 on b0 and b1): the
 `DEFAULTS` in `sweepguard.py` are what runs.
@@ -544,3 +550,99 @@ Imprime la clave de host ed25519 de cada base: si cambió, hay que actualizar
 `unblock_my_ip`; hasta entonces esa base sale como «no se pudo comprobar».
 
 Tests: `python3 base/sweepguard/test_unblock_ip.py`.
+
+
+## Flood (`maxConns`) y sesión probada; excepciones por cliente desde el panel (2026-10-22)
+
+### El detector de conexiones también mira la sesión
+
+**Datos** (journal de b0 y b1, 30 días, solo lectura, 22/10): **152 bloqueos**
+por «>100 live connections» (b0 81, b1 71), **32 fuentes**. Cruce con la
+memoria de sesiones compartida y con las conexiones que aún tiene conntrack:
+
+| | bloqueos | fuentes | sesión RDP probada | VMs distintas |
+|---|---|---|---|---|
+| clientes | 7 | 3 direcciones de 2 clientes | sí (de 3 h a 2,6 d antes) | 1-2 |
+| resto | 145 | 29 | ninguna | 0-3 (casi todas 1) |
+
+* Los dos clientes: el del 22/10 (`47.194.157.202` y su IPv6, VMs 1670/1671,
+  ~105 SSH ESTABLISHED, bloqueado 3+3 veces desde el 20/10) y `95.95.26.142`
+  (13/10, VM 1256, `SKIP … RDP session now` tres horas antes del bloqueo).
+* **El número de VMs NO separa**: los atacantes de esta regla también apuntan a
+  1-3 VMs (p. ej. 100 conexiones al puerto 21422). Lo que separa es la sesión.
+* Las conexiones del cliente son de un programa que abre una SSH por minuto y
+  la deja callada: de 105, unas 5 tenían tráfico en los últimos 300 s. El
+  bloqueo, además, las congela 5 días en ESTABLISHED (como en hot-port), y por
+  eso volvía a caer cada 24 h.
+
+**Regla** (`flood_scan`): si la fuente llega a `maxConns`, tiene sesión en la
+memoria (`sessionMemorySeconds`, 30 d, b0+b1) y sus conexiones van a
+`connsMaxVmsWithSession` (**10**) VMs o menos, solo cuenta lo **vivo**
+(`is_live`, como hot-port) y se bloquea a partir de `maxConnsWithSession`
+(**300**) vivas; en el log, `SKIP … (N connections, M live, onto K VM(s))`.
+Sin sesión, o con más VMs, todo igual. 10 VMs = el cliente con más servidores
+(7) con margen, y la mitad de `minPorts`; 300 vivas = 3× `maxConns` contando
+solo lo vivo. Si el sysctl del timeout no se lee, todas cuentan como vivas.
+Con los datos de arriba: los 7 bloqueos a clientes no se habrían producido y
+los 145 restantes sí (ninguno tenía sesión). Pasada en seco del `.py` nuevo
+frente al instalado en b1 y b0 (22/10, 3 pasadas): mismos candidatos.
+
+### `cust_allow`: el panel abre a un cliente bloqueado SOLO sus VMs
+
+`bf_auto` corta todo el tráfico de la IP hacia la base. «Desbloquear mi IP» la
+quita del set entero; el panel, además, al entrar el cliente (función
+`unblock_my_ip` con `{"mode": "auto-vm"}`, repo NeuraVPS) hace algo más
+acotado y sin que pulse nada:
+
+* `deploy_customer_allow.sh` crea en las dos tablas rdpguard el set
+  `cust_allow` (`addr . inet_service`, con timeout) y UNA regla por familia
+  justo antes de la de `bf_auto` (en v4, después de `bf_static`):
+
+      meta l4proto { tcp, udp } ip  saddr . th dport @cust_allow accept
+      meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept
+
+  Orden: `bf_allow → (exenciones de invitados) → bf_static → cust_allow →
+  bf_auto → registro bf_seen → límites de ritmo`. El script lo comprueba.
+* `neuravps-unblock-ip allow-vm <ip> <vmid>[,...] [console]` mete los pares de
+  esas VMs: 1xxxx (SMB), 2xxxx (RDP, TCP y UDP), 3xxxx (SSH) y, con
+  `console`, el **443** de la base: la consola VNC del panel va por
+  `https://<nodo>.pve-{fsn,hel}.neuravps.com`, que es el nginx de la base en la
+  VIP, y un cliente en `bf_auto` tampoco la abre. Solo actúa si la IP está en
+  `bf_auto` y no en `bf_static`; nunca la saca de `bf_auto` ni borra entradas
+  de `cust_allow` (dos clientes pueden compartir IP); como mucho 50 VMs por
+  llamada; vmids 100-9999. Borra de `bf_seen` lo que esa IP tenía en esos
+  puertos. `status <ip>` es de solo lectura (bloqueos y VMs ya abiertas).
+* Duración: **30 días** (`ALLOW_SECONDS`), renovados al volver a entrar en el
+  panel bloqueado (la función renueva cuando quedan menos de 7). Por qué no
+  «hasta que caduque el bloqueo»: el bloqueo vuelve (3 días seguidos el del
+  22/10) y, mientras la entrada exista, sweepguard no cuenta esos pares, así
+  que el propio tráfico del cliente deja de poder rebloquearlo. 30 días es lo
+  mismo que dura la memoria de sesiones.
+* `sweepguard.py` lee `cust_allow` (`customer_allowed`) y no cuenta esos pares
+  en ningún detector (`bf_seen`, flood y hot-port; el UDP de RDP sigue sirviendo
+  para demostrar la sesión). La IP se sigue juzgando por todo lo demás.
+* Un par aceptado no pasa por los límites de ritmo: es el dueño hacia su propia
+  VM. Riesgos aceptados: un vmid que se borra y se reasigna a otro cliente en
+  esos 30 días, o una IP dinámica que cambia de abonado, dejan esos puertos
+  fuera del guard para esa IP hasta que caduquen; RDP/SSH siguen pidiendo
+  credenciales.
+* Los elementos no se persisten (como `bf_auto`): tras recargar nftables el
+  cliente los recupera la próxima vez que entra en el panel.
+
+**Desplegar** (primero b1, luego b0; requiere el script restringido ya
+instalado por `setup_unblock_ip.sh`):
+
+    scp base/sweepguard/{deploy_customer_allow.sh,rollback_customer_allow.sh,sweepguard.py,neuravps-unblock-ip} bX:/root/sgrepo/
+    ssh bX 'python3 /root/sgrepo/sweepguard.py --dry-run'          # sin bloquear ni guardar memoria
+    ssh bX 'bash /root/sgrepo/deploy_customer_allow.sh'             # set+regla en vivo (1 transacción), conf, scripts
+
+Comprobar: `nft list chain ip rdpguard pre` (la regla `@cust_allow` justo
+antes de `@bf_auto`), `neuravps-unblock-ip status 9.9.9.9`, y en el journal
+`SKIP … live, onto` / `BLOCKED … live connections` como siempre.
+Deshacer: `rollback_customer_allow.sh` (borra reglas y sets por handle en una
+transacción, limpia la conf y vuelve a poner los dos scripts anteriores).
+
+Tests: `test_sweepguard_customers.py`, `test_unblock_ip.py` y, con nft de
+verdad y paquetes entre dos netns sin root, `test_customer_allow_netns.sh
+[nftables.conf]` (sin argumento usa unas tablas mínimas; con una copia de la
+conf de una base, despliega y deshace sobre ella).

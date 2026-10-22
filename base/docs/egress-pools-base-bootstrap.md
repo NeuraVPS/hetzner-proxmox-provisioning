@@ -178,7 +178,11 @@ por BASE; no promete una reconstrucción E2E por un único comando.
    persistidos. El endurecimiento de aislamiento se aplica después de construir
    los forwards que modifica, antes de recibir tráfico. Con las dos bases en
    pie, lanzar desde el puesto de operador `base/sweepguard/setup_session_peer.sh
-   b0 b1` (memoria de sesiones compartida; sin él, cada base usa solo la suya).
+   b0 b1` (memoria de sesiones compartida; sin él, cada base usa solo la suya),
+   `setup_unblock_ip.sh <clave.pub> b0 b1` («Desbloquear mi IP») y, en la base
+   nueva, `deploy_customer_allow.sh` (set `cust_allow` que el panel usa para
+   abrir a un cliente bloqueado solo sus VMs; sin él, el modo automático del
+   panel da error en esa base).
 9. Ejecutar `systemctl enable --now neuravps-base-tunnels.service` y
    `systemctl enable --now base-nat-boot.service`, seguido de:
 
