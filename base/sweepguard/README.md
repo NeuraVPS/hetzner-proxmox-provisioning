@@ -83,11 +83,10 @@ judges NATIVE v6 clients (NAT66).
     sessionPeerTimeout   seconds for the whole read from the other BASE (15)
     hotPortBlockSeconds  how long a hot-port block lasts (3600)
     connsMaxVmsWithSession  a source with a proven session whose connections go
-                         to at most this many VMs is judged by the flood
-                         detector on LIVE connections only (10, since
-                         2026-10-22)
-    maxConnsWithSession  live connections at which such a source IS blocked by
-                         the flood detector anyway (300)
+                         to at most this many VMs gets the flood limits below
+                         instead of maxConns (10, since 2026-10-22; -1 = off)
+    maxLiveConnsWithSession   ...blocked from this many LIVE connections (100)
+    maxConnsTotalWithSession  ...or this many in total, live or dead (500)
 
 No base carries this file today (checked 2026-09-27 on b0 and b1): the
 `DEFAULTS` in `sweepguard.py` are what runs.
@@ -556,36 +555,35 @@ Tests: `python3 base/sweepguard/test_unblock_ip.py`.
 
 ### El detector de conexiones también mira la sesión
 
-**Datos** (journal de b0 y b1, 30 días, solo lectura, 22/10): **152 bloqueos**
-por «>100 live connections» (b0 81, b1 71), **32 fuentes**. Cruce con la
-memoria de sesiones compartida y con las conexiones que aún tiene conntrack:
+**Datos** (journal de b0 y b1, 30 días, solo lectura, recontado el 22/10 por
+la tarde): **155 bloqueos** por «>100 live connections» (b0 83, b1 72).
+Cruce con la memoria de sesiones compartida y con conntrack:
 
 | | bloqueos | fuentes | sesión RDP probada | VMs distintas |
 |---|---|---|---|---|
-| clientes | 7 | 3 direcciones de 2 clientes | sí (de 3 h a 2,6 d antes) | 1-2 |
-| resto | 145 | 29 | ninguna | 0-3 (casi todas 1) |
+| clientes | 8 | 3 (2 clientes) | sí (de 3 h a 2,6 d antes) | 1-2 |
+| resto | 147 | 29 | ninguna | 0-3 (casi todas 1) |
 
-* Los dos clientes: el del 22/10 (`47.194.157.202` y su IPv6, VMs 1670/1671,
-  ~105 SSH ESTABLISHED, bloqueado 3+3 veces desde el 20/10) y `95.95.26.142`
-  (13/10, VM 1256, `SKIP … RDP session now` tres horas antes del bloqueo).
+* Los clientes: el del 22/10 (`47.194.157.202`, 3 bloqueos, y su IPv6, 4;
+  VMs 1670/1671) y `95.95.26.142` (b0, 13/10, VM 1256, `SKIP … RDP session
+  now` tres horas antes del bloqueo).
 * **El número de VMs NO separa**: los atacantes de esta regla también apuntan a
   1-3 VMs (p. ej. 100 conexiones al puerto 21422). Lo que separa es la sesión.
-* Las conexiones del cliente son de un programa que abre una SSH por minuto y
-  la deja callada: de 105, unas 5 tenían tráfico en los últimos 300 s. El
-  bloqueo, además, las congela 5 días en ESTABLISHED (como en hot-port), y por
-  eso volvía a caer cada 24 h.
+* Las conexiones del cliente son SSH que se abren y se quedan calladas: medido
+  el 22/10 tras desbloquearlo, ~13/h en v4 (44 en 3,4 h, ninguna con tráfico en
+  5 min) y ~45-50/h en v6 (102 en 2 h). El bloqueo, además, las congela 5 días
+  en ESTABLISHED, y por eso volvía a caer cada 24 h.
 
 **Regla** (`flood_scan`): si la fuente llega a `maxConns`, tiene sesión en la
 memoria (`sessionMemorySeconds`, 30 d, b0+b1) y sus conexiones van a
-`connsMaxVmsWithSession` (**10**) VMs o menos, solo cuenta lo **vivo**
-(`is_live`, como hot-port) y se bloquea a partir de `maxConnsWithSession`
-(**300**) vivas; en el log, `SKIP … (N connections, M live, onto K VM(s))`.
-Sin sesión, o con más VMs, todo igual. 10 VMs = el cliente con más servidores
-(7) con margen, y la mitad de `minPorts`; 300 vivas = 3× `maxConns` contando
-solo lo vivo. Si el sysctl del timeout no se lee, todas cuentan como vivas.
-Con los datos de arriba: los 7 bloqueos a clientes no se habrían producido y
-los 145 restantes sí (ninguno tenía sesión). Pasada en seco del `.py` nuevo
-frente al instalado en b1 y b0 (22/10, 3 pasadas): mismos candidatos.
+`connsMaxVmsWithSession` (**10**) VMs o menos, se bloquea solo a partir de
+`maxLiveConnsWithSession` (**100**) conexiones **vivas** (`is_live`, como
+hot-port) o de `maxConnsTotalWithSession` (**500**) en total; en el log, `SKIP
+… (N connections, M live, onto K VM(s))`. Sin sesión, o con más VMs, todo
+igual. Con los datos de arriba, los 8 bloqueos a clientes no se habrían
+producido y los 147 restantes sí. **Ojo:** al ritmo medido, la IPv6 del cliente
+del 22/10 llega a 500 en ~10 h; a partir de ahí lo que le evita el rebloqueo es
+`cust_allow` (abajo), que el panel le pone al entrar estando bloqueado.
 
 ### `cust_allow`: el panel abre a un cliente bloqueado SOLO sus VMs
 
@@ -596,36 +594,53 @@ acotado y sin que pulse nada:
 
 * `deploy_customer_allow.sh` crea en las dos tablas rdpguard el set
   `cust_allow` (`addr . inet_service`, con timeout) y UNA regla por familia
-  justo antes de la de `bf_auto` (en v4, después de `bf_static`):
+  justo antes de la de `bf_auto` (en v4, después de `bf_static`), que **solo
+  actúa mientras la IP esté en `bf_auto`**:
 
-      meta l4proto { tcp, udp } ip  saddr . th dport @cust_allow accept
-      meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept
+      ip  saddr @bf_auto meta l4proto { tcp, udp } ip  saddr . th dport @cust_allow accept
+      ip6 saddr @bf_auto meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept
 
   Orden: `bf_allow → (exenciones de invitados) → bf_static → cust_allow →
-  bf_auto → registro bf_seen → límites de ritmo`. El script lo comprueba.
+  bf_auto → registro bf_seen → límites de ritmo`. El script lo comprueba. Fuera
+  del bloqueo, el tráfico de esa IP vuelve al camino normal (registro en
+  `bf_seen`, `bf_src`, `bf_port`).
 * `neuravps-unblock-ip allow-vm <ip> <vmid>[,...] [console]` mete los pares de
   esas VMs: 1xxxx (SMB), 2xxxx (RDP, TCP y UDP), 3xxxx (SSH) y, con
   `console`, el **443** de la base: la consola VNC del panel va por
   `https://<nodo>.pve-{fsn,hel}.neuravps.com`, que es el nginx de la base en la
   VIP, y un cliente en `bf_auto` tampoco la abre. Solo actúa si la IP está en
   `bf_auto` y no en `bf_static`; nunca la saca de `bf_auto` ni borra entradas
-  de `cust_allow` (dos clientes pueden compartir IP); como mucho 50 VMs por
+  de otras IPs (dos clientes pueden compartir IP); como mucho 50 VMs por
   llamada; vmids 100-9999. Borra de `bf_seen` lo que esa IP tenía en esos
   puertos. `status <ip>` es de solo lectura (bloqueos y VMs ya abiertas).
-* Duración: **30 días** (`ALLOW_SECONDS`), renovados al volver a entrar en el
-  panel bloqueado (la función renueva cuando quedan menos de 7). Por qué no
-  «hasta que caduque el bloqueo»: el bloqueo vuelve (3 días seguidos el del
-  22/10) y, mientras la entrada exista, sweepguard no cuenta esos pares, así
-  que el propio tráfico del cliente deja de poder rebloquearlo. 30 días es lo
-  mismo que dura la memoria de sesiones.
+* Duración: **48 h** (`ALLOW_SECONDS`), el doble del bloqueo. El panel la
+  renueva (como mucho cada 10 min) mientras el cliente lo usa ESTANDO
+  bloqueado; una entrada olvidada caduca sola en 2 días.
+* `revoke-vm <vmid>[,...]` borra de las dos familias todas las entradas de los
+  puertos de esas VMs, sea cual sea la IP. Lo llama NeuraVPS (trigger
+  `cust_allow_revoke_trigger` sobre `servers/{id}`) cuando una VM se borra o
+  entra en cola de borrado, cambia de vmid o de dueño, y cuando un vmid se
+  asigna a una VM nueva: **el vmid se reutiliza** (`_first_available_vmid`) y,
+  sin esto, la IP del dueño anterior (o cualquiera tras su CGNAT/VPN) llegaría
+  a la VM del nuevo. Es best-effort: si falla, queda en `ip_unblock_log` y el
+  TTL de 48 h acota el riesgo. El 443 no se toca (no es de ninguna VM).
 * `sweepguard.py` lee `cust_allow` (`customer_allowed`) y no cuenta esos pares
-  en ningún detector (`bf_seen`, flood y hot-port; el UDP de RDP sigue sirviendo
-  para demostrar la sesión). La IP se sigue juzgando por todo lo demás.
-* Un par aceptado no pasa por los límites de ritmo: es el dueño hacia su propia
-  VM. Riesgos aceptados: un vmid que se borra y se reasigna a otro cliente en
-  esos 30 días, o una IP dinámica que cambia de abonado, dejan esos puertos
-  fuera del guard para esa IP hasta que caduquen; RDP/SSH siguen pidiendo
-  credenciales.
+  en ningún detector (el UDP de RDP sigue sirviendo para demostrar la sesión),
+  **también fuera del bloqueo**, a propósito: mientras la IP está en `bf_auto`
+  sweepguard ya no la juzga, así que la excepción solo sirve fuera, para que el
+  propio tráfico del dueño a su VM no lo vuelva a bloquear. Lo acotan el TTL,
+  los límites de ritmo (que fuera del bloqueo sí se le aplican) y que son solo
+  esa IP y esos puertos.
+* **Riesgo aceptado, el 443:** abre a esa IP el nginx de la base entero, es
+  decir la web y la API de Proxmox de todos los nodos (`location /` →
+  `$pve_backend_from_host`), no solo la consola de sus nodos. Acotarlo por
+  nodo exigiría mirar el Host/SNI, que nft no ve. No es una escalada: es lo
+  mismo que alcanza cualquier IP no bloqueada, Proxmox pide su ticket (el del
+  cliente es de una sola VM, VM.Console) y solo dura mientras esté en
+  `bf_auto` y la entrada viva.
+* Otros riesgos aceptados: una IP dinámica que cambia de abonado mientras la
+  entrada vive (≤48 h) deja esos puertos sin el bloqueo para el nuevo abonado,
+  que sigue necesitando credenciales.
 * Los elementos no se persisten (como `bf_auto`): tras recargar nftables el
   cliente los recupera la próxima vez que entra en el panel.
 
@@ -636,13 +651,20 @@ instalado por `setup_unblock_ip.sh`):
     ssh bX 'python3 /root/sgrepo/sweepguard.py --dry-run'          # sin bloquear ni guardar memoria
     ssh bX 'bash /root/sgrepo/deploy_customer_allow.sh'             # set+regla en vivo (1 transacción), conf, scripts
 
-Comprobar: `nft list chain ip rdpguard pre` (la regla `@cust_allow` justo
-antes de `@bf_auto`), `neuravps-unblock-ip status 9.9.9.9`, y en el journal
-`SKIP … live, onto` / `BLOCKED … live connections` como siempre.
-Deshacer: `rollback_customer_allow.sh` (borra reglas y sets por handle en una
-transacción, limpia la conf y vuelve a poner los dos scripts anteriores).
+Comprobar: `nft list chain ip rdpguard pre` (la regla `@bf_auto … @cust_allow
+accept` justo antes de la de drop de `@bf_auto`), `neuravps-unblock-ip status
+9.9.9.9`, `/usr/local/sbin/neuravps-unblock-ip revoke-vm 100` (`revoked`,
+`removed: 0`), `cat /var/lib/neuravps-sweepguard/cust_allow.deploy` (las dos
+copias que ha hecho) y en el journal `SKIP … live, onto` / `BLOCKED … live
+connections` como siempre.
+
+Deshacer: `rollback_customer_allow.sh`. Borra reglas y sets por handle en una
+transacción, limpia la conf, vuelve a poner los dos scripts **que guardó ese
+despliegue** (rutas en `/var/lib/neuravps-sweepguard/cust_allow.deploy`, que
+renombra a `.rolledback.*`) y borra los `/root/sg-cust-allow*.nft`.
 
 Tests: `test_sweepguard_customers.py`, `test_unblock_ip.py` y, con nft de
 verdad y paquetes entre dos netns sin root, `test_customer_allow_netns.sh
 [nftables.conf]` (sin argumento usa unas tablas mínimas; con una copia de la
-conf de una base, despliega y deshace sobre ella).
+conf de una base, despliega y deshace sobre ella; instala en un sbin de prueba
+y comprueba que el rollback elige la copia de su despliegue).

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Deshace deploy_customer_allow.sh. DIRIGIDO: borra exactamente las dos reglas
 # (por handle, localizadas por @cust_allow) y los dos sets, en UNA transacción;
-# quita lo mismo de /etc/nftables.conf; y vuelve a poner sweepguard.py y
-# neuravps-unblock-ip anteriores si hay copia.
+# quita lo mismo de /etc/nftables.conf; vuelve a poner sweepguard.py y
+# neuravps-unblock-ip que guardó ESE despliegue (rutas en $STATE) y borra los
+# /root/sg-cust-allow*.nft que hayan quedado.
 #
 # ⚠️ NUNCA se restaura un `nft list ruleset` ni se recarga /etc/nftables.conf
 #    (el primero AÑADE en vez de reemplazar; el segundo empieza por
@@ -17,6 +18,8 @@
 set -euo pipefail
 CONF=${CONF:-/etc/nftables.conf}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
+STATE=${STATE:-/var/lib/neuravps-sweepguard/cust_allow.deploy}
+SBIN=${SBIN:-/usr/local/sbin}
 
 echo "=== rollback de cust_allow en $(hostname) ==="
 
@@ -38,6 +41,7 @@ if [ -s "$TX" ]; then
 else
   echo "  [vivo] nada que deshacer"
 fi
+rm -f "$TX"
 
 if grep -q "cust_allow" "$CONF"; then
   BK="$CONF.bak.custallow-rollback.$(date +%Y%m%d-%H%M%S)"
@@ -47,7 +51,8 @@ import re, sys
 conf = sys.argv[1]
 s = open(conf).read()
 s, n1 = re.subn(r"    # cust_allow: [^\n]*\n    #[^\n]*\n    set cust_allow \{\n(?:        [^\n]*\n)*?    \}\n", "", s)
-s, n2 = re.subn(r" +meta l4proto \{ tcp, udp \} ip6? saddr \. th dport @cust_allow accept comment \"[^\"]*\"\n", "", s)
+s, n2 = re.subn(r" +ip6? saddr @bf_auto meta l4proto \{ tcp, udp \} ip6? saddr \. th dport "
+                r"@cust_allow accept comment \"[^\"]*\"\n", "", s)
 assert "cust_allow" not in s, "quedan restos de cust_allow"
 open(conf, "w").write(s)
 print(f"  [conf] quitados {n1} sets y {n2} reglas")
@@ -59,17 +64,20 @@ else
 fi
 
 if [ "$SKIP_INSTALL" != 1 ]; then
-  for dst in /usr/local/sbin/sweepguard.py /usr/local/sbin/neuravps-unblock-ip; do
-    # la MÁS ANTIGUA: la de antes de este cambio (sello del NOMBRE)
-    PREV=$(ls -1 "$dst".bak.custallow.* 2>/dev/null | sort | head -1 || true)
-    if [ -n "$PREV" ]; then
+  for dst in "$SBIN/sweepguard.py" "$SBIN/neuravps-unblock-ip"; do
+    # la que guardó el despliegue (no la más antigua del directorio)
+    PREV=$(awk -F= -v k="$dst" '$1 == k {print $2}' "$STATE" 2>/dev/null | tail -1 || true)
+    if [ -n "$PREV" ] && [ -e "$PREV" ]; then
       install -m 0755 -o root -g root "$PREV" "$dst"
       echo "  [py] restaurado $PREV"
     else
-      echo "  [py] sin copia previa de $dst (el nuevo sin el set se comporta como el viejo)"
+      echo "  !! sin copia registrada de $dst en $STATE: se queda el actual (sin el set" \
+           "se comporta como el anterior); revisa a mano los $dst.bak.custallow.*"
     fi
   done
+  if [ -e "$STATE" ]; then mv "$STATE" "$STATE.rolledback.$(date +%Y%m%d-%H%M%S)"; fi
 fi
+rm -f /root/sg-cust-allow*.nft 2>/dev/null || true
 
 nft list chain ip rdpguard pre | sed 's/^/  /'
 nft list chain ip6 rdpguard pre | sed 's/^/  /'

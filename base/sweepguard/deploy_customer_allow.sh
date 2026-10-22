@@ -13,18 +13,20 @@
 #
 # Este script:
 #   1. crea `cust_allow` en las dos tablas rdpguard (addr . inet_service, con
-#      timeout; los elementos llevan el suyo, 30 días por defecto);
+#      timeout; los elementos llevan el suyo, 48 h);
 #   2. inserta UNA regla por familia justo ANTES de la de `bf_auto`:
-#        meta l4proto { tcp, udp } ip  saddr . th dport @cust_allow accept
-#        meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept
-#      En v4 queda DESPUÉS de `bf_static` (un bloqueo manual manda: el script
-#      restringido tampoco abre nada a una IP de bf_static). `th dport` cubre
-#      TCP y UDP (el transporte UDP de RDP en 2xxxx). Un par aceptado no llega
-#      al registro de `bf_seen` ni a los límites de ritmo: es el dueño hacia su
-#      propia VM, que es justo a quien esos límites no deben frenar;
+#        ip  saddr @bf_auto meta l4proto { tcp, udp } ip  saddr . th dport @cust_allow accept
+#        ip6 saddr @bf_auto meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept
+#      Solo actúa mientras la IP ESTÉ en `bf_auto`: fuera del bloqueo, su
+#      tráfico sigue el camino normal (registro en `bf_seen` y límites de
+#      ritmo). En v4 queda DESPUÉS de `bf_static` (un bloqueo manual manda: el
+#      script restringido tampoco abre nada a una IP de bf_static). `th dport`
+#      cubre TCP y UDP (el transporte UDP de RDP en 2xxxx);
 #   3. lo persiste en /etc/nftables.conf, acotado a cada tabla;
 #   4. instala sweepguard.py (no cuenta esos pares en ningún detector) y
-#      neuravps-unblock-ip (status / allow-vm), con copia de los anteriores.
+#      neuravps-unblock-ip (status / allow-vm / revoke-vm), con copia de los
+#      anteriores; las rutas de ESAS copias quedan en $STATE para que el
+#      rollback vuelva exactamente a ellas.
 #
 # ⚠️ Vivo = UNA transacción `nft -f`. NUNCA se recarga /etc/nftables.conf:
 #    empieza por `flush ruleset` y tiraría los túneles. Se edita y se valida
@@ -34,15 +36,19 @@
 # Deshacer: rollback_customer_allow.sh.
 #
 # Variables para probarlo fuera de producción (netns):
-#   CONF=/ruta/nftables.conf   SKIP_INSTALL=1
+#   CONF=/ruta/nftables.conf   SKIP_INSTALL=1   STATE=/ruta/estado   SBIN=/ruta/sbin
 set -euo pipefail
 
 CONF=${CONF:-/etc/nftables.conf}
 SKIP_INSTALL=${SKIP_INSTALL:-0}
+STATE=${STATE:-/var/lib/neuravps-sweepguard/cust_allow.deploy}
+SBIN=${SBIN:-/usr/local/sbin}
 HERE=$(cd "$(dirname "$0")" && pwd)
 COM="cliente del panel: solo los puertos de SUS VMs (neuravps-unblock-ip allow-vm)"
-SETDEF4="type ipv4_addr . inet_service; size 65536; flags timeout; timeout 30d;"
-SETDEF6="type ipv6_addr . inet_service; size 65536; flags timeout; timeout 30d;"
+SETDEF4="type ipv4_addr . inet_service; size 65536; flags timeout; timeout 2d;"
+SETDEF6="type ipv6_addr . inet_service; size 65536; flags timeout; timeout 2d;"
+RULE4="ip saddr @bf_auto meta l4proto { tcp, udp } ip saddr . th dport @cust_allow accept"
+RULE6="ip6 saddr @bf_auto meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept"
 
 echo "=== cust_allow en $(hostname) ==="
 
@@ -70,13 +76,14 @@ else
   TX=$(mktemp --suffix=.nft /root/sg-cust-allow.XXXXXX 2>/dev/null || mktemp --suffix=.nft)
   cat > "$TX" <<NFT
 add set ip rdpguard cust_allow { $SETDEF4 }
-insert rule ip rdpguard pre position $H4 meta l4proto { tcp, udp } ip saddr . th dport @cust_allow accept comment "$COM"
+insert rule ip rdpguard pre position $H4 $RULE4 comment "$COM"
 add set ip6 rdpguard cust_allow { $SETDEF6 }
-insert rule ip6 rdpguard pre position $H6 meta l4proto { tcp, udp } ip6 saddr . th dport @cust_allow accept comment "$COM"
+insert rule ip6 rdpguard pre position $H6 $RULE6 comment "$COM"
 NFT
   nft -c -f "$TX"
   nft -f "$TX"
-  echo "  [vivo] set + regla en las dos familias, en una transacción ($TX)"
+  rm -f "$TX"
+  echo "  [vivo] set + regla en las dos familias, en una transacción"
 fi
 
 # --- comprobación de orden: bf_allow/bf_static < cust_allow < bf_auto -----------
@@ -85,8 +92,9 @@ import subprocess
 for fam, need_static in (("ip", True), ("ip6", False)):
     rules = [l.strip() for l in subprocess.run(["nft", "list", "chain", fam, "rdpguard", "pre"],
              capture_output=True, text=True, check=True).stdout.splitlines()]
-    idx = lambda s: next(i for i, l in enumerate(rules) if s in l)
-    c, a, w = idx("@cust_allow accept"), idx("saddr @bf_auto"), idx("saddr @bf_allow accept")
+    idx = lambda s, t="": next(i for i, l in enumerate(rules) if s in l and t in l)
+    c, a, w = idx("@cust_allow accept"), idx("saddr @bf_auto", "drop"), idx("saddr @bf_allow accept")
+    assert "saddr @bf_auto" in rules[c], f"{fam}: la regla de cust_allow no exige bf_auto"
     assert w < c < a, f"{fam}: orden incorrecto bf_allow={w} cust_allow={c} bf_auto={a}"
     if need_static:
         assert idx("saddr @bf_static") < c, f"{fam}: cust_allow antes que bf_static"
@@ -100,9 +108,9 @@ else
   BK="$CONF.bak.custallow.$(date +%Y%m%d-%H%M%S)"
   cp -a "$CONF" "$BK"
   echo "  [conf] copia en $BK"
-  python3 - "$CONF" "$COM" <<'PY'
+  python3 - "$CONF" "$COM" "$RULE4" "$RULE6" <<'PY'
 import re, sys
-conf, com = sys.argv[1:]
+conf, com, rule4, rule6 = sys.argv[1:]
 s = open(conf).read()
 
 def block(s, head):
@@ -112,7 +120,7 @@ def block(s, head):
     j = i + len(head) + (min(cands) if cands else len(rest))
     return i, j
 
-def patch(s, head, atype, saddr):
+def patch(s, head, atype, saddr, text):
     i, j = block(s, head)
     b = s[i:j]
     assert "chain pre {" in b and "cust_allow" not in b, f"{head}: sin chain pre o cust_allow ya presente"
@@ -121,15 +129,15 @@ def patch(s, head, atype, saddr):
     setdef = (f"    # cust_allow: (IP . puerto) que el panel abre a un cliente bloqueado,\n"
               f"    # solo hacia SUS VMs (deploy_customer_allow.sh). Caducan solos.\n"
               f"    set cust_allow {{\n        type {atype} . inet_service\n        size 65536\n"
-              f"        flags timeout\n        timeout 30d\n    }}\n")
+              f"        flags timeout\n        timeout 2d\n    }}\n")
     b = b.replace("    chain pre {", setdef + "    chain pre {", 1)
     m = re.search(rf"\n( +){saddr} @bf_auto [^\n]*drop[^\n]*\n", b)
-    rule = f"{m.group(1)}meta l4proto {{ tcp, udp }} {saddr} . th dport @cust_allow accept comment \"{com}\"\n"
+    rule = f"{m.group(1)}{text} comment \"{com}\"\n"
     b = b[:m.start() + 1] + rule + b[m.start() + 1:]
     return s[:i] + b + s[j:]
 
-s = patch(s, "table ip rdpguard {", "ipv4_addr", "ip saddr")
-s = patch(s, "table ip6 rdpguard {", "ipv6_addr", "ip6 saddr")
+s = patch(s, "table ip rdpguard {", "ipv4_addr", "ip saddr", rule4)
+s = patch(s, "table ip6 rdpguard {", "ipv6_addr", "ip6 saddr", rule6)
 open(conf, "w").write(s)
 print("  [conf] set y regla escritos en las dos tablas rdpguard")
 PY
@@ -145,14 +153,19 @@ if [ "$SKIP_INSTALL" = 1 ]; then
   echo "  [py] SKIP_INSTALL=1"
 else
   STAMP=$(date +%Y%m%d-%H%M%S)
-  for pair in "sweepguard.py:/usr/local/sbin/sweepguard.py" "neuravps-unblock-ip:/usr/local/sbin/neuravps-unblock-ip"; do
+  for pair in "sweepguard.py:$SBIN/sweepguard.py" "neuravps-unblock-ip:$SBIN/neuravps-unblock-ip"; do
     src=$HERE/${pair%%:*}; dst=${pair#*:}
     if cmp -s "$src" "$dst"; then
       echo "  [py] $dst ya instalado"; continue
     fi
-    # copia SOLO de la versión anterior a este cambio: a ella vuelve el rollback
+    # copia SOLO de la versión anterior a este cambio, y su ruta en $STATE: a
+    # ella vuelve el rollback (no a la más antigua que haya por ahí)
     if [ -e "$dst" ] && ! grep -q cust_allow "$dst"; then
       cp -a "$dst" "$dst.bak.custallow.$STAMP"
+      mkdir -p "$(dirname "$STATE")"
+      grep -v "^$dst=" "$STATE" 2>/dev/null > "$STATE.new" || true
+      echo "$dst=$dst.bak.custallow.$STAMP" >> "$STATE.new"
+      mv "$STATE.new" "$STATE"
     fi
     python3 -m py_compile "$src" 2>/dev/null || { echo "  !! $src no compila"; exit 1; }
     install -m 0755 -o root -g root "$src" "$dst"

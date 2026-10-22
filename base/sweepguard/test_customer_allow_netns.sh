@@ -11,7 +11,10 @@
 #   2. allow-vm <ip> 1671 console: llega a 11671/21671/31671 (TCP), 21671 (UDP)
 #      y 443, y NO a 21999 (otra VM) ni a 22;
 #   3. status lo refleja y sweepguard.customer_allowed lee los pares;
-#   4. rollback_customer_allow.sh lo deja como estaba (vuelve a no llegar).
+#   4. fuera de bf_auto la entrada no cuenta: su SYN vuelve a bf_seen;
+#   5. revoke-vm 1671 le corta esa VM (y el 443 sigue: no es de ninguna VM);
+#   6. rollback_customer_allow.sh lo deja como estaba y reinstala las copias
+#      que guardó ESE despliegue (no la .bak más antigua).
 # Necesita: unshare (util-linux), nft, ip (iproute2), python3.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -142,8 +145,17 @@ PY
 
 echo "-- 0) sin bloqueo llega a todo"
 expect tcp 21999 ok
-CONF=conf.nft SKIP_INSTALL=1 bash "$HERE/deploy_customer_allow.sh" > deploy.out 2>&1 || { cat deploy.out; exit 1; }
-grep -E "\[(vivo|orden|conf)\]" deploy.out
+# instalación de verdad en un sbin de prueba con versiones «anteriores», y una
+# copia .bak MÁS ANTIGUA que el rollback NO debe elegir
+mkdir -p sbin
+printf '# viejo sweepguard\n' > sbin/sweepguard.py
+printf '# viejo unblock\n' > sbin/neuravps-unblock-ip
+printf '# copia antigua ajena\n' > sbin/sweepguard.py.bak.custallow.20200101-000000
+cp sbin/sweepguard.py sweepguard.viejo
+CONF=conf.nft STATE=$WORK/state SBIN=$WORK/sbin bash "$HERE/deploy_customer_allow.sh" > deploy.out 2>&1 || { cat deploy.out; exit 1; }
+grep -E "\[(vivo|orden|conf|py)\]" deploy.out
+cmp -s sbin/sweepguard.py "$HERE/sweepguard.py" && echo "  ok  instalado"
+ls /tmp/sg-cust-allow* /root/sg-cust-allow* 2>/dev/null && { echo "FAIL quedan .nft"; exit 1; } || echo "  ok  sin .nft temporales"
 echo "-- 1) en bf_auto no llega a nada"
 nft add element ip rdpguard bf_auto "{ $CLIENT }"
 expect tcp 21671 blocked; expect tcp 443 blocked
@@ -154,6 +166,7 @@ for p in 11671 21671 31671 443; do expect tcp $p ok; done
 expect udp 21671 ok
 expect tcp 21999 blocked; expect tcp 22 blocked
 nft get element ip rdpguard bf_auto "{ $CLIENT }" >/dev/null && echo "  ok  sigue en bf_auto"
+nft list set ip rdpguard cust_allow | grep -q "timeout 2d\|expires 1d23h" && echo "  ok  48 h"
 echo "-- 3) status y sweepguard"
 UB status $CLIENT
 python3 - "$HERE" <<'PY'
@@ -168,9 +181,22 @@ seen = {tuple(e["elem"]["val"]["concat"]) for e in sg.set_elements("ip", "bf_see
 assert not any(p in (11671, 21671, 31671) for _, p in seen), seen   # aceptado antes del registro
 print("  ok  customer_allowed =", sorted(p for _, p in got), "; bf_seen sin sus puertos")
 PY
-echo "-- 4) rollback"
-CONF=conf.nft SKIP_INSTALL=1 bash "$HERE/rollback_customer_allow.sh" > rb.out 2>&1 || { cat rb.out; exit 1; }
+echo "-- 4) fuera de bf_auto la entrada no exime: camino normal (bf_seen)"
+nft delete element ip rdpguard bf_auto "{ $CLIENT }"
+expect tcp 21671 ok; expect tcp 21999 ok
+nft list set ip rdpguard bf_seen | grep -q "$CLIENT . 21671" && echo "  ok  21671 vuelve a anotarse en bf_seen"
+nft add element ip rdpguard bf_auto "{ $CLIENT }"
+echo "-- 5) revoke-vm 1671 (VM borrada / vmid reasignado)"
+UB revoke-vm 1671
+expect tcp 21671 blocked; expect tcp 31671 blocked
+expect tcp 443 ok          # la consola no es de ninguna VM: caduca sola (48 h)
+echo "-- 6) rollback"
+UB allow-vm $CLIENT 1671 console >/dev/null
+CONF=conf.nft STATE=$WORK/state SBIN=$WORK/sbin bash "$HERE/rollback_customer_allow.sh" > rb.out 2>&1 || { cat rb.out; exit 1; }
+grep -E "\[py\]|!!" rb.out
 cmp conf.orig conf.nft && echo "  ok  conf identica"
+cmp sbin/sweepguard.py sweepguard.viejo && echo "  ok  sweepguard.py = la copia de ESTE despliegue, no la antigua"
+grep -q "viejo unblock" sbin/neuravps-unblock-ip && echo "  ok  neuravps-unblock-ip restaurado"
 expect tcp 21671 blocked
 kill $SPID $CPID 2>/dev/null || true
 echo "NETNS_OK"
