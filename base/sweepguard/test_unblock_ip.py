@@ -326,6 +326,53 @@ class AllowVm(unittest.TestCase):
             self.assertFalse("bf_auto" in text and ("delete" in text or " add " in text), text)
 
 
+class RevokeVm(unittest.TestCase):
+    def setUp(self):
+        self.b = FakeBase()
+
+    def test_parse(self):
+        self.assertEqual(ub.parse_command("revoke-vm 1671,483,1671"), ("revoke-vm", None, [483, 1671], False))
+        for raw in ["revoke-vm", "revoke-vm ", f"revoke-vm {A4}", "revoke-vm 1671 console", "revoke-vm 99",
+                    "revoke-vm 1671,", "revoke-vm 01671", "revoke-vm 1671;id", "REVOKE-VM 1671"]:
+            with self.assertRaises(ub.BadRequest, msg=raw):
+                ub.parse_command(raw)
+
+    def test_removes_every_ip_for_those_vms_both_families(self):
+        self.b.sets[("ip", "cust_allow")] |= {(A4, 10483), (A4, 20483), ("8.8.4.4", 30483), (A4, 443),
+                                              (A4, 21671), ("8.8.4.4", 20484)}
+        self.b.sets[("ip6", "cust_allow")] |= {(A6, 20483), (A6, 21671)}
+        rc, out = call(self.b, "revoke-vm 483")
+        self.assertEqual((rc, out["result"], out["removed"], out["vmids"]), (0, "revoked", 4, [483]))
+        self.assertEqual(self.b.sets[("ip", "cust_allow")], {(A4, 443), (A4, 21671), ("8.8.4.4", 20484)})
+        self.assertEqual(self.b.sets[("ip6", "cust_allow")], {(A6, 21671)})
+        self.assertNotIn("ip", out)
+
+    def test_nothing_to_remove(self):
+        rc, out = call(self.b, "revoke-vm 483")
+        self.assertEqual((rc, out["result"], out["removed"]), (0, "revoked", 0))
+        self.assertFalse([c for c, _ in self.b.calls if c[1:3] == ["-f", "-"]])
+
+    def test_without_set_is_no_set(self):
+        del self.b.sets[("ip", "cust_allow")], self.b.sets[("ip6", "cust_allow")]
+        rc, out = call(self.b, "revoke-vm 483")
+        self.assertEqual((rc, out["result"]), (0, "no_set"))
+
+    def test_batch_failure_falls_back(self):
+        self.b.sets[("ip", "cust_allow")] |= {(A4, 20483), ("8.8.4.4", 30483)}
+        self.b.fail_batch = True
+        rc, out = call(self.b, "revoke-vm 483")
+        self.assertEqual((rc, out["removed"]), (0, 2))
+        self.assertEqual(self.b.sets[("ip", "cust_allow")], set())
+
+    def test_never_touches_other_sets(self):
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        self.b.sets[("ip", "bf_seen")].add((A4, 20483))
+        self.b.sets[("ip", "cust_allow")].add((A4, 20483))
+        call(self.b, "revoke-vm 483")
+        self.assertIn(A4, self.b.sets[("ip", "bf_auto")])
+        self.assertIn((A4, 20483), self.b.sets[("ip", "bf_seen")])
+
+
 class Status(unittest.TestCase):
     def setUp(self):
         self.b = FakeBase()

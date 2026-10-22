@@ -8,8 +8,9 @@ solo puede ejecutar este fichero:
     restrict,command="/usr/local/sbin/neuravps-unblock-ip" ssh-ed25519 AAAA... neuravps-unblock-ip@functions
 
 La peticion llega en SSH_ORIGINAL_COMMAND y solo se acepta exactamente
-`unblock <ip>`, `status <ip>` o `allow-vm <ip> <vmids> [console]` (abajo), con
-una direccion IPv4 o IPv6 global. Todo lo demas se rechaza sin tocar nada.
+`unblock <ip>`, `status <ip>`, `allow-vm <ip> <vmids> [console]` o
+`revoke-vm <vmids>` (abajo), con una direccion IPv4 o IPv6 global. Todo lo
+demas se rechaza sin tocar nada.
 Para probar a mano: `neuravps-unblock-ip status 203.0.113.7`.
 
 `unblock <ip>` (el boton) hace, y nada mas:
@@ -38,13 +39,23 @@ panel, que NO quita la IP de `bf_auto`:
       Si la IP esta en `bf_auto` (y no en `bf_static`), mete en `cust_allow`
       los pares (ip . puerto) de esas VMs: SMB 1xxxx, RDP 2xxxx y SSH 3xxxx
       (xxxx = vmid), y con `console` tambien el 443 de la base (la consola VNC
-      del panel entra por el nginx de la base). Duran ALLOW_SECONDS y se
-      renuevan si ya estaban. La cadena acepta esos pares antes de la regla
-      de `bf_auto`: esa IP llega a SUS VMs y el resto de la base le sigue
-      cerrado. Borra de `bf_seen` lo que esa IP tenia en esos puertos. Si la
-      IP no esta bloqueada no hace nada (`not_blocked`). Como mucho
-      MAX_VMIDS VMs por llamada; nunca borra entradas de `cust_allow` (dos
-      clientes pueden compartir IP).
+      del panel entra por el nginx de la base). Duran ALLOW_SECONDS (48 h) y
+      se renuevan si ya estaban. La cadena acepta esos pares antes de la regla
+      de `bf_auto` y SOLO mientras la IP este en `bf_auto`: esa IP llega a SUS
+      VMs, el resto de la base le sigue cerrado y, fuera del bloqueo, su
+      trafico pasa por bf_seen y los limites como el de cualquiera. Borra de
+      `bf_seen` lo que esa IP tenia en esos puertos. Si la IP no esta
+      bloqueada no hace nada (`not_blocked`). Como mucho MAX_VMIDS VMs por
+      llamada; nunca borra entradas de otras IPs (dos clientes pueden
+      compartir IP).
+
+  revoke-vm <vmid>[,<vmid>...]
+      Borra de `cust_allow`, en las dos familias, TODAS las entradas de los
+      puertos de esas VMs, sea cual sea la IP. Lo llama NeuraVPS (trigger
+      sobre servers/) cuando una VM se borra, cambia de vmid o de dueño, o
+      cuando un vmid se asigna a una VM nueva: el vmid se reutiliza, y una
+      entrada vieja dejaria a la IP del dueño anterior llegar a la VM de
+      otro. El 443 no se toca (no es de ninguna VM).
 
 Salida: una linea JSON. Codigo 0 si se atendio (sea cual sea el resultado),
 2 si la peticion no es valida, 1 si algo fallo en la base.
@@ -64,14 +75,15 @@ LOCK = "/run/neuravps-unblock-ip.lock"
 REQUEST_RE = re.compile(r"\Aunblock ([0-9A-Fa-f:.]{2,45})\Z")
 STATUS_RE = re.compile(r"\Astatus ([0-9A-Fa-f:.]{2,45})\Z")
 ALLOW_RE = re.compile(r"\Aallow-vm ([0-9A-Fa-f:.]{2,45}) ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})( console)?\Z")
+REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})\Z")
 NFT_TIMEOUT = 20
 
 CUSTOMER_SET = "cust_allow"
-# 30 dias, como la memoria de sesiones de sweepguard: el bloqueo dura 24 h pero
-# vuelve (el cliente del 22/10 fue rebloqueado tres dias seguidos), y mientras
-# la entrada exista sweepguard no cuenta esos pares, asi que su propio trafico
-# no lo vuelve a bloquear. Se renueva cada vez que entra en el panel bloqueado.
-ALLOW_SECONDS = 30 * 86400
+# 48 h: el doble del bloqueo (blockSeconds, 24 h). El panel la renueva cada
+# 10 min mientras el cliente lo usa ESTANDO bloqueado; una entrada olvidada
+# (VM borrada, IP dinamica que cambia de abonado) caduca sola en 2 dias, y
+# revoke-vm la quita antes cuando el vmid deja de ser de ese cliente.
+ALLOW_SECONDS = 48 * 3600
 MAX_VMIDS = 50                  # el cliente con mas servidores tiene 7
 VMID_MIN, VMID_MAX = 100, 9999  # los forwards son 1xxxx/2xxxx/3xxxx
 FORWARD_BASES = (10000, 20000, 30000)   # SMB, RDP, SSH
@@ -119,7 +131,8 @@ def parse_request(raw):
 
 def parse_command(raw):
     """Peticion -> (orden, ip, vmids, consola). Lanza BadRequest.
-    unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,<vmid>...] [console]"""
+    unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,<vmid>...] [console]
+    | revoke-vm <vmid>[,<vmid>...]   (en revoke-vm, ip = None)"""
     raw = raw or ""
     m = REQUEST_RE.match(raw)
     if m:
@@ -130,7 +143,11 @@ def parse_command(raw):
     m = ALLOW_RE.match(raw)
     if m:
         return "allow-vm", _ip(m.group(1)), _vmids(m.group(2)), bool(m.group(3))
-    raise BadRequest("expected: unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,...] [console]")
+    m = REVOKE_RE.match(raw)
+    if m:
+        return "revoke-vm", None, _vmids(m.group(1)), False
+    raise BadRequest("expected: unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,...] [console]"
+                     " | revoke-vm <vmid>[,...]")
 
 
 def vm_ports(vmids, console=False):
@@ -299,6 +316,52 @@ def allow_vm(ip, vmids, console):
     return out
 
 
+def set_pairs(fam, name):
+    """[(addr, puerto)] de todo un set (addr . puerto), con la addr tal cual la
+    da nft (forma comprimida)."""
+    r = run(["nft", "-j", "list", "set", fam, TABLE, name])
+    if r.returncode != 0:
+        return []
+    out = []
+    for obj in json.loads(r.stdout).get("nftables", []):
+        for e in (obj.get("set") or {}).get("elem", []) or []:
+            val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
+            concat = val.get("concat") if isinstance(val, dict) else None
+            if concat and len(concat) == 2 and isinstance(concat[0], str) and isinstance(concat[1], int):
+                out.append((concat[0], concat[1]))
+    return out
+
+
+def revoke_vm(vmids):
+    """Quita de cust_allow todas las entradas de los puertos de esas VMs, de
+    cualquier IP y en las dos familias."""
+    ports = set(vm_ports(vmids))
+    out = {"vmids": vmids, "removed": 0}
+    sets = 0
+    for fam in ("ip", "ip6"):
+        if not set_exists(fam, CUSTOMER_SET):
+            continue
+        sets += 1
+        doomed = [(a, p) for a, p in set_pairs(fam, CUSTOMER_SET) if p in ports]
+        if not doomed:
+            continue
+        batch = "".join(f"delete element {fam} {TABLE} {CUSTOMER_SET} {{ {a} . {p} }}\n"
+                        for a, p in doomed)
+        if run(["nft", "-f", "-"], stdin=batch).returncode == 0:
+            out["removed"] += len(doomed)
+            continue
+        # alguna caduco entre la lectura y el borrado: una a una
+        for a, p in doomed:
+            if run(["nft", "delete", "element", fam, TABLE, CUSTOMER_SET,
+                    "{ %s . %d }" % (a, p)]).returncode == 0:
+                out["removed"] += 1
+        left = [x for x in set_pairs(fam, CUSTOMER_SET) if x[1] in ports]
+        if left:
+            raise RuntimeError(f"{len(left)} entries of {fam} {CUSTOMER_SET} still there")
+    out["result"] = "revoked" if sets else "no_set"
+    return out
+
+
 def main(argv):
     raw = os.environ.get("SSH_ORIGINAL_COMMAND")
     if raw is None:                      # a mano: neuravps-unblock-ip status <ip>
@@ -311,21 +374,29 @@ def main(argv):
         syslog.syslog(syslog.LOG_WARNING, f"rejected ({via}): {exc}: {raw[:80]!r}")
         print(json.dumps({"ok": False, "error": "bad_request", "detail": str(exc)}))
         return 2
+    what = str(ip) if ip is not None else ",".join(str(v) for v in vmids)
     try:
         if verb == "status":                 # solo lectura: sin cerrojo
             out = status(ip)
         else:
             with open(LOCK, "w") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
-                out = unblock(ip) if verb == "unblock" else allow_vm(ip, vmids, console)
+                if verb == "unblock":
+                    out = unblock(ip)
+                elif verb == "allow-vm":
+                    out = allow_vm(ip, vmids, console)
+                else:
+                    out = revoke_vm(vmids)
     except Exception as exc:  # noqa: BLE001
-        syslog.syslog(syslog.LOG_ERR, f"{verb} {ip} ({via}): error {exc}")
-        print(json.dumps({"ok": False, "ip": str(ip), "error": "internal",
-                          "detail": str(exc)[:200]}))
+        syslog.syslog(syslog.LOG_ERR, f"{verb} {what} ({via}): error {exc}")
+        err = {"ok": False, "error": "internal", "detail": str(exc)[:200]}
+        if ip is not None:
+            err["ip"] = str(ip)
+        print(json.dumps(err))
         return 1
     out["ok"] = True
     syslog.syslog(syslog.LOG_INFO if verb == "status" else syslog.LOG_NOTICE,
-                  f"{verb} {ip} ({via}): {json.dumps(out, sort_keys=True)}")
+                  f"{verb} {what} ({via}): {json.dumps(out, sort_keys=True)}")
     print(json.dumps(out, sort_keys=True))
     return 0
 
