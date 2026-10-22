@@ -8,8 +8,10 @@ Caso real (22/10, b1): un cliente con dos VMs (1670 y 1671), sesion RDP
 probada, ~105 conexiones SSH ESTABLISHED contra 31670/31671 que se abren a
 ~1/min y se quedan calladas, bloqueado por «>100 live connections» cada 24 h
 desde el 20/10, en v4 y en v6. Los 145 bloqueos restantes de esa regla en 30
-dias (b0+b1) eran fuentes sin ninguna sesion, contra 1-3 VMs. Los datos son
+dias (b0+b1) eran fuentes sin ninguna sesion, contra 1-3 VMs (155 y 147 al
+volver a contar el 22/10 por la tarde: 8 bloqueos a 3 fuentes con sesion). Los datos son
 sinteticos con la forma de /proc/net/nf_conntrack y de `nft -j`.
+Con sesion y pocas VMs se bloquea desde 100 VIVAS o 500 en total.
 """
 import importlib.util
 import os
@@ -151,11 +153,28 @@ def test_session_but_too_many_vms_blocks():
 
 
 def test_session_but_live_flood_blocks():
-    lim = CFG["maxConnsWithSession"]
-    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=lim, live=lim))
+    lim = CFG["maxLiveConnsWithSession"]
+    assert lim == 100
+    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=lim + 5, live=lim))
     assert n == 1 and ANDRES4 in h.blocked()[0]
-    n, _ = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=lim, live=lim - 1))
+    n, _ = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=lim + 5, live=lim - 1))
     assert n == 0
+
+
+def test_session_but_total_cap_blocks():
+    cap = CFG["maxConnsTotalWithSession"]
+    assert cap == 500
+    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=cap, live=5))
+    assert n == 1 and ANDRES4 in h.blocked()[0]
+    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=cap - 1, live=5))
+    assert n == 0, h.logs
+    assert any("SKIP" in m and "100 live / 500 total" in m for m in h.logs), h.logs
+
+
+def test_no_exemption_switch():
+    cfg = dict(CFG, connsMaxVmsWithSession=-1)
+    n, _ = run_family({ANDRES4: NOW - 60}, cfg=cfg, conntrack=andres())
+    assert n == 1
 
 
 def test_session_proven_in_this_pass_counts():

@@ -81,22 +81,24 @@ both bases: of 9521 port blocks, that one was the only one it would have saved.
 
 The connection flood spares a proven session on few VMs (2026-10-22)
 --------------------------------------------------------------------
-30 days of journal on b0+b1: 152 blocks by `maxConns`, 145 from 30 sources
-with no RDP session ever seen, and 7 from two customers who had proven one
-hours or days before, holding SSH sessions to their own 1-2 VMs (one of them
-re-blocked every 24 h because the block freezes those connections in
-ESTABLISHED for 5 days). What separates them is the session, not the number of
-VMs: the attackers also aim at 1-3 VMs. A source with a session in the memory
-whose connections go to at most `connsMaxVmsWithSession` VMs is judged on its
-LIVE connections (is_live) against `maxConnsWithSession` instead.
+30 days of journal on b0+b1 (22/10): 155 blocks by `maxConns`; 147 from 29
+sources with no RDP session ever seen, and 8 from 3 sources (two customers)
+that had proven one hours or days before, holding SSH sessions to their own
+1-2 VMs (one of them re-blocked every 24 h because the block freezes those
+connections in ESTABLISHED for 5 days). What separates them is the session,
+not the number of VMs: the attackers also aim at 1-3 VMs. A source with a
+session in the memory whose connections go to at most `connsMaxVmsWithSession`
+VMs is blocked only from `maxLiveConnsWithSession` LIVE connections (is_live)
+or `maxConnsTotalWithSession` in total, live or dead.
 
 Customer allowances from the panel (2026-10-22)
 -----------------------------------------------
 When a customer opens the panel from a blocked IP, the panel puts that IP in
 `cust_allow` (addr . port, see neuravps-unblock-ip allow-vm) for the ports of
-THEIR VMs only. The chain accepts those pairs before the `bf_auto` drop, so
-they never reach `bf_seen`; here every detector also ignores them (see
-customer_allowed), or a customer would be re-blocked by their own traffic.
+THEIR VMs only, for 48 h. The chain accepts those pairs only while the IP is in
+`bf_auto`; out of the block they go through `bf_seen` and the rate limits like
+anyone else. Here every detector ignores them while the entry lives, blocked or
+not (see customer_allowed).
 """
 import ipaddress
 import json
@@ -136,11 +138,13 @@ DEFAULTS = {
     "sessionPeer": None,
     "sessionPeerTimeout": 15,
     # Flood (maxConns) con sesion probada en sessionMemorySeconds y pocas VMs:
-    # 30 dias b0+b1, los 7 bloqueos a clientes tenian sesion y 1-2 VMs; los
-    # 145 restantes, ninguna sesion. Se juzgan solo sus conexiones VIVAS
-    # (is_live): las muertas las fabrica el propio bloqueo.
-    "connsMaxVmsWithSession": 10,    # el cliente con mas servidores tiene 7
-    "maxConnsWithSession": 300,      # vivas; el cliente del 22/10 tenia ~5 de 105
+    # 30 dias b0+b1 (22/10), los 8 bloqueos a clientes tenian sesion y 1-2
+    # VMs; los 147 restantes, ninguna sesion. Se bloquea a partir de tantas
+    # VIVAS (is_live: las muertas las fabrica el propio bloqueo) o de tantas
+    # en total, vivas o muertas. -1 en connsMaxVmsWithSession = sin excepcion.
+    "connsMaxVmsWithSession": 10,       # el cliente con mas servidores tiene 7
+    "maxLiveConnsWithSession": 100,     # el cliente del 22/10: ~5 vivas de ~105
+    "maxConnsTotalWithSession": 500,
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
     # El detector hot-port es el UNICO ambiguo: el dueño legitimo del puerto
@@ -312,7 +316,17 @@ CUSTOMER_SET = "cust_allow"
 def customer_allowed(family):
     """Pares (addr canonica, puerto) de `cust_allow`: un cliente del panel hacia
     los puertos de SUS VMs (ver neuravps-unblock-ip allow-vm). Ningun detector
-    los cuenta. Set ausente o ilegible = vacio (lo de antes)."""
+    los cuenta. Set ausente o ilegible = vacio (lo de antes).
+
+    Se ignoran este o no la IP en bf_auto, y es a proposito: mientras esta
+    bloqueada, sweepguard ya no la juzga (run_family salta lo que esta en
+    bf_auto), asi que la excepcion solo tiene efecto FUERA del bloqueo. Ahi
+    sirve para que el trafico del dueño a su propia VM no lo vuelva a bloquear
+    (el 22/10: ~13 SSH/h en v4 y ~45/h en v6, casi todas calladas; sin
+    sesion RDP, el flood lo rebloquearia en horas). Lo acotan el TTL de la
+    entrada (48 h, solo se renueva entrando en el panel ESTANDO bloqueado),
+    los limites de ritmo de la cadena, que fuera del bloqueo si se aplican, y
+    que solo son esa IP y esos puertos."""
     out = set()
     for e in set_elements(family, CUSTOMER_SET):
         val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
@@ -382,8 +396,8 @@ def flooders(family, cfg, ours=None, sessions=None, exempt=None):
     out, spared = flood_scan(entries, cfg, est, sessions, exempt)
     for addr, (n, live, vms, t) in sorted(spared.items()):
         log(f"{family}: SKIP {addr} ({n} connections, {live} live, onto {vms} VM(s)) — "
-            f"RDP session proven {int((time.time() - t) // 60)} min ago: flood judged on "
-            f"live connections, under {cfg['maxConnsWithSession']}")
+            f"RDP session proven {int((time.time() - t) // 60)} min ago: flood limits "
+            f"{cfg['maxLiveConnsWithSession']} live / {cfg['maxConnsTotalWithSession']} total")
     return out
 
 
@@ -393,9 +407,10 @@ def flood_scan(entries, cfg, est_timeout, sessions=None, exempt=None, now=None):
     Cuenta las conexiones TCP de cada fuente (todas, vivas o no: lo de siempre)
     salvo los pares de `exempt` (customer_allowed). Una fuente que llega a
     `maxConns` se perdona si demostro una sesion RDP en `sessionMemorySeconds`
-    (memoria b0+b1), sus conexiones van a `connsMaxVmsWithSession` VMs o menos
-    y tiene menos de `maxConnsWithSession` VIVAS (is_live). Sin dato de silencio
-    (sysctl ilegible) todas cuentan como vivas: nunca mas laxo que eso.
+    (memoria b0+b1), sus conexiones van a `connsMaxVmsWithSession` VMs o menos,
+    tiene menos de `maxLiveConnsWithSession` VIVAS (is_live) y menos de
+    `maxConnsTotalWithSession` en total. Sin dato de silencio (sysctl
+    ilegible) todas cuentan como vivas: nunca mas laxo que eso.
     Devuelve (flooders addr -> n, spared addr -> (n, vivas, vms, epoch sesion))."""
     now = time.time() if now is None else now
     exempt = exempt or set()
@@ -419,7 +434,8 @@ def flood_scan(entries, cfg, est_timeout, sessions=None, exempt=None, now=None):
         t = sessions.get(a) if (sessions and memory > 0) else None
         if (t is not None and now - t <= memory
                 and len(vms[a]) <= cfg["connsMaxVmsWithSession"]
-                and live[a] < cfg["maxConnsWithSession"]):
+                and live[a] < cfg["maxLiveConnsWithSession"]
+                and n < cfg["maxConnsTotalWithSession"]):
             spared[a] = (n, live[a], len(vms[a]), t)
             continue
         out[a] = n
