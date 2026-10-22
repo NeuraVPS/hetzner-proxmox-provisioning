@@ -78,6 +78,25 @@ diversity now spares a source with a proven session in the last
 `sessionMemorySeconds` (30 days) below `sweepMaxWithSession` machines (150),
 and b0/b1 share that memory (see fetch_peer_sessions). 30 days of journal on
 both bases: of 9521 port blocks, that one was the only one it would have saved.
+
+The connection flood spares a proven session on few VMs (2026-10-22)
+--------------------------------------------------------------------
+30 days of journal on b0+b1: 152 blocks by `maxConns`, 145 from 30 sources
+with no RDP session ever seen, and 7 from two customers who had proven one
+hours or days before, holding SSH sessions to their own 1-2 VMs (one of them
+re-blocked every 24 h because the block freezes those connections in
+ESTABLISHED for 5 days). What separates them is the session, not the number of
+VMs: the attackers also aim at 1-3 VMs. A source with a session in the memory
+whose connections go to at most `connsMaxVmsWithSession` VMs is judged on its
+LIVE connections (is_live) against `maxConnsWithSession` instead.
+
+Customer allowances from the panel (2026-10-22)
+-----------------------------------------------
+When a customer opens the panel from a blocked IP, the panel puts that IP in
+`cust_allow` (addr . port, see neuravps-unblock-ip allow-vm) for the ports of
+THEIR VMs only. The chain accepts those pairs before the `bf_auto` drop, so
+they never reach `bf_seen`; here every detector also ignores them (see
+customer_allowed), or a customer would be re-blocked by their own traffic.
 """
 import ipaddress
 import json
@@ -116,6 +135,12 @@ DEFAULTS = {
     # "" = no compartir.
     "sessionPeer": None,
     "sessionPeerTimeout": 15,
+    # Flood (maxConns) con sesion probada en sessionMemorySeconds y pocas VMs:
+    # 30 dias b0+b1, los 7 bloqueos a clientes tenian sesion y 1-2 VMs; los
+    # 145 restantes, ninguna sesion. Se juzgan solo sus conexiones VIVAS
+    # (is_live): las muertas las fabrica el propio bloqueo.
+    "connsMaxVmsWithSession": 10,    # el cliente con mas servidores tiene 7
+    "maxConnsWithSession": 300,      # vivas; el cliente del 22/10 tenia ~5 de 105
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
     # El detector hot-port es el UNICO ambiguo: el dueño legitimo del puerto
@@ -281,8 +306,30 @@ def guarded_destinations(family):
     return ours
 
 
-def sweepers(family, cfg):
-    """(addr -> distinct port count) for sources over the threshold."""
+CUSTOMER_SET = "cust_allow"
+
+
+def customer_allowed(family):
+    """Pares (addr canonica, puerto) de `cust_allow`: un cliente del panel hacia
+    los puertos de SUS VMs (ver neuravps-unblock-ip allow-vm). Ningun detector
+    los cuenta. Set ausente o ilegible = vacio (lo de antes)."""
+    out = set()
+    for e in set_elements(family, CUSTOMER_SET):
+        val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
+        cat = val.get("concat") if isinstance(val, dict) else None
+        if not cat or len(cat) != 2 or not isinstance(cat[0], str):
+            continue
+        try:
+            out.add((canon(cat[0]), int(cat[1])))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def sweepers(family, cfg, exempt=None):
+    """(addr -> distinct port count) for sources over the threshold.
+    `exempt`: pares (addr, puerto) de customer_allowed, que no cuentan."""
+    exempt = exempt or set()
     per_src = defaultdict(set)
     for e in set_elements(family, "bf_seen"):
         val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
@@ -307,6 +354,8 @@ def sweepers(family, cfg):
                 continue
         except (TypeError, ValueError):
             continue
+        if exempt and (canon(addr), int(port)) in exempt:
+            continue                  # cliente hacia su propia VM (cust_allow)
         per_src[addr].add(vm_slot(int(port)))     # cuenta MAQUINAS, no puertos
     return {a: len(p) for a, p in per_src.items() if len(p) >= cfg["minPorts"]}
 
@@ -314,43 +363,67 @@ def sweepers(family, cfg):
 CONNTRACK = "/proc/net/nf_conntrack"
 
 
-def flooders(family, cfg, ours=None):
-    """(addr -> live RDP connection count) for sources over `maxConns`.
+def flooders(family, cfg, ours=None, sessions=None, exempt=None):
+    """(addr -> RDP connection count) for sources over `maxConns`.
 
     Counts what the source is holding open RIGHT NOW, which needs no state
     between runs and cannot be evaded by going slow — the trick that defeats
     the port-diversity detector. `ours` (see guarded_destinations) drops flows
-    that do not go to one of our addresses: a guest's Internet egress."""
-    want = "ipv4" if family == "ip" else "ipv6"
-    per_src = defaultdict(int)
+    that do not go to one of our addresses: a guest's Internet egress.
+    `sessions` and `exempt`: see flood_scan."""
     try:
-        with open(CONNTRACK) as fh:
-            for ln in fh:
-                if not ln.startswith(want) or " tcp " not in ln:
-                    continue
-                if "dport=" not in ln:
-                    continue
-                m = _CT_RE.search(ln)
-                if not m:
-                    continue
-                if not in_range(int(m.group(3))):
-                    continue
-                if ours is not None and not ours(m.group(2)):
-                    continue          # va a Internet, no a un forward nuestro
-                addr = canon(m.group(1))
-                if family == "ip6":
-                    try:
-                        if ipaddress.ip_address(addr) in NAT64:
-                            continue
-                    except ValueError:
-                        continue
-                per_src[addr] += 1
+        entries = conntrack_entries(family, ours)
     except FileNotFoundError:
         return {}
     except Exception as exc:
         log(f"{family}: conntrack unreadable ({exc}) — flood detector skipped")
         return {}
-    return {a: n for a, n in per_src.items() if n >= cfg["maxConns"]}
+    est = established_timeout() if sessions else None
+    out, spared = flood_scan(entries, cfg, est, sessions, exempt)
+    for addr, (n, live, vms, t) in sorted(spared.items()):
+        log(f"{family}: SKIP {addr} ({n} connections, {live} live, onto {vms} VM(s)) — "
+            f"RDP session proven {int((time.time() - t) // 60)} min ago: flood judged on "
+            f"live connections, under {cfg['maxConnsWithSession']}")
+    return out
+
+
+def flood_scan(entries, cfg, est_timeout, sessions=None, exempt=None, now=None):
+    """Nucleo del detector de flood, sin E/S.
+
+    Cuenta las conexiones TCP de cada fuente (todas, vivas o no: lo de siempre)
+    salvo los pares de `exempt` (customer_allowed). Una fuente que llega a
+    `maxConns` se perdona si demostro una sesion RDP en `sessionMemorySeconds`
+    (memoria b0+b1), sus conexiones van a `connsMaxVmsWithSession` VMs o menos
+    y tiene menos de `maxConnsWithSession` VIVAS (is_live). Sin dato de silencio
+    (sysctl ilegible) todas cuentan como vivas: nunca mas laxo que eso.
+    Devuelve (flooders addr -> n, spared addr -> (n, vivas, vms, epoch sesion))."""
+    now = time.time() if now is None else now
+    exempt = exempt or set()
+    total = defaultdict(int)
+    live = defaultdict(int)
+    vms = defaultdict(set)
+    max_idle = cfg["hotPortMaxIdle"]
+    for e in entries:
+        if e["proto"] != "tcp" or (e["src"], e["dport"]) in exempt:
+            continue
+        a = e["src"]
+        total[a] += 1
+        vms[a].add(vm_slot(e["dport"]))
+        if is_live(e, est_timeout, max_idle):
+            live[a] += 1
+    out, spared = {}, {}
+    memory = cfg["sessionMemorySeconds"]
+    for a, n in total.items():
+        if n < cfg["maxConns"]:
+            continue
+        t = sessions.get(a) if (sessions and memory > 0) else None
+        if (t is not None and now - t <= memory
+                and len(vms[a]) <= cfg["connsMaxVmsWithSession"]
+                and live[a] < cfg["maxConnsWithSession"]):
+            spared[a] = (n, live[a], len(vms[a]), t)
+            continue
+        out[a] = n
+    return out, spared
 
 
 # --- hot-port: solo conexiones VIVAS, y nunca a quien ha demostrado una sesion --
@@ -569,7 +642,7 @@ def sweep_with_session(addr, metric, sessions, cfg, now=None):
     return True, t
 
 
-def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None):
+def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None, exempt=None):
     """Nucleo del detector hot-port, sin E/S: lo usan sweepguard y la
     herramienta de evaluacion en seco (hotport_dryrun.py).
 
@@ -580,11 +653,14 @@ def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None):
       abusers  addr -> (conexiones vivas, puerto)
       skipped  addr -> (conexiones vivas, puerto, motivo) — pasaban el umbral
                pero tienen una sesion demostrada
+    `exempt`: pares (addr, puerto) de customer_allowed; cuentan para demostrar
+    una sesion, no como conexiones.
     """
     now = time.time() if now is None else now
     max_idle = cfg["hotPortMaxIdle"]
     memory = cfg["sessionMemorySeconds"]
     sessions = {} if sessions is None else sessions
+    exempt = exempt or set()
     pair = defaultdict(int)
     per_port = defaultdict(int)
     proven_now = set()
@@ -593,6 +669,8 @@ def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None):
             proven_now.add(e["src"])
         if e["proto"] != "tcp" or not is_live(e, est_timeout, max_idle):
             continue
+        if (e["src"], e["dport"]) in exempt:
+            continue          # cliente hacia su propia VM (cust_allow): ni suma al puerto
         pair[(e["src"], e["dport"])] += 1
         per_port[e["dport"]] += 1
     if memory > 0:
@@ -642,7 +720,7 @@ def conntrack_entries(family, ours=None):
     return out
 
 
-def hot_port_abusers(family, cfg, ours=None, sessions=None):
+def hot_port_abusers(family, cfg, ours=None, sessions=None, exempt=None):
     """(addr -> (conns, port)) for sources piling LIVE connections onto ONE attacked port.
 
     Detectors 1 and 2 both miss the slow DISTRIBUTED attack on a single VM:
@@ -699,7 +777,7 @@ def hot_port_abusers(family, cfg, ours=None, sessions=None):
     if est is None:
         log(f"{family}: {EST_TIMEOUT_SYSCTL} unreadable — hot-port counts every "
             f"ESTABLISHED connection, live or not")
-    abusers, skipped = hot_port_scan(entries, cfg, est, sessions)
+    abusers, skipped = hot_port_scan(entries, cfg, est, sessions, exempt=exempt)
     for addr, (n, port, why) in sorted(skipped.items()):
         log(f"{family}: SKIP {addr} ({n} live connections onto port {port}, "
             f"VM {vm_slot(port)}) — {why}: not judged by hot-port")
@@ -714,9 +792,10 @@ def run_family(family, cfg, sessions=None):
     # tres detectores independientes; la razon se conserva para el log.
     # hot-port va primero porque es el que anota en `sessions` las sesiones RDP
     # que se ven ahora, y diversidad de puertos las consulta.
-    hot = hot_port_abusers(family, cfg, ours, sessions)
+    exempt = customer_allowed(family)
+    hot = hot_port_abusers(family, cfg, ours, sessions, exempt)
     cand = {}
-    for a, n in sweepers(family, cfg).items():
+    for a, n in sweepers(family, cfg, exempt).items():
         spared, t = sweep_with_session(a, n, sessions, cfg)
         if spared:
             log(f"{family}: SKIP {a} ({n} ports) — RDP session proven "
@@ -727,7 +806,7 @@ def run_family(family, cfg, sessions=None):
             log(f"{family}: NOTE {a} has a proven RDP session but touches {n} "
                 f"machines (>= sweepMaxWithSession) — judged as usual")
         cand[a] = ("ports", n, None)
-    for a, n in flooders(family, cfg, ours).items():
+    for a, n in flooders(family, cfg, ours, sessions, exempt).items():
         if a not in cand:                      # diversidad de puertos manda
             cand[a] = ("conns", n, None)
     for a, (n, port) in hot.items():
@@ -761,6 +840,8 @@ def run_family(family, cfg, sessions=None):
         # El puerto y la VM van SIEMPRE en el log del detector ambiguo: sin eso
         # es imposible saber si acabamos de bloquear a un atacante o al dueño de
         # la maquina, que es exactamente lo que costo 10h de corte el 2026-07-29.
+        # «live connections» se queda asi aunque cuente tambien las muertas:
+        # es la cadena que buscan los runbooks y las notas en el journal.
         what = {"ports": "%d distinct ports" % metric,
                 "conns": "%d live connections" % metric,
                 "hotport": "%d live connections onto ONE attacked port (port %s, VM %s)"

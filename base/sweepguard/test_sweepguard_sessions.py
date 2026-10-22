@@ -141,9 +141,14 @@ def test_over_sweep_max_with_session_blocked_anyway():
     assert n == 0
 
 
-def test_flood_detector_unchanged_for_spared_source():
+def test_flood_with_session_judged_on_live_connections():
+    # desde el 22/10 el flood tambien mira la sesion (test_sweepguard_customers.py):
+    # con sesion y pocas VMs solo bloquea a partir de maxConnsWithSession VIVAS
     sessions = {PAUL: NOW - 60}
     flood = [off(PAUL, 20210) for _ in range(CFG["maxConns"])]
+    n, h = run_family(sessions, bf_seen=seen(PAUL, 20), conntrack=flood)
+    assert n == 0 and not h.blocked(), h.calls
+    flood = [off(PAUL, 20210) for _ in range(CFG["maxConnsWithSession"])]
     n, h = run_family(sessions, bf_seen=seen(PAUL, 20), conntrack=flood)
     assert n == 1 and PAUL in h.blocked()[0]
     assert any("live connections" in m and "BLOCKED" in m for m in h.logs), h.logs
