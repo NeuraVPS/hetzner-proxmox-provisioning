@@ -36,7 +36,9 @@ class FakeBase:
         self.sets = {("ip", "bf_allow"): set(), ("ip", "bf_static"): set(),
                      ("ip", "bf_auto"): set(), ("ip", "bf_seen"): set(),
                      ("ip6", "bf_allow"): set(), ("ip6", "bf_auto"): set(),
-                     ("ip6", "bf_seen"): set()}
+                     ("ip6", "bf_seen"): set(),
+                     ("ip", "cust_allow"): set(), ("ip6", "cust_allow"): set()}
+        self.expires = {}                  # (fam, addr, port) -> timeout de cust_allow
         self.conntrack = {}
         self.calls = []
         self.fail_batch = False
@@ -52,18 +54,31 @@ class FakeBase:
         if cmd[1:3] == ["-t", "list"]:
             return Done(0 if (cmd[4], cmd[6]) in self.sets else 1)
         if cmd[1:3] == ["-j", "list"]:
-            fam = cmd[4]
-            elem = [{"elem": {"val": {"concat": [a, p]}, "expires": 1000}}
-                    for a, p in sorted(self.sets[(fam, "bf_seen")])]
+            fam, name = cmd[4], cmd[6]
+            if (fam, name) not in self.sets:
+                return Done(1, err="Error: No such file or directory")
+            elem = [{"elem": {"val": {"concat": [a, p]},
+                              "expires": self.expires.get((fam, a, p), 1000)}}
+                    for a, p in sorted(self.sets[(fam, name)])]
             return Done(0, out=json.dumps({"nftables": [{"metainfo": {}},
-                                                        {"set": {"name": "bf_seen", "elem": elem}}]}))
+                                                        {"set": {"name": name, "elem": elem}}]}))
         if cmd[1:3] == ["-f", "-"]:
             if self.fail_batch:
                 return Done(1, err="Error: Could not process rule: No such file or directory")
+            staged = {k: set(v) for k, v in self.sets.items()}
             for ln in stdin.splitlines():
-                m = re.fullmatch(r"delete element (ip6?) rdpguard bf_seen \{ (\S+) \. (\d+) \}", ln)
+                m = re.fullmatch(r"(delete|add) element (ip6?) rdpguard (bf_seen|cust_allow) "
+                                 r"\{ (\S+) \. (\d+)(?: timeout (\d+)s)? \}", ln)
                 assert m, ln
-                self.sets[(m[1], "bf_seen")].discard((m[2], int(m[3])))
+                key, item = (m[2], m[3]), (m[4], int(m[5]))
+                if m[1] == "delete":
+                    if item not in staged[key]:      # la transaccion entera falla
+                        return Done(1, err="Error: Could not process rule: No such file or directory")
+                    staged[key].discard(item)
+                else:
+                    staged[key].add(item)
+                    self.expires[(m[2], m[4], int(m[5]))] = int(m[6])
+            self.sets = staged
             return Done(0)
         verb, fam, name = cmd[1], cmd[3], cmd[5]
         assert cmd[2] == "element" and cmd[4] == "rdpguard", cmd
@@ -71,11 +86,16 @@ class FakeBase:
         if key not in self.sets:
             return Done(1, err=f"Error: No such file or directory; did you mean set 'x' in table {fam} 'rdpguard'?")
         inner = cmd[6].strip("{} ")
-        if name == "bf_seen":
+        if name in ("bf_seen", "cust_allow"):
             a, _, p = inner.partition(" . ")
+            p, _, tmo = p.partition(" timeout ")
             item = (a, int(p))
         else:
             item = inner
+        if verb == "add":
+            self.sets[key].add(item)
+            self.expires[(fam, item[0], item[1])] = int(tmo.rstrip("s"))
+            return Done(0)
         if verb == "get":
             ok = item in self.sets[key]
         elif verb == "delete":
@@ -200,6 +220,135 @@ class Unblock(unittest.TestCase):
         self.b.sets[("ip", "bf_auto")].add("90.249.134.23")
         rc, out = call(self.b, "unblock 90.249.134.23", env=False)
         self.assertEqual((rc, out["result"]), (0, "unblocked"))
+
+
+A4 = "47.194.157.202"
+A6 = "2606:4d80:1300:22c5:54a3:613e:a786:5e30"
+
+
+class ParseCommand(unittest.TestCase):
+    def test_accepts_the_three_verbs(self):
+        self.assertEqual(ub.parse_command(f"status {A4}")[:2], ("status", ub.ipaddress.ip_address(A4)))
+        verb, ip, vmids, console = ub.parse_command(f"allow-vm {A6} 1671,1670,1671 console")
+        self.assertEqual((verb, str(ip), vmids, console), ("allow-vm", A6, [1670, 1671], True))
+        self.assertEqual(ub.parse_command(f"allow-vm {A4} 100")[2:], ([100], False))
+        self.assertEqual(ub.parse_command(f"unblock {A4}")[0], "unblock")
+
+    def test_rejects_bad_allow_vm(self):
+        many = ",".join(str(1000 + i) for i in range(ub.MAX_VMIDS + 1))
+        for raw in [f"allow-vm {A4}", f"allow-vm {A4} ", f"allow-vm {A4} 1671,", f"allow-vm {A4} ,1671",
+                    f"allow-vm {A4} 99", f"allow-vm {A4} 10000", f"allow-vm {A4} 01671",
+                    f"allow-vm {A4} 1671 consola", f"allow-vm {A4} 1671  console",
+                    f"allow-vm {A4} 1671 console ", f"allow-vm {A4} 1671;id", f"allow-vm {A4} -1",
+                    f"allow-vm 10.64.1.2 1671", f"allow-vm {A4} {many}", f"allow-vm {A4}/24 1671",
+                    f"allow-vm 1671 {A4}", f"status {A4} 1671", f"status 192.168.1.1",
+                    f"ALLOW-VM {A4} 1671", f"allow-vm {A4} 1671\n"]:
+            with self.assertRaises(ub.BadRequest, msg=raw):
+                ub.parse_command(raw)
+
+    def test_ports_per_vm(self):
+        self.assertEqual(ub.vm_ports([1670, 1671]), [11670, 11671, 21670, 21671, 31670, 31671])
+        self.assertEqual(ub.vm_ports([100], console=True), [443, 10100, 20100, 30100])
+
+
+class AllowVm(unittest.TestCase):
+    def setUp(self):
+        self.b = FakeBase()
+
+    def test_allows_only_their_ports_and_keeps_bf_auto(self):
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        self.b.sets[("ip", "bf_seen")] |= {(A4, 31671), (A4, 21999), ("8.8.4.4", 31671)}
+        rc, out = call(self.b, f"allow-vm {A4} 1670,1671 console")
+        self.assertEqual((rc, out["result"], out["ports"], out["renewed"]), (0, "allowed", 7, 0))
+        self.assertEqual(self.b.sets[("ip", "cust_allow")],
+                         {(A4, p) for p in (443, 11670, 11671, 21670, 21671, 31670, 31671)})
+        self.assertIn(A4, self.b.sets[("ip", "bf_auto")])          # el resto de la base, cerrado
+        self.assertEqual(out["seenForgotten"], 1)                   # solo sus puertos
+        self.assertEqual(self.b.sets[("ip", "bf_seen")], {(A4, 21999), ("8.8.4.4", 31671)})
+        self.assertEqual({v for (f, a, p), v in self.b.expires.items()}, {ub.ALLOW_SECONDS})
+        self.assertFalse([c for c, _ in self.b.calls if c[0] == "conntrack"])
+
+    def test_v6_goes_to_ip6_set(self):
+        self.b.sets[("ip6", "bf_auto")].add(A6)
+        rc, out = call(self.b, f"allow-vm {A6} 1671")
+        self.assertEqual((rc, out["result"], out["family"]), (0, "allowed", "ip6"))
+        self.assertEqual(self.b.sets[("ip6", "cust_allow")], {(A6, 11671), (A6, 21671), (A6, 31671)})
+        self.assertEqual(self.b.sets[("ip", "cust_allow")], set())
+
+    def test_renews_in_one_transaction(self):
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        self.b.sets[("ip", "cust_allow")] |= {(A4, 21671), ("8.8.4.4", 21671), (A4, 21999)}
+        self.b.expires[("ip", A4, 21671)] = 60
+        rc, out = call(self.b, f"allow-vm {A4} 1671")
+        self.assertEqual((rc, out["renewed"]), (0, 1))
+        self.assertEqual(self.b.expires[("ip", A4, 21671)], ub.ALLOW_SECONDS)
+        # nunca quita entradas: ni las de otra IP ni otras VMs de esta (IP compartida)
+        self.assertIn(("8.8.4.4", 21671), self.b.sets[("ip", "cust_allow")])
+        self.assertIn((A4, 21999), self.b.sets[("ip", "cust_allow")])
+        batches = [i for c, i in self.b.calls if c[1:3] == ["-f", "-"] and "cust_allow" in (i or "")]
+        self.assertEqual(len(batches), 1)
+        self.assertIn(f"delete element ip rdpguard cust_allow {{ {A4} . 21671 }}", batches[0])
+
+    def test_batch_failure_falls_back_one_by_one(self):
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        self.b.fail_batch = True
+        rc, out = call(self.b, f"allow-vm {A4} 1671")
+        self.assertEqual((rc, out["result"]), (0, "allowed"))
+        self.assertEqual(len(self.b.sets[("ip", "cust_allow")]), 3)
+
+    def test_not_blocked_adds_nothing(self):
+        rc, out = call(self.b, f"allow-vm {A4} 1671")
+        self.assertEqual((rc, out["result"]), (0, "not_blocked"))
+        self.assertEqual(self.b.sets[("ip", "cust_allow")], set())
+
+    def test_static_adds_nothing(self):
+        self.b.sets[("ip", "bf_static")].add(A4)
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        rc, out = call(self.b, f"allow-vm {A4} 1671")
+        self.assertEqual((rc, out["result"]), (0, "static"))
+        self.assertEqual(self.b.sets[("ip", "cust_allow")], set())
+
+    def test_missing_set_is_an_error(self):
+        del self.b.sets[("ip", "cust_allow")]
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        rc, out = call(self.b, f"allow-vm {A4} 1671")
+        self.assertEqual((rc, out["error"]), (1, "internal"))
+        self.assertIn("deploy_customer_allow.sh", out["detail"])
+
+    def test_never_touches_bf_auto_bf_allow_or_static(self):
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        call(self.b, f"allow-vm {A4} 1671 console")
+        for cmd, stdin in self.b.calls:
+            text = " ".join(cmd) + (stdin or "")
+            for name in ("bf_allow", "bf_static"):
+                if "delete" in text or "add" in text:
+                    self.assertNotIn(name, text)
+            self.assertFalse("bf_auto" in text and ("delete" in text or " add " in text), text)
+
+
+class Status(unittest.TestCase):
+    def setUp(self):
+        self.b = FakeBase()
+
+    def test_reports_blocks_and_allowed_vms_without_writing(self):
+        self.b.sets[("ip", "bf_auto")].add(A4)
+        for p, exp in ((11671, 500), (21671, 400), (31671, 900), (21670, 800), (443, 300)):
+            self.b.sets[("ip", "cust_allow")].add((A4, p))
+            self.b.expires[("ip", A4, p)] = exp
+        rc, out = call(self.b, f"status {A4}")
+        self.assertEqual(rc, 0)
+        self.assertEqual((out["blocked"], out["static"], out["customerSet"]), (True, False, True))
+        self.assertEqual(out["allowedVmids"], {"1671": 400})       # 1670 no tiene sus 3 puertos
+        self.assertEqual(out["consoleExpires"], 300)
+        for cmd, stdin in self.b.calls:
+            self.assertNotIn(cmd[1], ("delete", "add", "-f"))
+            self.assertNotEqual(cmd[0], "conntrack")
+
+    def test_v6_without_static_or_customer_set(self):
+        del self.b.sets[("ip6", "cust_allow")]
+        rc, out = call(self.b, f"status {A6}")
+        self.assertEqual((rc, out["blocked"], out["static"], out["customerSet"]), (0, False, False, False))
+        self.assertNotIn("allowedVmids", out)
 
 
 if __name__ == "__main__":
