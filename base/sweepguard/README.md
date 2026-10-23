@@ -85,8 +85,8 @@ judges NATIVE v6 clients (NAT66).
     connsMaxVmsWithSession  a source with a proven session whose connections go
                          to at most this many VMs gets the flood limits below
                          instead of maxConns (10, since 2026-10-22; -1 = off)
-    maxLiveConnsWithSession   ...blocked from this many LIVE connections (100)
-    maxConnsTotalWithSession  ...or this many in total, live or dead (500)
+    maxLiveConnsWithSession   ...blocked ONLY from this many LIVE connections;
+                         dead ones do not count (100)
 
 No base carries this file today (checked 2026-09-27 on b0 and b1): the
 `DEFAULTS` in `sweepguard.py` are what runs.
@@ -576,14 +576,14 @@ Cruce con la memoria de sesiones compartida y con conntrack:
 
 **Regla** (`flood_scan`): si la fuente llega a `maxConns`, tiene sesión en la
 memoria (`sessionMemorySeconds`, 30 d, b0+b1) y sus conexiones van a
-`connsMaxVmsWithSession` (**10**) VMs o menos, se bloquea solo a partir de
+`connsMaxVmsWithSession` (**10**) VMs o menos, se bloquea **solo** a partir de
 `maxLiveConnsWithSession` (**100**) conexiones **vivas** (`is_live`, como
-hot-port) o de `maxConnsTotalWithSession` (**500**) en total; en el log, `SKIP
-… (N connections, M live, onto K VM(s))`. Sin sesión, o con más VMs, todo
-igual. Con los datos de arriba, los 8 bloqueos a clientes no se habrían
-producido y los 147 restantes sí. **Ojo:** al ritmo medido, la IPv6 del cliente
-del 22/10 llega a 500 en ~10 h; a partir de ahí lo que le evita el rebloqueo es
-`cust_allow` (abajo), que el panel le pone al entrar estando bloqueado.
+hot-port); las muertas no cuentan. En el log, `SKIP … (N connections, M live,
+onto K VM(s))`. Sin sesión, o con más VMs, todo igual que antes. Con los datos
+de arriba, los 8 bloqueos a clientes no se habrían producido y los 147
+restantes sí. No hay tope total, por decisión de Iván (23/10): al ritmo medido
+el cliente del 22/10 junta ~50 SSH calladas por hora que conntrack guarda 5
+días, y con un tope de 500 caería cada 2-3 días.
 
 ### `cust_allow`: el panel abre a un cliente bloqueado SOLO sus VMs
 

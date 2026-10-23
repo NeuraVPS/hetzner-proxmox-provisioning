@@ -11,7 +11,7 @@ desde el 20/10, en v4 y en v6. Los 145 bloqueos restantes de esa regla en 30
 dias (b0+b1) eran fuentes sin ninguna sesion, contra 1-3 VMs (155 y 147 al
 volver a contar el 22/10 por la tarde: 8 bloqueos a 3 fuentes con sesion). Los datos son
 sinteticos con la forma de /proc/net/nf_conntrack y de `nft -j`.
-Con sesion y pocas VMs se bloquea desde 100 VIVAS o 500 en total.
+Con sesion y pocas VMs se bloquea solo desde 100 VIVAS; las muertas no cuentan.
 """
 import importlib.util
 import os
@@ -161,14 +161,20 @@ def test_session_but_live_flood_blocks():
     assert n == 0
 
 
-def test_session_but_total_cap_blocks():
-    cap = CFG["maxConnsTotalWithSession"]
-    assert cap == 500
-    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=cap, live=5))
+def test_dead_connections_never_count_with_session():
+    # ~50 SSH calladas por hora durante 5 dias de conntrack: sin tope total
+    assert "maxConnsTotalWithSession" not in CFG
+    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=2000, live=5))
+    assert n == 0 and not h.blocked(), h.calls
+    assert any("SKIP" in m and "2000 connections, 5 live" in m
+               and "only on live connections, from 100" in m for m in h.logs), h.logs
+    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=2000, live=100))
     assert n == 1 and ANDRES4 in h.blocked()[0]
-    n, h = run_family({ANDRES4: NOW - 60}, conntrack=andres(n=cap - 1, live=5))
-    assert n == 0, h.logs
-    assert any("SKIP" in m and "100 live / 500 total" in m for m in h.logs), h.logs
+
+
+def test_dead_connections_still_count_without_session():
+    n, h = run_family({}, conntrack=andres(n=2000, live=0))
+    assert n == 1 and ANDRES4 in h.blocked()[0]
 
 
 def test_no_exemption_switch():

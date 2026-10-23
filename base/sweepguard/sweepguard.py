@@ -88,8 +88,10 @@ that had proven one hours or days before, holding SSH sessions to their own
 connections in ESTABLISHED for 5 days). What separates them is the session,
 not the number of VMs: the attackers also aim at 1-3 VMs. A source with a
 session in the memory whose connections go to at most `connsMaxVmsWithSession`
-VMs is blocked only from `maxLiveConnsWithSession` LIVE connections (is_live)
-or `maxConnsTotalWithSession` in total, live or dead.
+VMs is blocked only from `maxLiveConnsWithSession` LIVE connections
+(is_live); dead ones do not count at all (the customer of 22/10 piles up ~50
+silent SSH per hour that stay 5 days in conntrack: any total cap would block
+him every few days).
 
 Customer allowances from the panel (2026-10-22)
 -----------------------------------------------
@@ -139,12 +141,12 @@ DEFAULTS = {
     "sessionPeerTimeout": 15,
     # Flood (maxConns) con sesion probada en sessionMemorySeconds y pocas VMs:
     # 30 dias b0+b1 (22/10), los 8 bloqueos a clientes tenian sesion y 1-2
-    # VMs; los 147 restantes, ninguna sesion. Se bloquea a partir de tantas
-    # VIVAS (is_live: las muertas las fabrica el propio bloqueo) o de tantas
-    # en total, vivas o muertas. -1 en connsMaxVmsWithSession = sin excepcion.
+    # VMs; los 147 restantes, ninguna sesion. Se bloquea SOLO a partir de
+    # tantas VIVAS (is_live); las muertas no cuentan (decision de Ivan 23/10:
+    # el cliente del 22/10 acumula ~50 SSH calladas por hora durante 5 dias).
+    # -1 en connsMaxVmsWithSession = sin excepcion.
     "connsMaxVmsWithSession": 10,       # el cliente con mas servidores tiene 7
     "maxLiveConnsWithSession": 100,     # el cliente del 22/10: ~5 vivas de ~105
-    "maxConnsTotalWithSession": 500,
     "maxAddsPerRun": 200,
     "blockSeconds": 86400,   # 24h
     # El detector hot-port es el UNICO ambiguo: el dueño legitimo del puerto
@@ -397,7 +399,7 @@ def flooders(family, cfg, ours=None, sessions=None, exempt=None):
     for addr, (n, live, vms, t) in sorted(spared.items()):
         log(f"{family}: SKIP {addr} ({n} connections, {live} live, onto {vms} VM(s)) — "
             f"RDP session proven {int((time.time() - t) // 60)} min ago: flood limits "
-            f"{cfg['maxLiveConnsWithSession']} live / {cfg['maxConnsTotalWithSession']} total")
+            f"only on live connections, from {cfg['maxLiveConnsWithSession']}")
     return out
 
 
@@ -407,10 +409,10 @@ def flood_scan(entries, cfg, est_timeout, sessions=None, exempt=None, now=None):
     Cuenta las conexiones TCP de cada fuente (todas, vivas o no: lo de siempre)
     salvo los pares de `exempt` (customer_allowed). Una fuente que llega a
     `maxConns` se perdona si demostro una sesion RDP en `sessionMemorySeconds`
-    (memoria b0+b1), sus conexiones van a `connsMaxVmsWithSession` VMs o menos,
-    tiene menos de `maxLiveConnsWithSession` VIVAS (is_live) y menos de
-    `maxConnsTotalWithSession` en total. Sin dato de silencio (sysctl
-    ilegible) todas cuentan como vivas: nunca mas laxo que eso.
+    (memoria b0+b1), sus conexiones van a `connsMaxVmsWithSession` VMs o menos
+    y tiene menos de `maxLiveConnsWithSession` VIVAS (is_live); las muertas no
+    cuentan. Sin dato de silencio (sysctl ilegible) todas cuentan como vivas:
+    nunca mas laxo que eso.
     Devuelve (flooders addr -> n, spared addr -> (n, vivas, vms, epoch sesion))."""
     now = time.time() if now is None else now
     exempt = exempt or set()
@@ -434,8 +436,7 @@ def flood_scan(entries, cfg, est_timeout, sessions=None, exempt=None, now=None):
         t = sessions.get(a) if (sessions and memory > 0) else None
         if (t is not None and now - t <= memory
                 and len(vms[a]) <= cfg["connsMaxVmsWithSession"]
-                and live[a] < cfg["maxLiveConnsWithSession"]
-                and n < cfg["maxConnsTotalWithSession"]):
+                and live[a] < cfg["maxLiveConnsWithSession"]):
             spared[a] = (n, live[a], len(vms[a]), t)
             continue
         out[a] = n
