@@ -12,7 +12,10 @@
 #       restrict,command="/usr/local/sbin/neuravps-unblock-ip" <clave.pub>
 #     restrict = sin TTY, sin reenvios, sin agente; command= ignora lo que pida
 #     el cliente SSH y ejecuta el script, que lee la peticion de
-#     SSH_ORIGINAL_COMMAND y solo acepta `unblock <ip>`. Sin from=: las
+#     SSH_ORIGINAL_COMMAND y solo acepta `unblock <ip>`, `status <ip>`,
+#     `allow-vm <ip> <vmids> [console]` y `revoke-vm <vmids>` (los dos
+#     ultimos necesitan el set de deploy_customer_allow.sh; sin el, allow-vm
+#     contesta error y revoke-vm `no_set`). Sin from=: las
 #     funciones salen por direcciones de Google que no son fijas. Una linea
 #     anterior con el mismo comentario (otra clave) se sustituye; queda copia
 #     .bak.unblock-ip.*;

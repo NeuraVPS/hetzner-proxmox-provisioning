@@ -8,10 +8,12 @@ solo puede ejecutar este fichero:
     restrict,command="/usr/local/sbin/neuravps-unblock-ip" ssh-ed25519 AAAA... neuravps-unblock-ip@functions
 
 La peticion llega en SSH_ORIGINAL_COMMAND y solo se acepta exactamente
-`unblock <ip>`, con una direccion IPv4 o IPv6 global. Todo lo demas se rechaza
-sin tocar nada. Para probar a mano: `neuravps-unblock-ip unblock 203.0.113.7`.
+`unblock <ip>`, `status <ip>`, `allow-vm <ip> <vmids> [console]` o
+`revoke-vm <vmids>` (abajo), con una direccion IPv4 o IPv6 global. Todo lo
+demas se rechaza sin tocar nada.
+Para probar a mano: `neuravps-unblock-ip status 203.0.113.7`.
 
-Que hace, y nada mas:
+`unblock <ip>` (el boton) hace, y nada mas:
   1. Si la direccion esta en `bf_static` (bloqueo manual) no toca nada y
      contesta `static`: eso lo decide una persona.
   2. Si esta en `bf_auto`, la quita, borra sus entradas de `bf_seen` y sus
@@ -25,6 +27,35 @@ mismos puertos. Las conexiones de conntrack, por lo mismo para los detectores
 de flood y hot-port (el bloqueo congela sus conexiones en ESTABLISHED).
 
 Nunca toca `bf_allow`, `bf_static`, las reglas ni la memoria de sesiones.
+
+Dos peticiones mas (22/10/2026), para el desbloqueo AUTOMATICO al entrar en el
+panel, que NO quita la IP de `bf_auto`:
+
+  status <ip>
+      Solo lectura: si esta en `bf_static` / `bf_auto` y que VMs tiene ya
+      abiertas en `cust_allow` (y cuanto les queda).
+
+  allow-vm <ip> <vmid>[,<vmid>...] [console]
+      Si la IP esta en `bf_auto` (y no en `bf_static`), mete en `cust_allow`
+      los pares (ip . puerto) de esas VMs: SMB 1xxxx, RDP 2xxxx y SSH 3xxxx
+      (xxxx = vmid), y con `console` tambien el 443 de la base (la consola VNC
+      del panel entra por el nginx de la base). Duran ALLOW_SECONDS (48 h) y
+      se renuevan si ya estaban. La cadena acepta esos pares antes de la regla
+      de `bf_auto` y SOLO mientras la IP este en `bf_auto`: esa IP llega a SUS
+      VMs, el resto de la base le sigue cerrado y, fuera del bloqueo, su
+      trafico pasa por bf_seen y los limites como el de cualquiera. Borra de
+      `bf_seen` lo que esa IP tenia en esos puertos. Si la IP no esta
+      bloqueada no hace nada (`not_blocked`). Como mucho MAX_VMIDS VMs por
+      llamada; nunca borra entradas de otras IPs (dos clientes pueden
+      compartir IP).
+
+  revoke-vm <vmid>[,<vmid>...]
+      Borra de `cust_allow`, en las dos familias, TODAS las entradas de los
+      puertos de esas VMs, sea cual sea la IP. Lo llama NeuraVPS (trigger
+      sobre servers/) cuando una VM se borra, cambia de vmid o de dueño, o
+      cuando un vmid se asigna a una VM nueva: el vmid se reutiliza, y una
+      entrada vieja dejaria a la IP del dueño anterior llegar a la VM de
+      otro. El 443 no se toca (no es de ninguna VM).
 
 Salida: una linea JSON. Codigo 0 si se atendio (sea cual sea el resultado),
 2 si la peticion no es valida, 1 si algo fallo en la base.
@@ -42,20 +73,30 @@ TABLE = "rdpguard"
 LOCK = "/run/neuravps-unblock-ip.lock"
 # Nada de comillas, espacios de mas ni otros caracteres: el resto se rechaza.
 REQUEST_RE = re.compile(r"\Aunblock ([0-9A-Fa-f:.]{2,45})\Z")
+STATUS_RE = re.compile(r"\Astatus ([0-9A-Fa-f:.]{2,45})\Z")
+ALLOW_RE = re.compile(r"\Aallow-vm ([0-9A-Fa-f:.]{2,45}) ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})( console)?\Z")
+REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})\Z")
 NFT_TIMEOUT = 20
+
+CUSTOMER_SET = "cust_allow"
+# 48 h: el doble del bloqueo (blockSeconds, 24 h). El panel la renueva cada
+# 10 min mientras el cliente lo usa ESTANDO bloqueado; una entrada olvidada
+# (VM borrada, IP dinamica que cambia de abonado) caduca sola en 2 dias, y
+# revoke-vm la quita antes cuando el vmid deja de ser de ese cliente.
+ALLOW_SECONDS = 48 * 3600
+MAX_VMIDS = 50                  # el cliente con mas servidores tiene 7
+VMID_MIN, VMID_MAX = 100, 9999  # los forwards son 1xxxx/2xxxx/3xxxx
+FORWARD_BASES = (10000, 20000, 30000)   # SMB, RDP, SSH
+CONSOLE_PORT = 443
 
 
 class BadRequest(ValueError):
     pass
 
 
-def parse_request(raw):
-    """`unblock <ip>` -> ipaddress normalizado. Lanza BadRequest."""
-    m = REQUEST_RE.match(raw or "")
-    if not m:
-        raise BadRequest("expected: unblock <ip>")
+def _ip(raw):
     try:
-        ip = ipaddress.ip_address(m.group(1))
+        ip = ipaddress.ip_address(raw)
     except ValueError:
         raise BadRequest("not an IP address")
     if ip.version == 6 and ip.ipv4_mapped is not None:
@@ -63,6 +104,55 @@ def parse_request(raw):
     if not ip.is_global:
         raise BadRequest("not a global address")
     return ip
+
+
+def _vmids(raw):
+    out = []
+    for tok in raw.split(","):
+        if tok != str(int(tok)):             # sin ceros a la izquierda
+            raise BadRequest("bad vmid")
+        v = int(tok)
+        if not VMID_MIN <= v <= VMID_MAX:
+            raise BadRequest("vmid out of range")
+        if v not in out:
+            out.append(v)
+    if len(out) > MAX_VMIDS:
+        raise BadRequest(f"more than {MAX_VMIDS} vmids")
+    return sorted(out)
+
+
+def parse_request(raw):
+    """`unblock <ip>` -> ipaddress normalizado. Lanza BadRequest."""
+    m = REQUEST_RE.match(raw or "")
+    if not m:
+        raise BadRequest("expected: unblock <ip>")
+    return _ip(m.group(1))
+
+
+def parse_command(raw):
+    """Peticion -> (orden, ip, vmids, consola). Lanza BadRequest.
+    unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,<vmid>...] [console]
+    | revoke-vm <vmid>[,<vmid>...]   (en revoke-vm, ip = None)"""
+    raw = raw or ""
+    m = REQUEST_RE.match(raw)
+    if m:
+        return "unblock", _ip(m.group(1)), [], False
+    m = STATUS_RE.match(raw)
+    if m:
+        return "status", _ip(m.group(1)), [], False
+    m = ALLOW_RE.match(raw)
+    if m:
+        return "allow-vm", _ip(m.group(1)), _vmids(m.group(2)), bool(m.group(3))
+    m = REVOKE_RE.match(raw)
+    if m:
+        return "revoke-vm", None, _vmids(m.group(1)), False
+    raise BadRequest("expected: unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,...] [console]"
+                     " | revoke-vm <vmid>[,...]")
+
+
+def vm_ports(vmids, console=False):
+    ports = [b + v for v in vmids for b in FORWARD_BASES]
+    return sorted(ports + ([CONSOLE_PORT] if console else []))
 
 
 def family_of(ip):
@@ -90,9 +180,14 @@ def in_set(fam, name, addr):
     raise RuntimeError(f"nft get element {name}: {' '.join(r.stderr.split())[:160]}")
 
 
-def seen_ports(fam, addr):
-    """Puertos que `bf_seen` tiene anotados para esta fuente."""
-    r = run(["nft", "-j", "list", "set", fam, TABLE, "bf_seen"])
+def seen_ports(fam, addr, name="bf_seen"):
+    """Puertos que `bf_seen` (o `cust_allow`) tiene anotados para esta fuente."""
+    return [p for p, _ in pair_ports(fam, addr, name)]
+
+
+def pair_ports(fam, addr, name):
+    """[(puerto, segundos que le quedan o None)] de un set (addr . puerto)."""
+    r = run(["nft", "-j", "list", "set", fam, TABLE, name])
     if r.returncode != 0:
         return []
     ports = []
@@ -107,13 +202,17 @@ def seen_ports(fam, addr):
             except ValueError:
                 continue
             if same and isinstance(concat[1], int):
-                ports.append(concat[1])
+                exp = e["elem"].get("expires")
+                ports.append((concat[1], exp if isinstance(exp, int) else None))
     return ports
 
 
-def forget_seen(fam, addr):
-    """Borra las entradas (addr . puerto) de bf_seen. Devuelve cuantas."""
+def forget_seen(fam, addr, only=None):
+    """Borra las entradas (addr . puerto) de bf_seen (solo las de `only` si se
+    da). Devuelve cuantas."""
     ports = seen_ports(fam, addr)
+    if only is not None:
+        ports = [p for p in ports if p in only]
     if not ports:
         return 0
     batch = "".join(f"delete element {fam} {TABLE} bf_seen {{ {addr} . {p} }}\n"
@@ -155,29 +254,149 @@ def unblock(ip):
     return out
 
 
+def status(ip):
+    """Solo lectura: bloqueos y VMs ya abiertas en cust_allow para esta IP."""
+    fam = family_of(ip)
+    addr = str(ip)
+    out = {"ip": addr, "family": fam, "result": "status",
+           "static": bool(set_exists(fam, "bf_static") and in_set(fam, "bf_static", addr)),
+           "blocked": in_set(fam, "bf_auto", addr),
+           "customerSet": set_exists(fam, CUSTOMER_SET)}
+    if out["customerSet"]:
+        left = dict(pair_ports(fam, ip, CUSTOMER_SET))
+        vms = {}
+        for p, exp in left.items():
+            if p == CONSOLE_PORT or not 10000 <= p <= 39999:
+                continue
+            v = p % 10000
+            trio = [left.get(b + v) for b in FORWARD_BASES]
+            if all(isinstance(x, int) for x in trio):
+                vms[str(v)] = min(trio)          # la VM esta abierta si lo estan sus 3 puertos
+        out["allowedVmids"] = vms
+        if isinstance(left.get(CONSOLE_PORT), int):
+            out["consoleExpires"] = left[CONSOLE_PORT]
+    return out
+
+
+def allow_vm(ip, vmids, console):
+    """Abre a esta IP solo los puertos de esas VMs (ver docstring del modulo)."""
+    fam = family_of(ip)
+    addr = str(ip)
+    out = {"ip": addr, "family": fam, "vmids": vmids}
+    if set_exists(fam, "bf_static") and in_set(fam, "bf_static", addr):
+        out["result"] = "static"
+        return out
+    if not set_exists(fam, CUSTOMER_SET):
+        raise RuntimeError(f"set {fam} {TABLE} {CUSTOMER_SET} missing (deploy_customer_allow.sh)")
+    if not in_set(fam, "bf_auto", addr):
+        out["result"] = "not_blocked"
+        return out
+    ports = vm_ports(vmids, console)
+    present = set(seen_ports(fam, ip, CUSTOMER_SET)) & set(ports)
+    # borrar y volver a meter en la MISMA transaccion renueva el plazo sin hueco
+    batch = "".join(f"delete element {fam} {TABLE} {CUSTOMER_SET} {{ {addr} . {p} }}\n"
+                    for p in sorted(present))
+    batch += "".join(f"add element {fam} {TABLE} {CUSTOMER_SET} {{ {addr} . {p} timeout {ALLOW_SECONDS}s }}\n"
+                     for p in ports)
+    if run(["nft", "-f", "-"], stdin=batch).returncode != 0:
+        # alguna caduco entre la lectura y el borrado: una a una
+        failed = 0
+        for p in ports:
+            run(["nft", "delete", "element", fam, TABLE, CUSTOMER_SET, "{ %s . %d }" % (addr, p)])
+            if run(["nft", "add", "element", fam, TABLE, CUSTOMER_SET,
+                    "{ %s . %d timeout %ds }" % (addr, p, ALLOW_SECONDS)]).returncode != 0:
+                failed += 1
+        if failed:
+            raise RuntimeError(f"nft add {CUSTOMER_SET}: {failed} of {len(ports)} failed")
+    out["result"] = "allowed"
+    out["ports"] = len(ports)
+    out["renewed"] = len(present)
+    out["console"] = console
+    out["seenForgotten"] = forget_seen(fam, ip, set(ports))
+    return out
+
+
+def set_pairs(fam, name):
+    """[(addr, puerto)] de todo un set (addr . puerto), con la addr tal cual la
+    da nft (forma comprimida)."""
+    r = run(["nft", "-j", "list", "set", fam, TABLE, name])
+    if r.returncode != 0:
+        return []
+    out = []
+    for obj in json.loads(r.stdout).get("nftables", []):
+        for e in (obj.get("set") or {}).get("elem", []) or []:
+            val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
+            concat = val.get("concat") if isinstance(val, dict) else None
+            if concat and len(concat) == 2 and isinstance(concat[0], str) and isinstance(concat[1], int):
+                out.append((concat[0], concat[1]))
+    return out
+
+
+def revoke_vm(vmids):
+    """Quita de cust_allow todas las entradas de los puertos de esas VMs, de
+    cualquier IP y en las dos familias."""
+    ports = set(vm_ports(vmids))
+    out = {"vmids": vmids, "removed": 0}
+    sets = 0
+    for fam in ("ip", "ip6"):
+        if not set_exists(fam, CUSTOMER_SET):
+            continue
+        sets += 1
+        doomed = [(a, p) for a, p in set_pairs(fam, CUSTOMER_SET) if p in ports]
+        if not doomed:
+            continue
+        batch = "".join(f"delete element {fam} {TABLE} {CUSTOMER_SET} {{ {a} . {p} }}\n"
+                        for a, p in doomed)
+        if run(["nft", "-f", "-"], stdin=batch).returncode == 0:
+            out["removed"] += len(doomed)
+            continue
+        # alguna caduco entre la lectura y el borrado: una a una
+        for a, p in doomed:
+            if run(["nft", "delete", "element", fam, TABLE, CUSTOMER_SET,
+                    "{ %s . %d }" % (a, p)]).returncode == 0:
+                out["removed"] += 1
+        left = [x for x in set_pairs(fam, CUSTOMER_SET) if x[1] in ports]
+        if left:
+            raise RuntimeError(f"{len(left)} entries of {fam} {CUSTOMER_SET} still there")
+    out["result"] = "revoked" if sets else "no_set"
+    return out
+
+
 def main(argv):
     raw = os.environ.get("SSH_ORIGINAL_COMMAND")
-    if raw is None:                      # a mano: neuravps-unblock-ip unblock <ip>
+    if raw is None:                      # a mano: neuravps-unblock-ip status <ip>
         raw = " ".join(argv[1:])
     via = "ssh" if "SSH_ORIGINAL_COMMAND" in os.environ else "local"
     syslog.openlog("neuravps-unblock-ip")
     try:
-        ip = parse_request(raw)
+        verb, ip, vmids, console = parse_command(raw)
     except BadRequest as exc:
         syslog.syslog(syslog.LOG_WARNING, f"rejected ({via}): {exc}: {raw[:80]!r}")
         print(json.dumps({"ok": False, "error": "bad_request", "detail": str(exc)}))
         return 2
+    what = str(ip) if ip is not None else ",".join(str(v) for v in vmids)
     try:
-        with open(LOCK, "w") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            out = unblock(ip)
+        if verb == "status":                 # solo lectura: sin cerrojo
+            out = status(ip)
+        else:
+            with open(LOCK, "w") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                if verb == "unblock":
+                    out = unblock(ip)
+                elif verb == "allow-vm":
+                    out = allow_vm(ip, vmids, console)
+                else:
+                    out = revoke_vm(vmids)
     except Exception as exc:  # noqa: BLE001
-        syslog.syslog(syslog.LOG_ERR, f"{ip} ({via}): error {exc}")
-        print(json.dumps({"ok": False, "ip": str(ip), "error": "internal",
-                          "detail": str(exc)[:200]}))
+        syslog.syslog(syslog.LOG_ERR, f"{verb} {what} ({via}): error {exc}")
+        err = {"ok": False, "error": "internal", "detail": str(exc)[:200]}
+        if ip is not None:
+            err["ip"] = str(ip)
+        print(json.dumps(err))
         return 1
     out["ok"] = True
-    syslog.syslog(syslog.LOG_NOTICE, f"{ip} ({via}): {json.dumps(out, sort_keys=True)}")
+    syslog.syslog(syslog.LOG_INFO if verb == "status" else syslog.LOG_NOTICE,
+                  f"{verb} {what} ({via}): {json.dumps(out, sort_keys=True)}")
     print(json.dumps(out, sort_keys=True))
     return 0
 
