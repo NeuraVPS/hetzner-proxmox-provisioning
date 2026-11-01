@@ -18,13 +18,14 @@ anything.
 
 Behaviour, one run (systemd timer, every 10 min, b1 only):
 - watched model goes from not orderable (or unknown) to orderable -> one email;
-- watched model goes from orderable to not available -> one short email
-  ("se agotó"), so the operator knows the window closed;
+- watched model goes from orderable to not available -> log line only (no
+  email since 2026-11-01: the operator only needs to act on "disponible");
 - the page cannot be fetched or a watched model is missing from it for
   FAIL_EMAIL_AFTER consecutive runs -> one email, then at most one every
   FAIL_EMAIL_EVERY_H hours while it lasts (the page layout may have changed).
-Stock emails ("disponible"/"agotado") go to soporte@ and ivan@ (operator's ask,
-2026-10-16: a window can close in hours); the "sin datos" one only to soporte@.
+The "disponible" email goes to ivan@ only (operator's ask, 2026-10-16: a window
+can close in hours; the soporte@ copy was dropped on 2026-11-01 as a duplicate);
+the "sin datos" one only to soporte@.
 State lives in /var/lib/neuravps/ltd-watch/state.json. SMTP is the same
 authenticated Gmail path as neuravps-hw-error-scan (SMTP_PASSWORD in
 /etc/neuravps/hw-error-scan.env, mode 600).
@@ -48,7 +49,7 @@ DEFAULT_STATE = "/var/lib/neuravps/ltd-watch/state.json"
 DEFAULT_ENV_FILE = "/etc/neuravps/hw-error-scan.env"
 SMTP_LOGIN = "soporte@neuravps.com"
 SMTP_TO = ["soporte@neuravps.com"]
-STOCK_TO = ["soporte@neuravps.com", "ivan@neuravps.com"]
+STOCK_TO = ["ivan@neuravps.com"]
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 VAT = 1.19
@@ -267,11 +268,8 @@ def main():
                 cur["status"] = prev_status  # retry the alert on the next run
         elif info["status"] == NOT_AVAILABLE and prev_status == ORDERABLE:
             hours = (now - float(prev.get("since") or now)) / 3600
-            body = (f"{model} ya no está disponible en Hetzner ({stamp}). "
-                    f"Estuvo disponible unas {hours:.1f} h desde el aviso.\n\n"
-                    f"Estado de los modelos vigilados:\n{summary(seen, args.watch)}\n")
-            send_email(f"[NeuraVPS] Stock LTD: {model} agotado", body,
-                       args.env_file, args.dry_run, to=STOCK_TO)
+            log(f"ltd-watch: {model} agotado ({stamp}); estuvo disponible unas {hours:.1f} h "
+                "desde el aviso (sin correo desde 2026-11-01)")
         else:
             cur["notifiedAt"] = prev.get("notifiedAt")
         models[model] = cur
