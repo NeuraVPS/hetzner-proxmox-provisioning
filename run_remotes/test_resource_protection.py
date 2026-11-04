@@ -62,10 +62,12 @@ class Capacity(unittest.TestCase):
                 (Path(directory)/f'{vmid}.conf').write_text(f'memory: 4096\nballoon: {floor}\n[snapshot]\nmemory: 99999\n')
             self.assertEqual(guard.floor_total(),6144)
 
-    def run_boost(self, available=30000, floors=100000, pending=0):
+    def run_boost(self, available=30000, floors=100000, pending=0, reconciler=True):
         from io import StringIO
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(guard,'STATE_DIR',Path(directory)), \
+             patch.object(guard,'RECONCILER_TIMER',
+                          Path(directory) if reconciler else Path(directory)/'absent.timer'), \
              patch('builtins.open',return_value=MagicMock()), \
              patch.object(guard.fcntl,'flock'), \
              patch.object(guard,'inspect',return_value=(19456,9932,12000,available)), \
@@ -83,6 +85,12 @@ class Capacity(unittest.TestCase):
             result,calls,_=self.run_boost(**kwargs)
             self.assertEqual(result['status'],'blocked')
             self.assertEqual(calls,0)
+
+    def test_budget_follows_the_reconciler_not_the_node_name(self):
+        # 2026-11-04: 90 % only where the balloon reconciler runs (all SQX
+        # nodes, including an AX102 assigned to SQX); 100 % without it (MT).
+        self.assertEqual(self.run_boost(floors=230000)[0]['status'], 'blocked')
+        self.assertEqual(self.run_boost(floors=230000, reconciler=False)[0]['status'], 'boosted')
 
     def test_qmp_uses_bytes_and_only_after_budget_passes(self):
         result,calls,args=self.run_boost()
