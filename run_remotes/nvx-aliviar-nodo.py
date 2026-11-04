@@ -136,15 +136,27 @@ def firma_cpu(nid):
 def cpu_de_vm(nid, vmid):
     """El `cpu:` REAL de la VM en su nodo ('kvm64' si la config no trae linea,
     que es el defecto de PVE); None si no se puede leer."""
+    # Si la VM esta encendida manda lo que ejecuta QEMU: una config reescrita
+    # en caliente sigue con `-cpu host` hasta el siguiente arranque.
     out = en_nodo(nid, "if test -f /etc/pve/qemu-server/%d.conf; then "
                        "sed '/^\\[/q' /etc/pve/qemu-server/%d.conf | "
-                       "grep -m1 '^cpu:'; echo FIN; fi" % (vmid, vmid), timeout=30)
+                       "grep -m1 '^cpu:'; "
+                       "p=$(cat /var/run/qemu-server/%d.pid 2>/dev/null); "
+                       "if [ -n \"$p\" ] && [ -r /proc/$p/cmdline ]; then "
+                       "echo RUN:$(tr '\\0' '\\n' < /proc/$p/cmdline | grep -A1 -x -- -cpu | tail -1 | cut -d, -f1); fi; "
+                       "echo FIN; fi" % (vmid, vmid, vmid), timeout=30)
     if out is None or not out.endswith("FIN"):
         return None
-    linea = out[:-3].strip()
-    if not linea:
-        return "kvm64"
-    return linea.split(":", 1)[1].strip().split(",")[0] or "kvm64"
+    lineas = [l for l in out[:-3].strip().split("\n") if l.strip()]
+    run = next((l[4:].strip() for l in lineas if l.startswith("RUN:")), None)
+    cfg = next((l for l in lineas if l.startswith("cpu:")), None)
+    cfg = cfg.split(":", 1)[1].strip().split(",")[0] if cfg else "kvm64"
+    if run is not None:
+        if not run:
+            return None
+        if run in ("host", "max"):
+            return "host"
+    return cfg or "kvm64"
 
 
 def cpu_permite(cpu_vm, firma_origen, firma_destino):
@@ -168,7 +180,7 @@ def permitidos(n):
         return None
     if not isinstance(raw, (list, tuple)):
         return frozenset()
-    return frozenset(str(x).strip() for x in raw if isinstance(x, str))
+    return frozenset(str(x).strip() for x in raw if isinstance(x, str) and str(x).strip())
 
 
 def elige_destino(nid_origen, vmid, db, reservado):
@@ -211,6 +223,9 @@ def elige_destino(nid_origen, vmid, db, reservado):
             continue
         lista = permitidos(n)
         if lista is not None and plan_vm not in lista:
+            continue
+        # nunca mezclar: MT solo mt/mt-plus, SQX solo vps-*
+        if not plan_vm.startswith("mt" if modelo == "MT5" else "vps-"):
             continue
         pct = n.get("zpoolCapPct")
         if pct is None:

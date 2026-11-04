@@ -612,8 +612,14 @@ def _boot_stagger_config():
     File format (shell-style KEY=VALUE): MEM_STAGGER=1 enables it;
     RESERVE_MB (12288, same margin as the RAM guard), MIN_GAP_S (30) and
     MAX_WAIT_S (240: a VM is started anyway after that — a customer left down
-    is worse than a minute of pressure). Absent/unreadable/MEM_STAGGER!=1 ->
-    None (old behaviour)."""
+    is worse than a minute of pressure) and TOTAL_MAX_S, a DEADLINE for the
+    pacing measured from the start of the reconcile (starts included): past
+    it, the remaining VMs start with the plain 2 s stagger. node-boot-sync-dnat.service has TimeoutStartSec=300 and systemd
+    KILLS the reconcile when it is exceeded — the VMs not yet started then
+    stay down and the watch later records them as stopped — so the default
+    (120, leaving ~12 s x VM for the unpaced starts) stays under it; install-sqx-node-extras.sh raises the unit timeout
+    with a drop-in and sets TOTAL_MAX_S=1200. Absent/unreadable/MEM_STAGGER!=1
+    -> None (old behaviour)."""
     try:
         with open(BOOT_STAGGER_FILE) as fh:
             raw = dict(line.strip().split("=", 1) for line in fh
@@ -628,7 +634,7 @@ def _boot_stagger_config():
         except (TypeError, ValueError):
             return default
     return {"reserve_mb": num("RESERVE_MB", 12288), "min_gap_s": num("MIN_GAP_S", 30),
-            "max_wait_s": num("MAX_WAIT_S", 240)}
+            "max_wait_s": num("MAX_WAIT_S", 240), "total_max_s": num("TOTAL_MAX_S", 120)}
 
 
 def _mem_available_mb():
@@ -682,6 +688,8 @@ def _wait_for_boot_memory(vmid, cfg, last_start, sleep=time.sleep,
 def _node_boot_reconcile_locked():
     stagger = _boot_stagger_config()
     last_start = None
+    reconcile_start = time.monotonic()
+    budget_spent_logged = False
     if stagger:
         logger.info(f"boot stagger ON: {stagger}")
     all_vm_status = get_all_vms()
@@ -700,7 +708,15 @@ def _node_boot_reconcile_locked():
                 continue
             logger.info(f"VM {vmid}: desired=running, stopped after node reboot — auto-starting")
             if stagger is not None:
-                _wait_for_boot_memory(vmid, stagger, last_start)
+                left = stagger["total_max_s"] - (time.monotonic() - reconcile_start)
+                if left > 0:
+                    _wait_for_boot_memory(
+                        vmid, dict(stagger, max_wait_s=min(stagger["max_wait_s"], left)),
+                        last_start)
+                elif not budget_spent_logged:
+                    logger.warning("boot stagger: total wait budget spent — starting the "
+                                   "remaining VMs without waiting")
+                    budget_spent_logged = True
             try:
                 run(["qm", "start", str(vmid)])
                 last_start = time.monotonic()

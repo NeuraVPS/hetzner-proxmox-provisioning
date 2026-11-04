@@ -177,9 +177,24 @@ def node_allowed(data):
     return frozenset(str(x).strip() for x in raw if isinstance(x, str) and str(x).strip())
 
 
+def plan_fits_model(model, plan):
+    """Never mix: MT nodes take mt/mt-plus, SQX nodes take vps-*. Measured
+    04/11: every server on a typed node already matches (1061 mt/mt-plus on
+    MT5, 841 vps-* on SQX), so this immobilises nobody today; it stops a
+    misplaced VM from being shuffled between nodes of the wrong type."""
+    plan = (plan or "").strip()
+    if model == "MT5":
+        return plan.startswith("mt")
+    if model == "SQX":
+        return plan.startswith("vps-")
+    return False
+
+
 def dest_allows(dn, vm):
-    """A destination with an allow-list only takes the listed plans. A VM with
-    no known plan is refused by every restricted node."""
+    """A destination with an allow-list only takes the listed plans, and no
+    node takes a plan of the other type. A VM with no known plan is refused."""
+    if not plan_fits_model(dn.get("model"), vm.get("type")):
+        return False
     allowed = dn.get("allowed")
     return allowed is None or (vm.get("type") or "") in allowed
 
@@ -213,6 +228,10 @@ def cpu_move_ok(vm_cpu, src_sig, dst_sig):
     if not src_sig.get("vendor") or src_sig.get("vendor") != dst_sig.get("vendor"):
         return False
     if vm_cpu_generic(vm_cpu):
+        # x86-64-v4 needs AVX-512 on the destination (PVE adds `enforce`: the
+        # guest would refuse to run); unknown -> no.
+        if str(vm_cpu).split(",")[0].strip().lower().startswith("x86-64-v4"):
+            return dst_sig.get("avx512") is True
         return True
     key = ("vendor", "family", "model", "stepping")
     return all(src_sig.get(k) not in (None, "") for k in key) and \
@@ -228,12 +247,13 @@ info = {}
 for line in open('/proc/cpuinfo'):
     k, _, v = line.partition(':')
     k = k.strip()
-    if k in ('vendor_id', 'cpu family', 'model', 'stepping', 'model name') and k not in info:
+    if k in ('vendor_id', 'cpu family', 'model', 'stepping', 'model name', 'flags') and k not in info:
         info[k] = v.strip()
     if not line.strip() and info:
         break
-print('SIG|%s|%s|%s|%s|%s' % (info.get('vendor_id', ''), info.get('cpu family', ''),
-      info.get('model', ''), info.get('stepping', ''), info.get('model name', '')))
+avx = '1' if ' avx512f ' in ' %s ' % info.get('flags', '') else '0'
+print('SIG|%s|%s|%s|%s|%s|%s' % (info.get('vendor_id', ''), info.get('cpu family', ''),
+      info.get('model', ''), info.get('stepping', ''), info.get('model name', ''), avx))
 for path in sorted(glob.glob('/etc/pve/qemu-server/*.conf')):
     vmid = os.path.basename(path)[:-5]
     cpu = 'kvm64'
@@ -246,7 +266,22 @@ for path in sorted(glob.glob('/etc/pve/qemu-server/*.conf')):
                 break
     except OSError:
         cpu = ''
-    print('VM|%s|%s' % (vmid, cpu))
+    # What a RUNNING guest actually executes: a config rewritten while the VM
+    # ran (migrate_vm.sh warns about it) still runs the old model until the
+    # next boot. '-' = not running; '' = running but unreadable.
+    run = '-'
+    try:
+        pid = open('/var/run/qemu-server/%s.pid' % vmid).read().strip()
+        if os.path.exists('/proc/%s' % pid):
+            args = open('/proc/%s/cmdline' % pid, 'rb').read().split(b'\0')
+            run = ''
+            for i, a in enumerate(args[:-1]):
+                if a == b'-cpu':
+                    run = args[i + 1].decode('ascii', 'replace').split(',')[0]
+                    break
+    except OSError:
+        pass
+    print('VM|%s|%s|%s' % (vmid, cpu, run))
 """
 
 
@@ -255,18 +290,41 @@ def node_probe_cmd():
     return shlex.join(["python3", "-c", NODE_PROBE_PY])
 
 
+def effective_vm_cpu(cfg_cpu, run_cpu):
+    """The CPU a move must respect. Config value, unless the running QEMU
+    passes the host through (`-cpu host|max`), which wins: that guest sees the
+    host until its next boot whatever the config says now. A running guest
+    whose QEMU args can't be read -> None (no move). PVE runs the x86-64-vN
+    models as `qemu64,+flags`, so any other runtime token defers to config."""
+    cfg_cpu = (cfg_cpu or "").strip() or None
+    if run_cpu is None:          # not reported at all (old probe line)
+        return cfg_cpu
+    run_cpu = run_cpu.strip()
+    if run_cpu == "-":
+        return cfg_cpu
+    if not run_cpu:
+        return None
+    if run_cpu in ("host", "max"):
+        return "host"
+    return cfg_cpu
+
+
 def parse_node_probe(text):
-    """-> (sig | None, {vmid: cpu}). sig None unless all fields parsed."""
+    """-> (sig | None, {vmid: effective cpu | None}). sig None unless all
+    fields parsed; sig["avx512"] is True/False/None (unknown)."""
     sig, cpus = None, {}
     for line in (text or "").splitlines():
         parts = line.strip().split("|")
         if parts[0] == "SIG" and len(parts) >= 6:
             vendor, family, model, stepping = (p.strip() for p in parts[1:5])
             if vendor and family.isdigit() and model.isdigit() and stepping.isdigit():
+                avx = parts[6].strip() if len(parts) >= 7 else ""
                 sig = {"vendor": vendor, "family": family, "model": model,
-                       "stepping": stepping, "name": parts[5].strip()}
+                       "stepping": stepping, "name": parts[5].strip(),
+                       "avx512": {"1": True, "0": False}.get(avx)}
         elif parts[0] == "VM" and len(parts) >= 3 and parts[1].isdigit():
-            cpus[int(parts[1])] = parts[2].strip() or None
+            cpus[int(parts[1])] = effective_vm_cpu(
+                parts[2], parts[3] if len(parts) >= 4 else None)
     return sig, cpus
 
 

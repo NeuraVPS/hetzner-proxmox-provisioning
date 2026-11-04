@@ -39,6 +39,7 @@ REC_SVC=/etc/systemd/system/neuravps-balloon-reconciler.service
 REC_TMR=/etc/systemd/system/neuravps-balloon-reconciler.timer
 MTG_DEF=/etc/default/neuravps-mt-freemem-guard
 STAGGER=/etc/default/neuravps-boot-stagger
+BOOT_DROPIN=/etc/systemd/system/node-boot-sync-dnat.service.d/neuravps-stagger.conf
 
 mkdir -p "$STATE"
 
@@ -47,7 +48,11 @@ rollback() {
   m="$(ls -1 "$STATE"/manifest-* 2>/dev/null | sort | tail -1 || true)"
   [ -n "$m" ] || { echo "no hay instalación que deshacer"; exit 1; }
   echo "deshaciendo $m"
-  systemctl disable --now neuravps-balloon-reconciler.timer 2>/dev/null || true
+  # Solo se apaga el reconciliador si lo creó ESTA instalación: en un nodo que
+  # ya lo tenía (un SQX AX162) un rollback no puede dejarlo sin él.
+  if grep -qx "created|$REC_TMR|" "$m"; then
+    systemctl disable --now neuravps-balloon-reconciler.timer 2>/dev/null || true
+  fi
   while IFS='|' read -r kind path bak; do
     case "$kind" in
       replaced) cp -a "$bak" "$path"; echo "restaurado $path <- $bak" ;;
@@ -61,6 +66,14 @@ rollback() {
 }
 
 [ "${1:-}" = "--rollback" ] && { rollback; exit 0; }
+
+# Para nodos que NO traen ya el reconciliador (los AX162 lo instalan en
+# first_boot). Instalar encima de uno existente no aportaría nada y dejaría un
+# manifiesto engañoso; se niega salvo FORCE=1.
+if [ -e "$REC_TMR" ] && [ "${FORCE:-0}" != "1" ]; then
+  echo "este nodo ya tiene el reconciliador ($REC_TMR): no es un nodo para este script (FORCE=1 para forzar)" >&2
+  exit 3
+fi
 
 MAN="$STATE/manifest-$TS"
 : > "$MAN"
@@ -121,12 +134,24 @@ MEM_STAGGER=1
 RESERVE_MB=12288
 MIN_GAP_S=30
 MAX_WAIT_S=240
+# Plazo total del escalonado desde el inicio del node-boot; después, el resto
+# arranca sin esperar. Requiere el drop-in de TimeoutStartSec=1800 (abajo): con
+# el 300 de serie, systemd mataría el arranque a medias.
+TOTAL_MAX_S=1200
 CONF
+cat > "$TMP/dropin" <<'UNIT'
+# Gestionado por NeuraVPS (install-sqx-node-extras.sh): el arranque escalonado
+# por memoria puede tardar hasta TOTAL_MAX_S=1200 s + los arranques.
+[Service]
+TimeoutStartSec=1800
+UNIT
 
 put "$HERE/neuravps-balloon-reconciler.sh" "$REC" 755
 put "$TMP/rec.default" "$REC_DEF" 644
 put "$TMP/rec.service" "$REC_SVC" 644
 put "$TMP/rec.timer" "$REC_TMR" 644
+mkdir -p "$(dirname "$BOOT_DROPIN")"
+put "$TMP/dropin" "$BOOT_DROPIN" 644
 put "$TMP/stagger" "$STAGGER" 644
 
 if [ -f "$MTG_DEF" ]; then
@@ -141,3 +166,4 @@ echo "manifest: $MAN"
 cat "$MAN"
 echo "reconciler: $(systemctl is-enabled neuravps-balloon-reconciler.timer) / $(systemctl is-active neuravps-balloon-reconciler.timer)"
 echo "mt-guard: $(grep -E '^ENABLED=' "$MTG_DEF" 2>/dev/null || echo 'sin fichero')"
+echo "node-boot timeout: $(systemctl show -p TimeoutStartUSec node-boot-sync-dnat.service 2>/dev/null)"

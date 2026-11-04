@@ -23,12 +23,12 @@ df = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(df)
 
 EPYC_P = {"vendor": "AuthenticAMD", "family": "25", "model": "17", "stepping": "1",
-          "name": "AMD EPYC 9454P 48-Core Processor"}
+          "name": "AMD EPYC 9454P 48-Core Processor", "avx512": True}
 EPYC = dict(EPYC_P, name="AMD EPYC 9454 48-Core Processor")
 RYZEN = {"vendor": "AuthenticAMD", "family": "25", "model": "97", "stepping": "2",
-         "name": "AMD Ryzen 9 7950X3D 16-Core Processor"}
+         "name": "AMD Ryzen 9 7950X3D 16-Core Processor", "avx512": True}
 INTEL = {"vendor": "GenuineIntel", "family": "6", "model": "183", "stepping": "1",
-         "name": "13th Gen Intel(R) Core(TM) i5-13500"}
+         "name": "13th Gen Intel(R) Core(TM) i5-13500", "avx512": False}
 
 
 class NodeRole(unittest.TestCase):
@@ -54,11 +54,21 @@ class AllowList(unittest.TestCase):
         self.assertEqual(df.node_allowed({"allowedServerTypes": "vps-a,vps-b"}), frozenset())
 
     def test_dest_allows(self):
-        ab = {"allowed": frozenset({"vps-a", "vps-b"})}
+        ab = {"model": "SQX", "allowed": frozenset({"vps-a", "vps-b"})}
         self.assertTrue(df.dest_allows(ab, {"type": "vps-b"}))
         self.assertFalse(df.dest_allows(ab, {"type": "vps-c"}))
         self.assertFalse(df.dest_allows(ab, {"type": ""}))
-        self.assertTrue(df.dest_allows({"allowed": None}, {"type": "vps-e"}))
+        self.assertTrue(df.dest_allows({"model": "SQX", "allowed": None}, {"type": "vps-e"}))
+
+    def test_never_mix_plan_and_node_type(self):
+        sqx, mt = {"model": "SQX", "allowed": None}, {"model": "MT5", "allowed": None}
+        self.assertFalse(df.dest_allows(sqx, {"type": "mt"}))
+        self.assertFalse(df.dest_allows(mt, {"type": "vps-a"}))
+        self.assertTrue(df.dest_allows(mt, {"type": "mt-plus"}))
+        self.assertFalse(df.dest_allows(mt, {"type": ""}))
+        # even a list that names the wrong type cannot widen it
+        self.assertFalse(df.dest_allows({"model": "MT5", "allowed": frozenset({"vps-a"})},
+                                        {"type": "vps-a"}))
 
     def test_plan_sizes_follow_the_list(self):
         sizes, plans = df.plan_sizes(frozenset({"vps-a", "vps-b"}))
@@ -99,6 +109,20 @@ class CpuRule(unittest.TestCase):
         self.assertTrue(df.cpu_move_ok("host", EPYC, EPYC_P))
         self.assertFalse(df.cpu_move_ok("kvm64", EPYC, RYZEN))
 
+    def test_v4_needs_avx512_on_the_destination(self):
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(RYZEN, avx512=False)))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(RYZEN, avx512=None)))
+        self.assertTrue(df.cpu_move_ok("x86-64-v3", EPYC, dict(RYZEN, avx512=False)))
+
+    def test_running_host_passthrough_wins_over_config(self):
+        # config rewritten to v4 while the guest still runs `-cpu host`
+        self.assertEqual(df.effective_vm_cpu("x86-64-v4", "host"), "host")
+        self.assertEqual(df.effective_vm_cpu("x86-64-v4", "qemu64"), "x86-64-v4")
+        self.assertEqual(df.effective_vm_cpu("x86-64-v4", "-"), "x86-64-v4")   # stopped
+        self.assertIsNone(df.effective_vm_cpu("x86-64-v4", ""))                 # unreadable
+        self.assertEqual(df.effective_vm_cpu("host", "-"), "host")
+        self.assertIsNone(df.effective_vm_cpu("", "-"))
+
     def test_unknown_never_moves(self):
         self.assertFalse(df.cpu_move_ok(None, EPYC, EPYC))       # config unreadable
         self.assertFalse(df.cpu_move_ok("x86-64-v4", None, EPYC))
@@ -106,11 +130,15 @@ class CpuRule(unittest.TestCase):
         self.assertFalse(df.cpu_move_ok("host", dict(EPYC, stepping=""), EPYC))
 
     def test_probe_parsing(self):
-        out = ("SIG|AuthenticAMD|25|97|2|AMD Ryzen 9 7950X3D 16-Core Processor\n"
-               "VM|1751|x86-64-v3\nVM|936|host\nVM|12|kvm64\nVM|bad|host\n")
+        out = ("SIG|AuthenticAMD|25|97|2|AMD Ryzen 9 7950X3D 16-Core Processor|1\n"
+               "VM|1751|x86-64-v3|qemu64\nVM|936|host|host\nVM|12|kvm64|-\nVM|bad|host|-\n"
+               "VM|55|x86-64-v4|host\nVM|56|x86-64-v4|\n")
         sig, cpus = df.parse_node_probe(out)
         self.assertEqual(sig, RYZEN)
-        self.assertEqual(cpus, {1751: "x86-64-v3", 936: "host", 12: "kvm64"})
+        self.assertEqual(cpus, {1751: "x86-64-v3", 936: "host", 12: "kvm64",
+                                55: "host", 56: None})
+        old_sig, _ = df.parse_node_probe("SIG|AuthenticAMD|25|97|2|x\n")
+        self.assertIsNone(old_sig["avx512"])
         self.assertEqual(df.parse_node_probe("SIG|||||\n"), (None, {}))
         self.assertEqual(df.parse_node_probe(""), (None, {}))
 
