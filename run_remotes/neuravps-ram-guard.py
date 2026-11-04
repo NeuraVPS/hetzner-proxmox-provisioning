@@ -13,6 +13,7 @@ import time
 CONF_DIR = Path('/etc/pve/qemu-server')
 STATE_DIR = Path('/var/lib/neuravps-balloon')
 RESERVE_MB = 12288
+RECONCILER_TIMER = Path('/etc/systemd/system/neuravps-balloon-reconciler.timer')
 
 
 def config(vmid):
@@ -100,7 +101,13 @@ def boost(vmid, expected_node, boot_token=None):
         now = time.time()
         pending = {k: v for k, v in pending.items() if v['until'] > now}
         reserved = sum(v['mb'] for v in pending.values())
-        budget = info['MemTotal'] * (90 if '-AX162' in expected_node else 100) // 100
+        # The 90 % floor budget is the BALLOON RECONCILER's (FLOOR_BUDGET_PCT):
+        # a node that runs it must not be pushed past it by boosts, or the
+        # reconciler sees NO BUDGET. Keyed on the reconciler being installed,
+        # not on the node's name (2026-11-04: an AX102 assigned to SQX runs it
+        # too). Measured 04/11: installed on 86/86 SQX nodes, 0/36 MT nodes —
+        # identical to the old '-AX162' test for the whole fleet.
+        budget = info['MemTotal'] * (90 if RECONCILER_TIMER.exists() else 100) // 100
         if (info['MemAvailable'] < need + reserved + RESERVE_MB
                 or floor_total() + maximum - floor > budget):
             return {'status': 'blocked', 'reason': 'capacity'}

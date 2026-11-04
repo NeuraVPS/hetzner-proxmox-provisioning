@@ -80,7 +80,7 @@ State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
 
 --dry-run flag: plan + journal (as dryRun) but never execute, without
 touching the config/defrag kill-switch the hourly timers read.
-#NDFVER=12
+#NDFVER=13
 """
 import fcntl
 import json
@@ -151,26 +151,133 @@ def disk_ok(n):
     return pct is None or pct < DISK_REAL_MAX_PCT
 
 
-def cpu_vendor(node_id):
-    """CPU vendor from the Hetzner product in the node id: AX* = AMD, EX* =
-    Intel (0000263-EX131-2-LTD, the EX44s). None = unknown."""
-    product = node_id.split("-", 1)[1] if "-" in node_id else ""
-    if product.startswith("AX"):
-        return "AMD"
-    if product.startswith("EX"):
-        return "Intel"
-    return None
+# ---- node role, plan allow-list and CPU: from Firestore + the real hardware ----
+# Operator rule 2026-11-04: proxmox_nodes.nodeType (set by hand) is the ONLY
+# source of truth for SQX vs MT — never the node's name. An AX102 assigned to
+# SQX is an SQX node; an AX162 typed MT5 would be an MT node. A node without a
+# nodeType of SQX/MT5 takes no part in the defrag at all (fail-safe).
+NODE_MODELS = ("SQX", "MT5")
 
 
-def same_cpu_vendor(dst_id, source_ids):
-    """A destination must share the CPU vendor of the node(s) it relieves.
-    migrate_vm.sh refuses every LIVE AMD<->Intel move since 2026-10-10 (an
-    x86-64-v4 Windows guest bugchecked ~20 s after resuming on Intel), and a
-    cold one changes the SQX Hardware ID — neither is the defrag's to do.
-    Unknown vendor on either side = not the same."""
-    dst = cpu_vendor(dst_id)
-    srcs = {cpu_vendor(s) for s in source_ids}
-    return dst is not None and srcs == {dst}
+def node_model(data):
+    t = str((data or {}).get("nodeType") or "").strip()
+    return t if t in NODE_MODELS else None
+
+
+def node_allowed(data):
+    """proxmox_nodes.allowedServerTypes, the hand-set plan allow-list (mirror of
+    NeuraVPS auto_provision.node_allowed_server_types): None = no restriction;
+    a list = only those plans; anything else = NOTHING (fail-closed — a typo
+    must never widen into "anything goes")."""
+    raw = (data or {}).get("allowedServerTypes")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    return frozenset(str(x).strip() for x in raw if isinstance(x, str) and str(x).strip())
+
+
+def dest_allows(dn, vm):
+    """A destination with an allow-list only takes the listed plans. A VM with
+    no known plan is refused by every restricted node."""
+    allowed = dn.get("allowed")
+    return allowed is None or (vm.get("type") or "") in allowed
+
+
+# CPU (operator rule 2026-11-04, safe mode). The SQX licence Hardware ID and a
+# live migration's survival both depend on the CPU the guest SEES:
+#   * a guest with a GENERIC model (x86-64-v2/v3/v4) sees the same virtual CPU
+#     on every host of the vendor -> any same-vendor destination;
+#   * anything else (`cpu: host`, a named model, the kvm64 default of a config
+#     without a cpu line) sees the host -> only a destination whose CPU is the
+#     SAME silicon: vendor + family + model + stepping, from /proc/cpuinfo.
+#     EPYC 9454 and 9454P are the same Genoa die (25/17/1), as before; a
+#     Ryzen 7950X3D (25/97/2) is not, so a host guest never moves AX162<->AX102.
+#   * live AMD<->Intel is never allowed, generic or not (x86-64-v4 Windows
+#     bugchecked ~20 s after resuming on Intel, 10/10/2026).
+# Everything unknown -> no move: an unreadable VM config or an unprobed node
+# never yields a destination.
+GENERIC_CPU_RE = re.compile(r"^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$")
+
+
+def vm_cpu_generic(cpu):
+    return bool(cpu) and bool(GENERIC_CPU_RE.match(str(cpu).split(",")[0].strip()))
+
+
+def cpu_move_ok(vm_cpu, src_sig, dst_sig):
+    """True only when a guest with `vm_cpu` (the VM's real `cpu:` value, None =
+    unreadable) may move from a host with `src_sig` to one with `dst_sig`
+    (dicts from parse_node_probe; None = not probed)."""
+    if not src_sig or not dst_sig or not vm_cpu:
+        return False
+    if not src_sig.get("vendor") or src_sig.get("vendor") != dst_sig.get("vendor"):
+        return False
+    if vm_cpu_generic(vm_cpu):
+        return True
+    key = ("vendor", "family", "model", "stepping")
+    return all(src_sig.get(k) not in (None, "") for k in key) and \
+        all(src_sig.get(k) == dst_sig.get(k) for k in key)
+
+
+# One SSH per node: its CPU signature and the real `cpu:` of every VM config.
+# A config without a `cpu:` line runs PVE's kvm64 default -> reported as such
+# (non-generic: same-silicon only).
+NODE_PROBE_PY = r"""
+import glob, os
+info = {}
+for line in open('/proc/cpuinfo'):
+    k, _, v = line.partition(':')
+    k = k.strip()
+    if k in ('vendor_id', 'cpu family', 'model', 'stepping', 'model name') and k not in info:
+        info[k] = v.strip()
+    if not line.strip() and info:
+        break
+print('SIG|%s|%s|%s|%s|%s' % (info.get('vendor_id', ''), info.get('cpu family', ''),
+      info.get('model', ''), info.get('stepping', ''), info.get('model name', '')))
+for path in sorted(glob.glob('/etc/pve/qemu-server/*.conf')):
+    vmid = os.path.basename(path)[:-5]
+    cpu = 'kvm64'
+    try:
+        for line in open(path):
+            if line.startswith('['):
+                break
+            if line.startswith('cpu:'):
+                cpu = line.split(':', 1)[1].strip().split(',')[0] or 'kvm64'
+                break
+    except OSError:
+        cpu = ''
+    print('VM|%s|%s' % (vmid, cpu))
+"""
+
+
+def node_probe_cmd():
+    import shlex
+    return shlex.join(["python3", "-c", NODE_PROBE_PY])
+
+
+def parse_node_probe(text):
+    """-> (sig | None, {vmid: cpu}). sig None unless all fields parsed."""
+    sig, cpus = None, {}
+    for line in (text or "").splitlines():
+        parts = line.strip().split("|")
+        if parts[0] == "SIG" and len(parts) >= 6:
+            vendor, family, model, stepping = (p.strip() for p in parts[1:5])
+            if vendor and family.isdigit() and model.isdigit() and stepping.isdigit():
+                sig = {"vendor": vendor, "family": family, "model": model,
+                       "stepping": stepping, "name": parts[5].strip()}
+        elif parts[0] == "VM" and len(parts) >= 3 and parts[1].isdigit():
+            cpus[int(parts[1])] = parts[2].strip() or None
+    return sig, cpus
+
+
+def plan_sizes(allowed):
+    """(PLAN_SIZES, PLANS) a node can be refilled with — all of them, or only
+    the allowed plans of a restricted node (a hole only a vps-c fits is a crumb
+    on an a/b-only node, not sellable space)."""
+    if allowed is None:
+        return PLAN_SIZES, PLANS
+    plans = [p for p in PLANS if p[0] in allowed]
+    return sorted({r for _, r, _ in plans}), plans
 
 
 def base_ram(data):
@@ -312,23 +419,28 @@ def log(msg):
     subprocess.run(["logger", "-t", "neuravps-defrag", msg], check=False)
 
 
-def leftover_clean(gb):
-    """GB leftover still plan-shaped (fillable to within 4 GB) or sub-plan tiny."""
+def leftover_clean(gb, sizes=None):
+    """GB leftover still plan-shaped (fillable to within 4 GB) or sub-plan tiny.
+    `sizes` = the plan sizes the node can take (plan_sizes); all by default."""
+    sizes = PLAN_SIZES if sizes is None else sizes
     L = int(gb)
     if L < 5:
         return True
+    if not sizes:
+        return False
     reach = [False] * (L + 1)
     reach[0] = True
     for g in range(1, L + 1):
-        for s in PLAN_SIZES:
+        for s in sizes:
             if s <= g and reach[g - s]:
                 reach[g] = True
                 break
     return any(reach[s] for s in range(max(0, L - 4), L + 1))
 
 
-def fits_any_plan(commit_h, floor_h):
-    return any(r <= commit_h and f <= floor_h for _, r, f in PLANS)
+def fits_any_plan(commit_h, floor_h, plans=None):
+    return any(r <= commit_h and f <= floor_h
+               for _, r, f in (PLANS if plans is None else plans))
 
 
 def load_recent_moves(cooldown_h):
@@ -443,11 +555,14 @@ def main():
     nodes = {}
     for nd in db.collection("proxmox_nodes").stream():
         d = nd.to_dict() or {}
-        model = "SQX" if "-AX162" in nd.id else ("MT5" if "-AX102" in nd.id else None)
+        # nodeType is the only source of truth (operator 2026-11-04), never
+        # the name: an AX102 typed SQX is an SQX node.
+        model = node_model(d)
         if not model:
             continue
         nodes[nd.id] = {
             "model": model, "ip": d.get("ip") or "", "frozen": bool(d.get("frozen")),
+            "allowed": node_allowed(d),
             "status": str(d.get("status") or "").strip(),
             "g": base_ram(d),
             "cap": int(d.get("max_cores") or 0),
@@ -492,7 +607,36 @@ def main():
                 and int(d.get("proxmoxId")) not in skip_vmids):
             n["vms"].append({"vmid": int(d["proxmoxId"]), "ram": ram,
                              "fl": fl, "cores": cores,
-                             "st": d.get("status")})
+                             "st": d.get("status"),
+                             "type": str(d.get("serverType") or ""),
+                             "node": nid})
+
+    # Real hardware + real VM configs, one SSH per node, in parallel. A node
+    # that does not answer gets no signature and therefore neither gives nor
+    # receives a VM this run (cpu_move_ok fails closed).
+    import concurrent.futures as _cf
+    probe_cmd = node_probe_cmd()
+
+    def _probe(nid):
+        ip = nodes[nid]["ip"]
+        if not ip:
+            return nid, None, {}
+        try:
+            p = subprocess.run(SSH + [f"root@{ip}", probe_cmd],
+                               capture_output=True, text=True, timeout=20)
+            sig, cpus = parse_node_probe(p.stdout)
+            return nid, sig, cpus
+        except Exception:
+            return nid, None, {}
+
+    with _cf.ThreadPoolExecutor(max_workers=16) as _ex:
+        for nid, sig, cpus in _ex.map(_probe, sorted(nodes)):
+            nodes[nid]["sig"] = sig
+            nodes[nid]["vm_cpu"] = cpus
+    _unprobed = sorted(nid for nid, n in nodes.items() if not n.get("sig"))
+    log(f"cpu probe: {len(nodes) - len(_unprobed)}/{len(nodes)} nodes; "
+        f"sin respuesta (no dan ni reciben VMs): {_unprobed[:10]}"
+        f"{' …' if len(_unprobed) > 10 else ''}")
 
     def sqx_head(n):
         return COMMIT * n["g"] - n["ram"], FLOOR * n["g"] - n["fl"]
@@ -530,7 +674,7 @@ def main():
         return n["cpu_ms"] <= CPU_MAX_MS
 
 
-    def pick_dest(model, ram, fl, cores, exclude, tidy=True):
+    def pick_dest(model, ram, fl, cores, exclude, tidy=True, vm=None):
         """tidy=False drops the leftover_clean() packing rule. Relief passes
         False: that rule exists to keep the fleet SELLABLE, and trading
         sellability against a customer who is thrashing is the wrong way round.
@@ -539,11 +683,21 @@ def main():
         preserved (0000214 vm 1868, 2026-07-29: blocked 2h at up to 3023
         faults/s while 0000209 sat on 37.5 GB, rejected only because moving a
         19 GB guest would have left an 18.5 GB gap no plan can fill)."""
+        # `vm` is mandatory: without its plan, its source and its real CPU
+        # nothing can be checked, so nothing moves (safe mode, 2026-11-04).
+        if not vm or vm.get("node") not in nodes:
+            return None
+        src = nodes[vm["node"]]
+        vm_cpu = (src.get("vm_cpu") or {}).get(vm["vmid"])
         best = None
         for did, dn in nodes.items():
             if dn["model"] != model or did in exclude or not placeable(dn):
                 continue
-            if not same_cpu_vendor(did, exclude):
+            if dn["model"] != src["model"]:
+                continue   # never SQX<->MT, whatever the caller asked for
+            if not dest_allows(dn, vm):
+                continue
+            if not cpu_move_ok(vm_cpu, src.get("sig"), dn.get("sig")):
                 continue
             if not disk_ok(dn):
                 continue
@@ -560,7 +714,8 @@ def main():
                 # soon as reconcilers acted). 12GB = 3 reconciler steps.
                 if ch - ram < 8 or fh - fl < 12:
                     continue
-                if tidy and not leftover_clean(ch - ram):
+                if tidy and not leftover_clean(ch - ram,
+                                               plan_sizes(dn.get("allowed"))[0]):
                     continue
                 key = ch
             else:
@@ -787,7 +942,7 @@ def main():
             for vm in order_victims([v for v in n["vms"]
                                      if v["st"] == "running"], nid):
                 dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid},
-                                tidy=False)
+                                tidy=False, vm=vm)
                 if dst:
                     picked = (vm, dst)
                     break
@@ -843,7 +998,7 @@ def main():
                       and sustained_cpu_harm(n['cpu_history'])]
             _moved, mt_outcomes = plan_mt_cpu_relief(
                 mt_hot, victims_of,
-                lambda vm, excluded: pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False),
+                lambda vm, excluded: pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False,vm=vm),
                 load_of, lambda dst: nodes[dst]['threads'],
                 lambda nid, vm: agent_alive(nid,vm['vmid']),
                 lambda vm, nid, dst, demand: book(vm,nid,dst,f'cpu-relief (two sustained wait windows; guest p95 {demand:.2f} CPUs)'))
@@ -866,7 +1021,7 @@ def main():
                 cand = order_victims(n["vms"], nid)
                 moved = False
                 for vm in cand:
-                    dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
+                    dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid}, vm=vm)
                     if dst:
                         book(vm, nid, dst, f"over-gate ({ch:.0f}/{fh:.0f} headroom)")
                         moved = True
@@ -884,7 +1039,7 @@ def main():
                 for vm in cand:
                     if vm["cores"] <= 0:
                         continue
-                    dst = pick_dest("MT5", vm["ram"], vm["fl"], vm["cores"], {nid})
+                    dst = pick_dest("MT5", vm["ram"], vm["fl"], vm["cores"], {nid}, vm=vm)
                     if dst:
                         book(vm, nid, dst, f"over-cap ({n['cores']}/{n['cap']}c)")
                         moved = True
@@ -910,7 +1065,7 @@ def main():
         if fh < 0 or fh >= 6.0:
             continue
         for vm in order_victims(n["vms"], nid):
-            dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
+            dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid}, vm=vm)
             if dst:
                 book(vm, nid, dst, f"floor-starved (headroom {fh:.1f}GB blocks reconciler)")
                 break
@@ -931,12 +1086,13 @@ def main():
         fh_s = FLOOR_SALES * n["g"] - n["fl"]
         if ch < 0 or fh < 0:
             continue          # over the op ceiling: phase 1 territory
-        if min(ch, fh_s) < MIN_STRANDED or fits_any_plan(ch, fh_s):
+        own_plans = plan_sizes(n.get("allowed"))[1]
+        if min(ch, fh_s) < MIN_STRANDED or fits_any_plan(ch, fh_s, own_plans):
             continue
         # smallest VM whose departure makes some plan fit again
         for vm in order_victims(n["vms"], nid):
-            if fits_any_plan(ch + vm["ram"], fh_s + vm["fl"]):
-                dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid})
+            if fits_any_plan(ch + vm["ram"], fh_s + vm["fl"], own_plans):
+                dst = pick_dest("SQX", vm["ram"], vm["fl"], vm["cores"], {nid}, vm=vm)
                 if dst:
                     book(vm, nid, dst, f"defrag ({min(ch, fh_s):.0f}GB stranded)")
                 break
@@ -950,7 +1106,11 @@ def main():
         if not placeable(n):
             continue
         reserve = int(cfg.get('reserveEmptySqx' if n['model'] == 'SQX' else 'reserveEmptyMt', 2))
+        # A restricted node (allowedServerTypes) is not the drain reserve: it
+        # cannot take every plan of its pool, so an empty one must not let the
+        # pass believe the reserve is already there.
         empty = sum(1 for x in nodes.values() if x['model'] == n['model']
+                    and x.get('allowed') is None
                     and placeable(x) and x['ram'] <= 0 and x['cores'] <= 0)
         if empty >= reserve:
             continue  # consolidation must restore a reserve that is missing
@@ -969,7 +1129,7 @@ def main():
         ok = True
         for vm in sorted(n["vms"], key=lambda v: -v["ram"]):
             dst = pick_dest(n["model"], vm["ram"], vm["fl"], vm["cores"],
-                            {nid})
+                            {nid}, vm=vm)
             if not dst:
                 ok = False
                 break

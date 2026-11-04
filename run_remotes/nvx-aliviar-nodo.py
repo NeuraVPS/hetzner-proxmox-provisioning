@@ -29,8 +29,11 @@ SALVAGUARDAS
   · No hace NADA si el defrag o un lote de migracion esta corriendo:
     competirian por los mismos destinos.
   · Solo saca del nodo que se le nombra. Nunca de otro.
-  · El destino tiene que ser del MISMO modelo, pasar el gate de disco del 80%
-    (el mismo que la venta y el defrag) y tener holgura de cores.
+  · El destino tiene que ser del MISMO tipo (nodeType, no el nombre), admitir
+    el plan de la VM (allowedServerTypes), tener una CPU compatible con la de
+    la VM (una `cpu: host` solo va a la misma CPU; sin dato no se mueve),
+    pasar el gate de disco del 80% (el mismo que la venta y el defrag) y tener
+    holgura de cores.
   · Se mueve de UNA EN UNA, remidiendo el pool despues de cada una. Un fallo
     para la tanda en vez de arrastrarla.
 """
@@ -114,18 +117,86 @@ def uso_real(nid):
     return uso
 
 
+_SIG_CMD = ("grep -m4 -E '^(vendor_id|cpu family|model|stepping)[[:space:]]*:' "
+            "/proc/cpuinfo")
+
+
+def firma_cpu(nid):
+    """(vendor, familia, modelo, stepping) del nodo, de /proc/cpuinfo; None si
+    no se puede leer. Misma regla que el defrag (cpu_move_ok)."""
+    out = en_nodo(nid, _SIG_CMD, timeout=30) or ""
+    campos = {}
+    for linea in out.split("\n"):
+        k, _, v = linea.partition(":")
+        campos.setdefault(k.strip(), v.strip())
+    firma = tuple(campos.get(k) or "" for k in ("vendor_id", "cpu family", "model", "stepping"))
+    return firma if all(firma) else None
+
+
+def cpu_de_vm(nid, vmid):
+    """El `cpu:` REAL de la VM en su nodo ('kvm64' si la config no trae linea,
+    que es el defecto de PVE); None si no se puede leer."""
+    out = en_nodo(nid, "if test -f /etc/pve/qemu-server/%d.conf; then "
+                       "sed '/^\\[/q' /etc/pve/qemu-server/%d.conf | "
+                       "grep -m1 '^cpu:'; echo FIN; fi" % (vmid, vmid), timeout=30)
+    if out is None or not out.endswith("FIN"):
+        return None
+    linea = out[:-3].strip()
+    if not linea:
+        return "kvm64"
+    return linea.split(":", 1)[1].strip().split(",")[0] or "kvm64"
+
+
+def cpu_permite(cpu_vm, firma_origen, firma_destino):
+    """Modo seguro (operador 04/11): sin dato, no se mueve. CPU generica
+    (x86-64-vN) -> mismo fabricante; cualquier otra (`host`, kvm64, modelos
+    con nombre) -> el MISMO silicio (fabricante, familia, modelo, stepping)."""
+    if not cpu_vm or not firma_origen or not firma_destino:
+        return False
+    if firma_origen[0] != firma_destino[0]:
+        return False
+    if cpu_vm.startswith("x86-64-v"):
+        return True
+    return firma_origen == firma_destino
+
+
+def permitidos(n):
+    """proxmox_nodes.allowedServerTypes: None = sin restriccion; lista = solo
+    esos planes; cualquier otra cosa = ninguno."""
+    raw = n.get("allowedServerTypes")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    return frozenset(str(x).strip() for x in raw if isinstance(x, str))
+
+
 def elige_destino(nid_origen, vmid, db, reservado):
-    """Mismo criterio que el defrag: mismo modelo, gate de disco, holgura de
-    cores. Se prefiere el pool MAS VACIO — el objetivo es repartir presion, no
-    compactar. `reservado` descuenta lo ya prometido a destinos en esta tanda,
-    porque zpoolCapPct solo se refresca una vez al dia (06:00 UTC) y sin eso
-    las seis migraciones irian todas al mismo sitio creyendolo vacio."""
+    """Mismo criterio que el defrag: mismo TIPO de nodo (nodeType, nunca el
+    nombre), plan admitido por el destino (allowedServerTypes), CPU compatible
+    con la de la VM, gate de disco y holgura de cores. Se prefiere el pool MAS
+    VACIO — el objetivo es repartir presion, no compactar. `reservado`
+    descuenta lo ya prometido a destinos en esta tanda, porque zpoolCapPct solo
+    se refresca una vez al dia (06:00 UTC) y sin eso las seis migraciones irian
+    todas al mismo sitio creyendolo vacio."""
     from google.cloud.firestore_v1 import FieldFilter
-    modelo = "-AX102" if "-AX102" in nid_origen else "-AX162"
+    origen = (db.collection("proxmox_nodes").document(nid_origen).get().to_dict() or {})
+    modelo = str(origen.get("nodeType") or "").strip()
+    if modelo not in ("SQX", "MT5"):
+        log("%s no tiene nodeType SQX/MT5 — no elijo destino" % nid_origen)
+        return None
     cores_vm = 2
+    plan_vm = ""
     for d in db.collection("servers").where(
             filter=FieldFilter("proxmoxId", "==", vmid)).limit(1).stream():
         cores_vm = int((d.to_dict() or {}).get("cores") or 2)
+        plan_vm = str((d.to_dict() or {}).get("serverType") or "")
+    cpu_vm = cpu_de_vm(nid_origen, vmid)
+    firma_origen = firma_cpu(nid_origen)
+    if not cpu_vm or not firma_origen:
+        log("vm%d: no puedo leer su cpu (%r) o la del origen (%r) — no se mueve"
+            % (vmid, cpu_vm, firma_origen))
+        return None
     usados = {}
     for d in db.collection("servers").select(["nodeId", "cores"]).stream():
         s = d.to_dict() or {}
@@ -134,9 +205,12 @@ def elige_destino(nid_origen, vmid, db, reservado):
     mejor = None
     for nd in db.collection("proxmox_nodes").stream():
         n = nd.to_dict() or {}
-        if modelo not in nd.id or nd.id == nid_origen:
+        if str(n.get("nodeType") or "").strip() != modelo or nd.id == nid_origen:
             continue
         if n.get("frozen") or str(n.get("status") or "").strip():
+            continue
+        lista = permitidos(n)
+        if lista is not None and plan_vm not in lista:
             continue
         pct = n.get("zpoolCapPct")
         if pct is None:
@@ -146,8 +220,12 @@ def elige_destino(nid_origen, vmid, db, reservado):
             continue
         if int(n.get("max_cores") or 0) - usados.get(nd.id, 0) - cores_vm < 0:
             continue
-        if mejor is None or pct < mejor[1]:
-            mejor = (nd.id, pct, float(n.get("zpoolMainPoolSizeGb") or 0))
+        if mejor is not None and pct >= mejor[1]:
+            continue
+        # la CPU se comprueba al final: es la unica condicion que cuesta un SSH
+        if not cpu_permite(cpu_vm, firma_origen, firma_cpu(nd.id)):
+            continue
+        mejor = (nd.id, pct, float(n.get("zpoolMainPoolSizeGb") or 0))
     return mejor
 
 

@@ -595,7 +595,95 @@ def node_boot_reconcile():
             lock_fh.close()
 
 
+BOOT_STAGGER_FILE = "/etc/default/neuravps-boot-stagger"
+
+
+def _boot_stagger_config():
+    """Memory-paced auto-start after a node reboot — OPT-IN per node.
+
+    Why (pilot 0000260-AX102-3-LTD, 03/11/2026): a Windows guest touches its
+    whole RAM while booting, before the balloon reclaims anything. 8 vps-b
+    (19 GB) started 5 s apart on a 125 GB host took MemAvailable from 105 to
+    4.5 GB, pushed 8.4 GB to host swap and PSI-mem to 6.5 for 1-2 min; in
+    production the boot RAM guard also holds every guest at its full RAM for
+    180 s, which makes it worse. On the 256/384 GB AX162s and the 4 GB MT
+    guests this never happens, so the fleet keeps the plain 2 s stagger.
+
+    File format (shell-style KEY=VALUE): MEM_STAGGER=1 enables it;
+    RESERVE_MB (12288, same margin as the RAM guard), MIN_GAP_S (30) and
+    MAX_WAIT_S (240: a VM is started anyway after that — a customer left down
+    is worse than a minute of pressure). Absent/unreadable/MEM_STAGGER!=1 ->
+    None (old behaviour)."""
+    try:
+        with open(BOOT_STAGGER_FILE) as fh:
+            raw = dict(line.strip().split("=", 1) for line in fh
+                       if "=" in line and not line.lstrip().startswith("#"))
+    except (OSError, ValueError):
+        return None
+    if raw.get("MEM_STAGGER", "").strip() != "1":
+        return None
+    def num(key, default):
+        try:
+            return max(0, int(raw.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+    return {"reserve_mb": num("RESERVE_MB", 12288), "min_gap_s": num("MIN_GAP_S", 30),
+            "max_wait_s": num("MAX_WAIT_S", 240)}
+
+
+def _mem_available_mb():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _vm_memory_mb(vmid):
+    try:
+        with open(f"/etc/pve/qemu-server/{vmid}.conf") as fh:
+            for line in fh:
+                if line.startswith("["):
+                    break
+                if line.startswith("memory:"):
+                    return int(line.split(":", 1)[1].strip())
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _wait_for_boot_memory(vmid, cfg, last_start, sleep=time.sleep,
+                          now=time.monotonic, avail=_mem_available_mb,
+                          memory=_vm_memory_mb):
+    """Block until the host can absorb this guest's boot: MemAvailable >=
+    its full RAM + reserve, and at least min_gap_s since the previous start.
+    Never longer than max_wait_s. Returns the seconds waited."""
+    start = now()
+    need = (memory(vmid) or 0) + cfg["reserve_mb"]
+    while True:
+        waited = now() - start
+        if waited >= cfg["max_wait_s"]:
+            logger.warning(f"boot stagger: VM {vmid} started after {waited:.0f}s "
+                           f"without {need} MB available (cap reached)")
+            return waited
+        gap_ok = last_start is None or now() - last_start >= cfg["min_gap_s"]
+        free = avail()
+        if gap_ok and (free is None or free >= need):
+            if waited >= 1:
+                logger.info(f"boot stagger: VM {vmid} waited {waited:.0f}s "
+                            f"(MemAvailable {free} MB, need {need})")
+            return waited
+        sleep(5)
+
+
 def _node_boot_reconcile_locked():
+    stagger = _boot_stagger_config()
+    last_start = None
+    if stagger:
+        logger.info(f"boot stagger ON: {stagger}")
     all_vm_status = get_all_vms()
     logger.info(f"All VMs: {sorted(all_vm_status.keys())}")
     loop = _boot_history_crashloop()
@@ -611,8 +699,11 @@ def _node_boot_reconcile_locked():
                 logger.warning(f"VM {vmid}: desired=running but node in reboot loop — skipping auto-start (Firestore left 'running')")
                 continue
             logger.info(f"VM {vmid}: desired=running, stopped after node reboot — auto-starting")
+            if stagger is not None:
+                _wait_for_boot_memory(vmid, stagger, last_start)
             try:
                 run(["qm", "start", str(vmid)])
+                last_start = time.monotonic()
                 time.sleep(2)  # small stagger so N guests don't all boot at once
             except subprocess.CalledProcessError as e:
                 logger.error(f"auto-start VM {vmid} failed ({e.stderr or e}); Firestore desired state ('running') left intact")
