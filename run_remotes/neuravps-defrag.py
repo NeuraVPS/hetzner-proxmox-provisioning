@@ -14,6 +14,10 @@ sweep has reconciled counters. Two phases, corrections first:
        MT5 (AX102): usedCores > max_cores (sin fallback fijo: cap ausente =
                     nodo NI over-gate NI destino)
      -> move the smallest RUNNING VMs out until back within limits.
+  1b. MT RAM GATE (v14, 2026-11-05) — MT5 nodes whose floors exceed
+     mtRamGatePct (0.85) x gbRam: move RUNNING VMs (the smallest that gets the
+     node under the gate on its own, else the largest) to MT nodes that stay
+     <= mtRamDestMaxPct (0.80) x gbRam and <= max_cores; same region preferred.
   2. DEFRAG (SQX) — nodes where no sellable plan fits but >=5 GB remain
      stranded -> move the smallest RUNNING VM whose departure makes the hole
      plan-sized again (recovers the crumb as sellable capacity).
@@ -80,7 +84,7 @@ State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
 
 --dry-run flag: plan + journal (as dryRun) but never execute, without
 touching the config/defrag kill-switch the hourly timers read.
-#NDFVER=13
+#NDFVER=14
 """
 import fcntl
 import json
@@ -423,6 +427,133 @@ def no_dest_nodes(mt_outcomes, sqx_failed):
     nothing failed" (empty list) from "old defrag, not recorded" (no field)."""
     return {"MT5": sorted(n for n, o in (mt_outcomes or {}).items() if o == "no-dest"),
             "SQX": sorted(sqx_failed or ())}
+
+
+# ---- MT RAM gate (v14, approved by Iván 2026-11-05) ----
+# The MT5 correction only looked at cores (usedCores > max_cores). A full AX102
+# MT sits at 96/96 cores, so it is never "over", even with 123 of its 125 GB
+# reserved as balloon floors — while other AX102 MT nodes are half empty.
+# Floors that close to physical RAM are what drives the swap / ZFS txg_sync
+# stalls of neuravps-ax102-mt-ram-txg-stall (05/11: 9 MT nodes > 85 %).
+#   origin      : sum of floors (usedRamFloorGb) > gate x gbRam (PHYSICAL RAM)
+#   destination : after the move, floors <= destMax x gbRam and cores <=
+#                 max_cores (plus every existing pick_dest rule: same nodeType,
+#                 plan allow-list, CPU, disk, CPU harm, never an empty node)
+# The 5-point gap between gate and destMax is the hysteresis: a destination
+# is never filled to a level that would make it an origin the next night.
+# Every OTHER MT move (cores gate, consolidation, CPU relief) also refuses a
+# destination it would push above the gate, for the same reason: otherwise
+# tonight's consolidation re-fills the node the RAM gate just relieved.
+# Config (config/defrag): mtRamGateEnabled (default true), mtRamGatePct (0.85),
+# mtRamDestMaxPct (0.80). A malformed value DISABLES the gate (logged), it
+# never widens it.
+MT_RAM_GATE_PCT = 0.85
+MT_RAM_DEST_MAX_PCT = 0.80
+MT_RAM_MAX_MOVES_PER_NODE = 16
+
+
+def mt_ram_settings(cfg):
+    """(gate, dest_max) from config/defrag, or None when the gate is off."""
+    cfg = cfg or {}
+    if cfg.get("mtRamGateEnabled", True) is not True:
+        return None
+    try:
+        gate = float(cfg.get("mtRamGatePct", MT_RAM_GATE_PCT))
+        dest = float(cfg.get("mtRamDestMaxPct", MT_RAM_DEST_MAX_PCT))
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < dest < gate <= 1.0):
+        return None
+    return gate, dest
+
+
+def mt_ram_pct(n):
+    """Floors as a fraction of PHYSICAL RAM (gbRam); None if gbRam unknown."""
+    phys = float(n.get("phys") or 0)
+    return n["fl"] / phys if phys > 0 else None
+
+
+def mt_ram_excess(n, gate):
+    """GB of floor above the gate (<= 0: not over). Unknown gbRam -> 0: a node
+    whose physical RAM is not synced is neither origin nor destination."""
+    phys = float(n.get("phys") or 0)
+    return n["fl"] - gate * phys if phys > 0 else 0.0
+
+
+def mt_ram_dest_ok(dn, fl, cap_pct):
+    """Would `dn` stay at or below cap_pct x gbRam after receiving `fl` GB of
+    floor? cap_pct None = no RAM cap (gate disabled). Unknown gbRam -> no."""
+    if cap_pct is None:
+        return True
+    phys = float(dn.get("phys") or 0)
+    return phys > 0 and dn["fl"] + fl <= cap_pct * phys + 1e-9
+
+
+def mt_ram_victim_key(excess):
+    """Order for the RAM gate: first the VMs that bring the node under the
+    gate on their own, SMALLEST first (the minimum VM that does the job); if
+    none is big enough, the LARGEST first (fewest moves / frozen customers)."""
+    def key(v):
+        return (0, v["fl"]) if v["fl"] >= excess else (1, -v["fl"])
+    return key
+
+
+def plan_mt_ram_gate(nodes, gate, victims_of, pick_dest, book, room,
+                     per_node=MT_RAM_MAX_MOVES_PER_NODE):
+    """Book RAM-gate moves, worst node first. Callbacks (main() supplies them):
+      victims_of(nid, excess) -> iterable of candidate VMs, in preference order
+      pick_dest(vm)           -> destination nid or None (RAM cap applied)
+      book(vm, nid, dst, reason)
+      room()                  -> moves still allowed this run
+    Returns {nid: {"before", "after" (fraction of gbRam), "moves", "outcome"}}
+    for every over-gate MT node; outcome is "under" (back below the gate),
+    "partial" (moved some, still over: cap reached), "no-dest", "no-victim",
+    "rate-limited" (no move left for it this run) or "not-placeable"."""
+    over = [nid for nid, n in nodes.items()
+            if n["model"] == "MT5" and mt_ram_excess(n, gate) > 0]
+    over.sort(key=lambda nid: (-(mt_ram_pct(nodes[nid]) or 0), nid))
+    report = {}
+    for nid in over:
+        n = nodes[nid]
+        rec = {"before": round(mt_ram_pct(n), 4), "moves": 0}
+        report[nid] = rec
+        if n["frozen"] or n["status"]:
+            rec["outcome"] = "not-placeable"
+        elif room() <= 0:
+            rec["outcome"] = "rate-limited"
+        else:
+            outcome = None
+            while rec["moves"] < per_node:
+                excess = mt_ram_excess(n, gate)
+                if excess <= 0:
+                    outcome = "under"
+                    break
+                if room() <= 0:
+                    break
+                picked = None
+                any_victim = False
+                for vm in victims_of(nid, excess):
+                    if vm.get("fl", 0) <= 0:
+                        continue
+                    any_victim = True
+                    dst = pick_dest(vm)
+                    if dst:
+                        picked = (vm, dst)
+                        break
+                if not picked:
+                    outcome = "no-dest" if any_victim else "no-victim"
+                    break
+                pct = mt_ram_pct(n)
+                book(picked[0], nid, picked[1],
+                     f"mt-ram-gate (floors {n['fl']:.0f}/{n['phys']:.0f}GB = "
+                     f"{pct * 100:.0f}% > {gate * 100:.0f}%)")
+                rec["moves"] += 1
+            if outcome is None:
+                outcome = "under" if mt_ram_excess(n, gate) <= 0 else (
+                    "partial" if rec["moves"] else "rate-limited")
+            rec["outcome"] = outcome
+        rec["after"] = round(mt_ram_pct(n), 4)
+    return report
 # Sellable SQX catalog — mirror of pricingPlans.json (ram, expected floor =
 # max(ram_min, ram_min_observed), the same number auto_provision reserves).
 # vps-e is 48 GB since 2026-07-25; the old table still carried 60, and
@@ -594,6 +725,15 @@ def main():
     max_moves = int(cfg.get("maxMovesPerRun") or 8)
     if not relief:
         max_moves = min(max_moves, int(cfg.get('routineMaxMovesPerRun') or 4))
+    mt_ram = mt_ram_settings(cfg)
+    if mt_ram is None and cfg.get("mtRamGateEnabled", True) is True:
+        log(f"WARN mt RAM gate DISABLED: invalid mtRamGatePct/mtRamDestMaxPct "
+            f"({cfg.get('mtRamGatePct')!r}/{cfg.get('mtRamDestMaxPct')!r})")
+    # Cross-region: the planner has never looked at `location` and live
+    # migration keeps sessions across regions since 02/10 (GRACE_CROSS_REGION=1),
+    # so crossing stays allowed; the RAM gate only PREFERS same-region
+    # destinations. mtRamGateCrossRegion=false forbids crossing for it.
+    mt_ram_cross = cfg.get("mtRamGateCrossRegion", True) is not False
     cooldown_h = float(cfg.get("moveCooldownH") or 72)
     recent_vmids = load_recent_moves(cooldown_h)
     if recent_vmids:
@@ -623,6 +763,11 @@ def main():
             "allowed": node_allowed(d),
             "status": str(d.get("status") or "").strip(),
             "g": base_ram(d),
+            # PHYSICAL RAM, for the MT RAM gate (v14). `g` is the declared
+            # placement base (min with max_base_ram); the gate is about the
+            # box itself, so it reads gbRam alone. 0 = unknown -> no gate.
+            "phys": float(d.get("gbRam") or 0),
+            "loc": str(d.get("location") or "").strip(),
             "cap": int(d.get("max_cores") or 0),
             # Ocupacion real del pool, la escribe node_health en el doc del nodo.
             # None = todavia no sincronizada, y entonces no bloquea (fail-open).
@@ -732,8 +877,15 @@ def main():
         return n["cpu_ms"] <= CPU_MAX_MS
 
 
-    def pick_dest(model, ram, fl, cores, exclude, tidy=True, vm=None):
-        """tidy=False drops the leftover_clean() packing rule. Relief passes
+    def pick_dest(model, ram, fl, cores, exclude, tidy=True, vm=None,
+                  mt_ram_cap=None, region=None):
+        """mt_ram_cap (MT only): max floors / gbRam the destination may reach;
+        None = the RAM gate itself (never push an MT node over the gate), or
+        no cap when the gate is disabled. region=(loc, allow_cross): prefer
+        destinations in `loc`; others only if allow_cross. With mt_ram_cap
+        given, best-fit is by RAM headroom instead of free cores.
+
+        tidy=False drops the leftover_clean() packing rule. Relief passes
         False: that rule exists to keep the fleet SELLABLE, and trading
         sellability against a customer who is thrashing is the wrong way round.
         It also fails at its own job here — refusing the move leaves the source
@@ -780,7 +932,19 @@ def main():
                 free = dn["cap"] - dn["cores"]
                 if free - cores < 0 or dn['g'] <= 0 or dn['fl'] + fl > dn['g']:
                     continue
-                key = free
+                ram_cap = (mt_ram_cap if mt_ram_cap is not None
+                           else (mt_ram[0] if mt_ram else None))
+                if not mt_ram_dest_ok(dn, fl, ram_cap):
+                    continue
+                if mt_ram_cap is not None:
+                    key = ram_cap * dn["phys"] - dn["fl"] - fl
+                else:
+                    key = free
+            if region is not None:
+                same = (dn.get("loc") or "") == (region[0] or "")
+                if not same and not region[1]:
+                    continue
+                key = (0 if same else 1, key)
             # BEST-FIT: fullest fitting node (min headroom), and NEVER an
             # empty node — empties are the operator's drain/maintenance
             # reserve (worst-fit here is what consumed them on 07-12).
@@ -1107,6 +1271,32 @@ def main():
                     break
                 guard += 1
 
+    # ---- phase 1b: MT RAM gate (v14, see MT_RAM_GATE_PCT) ----
+    # After the SQX and MT-cores corrections (their priority is unchanged),
+    # before the SQX tidying phases. RUNNING VMs only: a stopped guest holds
+    # no physical RAM, so moving it would lower the counter and not the
+    # pressure the gate exists for.
+    mt_ram_report = {}
+    if not relief and mt_ram:
+        _gate, _dest_max = mt_ram
+
+        def _ram_victims(nid, excess):
+            return order_victims([v for v in nodes[nid]["vms"] if v["st"] == "running"],
+                                 nid, sizekey=mt_ram_victim_key(excess))
+
+        def _ram_dest(vm):
+            reg = (nodes[vm["node"]].get("loc"), mt_ram_cross)
+            return pick_dest("MT5", vm["ram"], vm["fl"], vm["cores"], {vm["node"]},
+                             vm=vm, mt_ram_cap=_dest_max, region=reg)
+
+        mt_ram_report = plan_mt_ram_gate(nodes, _gate, _ram_victims, _ram_dest, book,
+                                         lambda: max_moves - len(moves))
+        for nid, r in mt_ram_report.items():
+            log(f"mt-ram-gate {nid}: floors {r['before'] * 100:.1f}% -> "
+                f"{r['after'] * 100:.1f}% of gbRam, {r['moves']} move(s), {r['outcome']}")
+            if r["outcome"] in ("no-dest", "no-victim"):
+                log(f"WARN {nid} over the MT RAM gate but {r['outcome']} — leaving")
+
     # ---- phase 1.5: relieve floor-starved SQX nodes ----
     # A node whose floors sit within one reconciler STEP (4 GB) of the 60%
     # budget BLOCKS the balloon reconciler ("NO BUDGET" — it cannot raise a
@@ -1240,6 +1430,8 @@ def main():
            # Written in EVERY run, moves or not: a run that relieved one node
            # and found no destination for another used to record only "done".
            "noDestNodes": no_dest}
+    if mt_ram_report:
+        doc["mtRamGate"] = mt_ram_report
     if relief and mt_evaluated:
         doc["mtReliefOutcomes"] = mt_outcomes
     if relief and live_blocked:
