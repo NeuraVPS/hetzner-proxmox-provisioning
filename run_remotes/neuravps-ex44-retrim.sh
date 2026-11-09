@@ -94,7 +94,8 @@ except Exception: sys.exit(0)
 print(d.get("out-data",""), end="")' 2>/dev/null)"
   vols="$(printf '%s\n' "$out" | tr -d '\r' | grep "NV-RUN-$nonce VOL" | sed "s/NV-RUN-$nonce VOL //" | paste -sd, -)"
   if printf '%s' "$out" | grep -q "NV-RUN-$nonce DONE"; then
-    log "vm=$vmid OK before=$(gib "$before")G after=$(gib "$after")G freed=$(gib $((before-after)))G took=$((SECONDS-t0))s vols=[${vols}]"
+    st=OK; [[ "$vols" == *" ERR "* ]] && st="PARTIAL"
+    log "vm=$vmid $st before=$(gib "$before")G after=$(gib "$after")G freed=$(gib $((before-after)))G took=$((SECONDS-t0))s vols=[${vols}]"
     ok=$((ok+1))
   else
     log "vm=$vmid FAIL rc=$rc no valid NV-RUN-$nonce marker (timeout or foreign output) before=$(gib "$before")G after=$(gib "$after")G took=$((SECONDS-t0))s vols=[${vols}] raw=$(printf '%s' "$raw" | head -c 200 | tr '\n' ' ')"
