@@ -68,8 +68,25 @@ PS
   enc="$(printf '%s' "$ps" | iconv -t UTF-16LE | base64 -w0)"
   before=$(zvol_bytes "$vmid")
   t0=$SECONDS
-  raw="$(qm guest exec "$vmid" --timeout "$GUEST_TIMEOUT" -- powershell -NoProfile -NonInteractive -EncodedCommand "$enc" 2>&1)"
-  rc=$?
+  # Async exec + our own polling: the synchronous form dies when a single
+  # guest-exec-status call exceeds QMP's short timeout (ReTrim takes minutes).
+  raw=""; rc=1
+  pid="$(qm guest exec "$vmid" --synchronous 0 --timeout 0 -- powershell -NoProfile -NonInteractive -EncodedCommand "$enc" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["pid"])
+except Exception: pass' 2>/dev/null)"
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    while (( SECONDS - t0 < GUEST_TIMEOUT )); do
+      sleep 10
+      st="$(timeout 60 qm guest exec-status "$vmid" "$pid" 2>/dev/null)" || continue   # transient QGA timeout: keep polling
+      if printf '%s' "$st" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("exited") else 1)' 2>/dev/null; then
+        raw="$st"; rc=0; break
+      fi
+    done
+    [[ $rc -ne 0 ]] && raw="no exit after ${GUEST_TIMEOUT}s (pid $pid)"
+  else
+    raw="guest exec did not start"
+  fi
   after=$(zvol_bytes "$vmid")
   out="$(printf '%s' "$raw" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
