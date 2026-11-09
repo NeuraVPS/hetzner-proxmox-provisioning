@@ -1,0 +1,10 @@
+[Unit]
+Description=NeuraVPS: weekly EX44 guest ReTrim (Sunday night)
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=2h
+Persistent=false
+
+[Install]
+WantedBy=timers.target

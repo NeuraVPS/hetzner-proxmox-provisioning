@@ -1,0 +1,12 @@
+[Unit]
+Description=NeuraVPS: weekly ReTrim of Windows guests on EX44 (return deleted space to the zvol)
+Documentation=https://github.com/NeuraVPS/hetzner-proxmox-provisioning
+ConditionPathExists=/usr/local/sbin/neuravps-ex44-retrim.sh
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/sbin/neuravps-ex44-retrim.sh
+# Never compete with the guests.
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=3h
