@@ -71,7 +71,7 @@ PS
   # Async exec + our own polling: the synchronous form dies when a single
   # guest-exec-status call exceeds QMP's short timeout (ReTrim takes minutes).
   raw=""; rc=1
-  pid="$(qm guest exec "$vmid" --synchronous 0 --timeout 0 -- powershell -NoProfile -NonInteractive -EncodedCommand "$enc" 2>/dev/null \
+  pid="$(qm guest exec "$vmid" --synchronous 0 -- powershell -NoProfile -NonInteractive -EncodedCommand "$enc" 2>/dev/null \
         | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["pid"])
 except Exception: pass' 2>/dev/null)"
