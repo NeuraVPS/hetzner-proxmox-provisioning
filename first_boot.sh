@@ -484,6 +484,22 @@ UNITEOF
 systemctl daemon-reload
 systemctl enable --now neuravps-zswap.service || log "WARNING: neuravps-zswap enable failed"
 
+# EX44 only: zvol readahead 128 KB + watermark_scale_factor=100. ZFS 2.4 declares
+# io_opt=32 MiB on zvols -> read_ahead_kb=65536 -> order-8/9 readahead folios ->
+# direct compaction in QEMU I/O threads on a full 64 GB host (incident
+# 2026-11-11). Same content as run_remotes/install-ex44-readahead.sh — keep in sync.
+if [ "$MEM_PROFILE" = "e" ]; then
+  log "EX44: zvol read_ahead_kb=128 (udev) + vm.watermark_scale_factor=100"
+  cat > /etc/udev/rules.d/61-neuravps-zvol-readahead.rules <<'RAEOF'
+# NeuraVPS: zvol readahead 128 KB (ZFS 2.4 io_opt=32 MiB makes the kernel pick 64 MB,
+# which drives direct compaction in QEMU I/O threads on 64 GB EX44 hosts).
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="zd*", ENV{DEVTYPE}=="disk", ATTR{queue/read_ahead_kb}="128"
+RAEOF
+  printf '# NeuraVPS EX44: wake kswapd earlier (default 10) — see run_remotes/install-ex44-readahead.sh\nvm.watermark_scale_factor = 100\n' > /etc/sysctl.d/99-neuravps-ex44-watermark.conf
+  udevadm control --reload 2>/dev/null || true
+  sysctl -q -p /etc/sysctl.d/99-neuravps-ex44-watermark.conf 2>/dev/null || true
+fi
+
 if [ "$ARC_MIN_BYTES" -gt 0 ]; then
   echo "$ARC_MIN_BYTES" > /sys/module/zfs/parameters/zfs_arc_min
   echo "$ARC_BYTES" > /sys/module/zfs/parameters/zfs_arc_max
