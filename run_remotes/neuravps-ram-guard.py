@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Serialize demand boosts with the balloon reconciler; never trust old capacity."""
+import errno
 import fcntl
 import base64
 import json
@@ -14,6 +15,49 @@ CONF_DIR = Path('/etc/pve/qemu-server')
 STATE_DIR = Path('/var/lib/neuravps-balloon')
 RESERVE_MB = 12288
 RECONCILER_TIMER = Path('/etc/systemd/system/neuravps-balloon-reconciler.timer')
+
+
+LOCK_PATH = '/run/neuravps-ram.lock'
+# Bounded wait per action. Callers over SSH have their own timeouts
+# (welcome-boost: hold 15 s, boost 30 s; migrate_vm retries state 12x), so
+# those waits stay below them. The boot restore runs detached from a
+# transient systemd unit, so it can wait out a whole reconciler pass.
+LOCK_WAIT_S = {'boot': 60, 'restore': 120, 'hold': 10, 'boost': 25,
+               'state': 30}
+LOCK_POLL_S = (0.2, 0.5, 1.0, 2.0)  # backoff steps; the last one repeats
+
+
+def log(message):
+    print(f'neuravps-ram-guard: {message}', file=sys.stderr, flush=True)
+
+
+def acquire(lock, action):
+    """Take the shared RAM lock, waiting a bounded time instead of failing.
+
+    The balloon reconciler holds this lock for a whole pass and SKIPS its own
+    pass when it is busy (correct for a periodic job). The actions in this
+    file are one-shot: 2026-11-15 a boot restore collided with a reconciler
+    pass (EAGAIN) and the VM stayed at full balloon until someone re-ran it.
+    On timeout we raise (-> JSON error + exit 1) and log; we never hang.
+    """
+    wait = LOCK_WAIT_S[action]
+    deadline = time.monotonic() + wait
+    attempt = 0
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if attempt:
+                log(f'{action}: got {LOCK_PATH} after {attempt} retries')
+            return
+        except (BlockingIOError, OSError) as exc:
+            if getattr(exc, 'errno', None) not in (errno.EAGAIN, errno.EACCES):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log(f'{action}: gave up on {LOCK_PATH} after {wait}s (lock busy)')
+                raise RuntimeError(f'ram lock busy after {wait}s')
+            time.sleep(min(LOCK_POLL_S[min(attempt, len(LOCK_POLL_S) - 1)], remaining))
+            attempt += 1
 
 
 def config(vmid):
@@ -87,8 +131,8 @@ def inspect(vmid, expected_node):
 
 def boost(vmid, expected_node, boot_token=None):
     # Also protects floors.json against concurrent bases and reconciler writes.
-    with open('/run/neuravps-ram.lock', 'a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with open(LOCK_PATH, 'a') as lock:
+        acquire(lock, 'boost' if boot_token is None else 'boot')
         maximum, floor, actual, avail = inspect(vmid, expected_node)
         if actual >= maximum - 1024 and boot_token is None:
             return {'status': 'full'}
@@ -131,8 +175,8 @@ def boost(vmid, expected_node, boot_token=None):
 
 def boot_control(vmid, expected_node, token=None):
     """Hold on a real RDP return; otherwise restore only this boot's own floor."""
-    with open('/run/neuravps-ram.lock', 'a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with open(LOCK_PATH, 'a') as lock:
+        acquire(lock, 'hold' if token is None else 'restore')
         if socket.gethostname() != expected_node:
             raise RuntimeError('node identity mismatch')
         path = STATE_DIR / 'boot-guards.json'
@@ -156,8 +200,8 @@ def boot_control(vmid, expected_node, token=None):
 
 def transfer_state(vmid, expected_node, encoded=None):
     """Carry working-set history across migration, tied to the VM's UUID."""
-    with open('/run/neuravps-ram.lock','a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with open(LOCK_PATH, 'a') as lock:
+        acquire(lock, 'state')
         if socket.gethostname() != expected_node:
             raise RuntimeError('node identity mismatch')
         uuid = config(vmid).get('smbios1')

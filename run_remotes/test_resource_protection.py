@@ -129,6 +129,70 @@ class BootOwnership(unittest.TestCase):
         self.assertEqual(state['99']['token'],'current')
 
 
+class LockContention(unittest.TestCase):
+    """2026-11-15: the boot restore hit EAGAIN against a reconciler pass and was lost."""
+
+    def setUp(self):
+        import fcntl
+        self.fcntl = fcntl
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lock_path = str(Path(self.dir.name) / 'ram.lock')
+        self.holder = open(self.lock_path, 'a')
+        self.addCleanup(self.holder.close)
+        fcntl.flock(self.holder, fcntl.LOCK_EX)  # the "reconciler"
+
+    def run_restore(self, wait):
+        guards = {'99': {'token': 'tok', 'floor': 9932, 'target': 19456,
+                         'uuid': 'uuid=one', 'held': False}}
+        state = Path(self.dir.name) / 'state'
+        state.mkdir()
+        (state / 'boot-guards.json').write_text(json.dumps(guards))
+        with patch.object(guard, 'LOCK_PATH', self.lock_path), \
+             patch.object(guard, 'STATE_DIR', state), \
+             patch.object(guard, 'LOCK_WAIT_S', {'restore': wait}), \
+             patch.object(guard, 'LOCK_POLL_S', (0.05,)), \
+             patch.object(guard.socket, 'gethostname', return_value='node'), \
+             patch.object(guard, 'config', return_value={'balloon': '19456', 'smbios1': 'uuid=one'}), \
+             patch.object(guard.subprocess, 'run') as qm:
+            try:
+                result = guard.boot_control(99, 'node', 'tok')
+            except RuntimeError as exc:
+                result = exc
+            return result, qm.call_count, json.loads((state / 'boot-guards.json').read_text())
+
+    def test_busy_for_a_few_seconds_then_restore_applies(self):
+        import threading
+        threading.Timer(0.4, lambda: self.fcntl.flock(self.holder, self.fcntl.LOCK_UN)).start()
+        started = time.monotonic()
+        result, calls, state = self.run_restore(wait=5)
+        self.assertEqual(result, {'status': 'boot-guard-updated'})
+        self.assertEqual(calls, 1)  # qm set --balloon <floor>
+        self.assertEqual(state, {})
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+
+    def test_busy_forever_gives_up_with_log_and_does_not_hang(self):
+        from io import StringIO
+        err = StringIO()
+        started = time.monotonic()
+        with patch.object(guard.sys, 'stderr', err):
+            result, calls, state = self.run_restore(wait=0.5)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn('busy', str(result))
+        self.assertEqual(calls, 0)
+        self.assertIn('gave up', err.getvalue())
+        self.assertIn('99', json.dumps(state))  # guard entry kept, nothing lost
+
+    def test_every_action_has_a_bounded_wait(self):
+        for action in ('boot', 'restore', 'hold', 'boost', 'state'):
+            self.assertGreater(guard.LOCK_WAIT_S[action], 0)
+        # welcome-boost's SSH timeouts: hold 15 s, boost 30 s
+        self.assertLess(guard.LOCK_WAIT_S['hold'], 15)
+        self.assertLess(guard.LOCK_WAIT_S['boost'], 30)
+        self.assertGreaterEqual(guard.LOCK_WAIT_S['restore'], 90)
+
+
 class MigrationHistory(unittest.TestCase):
     def test_import_preserves_bounces_without_reusing_old_host_rates(self):
         import base64
