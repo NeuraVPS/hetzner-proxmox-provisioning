@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 ############################################################
-# Migration: EX44 zvol readahead 128 KB + vm.watermark_scale_factor=100
+# Migration: zvol readahead 128 KB + vm.watermark_scale_factor=100
+# (EX44 by default; AX162 with NODE_TYPES="AX162" — see below)
 #
 # WHY (incident analysis 2026-11-11, nodes 120/5/169/99): the EX44 VPS-E guests
 # hang for minutes with PSI-memory "full" at 90-99 % WITHOUT the swap growing.
@@ -22,15 +23,23 @@
 #     reached less often. Costs ~0.6 GiB of permanently free memory.
 #   * applies both LIVE to the current zvols (no VM/node restart, no cache=none)
 # Pilot: node 0000120 from 2026-11-11 20:07Z -> compact_stall 123k/day -> 23k/day.
+# AX162 pilot (nodes 54/55/227, 2026-11-14 -> 16, 48 h vs 2 h baseline): compact_stall
+# -75..-88 %, PSI memory full -75 %, untouched controls did not drop. Rolled out to
+# every *-AX162* node on 2026-11-16 with NODE_TYPES="AX162".
 #
 # Does NOT touch guest RAM, balloon or cache= (cache=none needs a VM stop).
-# Self-guards on hostname (*-EX44* only): a stray run elsewhere is a no-op.
-# Idempotent. Revert: rm both files, `udevadm control --reload`, then
+# NODE_TYPES (space separated, default "EX44"): hostname must contain -<TYPE> for
+# one of them (e.g. "AX162" matches 0000054-AX162-R and 0000260-AX162-2-LTD).
+# Anything else is a no-op. The sysctl file is per type so nothing is duplicated
+# on nodes that already have it: 99-neuravps-<type lowercase>-watermark.conf
+# (EX44 keeps 99-neuravps-ex44-watermark.conf). The udev rule is shared.
+# Idempotent. Revert: rm both files (rule + that type's sysctl), `udevadm control --reload`, then
 #   for d in /sys/block/zd*; do echo 65536 > $d/queue/read_ahead_kb; done
 #   sysctl -w vm.watermark_scale_factor=10
 #
 # Run from a BASE host:  bash install-ex44-readahead.sh
 #   ONLY_HOST_NUMS="5 169 167" bash install-ex44-readahead.sh   (staged rollout)
+#   NODE_TYPES="AX162" bash install-ex44-readahead.sh           (AX162 fleet)
 #   DRY_RUN=1 ...                                              (print, change nothing)
 ############################################################
 
@@ -38,26 +47,31 @@
 # DEFINE LOCAL FUNCTION (runs remotely)
 ############################################################
 remote_task() {
-  case "$(hostname)" in
-    *-EX44*) ;;
-    *) echo "skip: $(hostname) is not an EX44"; return 0 ;;
-  esac
+  local NTYPE="" t
+  for t in ${NODE_TYPES:-EX44}; do
+    case "$(hostname)" in
+      *-"$t"*) NTYPE="$t"; break ;;
+    esac
+  done
+  if [ -z "$NTYPE" ]; then
+    echo "skip: $(hostname) is not one of: ${NODE_TYPES:-EX44}"; return 0
+  fi
   local RULE=/etc/udev/rules.d/61-neuravps-zvol-readahead.rules
-  local SYSCTL=/etc/sysctl.d/99-neuravps-ex44-watermark.conf
+  local SYSCTL="/etc/sysctl.d/99-neuravps-$(echo "$NTYPE" | tr 'A-Z' 'a-z')-watermark.conf"
   local RA=128 WSF=100
 
-  echo "== EX44 readahead/watermark ($(hostname)) DRY_RUN=${DRY_RUN:-0} =="
+  echo "== $NTYPE readahead/watermark ($(hostname)) DRY_RUN=${DRY_RUN:-0} =="
   echo "-- before: wsf=$(cat /proc/sys/vm/watermark_scale_factor) zvol ra: $(for d in /sys/block/zd*; do [ -e "$d/queue/read_ahead_kb" ] && echo -n "$(basename "$d")=$(cat "$d/queue/read_ahead_kb") "; done)"
   if [ "${DRY_RUN:-0}" = "1" ]; then echo "[DRY-RUN] no changes"; return 0; fi
 
   cat > "$RULE.new" <<RULEEOF
 # NeuraVPS: zvol readahead 128 KB (ZFS 2.4 io_opt=32 MiB makes the kernel pick 64 MB,
-# which drives direct compaction in QEMU I/O threads on 64 GB EX44 hosts).
+# which drives direct compaction in QEMU I/O threads on EX44/AX162 hosts).
 ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="zd*", ENV{DEVTYPE}=="disk", ATTR{queue/read_ahead_kb}="$RA"
 RULEEOF
   mv "$RULE.new" "$RULE"
 
-  printf '# NeuraVPS EX44: wake kswapd earlier (default 10) — see install-ex44-readahead.sh\nvm.watermark_scale_factor = %s\n' "$WSF" > "$SYSCTL.new"
+  printf '# NeuraVPS %s: wake kswapd earlier (default 10) — see run_remotes/install-ex44-readahead.sh\nvm.watermark_scale_factor = %s\n' "$NTYPE" "$WSF" > "$SYSCTL.new"
   mv "$SYSCTL.new" "$SYSCTL"
 
   udevadm control --reload
@@ -105,11 +119,17 @@ if [[ ! -f "$NODES_FILE" ]]; then
     exit 1
 fi
 
-# Space-separated host numbers, e.g. ONLY_HOST_NUMS="5 169". Empty = all EX44.
+# Space-separated host numbers, e.g. ONLY_HOST_NUMS="5 169". Empty = all nodes of NODE_TYPES.
 read -r -a ONLY_HOST_NUMS <<< "${ONLY_HOST_NUMS:-}"
+NODE_TYPES="${NODE_TYPES:-EX44}"
+if [[ ! "$NODE_TYPES" =~ ^[A-Za-z0-9\ -]+$ ]]; then echo "Bad NODE_TYPES: $NODE_TYPES"; exit 1; fi
 
 while read -r hostname ip; do
-    if [[ "$hostname" != *EX44* ]]; then continue; fi
+    type_ok=0
+    for t in $NODE_TYPES; do
+        if [[ "$hostname" == *-"$t"* ]]; then type_ok=1; break; fi
+    done
+    if [[ $type_ok -eq 0 ]]; then continue; fi
     host_num=$((10#${hostname%%-*}))
     if (( ${#ONLY_HOST_NUMS[@]} > 0 )); then
         in_only=0
@@ -121,6 +141,6 @@ while read -r hostname ip; do
     echo "------------------------------------------------"
     echo "Connecting to $hostname ($ip)"
     ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 "root@$ip" \
-        "DRY_RUN=${DRY_RUN:-0}; $FUNC_CONTENT; remote_task" \
+        "DRY_RUN=${DRY_RUN:-0}; NODE_TYPES='${NODE_TYPES}'; $FUNC_CONTENT; remote_task" \
         || echo "❌ Failed on $hostname ($ip)"
 done < <(node_list "$NODES_FILE" | sort)
