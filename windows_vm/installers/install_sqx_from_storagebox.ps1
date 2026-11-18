@@ -19,18 +19,19 @@
   Password for the Storage Box SMB user (required).
 
 .PARAMETER Version
-  SQX build number: 142, 143, or 144. Used for the zip name (SQX_<Version>.zip), install folder (C:\SQX_<Version>), and shortcut labels. Defaults to 143 — 143 remains the default while 144 is being validated; customers can opt into 144 from the panel's custom-install settings.
+  SQX build number: 142, 143, 144, or 145. Used for the zip name (SQX_<Version>.zip), install folder (C:\SQX_<Version>), and shortcut labels. Defaults to 143 — 143 remains the default while the newer builds are being validated; customers can opt into 144 or 145 from the panel's custom-install settings.
 
 .PARAMETER MaxRamGb
-  When set, writes a line "option -Xmx<MaxRamGb>g" into the SQX heap-config file (replacing any existing option -Xmx...g line). The target file depends on the SQX version: for v142 / v143 it's C:\SQX_<Version>\StrategyQuantX_nocheck.config; for v144 it's C:\SQX_<Version>\StrategyQuantX.config (v144 moved the heap setting out of the _nocheck file). When omitted, no file is modified.
+  When set, writes a line "option -Xmx<MaxRamGb>g" into the SQX heap-config file (replacing any existing option -Xmx...g line). The target file depends on the SQX version: for v142 / v143 it's C:\SQX_<Version>\StrategyQuantX_nocheck.config; for v144 and v145 it's C:\SQX_<Version>\StrategyQuantX.config (v144 moved the heap setting out of the _nocheck file; v145 keeps that layout). When omitted, no file is modified.
 
 .PARAMETER PatchHobbiecodeLoadingScreen
   When specified, downloads and runs customize_sqx_loading_screen.ps1 to add the Hobbiecode logo above the StrategyQuant logo on the SQX loading screen. Defaults to false.
 
 .NOTES
   The installer also applies the per-installation headless setting and the v142/v143
-  launch hook. SQX v144 is deliberately never wired through IFEO: its executable
-  name collides with the v143 self-relaunching executable on dual installations.
+  launch hook. SQX v144 and v145 are deliberately never wired through IFEO: their
+  executable name collides with the v143 self-relaunching executable on dual
+  installations.
 
 .EXAMPLE
   .\install_sqx_from_storagebox.ps1 -SmbPassword $env:STORAGEBOX_SMB_PASSWORD
@@ -53,7 +54,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$SmbPassword,
 
-    [ValidateSet('142', '143', '144')]
+    [ValidateSet('142', '143', '144', '145')]
     [string]$Version = '143',
 
     [Parameter(Mandatory = $false)]
@@ -499,9 +500,9 @@ try {
     }
 
     if ($PSBoundParameters.ContainsKey('MaxRamGb')) {
-        # v144 moved the heap setting from StrategyQuantX_nocheck.config to StrategyQuantX.config.
-        # v142 / v143 still read it from the _nocheck.config file.
-        $xmxConfigName = if ($Version -eq '144') { 'StrategyQuantX.config' } else { 'StrategyQuantX_nocheck.config' }
+        # v144 moved the heap setting from StrategyQuantX_nocheck.config to StrategyQuantX.config,
+        # and v145 (build 3228) keeps it there. v142 / v143 still read it from the _nocheck.config file.
+        $xmxConfigName = if ($Version -in @('144', '145')) { 'StrategyQuantX.config' } else { 'StrategyQuantX_nocheck.config' }
         $xmxConfig = Join-Path -Path $ExtractRoot -ChildPath $xmxConfigName
         $xmxLine = "option -Xmx${MaxRamGb}g"
         $lines = @()
