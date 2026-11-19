@@ -183,12 +183,24 @@ def parse_conf(text: str) -> dict:
 
 def rewrite(config, remote_vmid, next_vmid, name, token_to_local_leaf, regen):
     rewritten = {}
+    # ONE pass, whole tokens only. Chained str.replace swapped disks on an
+    # in-place restore (19/11/2026, lab VM1517): the usual layout is
+    # efidisk0=vm-X-disk-1, scsi0=vm-X-disk-0, so "disk-1 -> disk-0" followed
+    # by "disk-0 -> disk-1" left efidisk0 AND scsi0 on the SAME zvol, and OVMF
+    # then wrote its EFI vars over the Windows disk. Also "vm-X-disk-1" must
+    # not match inside "vm-X-disk-10".
+    token_re = None
+    if token_to_local_leaf:
+        alternation = "|".join(re.escape(t) for t in
+                                sorted(token_to_local_leaf, key=len, reverse=True))
+        token_re = re.compile(r"(?<![\w-])(" + alternation + r")(?![\w-])")
     for k, v in sorted(config.items()):
-        if k in ("parent", "snaptime"):
+        # digest: PVE's config checksum, returned by the API and serialized
+        # into backups; not a valid key in a .conf ("unknown setting 'digest'").
+        if k in ("parent", "snaptime", "digest"):
             continue
-        if token_to_local_leaf:
-            for token, local_leaf in token_to_local_leaf.items():
-                v = v.replace(token, local_leaf)
+        if token_re is not None:
+            v = token_re.sub(lambda m: token_to_local_leaf[m.group(1)], v)
         else:
             v = v.replace(f"vm-{remote_vmid}-disk-", f"vm-{next_vmid}-disk-")
         if k == "name" and name:
