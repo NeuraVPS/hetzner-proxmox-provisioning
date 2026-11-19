@@ -163,12 +163,18 @@ def rewrite(
     token_to_local_leaf: dict,
 ) -> str:
     rewritten = {}
+    # One pass, whole tokens only (see restore_vm_from_backup.sh, 19/11/2026:
+    # chained str.replace can map two disks onto the same volume).
+    token_re = None
+    if token_to_local_leaf:
+        alternation = "|".join(re.escape(t) for t in
+                                sorted(token_to_local_leaf, key=len, reverse=True))
+        token_re = re.compile(r"(?<![\w-])(" + alternation + r")(?![\w-])")
     for k, v in sorted(config.items()):
-        if k in ("parent", "snaptime"):
+        if k in ("parent", "snaptime", "digest"):
             continue
-        if token_to_local_leaf:
-            for token, local_leaf in token_to_local_leaf.items():
-                v = v.replace(token, local_leaf)
+        if token_re is not None:
+            v = token_re.sub(lambda m: token_to_local_leaf[m.group(1)], v)
         else:
             v = v.replace(f"vm-{remote_vmid}-disk-", f"vm-{next_vmid}-disk-")
         if k == "name":
