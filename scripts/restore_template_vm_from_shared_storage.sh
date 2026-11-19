@@ -360,7 +360,7 @@ shopt -u nullglob
 n="${#REMOTE_TOKENS[@]}"
 echo "Restoring VMID ${VMID} on node ${NODE} (${n} unique volume(s) / stream(s), create_vm_from_storagebox layout)"
 
-# 3) Stream each disk: ssh storagebox "dd if=... bs=4M" | zstd -d | zfs receive <local_ds>
+# 3) Stream each disk: ssh storagebox "dd if=... bs=4M" | zstd -d --long=31 | zfs receive <local_ds>
 for ((i = 0; i < n; i++)); do
   local_ds="${ZFS_PARENT}/vm-${VMID}-disk-${i}"
   remote_file="${REMOTE_BASE}/disk${i}.stream.zst"
@@ -372,7 +372,7 @@ for ((i = 0; i < n; i++)); do
   done < <(zfs list -H -o name -t snapshot -S creation -r "$local_ds" 2>/dev/null || true)
 
   "${SSH_BASE[@]}" "dd if='${remote_file}' bs=4M" \
-    | zstd -d \
+    | zstd -d --long=31 \
     | zfs receive -F "$local_ds"
 
   zfs set refreservation=none "$local_ds" || true
