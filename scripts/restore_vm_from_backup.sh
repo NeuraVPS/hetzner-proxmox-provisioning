@@ -42,6 +42,11 @@ set -euo pipefail
 #     config.conf
 #     firewall.fw           (optional)
 #     disk0.stream.zst ... disk{n-1}.stream.zst   (one zfs-send|zstd per disk, in sorted-config-key order)
+#
+# Since 19/11/2026 backups are written with `zstd -3 --long=30|31` (1-2 GiB
+# window, ~13 % smaller). Decompression therefore needs `zstd -d --long=31`
+# (plain `zstd -d` refuses with "Frame requires too much memory", rc 1) and up
+# to ~2 GiB of RAM on the restoring node. Older backups decompress identically.
 
 die() {
   echo "ERROR: $*" >&2
@@ -496,7 +501,7 @@ case "$MODE" in
     ;;
 esac
 
-# Stream each disk: ssh storagebox "dd if=... bs=4M" | zstd -d | zfs receive -F <local_ds>
+# Stream each disk: ssh storagebox "dd if=... bs=4M" | zstd -d --long=31 | zfs receive -F <local_ds>
 for ((i = 0; i < n; i++)); do
   local_ds="${LOCAL_DATASETS[i]}"
   remote_file="${REMOTE_BASE}/disk${i}.stream.zst"
@@ -510,7 +515,7 @@ for ((i = 0; i < n; i++)); do
   done < <(zfs list -H -o name -t snapshot -S creation -r "$local_ds" 2>/dev/null || true)
 
   "${SSH_BASE[@]}" "dd if='${remote_file}' bs=4M" \
-    | zstd -d \
+    | zstd -d --long=31 \
     | zfs receive -F "$local_ds"
 
   zfs set refreservation=none "$local_ds" || true
