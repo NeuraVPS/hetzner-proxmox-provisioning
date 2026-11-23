@@ -32,8 +32,11 @@ if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c - >/dev/null 2>&1; 
 fi
 
 apt-get update
+# libtirpc-dev: the Debian 13 rescue (kernel 7.1, seen 2026-11-23) lacks it
+# (no sunrpc headers) and ZFS configure aborts without it.
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  build-essential pkg-config gawk libssl-dev uuid-dev zlib1g-dev libblkid-dev
+  build-essential pkg-config gawk libssl-dev uuid-dev zlib1g-dev libblkid-dev \
+  libtirpc-dev
 
 build_dir="$(mktemp -d /root/neuravps-zfs-build.XXXXXX)"
 tar -xzf "$archive" -C "$build_dir"
