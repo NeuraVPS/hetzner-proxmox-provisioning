@@ -495,7 +495,19 @@ log "Detected firmware: $FIRMWARE"
 
 BIOS_ARGS=()
 if [ "$FIRMWARE" = "UEFI" ]; then
-  BIOS_ARGS+=(-bios /usr/share/OVMF/OVMF_CODE.fd)
+  # Debian 12 rescue: /usr/share/OVMF/OVMF_CODE.fd. The Debian 13 rescue (seen
+  # 2026-11-23) only ships the 4M split images there, which -bios cannot boot;
+  # its unified /usr/share/ovmf/OVMF.fd (CODE+VARS) can.
+  OVMF_BIOS=""
+  for f in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do
+    [ -f "$f" ] && { OVMF_BIOS="$f"; break; }
+  done
+  if [ -z "$OVMF_BIOS" ]; then
+    log "ERROR: no OVMF image usable with -bios found — cannot run the UEFI installer"
+    exit 1
+  fi
+  log "OVMF firmware: $OVMF_BIOS"
+  BIOS_ARGS+=(-bios "$OVMF_BIOS")
 fi
 
 DRIVE_ARGS=()
@@ -514,6 +526,13 @@ qemu-system-x86_64 \
   "${BIOS_ARGS[@]}" \
   -vnc 127.0.0.1:0 \
   -no-reboot
+QEMU_RC=$?
+# die() does not exit (see top of file): a QEMU that never started must not be
+# taken for a finished install.
+if [ "$QEMU_RC" -ne 0 ]; then
+  log "ERROR: QEMU exited with code $QEMU_RC — the Proxmox installer did not run"
+  exit 1
+fi
 
 log "QEMU exited; assuming installation finished"
 
