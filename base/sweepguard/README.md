@@ -668,3 +668,40 @@ verdad y paquetes entre dos netns sin root, `test_customer_allow_netns.sh
 [nftables.conf]` (sin argumento usa unas tablas mínimas; con una copia de la
 conf de una base, despliega y deshace sobre ella; instala en un sbin de prueba
 y comprueba que el rollback elige la copia de su despliegue).
+
+## IPs de confianza por VPS — `cust_trust` (2026-11-24)
+
+El cliente fija en el panel hasta **10 IPs de confianza por VPS** (IPv4 /32; IPv6 /128 o /64, porque con
+direcciones de privacidad la IPv6 del equipo rota a diario dentro de su /64). Caso: un servidor de
+automatización que abre ~10 SSH a la vez a SU VPS, bloqueado dos veces por hot-port el 24/11 (y el bloqueo
+cortaba todos sus VPS).
+
+* `deploy_customer_trust.sh` crea `cust_trust` (v4 `ipv4_addr . inet_service`; v6 igual con
+  `flags interval` para el /64; sin caducidad) y UNA regla por familia justo antes de la de `cust_allow`:
+
+      meta l4proto { tcp, udp } ip  saddr . th dport @cust_trust accept
+      meta l4proto { tcp, udp } ip6 saddr . th dport @cust_trust accept
+
+  Orden v4: `bf_allow → (invitado) → bf_static → cust_trust → cust_allow → bf_auto → bf_seen → bf_src/bf_port`;
+  v6: `bf_allow → (invitado) → cust_trust → cust_allow → bf_auto → bf_seen → bf`. **`bf_static` manda** (y no se
+  puede añadir una IP que esté ahí). Cubre los tres puertos de ESA VM (1xxxx, 2xxxx tcp+udp, 3xxxx); no el 443.
+  Aunque la IP entre en `bf_auto` por lo que haga contra OTRAS VMs, sigue llegando a la suya.
+* `sweepguard.py` no cuenta esos pares en ningún detector (`customer_trusted` + `Exempt`, con el /64).
+* `neuravps-unblock-ip` (misma clave restringida): `trust-check <ip>[/len]` (solo lectura: `static`/`ours`),
+  `trust-set <vmid> <entradas>|-`, `trust-sync` (lista completa en JSON por stdin), `trust-restore`,
+  `trust-status`; `revoke-vm` también quita la confianza. Fuente de verdad en la base:
+  `/var/lib/neuravps-sweepguard/cust_trust.json`; el set se reescribe entero desde ella en UNA transacción
+  (`flush set` + `add element`). Estado ilegible → error, nunca se vacía el set.
+* Persistencia: set y regla en `/etc/nftables.conf`; elementos por `neuravps-cust-trust-restore.service`
+  (arranque, tras nftables) y por la reconciliación horaria de NeuraVPS (`trusted_ips_reconcile`, `trust-sync`
+  desde Firestore `trusted_ips/`).
+* Rechazos (script y función): no global, IPv4 mapeada, NAT64, más ancho que /32 o /64, solapa con
+  `nuestras4/6`, IPv4 en `bf_static`.
+
+**Límite conocido:** los clientes IPv4 llegan a `ip6 rdpguard` traducidos como `64:ff9b:1::<VIP>` y comparten
+el limitador v6 `@bf` (12/min, ráfaga 6, por puerto). Ahí ya no se ve la IP real, así que la confianza no se lo
+salta. Solo retrasa SYN (el TCP reintenta); no bloquea ni cuenta para sweepguard (que salta 64:ff9b:1::/96).
+
+Probar sin tocar las bases: `test_customer_trust_netns.sh` (v4+v6, nft real). Deshacer:
+`rollback_customer_trust.sh` (dirigido; deja el estado para volver a desplegar). Al sustituir una base:
+`deploy_customer_trust.sh` y esperar a la reconciliación (o lanzarla) para llenar el set.

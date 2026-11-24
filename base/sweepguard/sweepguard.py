@@ -101,6 +101,14 @@ THEIR VMs only, for 48 h. The chain accepts those pairs only while the IP is in
 `bf_auto`; out of the block they go through `bf_seen` and the rate limits like
 anyone else. Here every detector ignores them while the entry lives, blocked or
 not (see customer_allowed).
+
+Trusted IPs per VPS (2026-11-24)
+--------------------------------
+A customer can trust up to 10 sources (IPv4 /32, IPv6 /128 or /64) for the
+ports of ONE VM from the panel (set `cust_trust`, neuravps-unblock-ip
+trust-set). The chain accepts them before bf_auto, bf_seen and the rate limits;
+here no detector counts those pairs (see customer_trusted / Exempt). Towards
+any other VM the source is judged like anyone else.
 """
 import ipaddress
 import json
@@ -338,6 +346,68 @@ def customer_allowed(family):
         try:
             out.add((canon(cat[0]), int(cat[1])))
         except (TypeError, ValueError):
+            continue
+    return out
+
+
+TRUST_SET = "cust_trust"
+
+
+class Exempt:
+    """Pares (addr, puerto) que ningun detector cuenta: los exactos de
+    `cust_allow` y los de `cust_trust`, que en IPv6 pueden ser un /64.
+    Se usa con `(addr_canonica, puerto) in exempt`."""
+
+    def __init__(self, exact=None, nets=None):
+        self.exact = set(exact or ())
+        self.nets = defaultdict(list)            # puerto -> [red]
+        for net, port in nets or ():
+            self.nets[port].append(net)
+
+    def __contains__(self, pair):
+        if pair in self.exact:
+            return True
+        addr, port = pair
+        nets = self.nets.get(port)
+        if not nets:
+            return False
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        return any(ip.version == n.version and ip in n for n in nets)
+
+    def __bool__(self):
+        return bool(self.exact) or any(self.nets.values())
+
+    def __len__(self):
+        return len(self.exact) + sum(len(v) for v in self.nets.values())
+
+
+def customer_trusted(family):
+    """[(red, puerto)] de `cust_trust`: IPs de confianza que el cliente fijo en
+    el panel para los puertos de UNA VM (neuravps-unblock-ip trust-set,
+    24/11/2026). La cadena las acepta antes de bf_auto, bf_seen y los
+    limitadores; aqui ningun detector las cuenta, asi que ni se bloquea a esa
+    IP por su trafico hacia esa VM ni ese trafico hace «caliente» el puerto.
+    Hacia las demas VMs se la juzga como a cualquiera. Set ausente = vacio."""
+    out = []
+    for e in set_elements(family, TRUST_SET):
+        # sin timeout nft da {"concat": [...]}; con timeout/contador, {"elem": {"val": ...}}
+        val = e.get("elem", {}).get("val") if isinstance(e, dict) and "elem" in e else e
+        cat = val.get("concat") if isinstance(val, dict) else None
+        if not cat or len(cat) != 2:
+            continue
+        a, port = cat
+        try:
+            if isinstance(a, str):
+                net = ipaddress.ip_network(a)
+            elif isinstance(a, dict) and "prefix" in a:
+                net = ipaddress.ip_network(f"{a['prefix']['addr']}/{a['prefix']['len']}", strict=False)
+            else:
+                continue
+            out.append((net, int(port)))
+        except (TypeError, ValueError, KeyError):
             continue
     return out
 
@@ -809,7 +879,7 @@ def run_family(family, cfg, sessions=None):
     # tres detectores independientes; la razon se conserva para el log.
     # hot-port va primero porque es el que anota en `sessions` las sesiones RDP
     # que se ven ahora, y diversidad de puertos las consulta.
-    exempt = customer_allowed(family)
+    exempt = Exempt(customer_allowed(family), customer_trusted(family))
     hot = hot_port_abusers(family, cfg, ours, sessions, exempt)
     cand = {}
     for a, n in sweepers(family, cfg, exempt).items():
