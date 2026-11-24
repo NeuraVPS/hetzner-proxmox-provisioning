@@ -67,15 +67,23 @@ echo "=== cust_trust en $(hostname) ==="
 CH4=$(nft list chain ip rdpguard pre)
 CH6=$(nft list chain ip6 rdpguard pre)
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
-FRESH=0
 if has "$CH4" "@cust_trust" && has "$CH6" "@cust_trust" \
    && nft list set ip rdpguard cust_trust >/dev/null 2>&1 && nft list set ip6 rdpguard cust_trust >/dev/null 2>&1; then
   echo "  [vivo] ya estaba"
 else
-  FRESH=1
   if has "$CH4" "@cust_trust" || has "$CH6" "@cust_trust" \
      || nft list set ip rdpguard cust_trust >/dev/null 2>&1 || nft list set ip6 rdpguard cust_trust >/dev/null 2>&1; then
     echo "  !! estado a medias (set o regla de una sola familia) — revisa a mano, no toco nada"; exit 1
+  fi
+  # Despliegue NUEVO: un cust_trust.json que quede de antes (rollback, base
+  # reutilizada) puede traer confianza de VMs que cambiaron de dueño mientras
+  # tanto. Se aparta ANTES de crear los sets, para que un reintento tras un corte
+  # (ya con sets, FRESH=0) no lo restaure. El set se llena con la reconciliación
+  # de NeuraVPS (trusted_ips_reconcile, cada hora; o lanzarla a mano).
+  if [ -e "$TRUST_STATE" ]; then
+    mv "$TRUST_STATE" "$TRUST_STATE.stale.$(date +%Y%m%d-%H%M%S)"
+    sync "$(dirname "$TRUST_STATE")" 2>/dev/null || true
+    echo "  [estado] cust_trust.json anterior apartado: se llena con la reconciliación"
   fi
   A4=$(nft -a list chain ip rdpguard pre)
   A6=$(nft -a list chain ip6 rdpguard pre)
@@ -237,15 +245,7 @@ if [ "$SKIP_SYSTEMD" != 1 ]; then
   echo "  [unit] habilitado (no se arranca ahora)"
 fi
 
-# --- 5) el set ---------------------------------------------------------------------
-# En un despliegue NUEVO (no había set vivo) un cust_trust.json que quede de antes
-# (rollback, base reutilizada) puede traer confianza de VMs que cambiaron de dueño
-# mientras tanto: se aparta y el set empieza vacío hasta la reconciliación de
-# NeuraVPS (trusted_ips_reconcile, cada hora; o lanzarla a mano).
-if [ "$FRESH" = 1 ] && [ -e "$TRUST_STATE" ]; then
-  mv "$TRUST_STATE" "$TRUST_STATE.stale.$(date +%Y%m%d-%H%M%S)"
-  echo "  [estado] cust_trust.json anterior apartado: se llena con la reconciliación"
-fi
+# --- 5) el set, desde el estado (vacío en un despliegue nuevo) ---------------------
 if [ "$SKIP_INSTALL" != 1 ] && [ "${SKIP_RESTORE:-0}" != 1 ]; then
   "$SBIN/neuravps-unblock-ip" trust-restore | sed 's/^/  [estado] /'
   "$SBIN/neuravps-unblock-ip" trust-status | sed 's/^/  [estado] /'

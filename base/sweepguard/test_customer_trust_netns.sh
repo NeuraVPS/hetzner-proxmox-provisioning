@@ -220,6 +220,30 @@ expect tcp 21999 blocked
 nft list chain ip rdpguard pre | grep -q "fib daddr type local ip saddr . meta l4proto . th dport @cust_trust accept" \
   || { echo "FAIL regla v4 sin acotar destino"; exit 1; }
 echo "  ok  regla acotada a destinos locales"
+echo "-- 1b) mismo puerto hacia un destino que NO es de la base (p. ej. la IPv6 directa de otra VM)"
+unshare -n sleep 900 & OPID=$!
+sleep 0.3
+ip link add vo type veth peer name vx netns /proc/$OPID/ns/net
+ip addr add 10.99.0.1/24 dev vo; ip link set vo up
+nsenter --net=/proc/$OPID/ns/net sh -c "ip link set lo up; ip addr add 45.67.89.10/32 dev lo; \
+  ip addr add 10.99.0.2/24 dev vx; ip link set vx up; ip route add default via 10.99.0.1"
+ip route add 45.67.89.10/32 via 10.99.0.2
+sysctl -qw net.ipv4.ip_forward=1
+nsenter --net=/proc/$CPID/ns/net ip route add 45.67.89.10/32 via $BASE dev vc onlink
+nsenter --net=/proc/$OPID/ns/net python3 -c "
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('45.67.89.10', 21302)); s.listen(16)
+while True:
+    c, _ = s.accept(); c.close()" &
+OSPID=$!
+sleep 0.5
+nft delete element ip rdpguard bf_auto "{ $CLIENT }"
+expect tcp 21302 $CLIENT 45.67.89.10 ok          # sin bloqueo llega (camino normal)
+nft add element ip rdpguard bf_auto "{ $CLIENT }"
+expect tcp 21302 $CLIENT 45.67.89.10 blocked     # en bf_auto: la confianza NO vale fuera de la base
+expect tcp 21302 ok                               # hacia la base, sí
+kill $OSPID $OPID 2>/dev/null || true
 echo "-- 2) fuera de bf_auto: sin limitador hacia SU VM, con limitador hacia otra"
 nft delete element ip rdpguard bf_auto "{ $CLIENT }"
 n=$(burst 31302 60); [ "$n" = 60 ] && echo "  ok  60/60 a 31302" || { echo "FAIL 31302 $n/60"; exit 1; }
@@ -240,11 +264,15 @@ python3 - "$HERE" <<'PY'
 import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("sg", os.path.join(sys.argv[1], "sweepguard.py"))
 sg = importlib.util.module_from_spec(spec); spec.loader.exec_module(sg)
-ex = sg.Exempt(sg.customer_allowed("ip"), sg.customer_trusted("ip"))
-ex6 = sg.Exempt(sg.customer_allowed("ip6"), sg.customer_trusted("ip6"))
-assert ("149.56.212.201", 31302) in ex and ("149.56.212.201", 31999) not in ex
-assert ("2001:41d0:1:2::abcd", 21302) in ex6 and ("2001:41d0:1:3::1", 21302) not in ex6
-assert ("2001:41d0:1:2::abcd", 21999) not in ex6
+loc = sg.local_addresses()
+assert "77.42.49.79" in loc and "2a01:4f9:aaaa::2" in loc, loc
+ex = sg.Exempt(sg.customer_allowed("ip"), sg.customer_trusted("ip"), loc)
+ex6 = sg.Exempt(sg.customer_allowed("ip6"), sg.customer_trusted("ip6"), loc)
+B, B6 = "77.42.49.79", "2a01:4f9:aaaa::2"
+assert ("149.56.212.201", 31302, B) in ex and ("149.56.212.201", 31999, B) not in ex
+assert ("149.56.212.201", 31302, "45.67.89.10") not in ex       # destino que no es de la base
+assert ("2001:41d0:1:2::abcd", 21302, B6) in ex6 and ("2001:41d0:1:3::1", 21302, B6) not in ex6
+assert ("2001:41d0:1:2::abcd", 21999, B6) not in ex6
 print("  ok  Exempt v4 y v6 /64:", len(ex), len(ex6))
 PY
 echo "-- 5) rechazos: bf_static y nuestras"
@@ -264,7 +292,7 @@ echo "-- 6) revoke-vm, trust-sync, trust-restore, trust-status"
 { UB revoke-vm 1302 | tail -1 | grep -q '"trustRemoved": 1'; } || { echo "FAIL revoke-vm quita la confianza"; exit 1; }; echo "  ok  revoke-vm quita la confianza"
 nft add element ip rdpguard bf_auto "{ $CLIENT }"
 expect tcp 21302 blocked
-echo '{"vms": {"1302": ["149.56.212.201"], "1999": ["2001:41d0:1:2::/64"]}}' | UB trust-sync | tail -1 | tee o6
+echo "{\"gen\": $(date +%s%3N), \"vms\": {\"1302\": [\"149.56.212.201\"], \"1999\": [\"2001:41d0:1:2::/64\"]}}" | UB trust-sync | tail -1 | tee o6
 { grep -q '"pairs": 8' o6; } || { echo "FAIL trust-sync 8 pares (TCP x3 + UDP RDP, v4 y v6)"; exit 1; }; echo "  ok  trust-sync 8 pares (TCP x3 + UDP RDP, v4 y v6)"
 expect tcp 21302 ok
 nft flush set ip rdpguard cust_trust; nft flush set ip6 rdpguard cust_trust
@@ -272,11 +300,11 @@ expect tcp 21302 blocked
 { UB trust-restore | tail -1 | grep -q '"pairs": 8'; } || { echo "FAIL trust-restore"; exit 1; }; echo "  ok  trust-restore"
 expect tcp 21302 ok
 UB trust-status | tail -1
-{ echo '{"vms": {"1302": ["10.0.0.1"]}}' | UB trust-sync | tail -1 | grep -q 'bad_request'; } || { echo "FAIL sync con una entrada mala"; exit 1; }
+{ echo "{\"gen\": $(date +%s%3N), \"vms\": {\"1302\": [\"10.0.0.1\"]}}" | UB trust-sync | tail -1 | grep -q 'bad_request'; } || { echo "FAIL sync con una entrada mala"; exit 1; }
 { UB trust-status | tail -1 | grep -q '"ip": 4'; } || { echo "FAIL el set cambió tras una carga mala"; exit 1; }; echo "  ok  sync con una entrada mala: rechazada entera, set intacto"
-{ printf '{"vms": {"1302": ["1.1.1.1"], "1302": []}}' | UB trust-sync | tail -1 | grep -q 'duplicate key'; } || { echo "FAIL clave duplicada"; exit 1; }; echo "  ok  clave duplicada rechazada"
+{ printf '{"gen": %s, "vms": {"1302": ["1.1.1.1"], "1302": []}}' "$(date +%s%3N)" | UB trust-sync | tail -1 | grep -q 'duplicate key'; } || { echo "FAIL clave duplicada"; exit 1; }; echo "  ok  clave duplicada rechazada"
 { echo 'basura' | UB trust-sync | tail -1 | grep -q bad_request; } || { echo "FAIL sync rechaza carga no JSON"; exit 1; }; echo "  ok  sync rechaza carga no JSON"
-echo "{\"vms\": {\"1302\": [\"$CLIENT\"]}}" | UB trust-sync >/dev/null
+echo "{\"gen\": $(date +%s%3N), \"vms\": {\"1302\": [\"$CLIENT\"]}}" | UB trust-sync >/dev/null
 echo "garbage" > cust_trust.json
 { UB trust-set 1302 - | tail -1 | grep -qE "unreadable|invalid"; } || { echo "FAIL estado roto: no vacía el set"; exit 1; }; echo "  ok  estado roto: no vacía el set"
 expect tcp 21302 ok

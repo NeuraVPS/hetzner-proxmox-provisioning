@@ -108,10 +108,10 @@ LOCK = "/run/neuravps-unblock-ip.lock"
 REQUEST_RE = re.compile(r"\Aunblock ([0-9A-Fa-f:.]{2,45})\Z")
 STATUS_RE = re.compile(r"\Astatus ([0-9A-Fa-f:.]{2,45})\Z")
 ALLOW_RE = re.compile(r"\Aallow-vm ([0-9A-Fa-f:.]{2,45}) ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})( console)?\Z")
-REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})\Z")
+REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})(?: gen=([0-9]{13}))?\Z")
 _ENTRY = r"[0-9A-Fa-f:.]{2,45}(?:/[0-9]{1,3})?"
 TRUST_CHECK_RE = re.compile(r"\Atrust-check (%s)\Z" % _ENTRY)
-TRUST_SET_RE = re.compile(r"\Atrust-set ([0-9]{1,4}) (-|%s(?:,%s){0,9})\Z" % (_ENTRY, _ENTRY))
+TRUST_SET_RE = re.compile(r"\Atrust-set ([0-9]{1,4}) (-|%s(?:,%s){0,9})(?: gen=([0-9]{13}))?\Z" % (_ENTRY, _ENTRY))
 TRUST_PLAIN = ("trust-sync", "trust-restore", "trust-status")
 NFT_TIMEOUT = 20
 
@@ -175,6 +175,17 @@ def parse_request(raw):
     return _ip(m.group(1))
 
 
+def _gen_arg(raw):
+    """gen=<ms> de la orden; sin el (a mano, o NeuraVPS anterior), la hora de
+    la base."""
+    if raw is None:
+        return int(time.time() * 1000)
+    g = int(raw)
+    if g > int(time.time() * 1000) + TRUST_GEN_SKEW_MS:
+        raise BadRequest("gen in the future")
+    return g
+
+
 def parse_command(raw):
     """Peticion -> (orden, ip, vmids, consola). Lanza BadRequest.
     unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,<vmid>...] [console]
@@ -191,7 +202,7 @@ def parse_command(raw):
         return "allow-vm", _ip(m.group(1)), _vmids(m.group(2)), bool(m.group(3))
     m = REVOKE_RE.match(raw)
     if m:
-        return "revoke-vm", None, _vmids(m.group(1)), False
+        return "revoke-vm", None, _vmids(m.group(1)), _gen_arg(m.group(2))
     m = TRUST_CHECK_RE.match(raw)
     if m:
         return "trust-check", trust_entry(m.group(1)), [], False
@@ -199,7 +210,7 @@ def parse_command(raw):
     if m:
         vmid = _vmids(m.group(1))
         ents = [] if m.group(2) == "-" else [trust_entry(t) for t in m.group(2).split(",")]
-        return "trust-set", ents, vmid, False
+        return "trust-set", ents, vmid, _gen_arg(m.group(3))
     if raw in TRUST_PLAIN:
         return raw, None, [], False
     raise BadRequest("expected: unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,...] [console]"
@@ -389,9 +400,10 @@ def set_pairs(fam, name):
     return out
 
 
-def revoke_vm(vmids):
+def revoke_vm(vmids, gen=None):
     """Quita de cust_allow todas las entradas de los puertos de esas VMs, de
     cualquier IP y en las dos familias."""
+    gen = int(time.time() * 1000) if gen is None else gen
     ports = set(vm_ports(vmids))
     out = {"vmids": vmids, "removed": 0}
     sets = 0
@@ -416,7 +428,7 @@ def revoke_vm(vmids):
         if left:
             raise RuntimeError(f"{len(left)} entries of {fam} {CUSTOMER_SET} still there")
     out["result"] = "revoked" if sets else "no_set"
-    out["trustRemoved"] = revoke_trust(vmids)
+    out["trustRemoved"] = revoke_trust(vmids, gen)
     return out
 
 
@@ -430,6 +442,11 @@ def revoke_vm(vmids):
 _ENTRY_FULL = re.compile(r"\A%s\Z" % _ENTRY)
 _VMID_KEY = re.compile(r"\A[1-9][0-9]{2,3}\Z")
 TRUST_READ_SECONDS = 15
+# Generaciones (ms epoch, las pone NeuraVPS con la hora de Firestore): cada VM
+# recuerda la de la ultima orden y descarta las anteriores, para que una alta
+# atrasada no deshaga una revocacion ni una foto vieja deshaga una baja.
+TRUST_GEN_SKEW_MS = 10 * 60 * 1000
+TRUST_TOMBSTONE_MS = 30 * 86400 * 1000
 # Elementos (proto, base de puerto) por entrada: TCP a SMB/RDP/SSH, UDP solo a
 # RDP (el transporte UDP de RDP; la base solo reenvia UDP en 2xxxx).
 TRUST_PROTOS = (("tcp", 10000), ("tcp", 20000), ("udp", 20000), ("tcp", 30000))
@@ -555,9 +572,23 @@ def _no_dup_keys(pairs):
     return d
 
 
-def parse_trust_doc(raw, what):
-    """JSON {"vms": {"<vmid>": [entradas]}} -> {vmid: [red]}. TODO o nada:
-    una clave o una entrada mala rechaza el documento entero (BadRequest)."""
+def _gen_ok(g, now_ms):
+    """Generacion (ms epoch) valida: entero de 13 cifras, no del futuro (10 min
+    de margen de reloj). Una generacion del futuro bloquearia todo lo siguiente."""
+    return isinstance(g, int) and not isinstance(g, bool) and \
+        10 ** 12 <= g < 10 ** 13 and g <= now_ms + TRUST_GEN_SKEW_MS
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def parse_trust_doc(raw, what, kind="payload"):
+    """JSON -> dict. TODO o nada: una clave o entrada mala rechaza el documento
+    entero (BadRequest).
+      payload (trust-sync): {"gen": ms, "vms": {"<vmid>": [entradas]}}
+      state (TRUST_STATE):  {"v": 2, "vms": {...}, "gens": {"<vmid>": ms}}
+    Devuelve {"vms": {vmid: [red]}, "gens": {vmid: ms}, "gen": ms|None}."""
     try:
         doc = json.loads(raw, object_pairs_hook=_no_dup_keys)
     except BadRequest:
@@ -567,32 +598,50 @@ def parse_trust_doc(raw, what):
     vms = doc.get("vms") if isinstance(doc, dict) else None
     if not isinstance(vms, dict) or len(vms) > TRUST_MAX_VMS:
         raise BadRequest(f"{what}: expected {{\"vms\": {{vmid: [entries]}}}}")
-    out = {}
-    for k, ents in vms.items():
+
+    def vmid_key(k):
         if not isinstance(k, str) or not _VMID_KEY.match(k) or not VMID_MIN <= int(k) <= VMID_MAX:
             raise BadRequest(f"{what}: bad vmid {str(k)[:12]!r}")
+        return int(k)
+
+    out = {"vms": {}, "gens": {}, "gen": None}
+    for k, ents in vms.items():
         if not isinstance(ents, list) or len(ents) > TRUST_MAX_PER_VM:
             raise BadRequest(f"{what}: vm {k}: expected a list of at most {TRUST_MAX_PER_VM}")
-        out[int(k)] = [trust_entry(t) for t in ents]
+        out["vms"][vmid_key(k)] = [trust_entry(t) for t in ents]
+    now = now_ms()
+    if kind == "payload":
+        if not _gen_ok(doc.get("gen"), now):
+            raise BadRequest(f"{what}: missing or bad gen")
+        out["gen"] = doc["gen"]
+    else:
+        gens = doc.get("gens", {})
+        if not isinstance(gens, dict) or len(gens) > 4 * TRUST_MAX_VMS:
+            raise BadRequest(f"{what}: bad gens")
+        for k, g in gens.items():
+            if not isinstance(g, int) or isinstance(g, bool) or not 0 <= g < 10 ** 13:
+                raise BadRequest(f"{what}: bad gen for {str(k)[:12]!r}")
+            out["gens"][vmid_key(k)] = g
     return out
 
 
 def load_trust_state(path=None):
-    """{vmid: [red]} desde TRUST_STATE. Ausente = vacio (base nueva);
-    ilegible o con algo invalido = RuntimeError: nunca se reconstruye el set
-    desde un fichero roto."""
+    """(estado {vmid: [red]}, generaciones {vmid: ms}) desde TRUST_STATE.
+    Ausente = vacio (base nueva); ilegible o con algo invalido = RuntimeError:
+    nunca se reconstruye el set desde un fichero roto."""
     path = path or TRUST_STATE
     try:
         with open(path) as fh:
             raw = fh.read()
     except FileNotFoundError:
-        return {}
+        return {}, {}
     except OSError as exc:
         raise RuntimeError(f"{path} unreadable ({exc}); not touching {TRUST_SET}")
     try:
-        return parse_trust_doc(raw, path)
+        d = parse_trust_doc(raw, path, "state")
     except BadRequest as exc:
         raise RuntimeError(f"{path} invalid ({exc}); not touching {TRUST_SET}")
+    return d["vms"], d["gens"]
 
 
 def trust_elements(state):
@@ -606,26 +655,38 @@ def trust_elements(state):
     return out
 
 
-def _state_doc(state):
-    return json.dumps({"v": 1, "vms": {str(v): [entry_text(n) for n in state[v]] for v in sorted(state)}},
-                      sort_keys=True)
+def _state_doc(state, gens):
+    now = now_ms()
+    # las lapidas (VM sin confianza) se guardan TRUST_TOMBSTONE_MS: bastan para
+    # descartar una orden atrasada; luego se olvidan
+    keep = {v: g for v, g in gens.items() if v in state or now - g < TRUST_TOMBSTONE_MS}
+    return json.dumps({"v": 2,
+                       "vms": {str(v): [entry_text(n) for n in state[v]] for v in sorted(state)},
+                       "gens": {str(v): keep[v] for v in sorted(keep)}}, sort_keys=True)
 
 
 def _write_atomic(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         fh.write(text)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)            # el rename tambien tiene que llegar al disco
+    finally:
+        os.close(dfd)
 
 
-def apply_trust(state, path=None):
+def apply_trust(state, gens, path=None):
     """Publica el estado y reescribe `cust_trust` (las dos familias) en UNA
     transaccion. Primero el fichero (si se corta despues, al arrancar manda el
-    estado nuevo: una revocacion no se pierde) y luego nft; si nft rechaza, se
-    vuelve a escribir el estado anterior."""
+    estado nuevo: una revocacion no se pierde) y luego nft; si nft falla o no
+    contesta, se vuelve a escribir el estado anterior y se lanza: quien llama
+    ve el error y reintenta, y el reintento vuelve a aplicar el set entero."""
     path = path or TRUST_STATE
     for fam in ("ip", "ip6"):
         if not set_exists(fam, TRUST_SET):
@@ -642,14 +703,18 @@ def apply_trust(state, path=None):
             previous = fh.read()
     except FileNotFoundError:
         previous = None
-    _write_atomic(path, _state_doc(state))
-    r = run(["nft", "-f", "-"], stdin=batch)
-    if r.returncode != 0:
+    _write_atomic(path, _state_doc(state, gens))
+    try:
+        r = run(["nft", "-f", "-"], stdin=batch)
+        err = None if r.returncode == 0 else " ".join(r.stderr.split())[:200]
+    except Exception as exc:  # noqa: BLE001  (TimeoutExpired incluido)
+        err = f"{type(exc).__name__}: {exc}"[:200]
+    if err is not None:
         if previous is None:
             os.unlink(path)
         else:
             _write_atomic(path, previous)
-        raise RuntimeError(f"nft {TRUST_SET}: {' '.join(r.stderr.split())[:200]}")
+        raise RuntimeError(f"nft {TRUST_SET}: {err}")
     return {"vms": len(state), "pairs": sum(len(v) for v in elems.values())}
 
 
@@ -659,16 +724,22 @@ def trust_check(net):
             **({"reason": why} if why else {})}
 
 
-def trust_set(vmid, nets):
-    state = load_trust_state()
+def trust_set(vmid, nets, gen):
+    """Fija la lista de UNA VM si `gen` no es anterior a la ultima orden que
+    recibio esa VM (alta, baja, revocacion o sincronizacion). Si lo es, no se
+    toca nada y contesta `stale`: era una orden atrasada."""
+    state, gens = load_trust_state()
+    if gen < gens.get(vmid, 0):
+        return {"result": "stale", "vmid": vmid, "gen": gen, "current": gens[vmid]}
     ok, rejected = clean_list(nets, TrustChecker())
     if ok:
         state[vmid] = ok
     else:
         state.pop(vmid, None)
+    gens[vmid] = gen
     out = {"result": "set", "vmid": vmid, "entries": [entry_text(n) for n in ok],
-           "rejected": rejected}
-    out.update(apply_trust(state))
+           "rejected": rejected, "gen": gen}
+    out.update(apply_trust(state, gens))
     return out
 
 
@@ -695,39 +766,49 @@ def read_sync_payload(stream=None, seconds=TRUST_READ_SECONDS):
         text = buf.decode("ascii")
     except UnicodeDecodeError:
         raise BadRequest("payload is not ASCII JSON")
-    return parse_trust_doc(text, "payload")
+    return parse_trust_doc(text, "payload", "payload")
 
 
-def trust_sync(wanted):
+def trust_sync(payload):
+    """Reemplaza el estado por la foto de NeuraVPS (`gen` = cuando se leyo),
+    salvo en las VMs que recibieron despues una orden mas nueva (esas se quedan
+    como estan: la foto es anterior)."""
+    gen, wanted = payload["gen"], payload["vms"]
+    try:
+        before, gens = load_trust_state()
+    except RuntimeError:
+        before, gens = {}, {}     # estado roto: lo sustituye la foto autoritativa
     checker = TrustChecker()
-    state, rejected = {}, {}
-    for vmid, nets in wanted.items():
-        ok, rej = clean_list(nets, checker)
+    state, rejected, stale = {}, {}, []
+    for vmid in sorted(set(before) | set(wanted) | set(gens)):
+        if gens.get(vmid, 0) > gen:
+            stale.append(vmid)
+            if vmid in before:
+                state[vmid] = before[vmid]
+            continue
+        ok, rej = clean_list(wanted.get(vmid, []), checker)
         if ok:
             state[vmid] = ok
         rejected.update({f"{vmid}:{k}": v for k, v in rej.items()})
-    try:
-        before = load_trust_state()
-    except RuntimeError:
-        before = {}          # el estado roto se sustituye entero por el autoritativo
-    out = {"result": "synced", "rejected": dict(list(rejected.items())[:50]),
-           "rejectedCount": len(rejected),
+        gens[vmid] = gen
+    out = {"result": "synced", "gen": gen, "rejected": dict(list(rejected.items())[:50]),
+           "rejectedCount": len(rejected), "staleVms": stale[:100],
            "changedVms": sorted(v for v in set(before) | set(state)
                                 if [entry_text(n) for n in before.get(v, [])]
                                 != [entry_text(n) for n in state.get(v, [])])[:100]}
-    out.update(apply_trust(state))
+    out.update(apply_trust(state, gens))
     return out
 
 
 def trust_restore():
-    state = load_trust_state()
+    state, gens = load_trust_state()
     out = {"result": "restored"}
-    out.update(apply_trust(state))
+    out.update(apply_trust(state, gens))
     return out
 
 
 def trust_status():
-    state = load_trust_state()
+    state, gens = load_trust_state()
     live = {}
     for fam in ("ip", "ip6"):
         if set_exists(fam, TRUST_SET):
@@ -737,22 +818,26 @@ def trust_status():
                 n += len((obj.get("set") or {}).get("elem", []) or [])
             live[fam] = n
     want = trust_elements(state)
-    return {"result": "status", "vms": len(state),
+    return {"result": "status", "vms": len(state), "gens": len(gens),
             "statePairs": {f: len(v) for f, v in want.items()},
             "setPairs": live, "trustSet": len(live) == 2}
 
 
-def revoke_trust(vmids):
-    """Quita esas VMs de TRUST_STATE y reescribe el set. Sin set (base sin
-    desplegar) no hace nada. Devuelve cuantas VMs tenian confianza."""
+def revoke_trust(vmids, gen):
+    """Quita esas VMs de TRUST_STATE, anota la generacion de la revocacion (una
+    alta atrasada de antes de ella ya no entra) y reescribe el set SIEMPRE,
+    aunque esas VMs ya no estuvieran en el estado: si una revocacion anterior
+    escribio el fichero pero nft no llego a aplicarse, el reintento lo repara.
+    Sin set (base sin desplegar) no hace nada. Devuelve cuantas VMs tenian
+    confianza."""
     if not (set_exists("ip", TRUST_SET) and set_exists("ip6", TRUST_SET)):
         return None
-    state = load_trust_state()
+    state, gens = load_trust_state()
     gone = [v for v in vmids if v in state]
-    if gone:
-        for v in gone:
-            del state[v]
-        apply_trust(state)
+    for v in vmids:
+        state.pop(v, None)
+        gens[v] = max(gens.get(v, 0), gen)
+    apply_trust(state, gens)
     return len(gone)
 
 
@@ -786,7 +871,7 @@ def main(argv):
             with open(LOCK, "w") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
                 if verb == "trust-set":
-                    out = trust_set(vmids[0], ip)
+                    out = trust_set(vmids[0], ip, console)
                 elif verb == "trust-sync":
                     out = trust_sync(wanted)
                 else:
@@ -799,7 +884,7 @@ def main(argv):
                 elif verb == "allow-vm":
                     out = allow_vm(ip, vmids, console)
                 else:
-                    out = revoke_vm(vmids)
+                    out = revoke_vm(vmids, console)
     except BadRequest as exc:                # trust-sync: carga por stdin no valida
         syslog.syslog(syslog.LOG_WARNING, f"rejected {verb} ({via}): {exc}")
         print(json.dumps({"ok": False, "error": "bad_request", "detail": str(exc)}))
