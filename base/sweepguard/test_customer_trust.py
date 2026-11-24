@@ -53,7 +53,9 @@ class Commands(unittest.TestCase):
         self.assertEqual((v, vmids, [ub.entry_text(n) for n in ents]),
                          ("trust-set", [1302], ["149.56.212.201", "2001:41d0:1:2::/64"]))
         self.assertEqual(ub.parse_command("trust-set 1302 -")[1], [])
-        self.assertEqual(ub.parse_command("trust-set 1302 - gen=7000000000000001")[3], 7000000000000001)
+        self.assertEqual(ub.parse_command("trust-set 1302 - gen=7000000000000001")[3], (7000000000000001, False))
+        self.assertEqual(ub.parse_command("trust-set 1302 1.1.1.1 closed gen=7000000000000001")[3],
+                         (7000000000000001, True))
         self.assertEqual(ub.parse_command("trust-sync")[0], "trust-sync")
         self.assertEqual(ub.parse_command("trust-check 1.1.1.1")[0], "trust-check")
 
@@ -224,6 +226,47 @@ class Generations(unittest.TestCase):
         self.assertNotIn("1.1.1.1", self.live())
         ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))                  # otro: ya no cambia nada,
         self.assertEqual(len(self.batches), n + 2)                          # pero repara el set igual
+
+
+class ClosedMode(Generations):
+    def test_closed_needs_entries_and_follows_order(self):
+        out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+        self.assertTrue(out["closed"])
+        self.assertIn("add element ip rdpguard cust_closed { tcp . 11302, tcp . 21302, udp . 21302, tcp . 31302 }",
+                      self.live())
+        out = ub.trust_set(1302, [], self.g(2, ub.GEN_SET), closed=True)        # sin lista: queda abierta
+        self.assertEqual((out["closed"], out["closedRefused"]), (False, "no_entries"))
+        self.assertNotIn("add element ip rdpguard cust_closed", self.live())
+        ub.trust_set(1302, self.e, self.g(3, ub.GEN_SET), closed=True)
+        ub.revoke_trust([1302], self.g(4, ub.GEN_REVOKE))                      # VM reasignada: se abre
+        self.assertNotIn("21302", self.live())
+        self.assertEqual(ub.load_trust_state().closed, set())
+
+    def test_sync_closed(self):
+        ub.trust_sync({"gen": self.g(5, ub.GEN_SYNC), "vms": {1302: self.e, 1999: self.e}, "closed": {1999}})
+        st = ub.load_trust_state()
+        self.assertEqual(st.closed, {1999})
+        closed = [l for l in self.live().splitlines() if "add element ip rdpguard cust_closed" in l][0]
+        self.assertIn("tcp . 21999", closed)
+        self.assertNotIn("21302", closed)
+
+    def test_pub6(self):
+        import json as _j
+        pol = os.path.join(self.dir, "pol.json")
+        with open(pol, "w") as fh:
+            _j.dump({"main": "2a01:4f9:2a:2d56::2"}, fh)
+        saved, ub.IPV6_POLICY_STATE = ub.IPV6_POLICY_STATE, pol
+        try:
+            ub.trust_set(1517, [ub.trust_entry("2001:41d0:1:2::/64"), ub.trust_entry("1.1.1.1")],
+                         self.g(1, ub.GEN_SET), closed=True)
+            self.assertIn("2a01:4f9:2a:2d56::5ed", self.live())                 # su IPv6 directa
+            self.assertIn("2001:41d0:1:2::/64 . 2a01:4f9:2a:2d56::5ed", self.live())
+        finally:
+            ub.IPV6_POLICY_STATE = saved
+
+    def test_doc_closed_requires_list(self):
+        with self.assertRaises(ub.BadRequest):
+            ub.parse_trust_doc('{"gen": 7000000000000001, "vms": {}, "closed": ["1302"]}', "x")
 
 
 class SweepguardExempt(unittest.TestCase):

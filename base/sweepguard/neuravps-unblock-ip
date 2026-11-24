@@ -111,7 +111,7 @@ ALLOW_RE = re.compile(r"\Aallow-vm ([0-9A-Fa-f:.]{2,45}) ([0-9]{1,4}(?:,[0-9]{1,
 REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})(?: gen=([0-9]{16}))?\Z")
 _ENTRY = r"[0-9A-Fa-f:.]{2,45}(?:/[0-9]{1,3})?"
 TRUST_CHECK_RE = re.compile(r"\Atrust-check (%s)\Z" % _ENTRY)
-TRUST_SET_RE = re.compile(r"\Atrust-set ([0-9]{1,4}) (-|%s(?:,%s){0,9})(?: gen=([0-9]{16}))?\Z" % (_ENTRY, _ENTRY))
+TRUST_SET_RE = re.compile(r"\Atrust-set ([0-9]{1,4}) (-|%s(?:,%s){0,9})( closed)?(?: gen=([0-9]{16}))?\Z" % (_ENTRY, _ENTRY))
 TRUST_PLAIN = ("trust-sync", "trust-restore", "trust-status")
 NFT_TIMEOUT = 20
 
@@ -127,6 +127,15 @@ FORWARD_BASES = (10000, 20000, 30000)   # SMB, RDP, SSH
 CONSOLE_PORT = 443
 
 TRUST_SET = "cust_trust"
+# Modo cerrado (24/11/2026, deploy_customer_closed.sh): en los puertos de una VM
+# cerrada solo entra su lista (cust_trust, que va antes) y la infraestructura
+# (bf_allow, antes todavia); el resto se descarta. CLOSED_SET (ip e ip6):
+# proto . puerto de esas VMs. En ip6 ademas su IPv6 publica directa
+# (CLOSED_PUB6) y los pares (origen . esa IPv6) de su lista (TRUST_PUB6).
+CLOSED_SET = "cust_closed"
+CLOSED_PUB6 = "cust_closed_pub6"
+TRUST_PUB6 = "cust_trust_pub6"
+IPV6_POLICY_STATE = "/var/lib/base-nat/ipv6-policy.json"
 TRUST_STATE = "/var/lib/neuravps-sweepguard/cust_trust.json"
 TRUST_MAX_PER_VM = 10
 TRUST_MAX_VMS = 5000            # ~1.900 VMs en la flota
@@ -210,7 +219,7 @@ def parse_command(raw):
     if m:
         vmid = _vmids(m.group(1))
         ents = [] if m.group(2) == "-" else [trust_entry(t) for t in m.group(2).split(",")]
-        return "trust-set", ents, vmid, _gen_arg(m.group(3), GEN_SET)
+        return "trust-set", ents, vmid, (_gen_arg(m.group(4), GEN_SET), bool(m.group(3)))
     if raw in TRUST_PLAIN:
         return raw, None, [], False
     raise BadRequest("expected: unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,...] [console]"
@@ -605,10 +614,12 @@ class TrustState:
     para toda VM sin revision propia (una foto dice «sin confianza» para todas
     las que no trae)."""
 
-    def __init__(self, vms=None, gens=None, sync_gen=0):
+    def __init__(self, vms=None, gens=None, sync_gen=0, closed=None):
         self.vms = vms or {}
         self.gens = gens or {}
         self.sync_gen = sync_gen
+        # VMs en modo cerrado; solo con lista (una VM sin lista nunca se cierra)
+        self.closed = {v for v in (closed or ()) if v in self.vms}
 
     def last(self, vmid):
         return max(self.gens.get(vmid, 0), self.sync_gen)
@@ -617,6 +628,7 @@ class TrustState:
         # una revision por debajo del suelo ya no aporta nada: se olvida
         keep = {v: g for v, g in self.gens.items() if v in self.vms or g > self.sync_gen}
         return json.dumps({"v": 3, "syncGen": self.sync_gen,
+                           "closed": [str(v) for v in sorted(self.closed) if v in self.vms],
                            "vms": {str(v): [entry_text(n) for n in self.vms[v]] for v in sorted(self.vms)},
                            "gens": {str(v): keep[v] for v in sorted(keep)}}, sort_keys=True)
 
@@ -649,11 +661,19 @@ def parse_trust_doc(raw, what, kind="payload"):
             raise BadRequest(f"{what}: bad gen {where}")
         return g
 
-    out = {"vms": {}, "gens": {}, "gen": None, "syncGen": 0}
+    out = {"vms": {}, "gens": {}, "gen": None, "syncGen": 0, "closed": set()}
     for k, ents in vms.items():
         if not isinstance(ents, list) or len(ents) > TRUST_MAX_PER_VM:
             raise BadRequest(f"{what}: vm {k}: expected a list of at most {TRUST_MAX_PER_VM}")
         out["vms"][vmid_key(k)] = [trust_entry(t) for t in ents]
+    closed = doc.get("closed", [])
+    if not isinstance(closed, list) or len(closed) > TRUST_MAX_VMS:
+        raise BadRequest(f"{what}: bad closed")
+    for k in closed:
+        v = vmid_key(k)
+        if v not in out["vms"]:
+            raise BadRequest(f"{what}: closed vm {v} without a list")
+        out["closed"].add(v)
     if kind == "payload":
         out["gen"] = rev(doc.get("gen"), "of payload")
     else:
@@ -684,7 +704,7 @@ def load_trust_state(path=None):
         d = parse_trust_doc(raw, path, "state")
     except BadRequest as exc:
         raise RuntimeError(f"{path} invalid ({exc}); not touching {TRUST_SET}")
-    return TrustState(d["vms"], d["gens"], d["syncGen"])
+    return TrustState(d["vms"], d["gens"], d["syncGen"], d["closed"])
 
 
 def trust_elements(vms):
@@ -728,10 +748,18 @@ def apply_trust(st, path=None):
     elems = trust_elements(st.vms)
     batch = ""
     for fam in ("ip", "ip6"):
-        batch += f"flush set {fam} {TABLE} {TRUST_SET}\n"
-        lst = elems[fam]
-        for i in range(0, len(lst), 500):
-            batch += f"add element {fam} {TABLE} {TRUST_SET} {{ {', '.join(lst[i:i + 500])} }}\n"
+        batch += _fill(fam, TRUST_SET, elems[fam])
+    closed_sets = [set_presence(fam, CLOSED_SET) for fam in ("ip", "ip6")] + \
+        [set_presence("ip6", n) for n in (CLOSED_PUB6, TRUST_PUB6)]
+    if any(closed_sets) and not all(closed_sets):
+        raise RuntimeError("closed-mode sets only partly present (deploy_customer_closed.sh)")
+    if all(closed_sets):
+        c = closed_elements(st)
+        batch += _fill("ip", CLOSED_SET, c["ports"]) + _fill("ip6", CLOSED_SET, c["ports"])
+        batch += _fill("ip6", CLOSED_PUB6, c["pub6"]) + _fill("ip6", TRUST_PUB6, c["trust_pub6"])
+    closed_applied = all(closed_sets) or not st.closed
+    # sin los sets (base sin desplegar o tras rollback_customer_closed.sh) las VMs
+    # «cerradas» quedan ABIERTAS: no se rompe la lista; se dice en closedApplied
     try:
         with open(path) as fh:
             previous = fh.read()
@@ -749,7 +777,46 @@ def apply_trust(st, path=None):
         else:
             _write_atomic(path, previous)
         raise RuntimeError(f"nft {TRUST_SET}: {err}")
-    return {"vms": len(st.vms), "pairs": sum(len(v) for v in elems.values())}
+    return {"vms": len(st.vms), "pairs": sum(len(v) for v in elems.values()),
+            "closedVms": len(st.closed), "closedApplied": closed_applied}
+
+
+def _fill(fam, name, lst):
+    out = f"flush set {fam} {TABLE} {name}\n"
+    for i in range(0, len(lst), 500):
+        out += f"add element {fam} {TABLE} {name} {{ {', '.join(lst[i:i + 500])} }}\n"
+    return out
+
+
+def public6_prefix():
+    """/64 de las IPv6 publicas directas de esta base (politica IPv6 directa:
+    publica = main/64 + vmid). None si la politica no esta en esta base (no hay
+    IPv6 directa que cerrar). Fichero presente pero ilegible = RuntimeError."""
+    try:
+        with open(IPV6_POLICY_STATE) as fh:
+            d = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise RuntimeError(f"{IPV6_POLICY_STATE} unreadable ({exc}): cannot close direct IPv6")
+    main = d.get("main") if isinstance(d, dict) else None
+    try:
+        return ipaddress.IPv6Network(f"{ipaddress.IPv6Address(main)}/64", strict=False)
+    except (ValueError, TypeError):
+        raise RuntimeError(f"{IPV6_POLICY_STATE}: bad main {str(main)[:40]!r}")
+
+
+def closed_elements(st):
+    """Elementos de los sets del modo cerrado para las VMs cerradas."""
+    ports, pub6, tpub6 = [], [], []
+    prefix = public6_prefix() if st.closed else None
+    for vmid in sorted(st.closed):
+        ports += [f"{proto} . {base + vmid}" for proto, base in TRUST_PROTOS]
+        if prefix is not None:
+            addr = ipaddress.IPv6Address(int(prefix.network_address) + vmid).compressed
+            pub6.append(addr)
+            tpub6 += [f"{entry_text(n)} . {addr}" for n in st.vms.get(vmid, []) if n.version == 6]
+    return {"ports": ports, "pub6": pub6, "trust_pub6": tpub6}
 
 
 def trust_check(net):
@@ -758,9 +825,12 @@ def trust_check(net):
             **({"reason": why} if why else {})}
 
 
-def trust_set(vmid, nets, gen):
-    """Fija la lista de UNA VM si `gen` es POSTERIOR (estricto) a la ultima
-    orden de esa VM o a la ultima foto. Si no, `stale` y la lista no cambia."""
+def trust_set(vmid, nets, gen, closed=False):
+    """Fija la lista de UNA VM (y su modo cerrado) si `gen` es POSTERIOR
+    (estricto) a la ultima orden de esa VM o a la ultima foto. Si no, `stale` y
+    nada cambia. Cerrado solo con al menos una entrada aceptada: si todas se
+    rechazan, la VM queda ABIERTA (reglas normales) y se dice en
+    `closedRefused`; NeuraVPS ya no deja cerrar sin lista."""
     st = load_trust_state()
     if gen <= st.last(vmid):
         out = {"result": "stale", "vmid": vmid, "gen": gen, "current": st.last(vmid)}
@@ -771,9 +841,15 @@ def trust_set(vmid, nets, gen):
         st.vms[vmid] = ok
     else:
         st.vms.pop(vmid, None)
+    if closed and ok:
+        st.closed.add(vmid)
+    else:
+        st.closed.discard(vmid)
     st.gens[vmid] = gen
     out = {"result": "set", "vmid": vmid, "entries": [entry_text(n) for n in ok],
-           "rejected": rejected, "gen": gen}
+           "rejected": rejected, "gen": gen, "closed": vmid in st.closed}
+    if closed and not ok:
+        out["closedRefused"] = "no_entries"
     out.update(apply_trust(st))
     return out
 
@@ -819,7 +895,8 @@ def trust_sync(payload):
                "rejectedCount": 0, "staleVms": [], "changedVms": []}
         out.update(apply_trust(st))
         return out
-    before = {v: [entry_text(n) for n in l] for v, l in st.vms.items()}
+    before = {v: [entry_text(n) for n in l] + (["closed"] if v in st.closed else [])
+              for v, l in st.vms.items()}
     checker = TrustChecker()
     rejected, stale = {}, []
     for vmid in sorted(set(st.vms) | set(wanted) | set(st.gens)):
@@ -831,10 +908,15 @@ def trust_sync(payload):
             st.vms[vmid] = ok
         else:
             st.vms.pop(vmid, None)
+        if ok and vmid in payload.get("closed", ()):
+            st.closed.add(vmid)
+        else:
+            st.closed.discard(vmid)
         st.gens.pop(vmid, None)           # su revision pasa a ser la de la foto (suelo)
         rejected.update({f"{vmid}:{k}": v for k, v in rej.items()})
     st.sync_gen = gen
-    after = {v: [entry_text(n) for n in l] for v, l in st.vms.items()}
+    after = {v: [entry_text(n) for n in l] + (["closed"] if v in st.closed else [])
+              for v, l in st.vms.items()}
     out = {"result": "synced", "gen": gen, "rejected": dict(list(rejected.items())[:50]),
            "rejectedCount": len(rejected), "staleVms": stale[:100],
            "changedVms": sorted(v for v in set(before) | set(after)
@@ -862,6 +944,7 @@ def trust_status():
             live[fam] = n
     want = trust_elements(st.vms)
     return {"result": "status", "vms": len(st.vms), "gens": len(st.gens), "syncGen": st.sync_gen,
+            "closed": sorted(st.closed),
             "statePairs": {f: len(v) for f, v in want.items()},
             "setPairs": live, "trustSet": len(live) == 2}
 
@@ -885,6 +968,7 @@ def revoke_trust(vmids, gen):
             continue
         if st.vms.pop(v, None) is not None:
             gone += 1
+        st.closed.discard(v)
         st.gens[v] = gen
     apply_trust(st)
     return gone
@@ -920,7 +1004,7 @@ def main(argv):
             with open(LOCK, "w") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
                 if verb == "trust-set":
-                    out = trust_set(vmids[0], ip, console)
+                    out = trust_set(vmids[0], ip, console[0], console[1])
                 elif verb == "trust-sync":
                     out = trust_sync(wanted)
                 else:

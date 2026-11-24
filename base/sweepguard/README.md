@@ -722,3 +722,25 @@ salta. Solo retrasa SYN (el TCP reintenta); no bloquea ni cuenta para sweepguard
 Probar sin tocar las bases: `test_customer_trust_netns.sh` (v4+v6, nft real). Deshacer:
 `rollback_customer_trust.sh` (dirigido; deja el estado para volver a desplegar). Al sustituir una base:
 `deploy_customer_trust.sh` y esperar a la reconciliación (o lanzarla) para llenar el set.
+
+## Modo cerrado por VPS — `cust_closed` (2026-11-24)
+
+Casilla del panel «Bloquear todas las conexiones desde IPs fuera de esta lista». En los puertos públicos de una VM
+cerrada (TCP 1xxxx/2xxxx/3xxxx, UDP 2xxxx y su IPv6 pública directa) solo entran su lista de confianza y la
+infraestructura; el resto se descarta.
+
+* `deploy_customer_closed.sh` (requiere cust_trust): `ip`: set `cust_closed` (proto . puerto) y
+  `fib daddr type local meta l4proto . th dport @cust_closed drop` justo DESPUÉS de `cust_trust` y ANTES de
+  `cust_allow`. `ip6`: además `cust_closed_pub6` (IPv6 directa = main/64 de la base + vmid, leída de
+  `/var/lib/base-nat/ipv6-policy.json`) y `cust_trust_pub6` (origen . esa IPv6):
+  `ip6 daddr @cust_closed_pub6 ip6 saddr . ip6 daddr @cust_trust_pub6 accept`, `ip6 daddr @cust_closed_pub6 drop`,
+  `iifname != "veth-host" fib daddr type local ... @cust_closed drop` (lo que vuelve de Jool ya se decidió en v4).
+* Orden: `bf_allow → (invitado) → bf_static → cust_trust → CERRADO → cust_allow → bf_auto`. Pasa la infraestructura
+  de `bf_allow` (bases → conncheck de las bases, DEVEL). **No** pasan: «Desbloquear mi IP» (cust_allow), las Cloud
+  Functions (sin IP fija: NeuraVPS no les manda SSH/sondas públicas a una VM cerrada) ni el tráfico VM→VM por el
+  VIP (origen 10.64.x). La consola VNC del panel no usa estos puertos.
+* `neuravps-unblock-ip trust-set <vmid> <lista> closed gen=…` y `trust-sync` (`"closed": ["<vmid>"]`): cerrado solo
+  con al menos una entrada aceptada (si no, la VM queda abierta y `closedRefused`); `revoke-vm` abre. Sin los sets
+  (base sin desplegar o tras rollback) la VM queda abierta y `closedApplied: false`.
+* Prueba: `test_customer_closed_netns.sh` (v4, v6, IPv6 directa, NAT64, bf_allow, cust_allow, sync, rollback).
+  Deshacer: `rollback_customer_closed.sh` (las VMs cerradas quedan abiertas; su lista sigue).
