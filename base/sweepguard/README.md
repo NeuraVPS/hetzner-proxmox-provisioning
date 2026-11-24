@@ -727,20 +727,25 @@ Probar sin tocar las bases: `test_customer_trust_netns.sh` (v4+v6, nft real). De
 
 Casilla del panel «Bloquear todas las conexiones desde IPs fuera de esta lista». En los puertos públicos de una VM
 cerrada (TCP 1xxxx/2xxxx/3xxxx, UDP 2xxxx y su IPv6 pública directa) solo entran su lista de confianza y la
-infraestructura; el resto se descarta.
+infraestructura (`bf_allow`); el resto se descarta.
 
-* `deploy_customer_closed.sh` (requiere cust_trust): `ip`: set `cust_closed` (proto . puerto) y
-  `fib daddr type local meta l4proto . th dport @cust_closed drop` justo DESPUÉS de `cust_trust` y ANTES de
-  `cust_allow`. `ip6`: además `cust_closed_pub6` (IPv6 directa = main/64 de la base + vmid, leída de
-  `/var/lib/base-nat/ipv6-policy.json`) y `cust_trust_pub6` (origen . esa IPv6):
-  `ip6 daddr @cust_closed_pub6 ip6 saddr . ip6 daddr @cust_trust_pub6 accept`, `ip6 daddr @cust_closed_pub6 drop`,
-  `iifname != "veth-host" fib daddr type local ... @cust_closed drop` (lo que vuelve de Jool ya se decidió en v4).
-* Orden: `bf_allow → (invitado) → bf_static → cust_trust → CERRADO → cust_allow → bf_auto`. Pasa la infraestructura
-  de `bf_allow` (bases → conncheck de las bases, DEVEL). **No** pasan: «Desbloquear mi IP» (cust_allow), las Cloud
-  Functions (sin IP fija: NeuraVPS no les manda SSH/sondas públicas a una VM cerrada) ni el tráfico VM→VM por el
-  VIP (origen 10.64.x). La consola VNC del panel no usa estos puertos.
+* `deploy_customer_closed.sh` (requiere cust_trust) crea una cadena `closed` en el hook **forward** de cada tabla
+  rdpguard. Solo mira conexiones que la base DNATeó (`ct status dnat`), solo en su sentido ORIGINAL
+  (`ct direction original`) y por el puerto que pidió el cliente (`ct original proto-dst`):
+  `bf_allow` → return; `saddr . proto . puerto @cust_trust` → return; `proto . puerto @cust_closed` → drop. En ip6
+  además `iifname "veth-host" ip6 saddr 64:ff9b:1::/96` → return (IPv4 de Jool, ya decidido en v4) y la IPv6 directa
+  (`ct original ip6 daddr @cust_closed_pub6`, con su lista en `cust_trust_pub6`).
+* Por qué en forward y no en `pre` (revisión de Codex del 24/11): así cubre exactamente los forwards, se llegue por la
+  dirección que se llegue (el DNAT v6 elige por puerto, sin mirar el destino); no toca las respuestas de conexiones que
+  inicia la propia VM (SNAT a su public6 o a la base: van en sentido «reply»); y vale igual para TCP y UDP y para el
+  tráfico de VM a VM por el VIP. La excepción de salida de invitados de `pre` (`10.64/16 meta l4proto != tcp accept`)
+  no le afecta.
+* Pasa: `bf_allow` (bases → conncheck de las bases, DEVEL). No pasan: «Desbloquear mi IP» (cust_allow), las Cloud
+  Functions (sin IP fija: NeuraVPS no les manda SSH/sondas públicas a una VM cerrada) ni VM→VM por el VIP. La consola
+  VNC del panel no usa estos puertos. Las conexiones ya descargadas en la flowtable antes de cerrar siguen hasta que
+  terminen; las nuevas no entran.
 * `neuravps-unblock-ip trust-set <vmid> <lista> closed gen=…` y `trust-sync` (`"closed": ["<vmid>"]`): cerrado solo
-  con al menos una entrada aceptada (si no, la VM queda abierta y `closedRefused`); `revoke-vm` abre. Sin los sets
-  (base sin desplegar o tras rollback) la VM queda abierta y `closedApplied: false`.
-* Prueba: `test_customer_closed_netns.sh` (v4, v6, IPv6 directa, NAT64, bf_allow, cust_allow, sync, rollback).
-  Deshacer: `rollback_customer_closed.sh` (las VMs cerradas quedan abiertas; su lista sigue).
+  con al menos una entrada aceptada (si no, abierta y `closedRefused`); `revoke-vm` abre; sin los sets la VM queda
+  abierta (`closedApplied: false`). IPv6 directa = main/64 de la base + vmid (`/var/lib/base-nat/ipv6-policy.json`).
+* Prueba: `test_customer_closed_netns.sh` con reenvío real (DNAT v4/v6, IPv6 directa, SNAT de salida, VM→VM TCP/UDP,
+  destino v6 enrutado no local, Jool, bf_allow, cust_allow, sync, rollback). Deshacer: `rollback_customer_closed.sh`.
