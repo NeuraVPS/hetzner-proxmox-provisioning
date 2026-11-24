@@ -135,6 +135,7 @@ TRUST_SET = "cust_trust"
 CLOSED_SET = "cust_closed"
 CLOSED_PUB6 = "cust_closed_pub6"
 TRUST_PUB6 = "cust_trust_pub6"
+DIRECT6 = "cust_direct6"    # rango de las IPv6 directas de esta base (main/64 sin la main)
 IPV6_POLICY_STATE = "/var/lib/base-nat/ipv6-policy.json"
 TRUST_STATE = "/var/lib/neuravps-sweepguard/cust_trust.json"
 TRUST_MAX_PER_VM = 10
@@ -750,13 +751,14 @@ def apply_trust(st, path=None):
     for fam in ("ip", "ip6"):
         batch += _fill(fam, TRUST_SET, elems[fam])
     closed_sets = [set_presence(fam, CLOSED_SET) for fam in ("ip", "ip6")] + \
-        [set_presence("ip6", n) for n in (CLOSED_PUB6, TRUST_PUB6)]
+        [set_presence("ip6", n) for n in (CLOSED_PUB6, TRUST_PUB6, DIRECT6)]
     if any(closed_sets) and not all(closed_sets):
         raise RuntimeError("closed-mode sets only partly present (deploy_customer_closed.sh)")
     if all(closed_sets):
         c = closed_elements(st)
         batch += _fill("ip", CLOSED_SET, c["ports"]) + _fill("ip6", CLOSED_SET, c["ports"])
         batch += _fill("ip6", CLOSED_PUB6, c["pub6"]) + _fill("ip6", TRUST_PUB6, c["trust_pub6"])
+        batch += _fill("ip6", DIRECT6, direct6_ranges())
     closed_applied = all(closed_sets) or not st.closed
     # sin los sets (base sin desplegar o tras rollback_customer_closed.sh) las VMs
     # «cerradas» quedan ABIERTAS: no se rompe la lista; se dice en closedApplied
@@ -804,6 +806,26 @@ def public6_prefix():
         return ipaddress.IPv6Network(f"{ipaddress.IPv6Address(main)}/64", strict=False)
     except (ValueError, TypeError):
         raise RuntimeError(f"{IPV6_POLICY_STATE}: bad main {str(main)[:40]!r}")
+
+
+def direct6_ranges():
+    """Rangos de las IPv6 directas de esta base: su /64 principal SIN la main
+    (que es destino de forwards). Vacío si la política IPv6 directa no está."""
+    try:
+        prefix = public6_prefix()
+    except RuntimeError:
+        raise
+    if prefix is None:
+        return []
+    with open(IPV6_POLICY_STATE) as fh:
+        main = ipaddress.IPv6Address(json.load(fh)["main"])
+    lo, hi = prefix.network_address, prefix.broadcast_address
+    out = []
+    if main > lo:
+        out.append(f"{lo.compressed}-{(main - 1).compressed}")
+    if main < hi:
+        out.append(f"{(main + 1).compressed}-{hi.compressed}")
+    return out
 
 
 def closed_elements(st):

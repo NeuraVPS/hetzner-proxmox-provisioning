@@ -111,6 +111,7 @@ table ip6 nat {
     chain direct_in {
         type nat hook prerouting priority -110; policy accept;
         ip6 daddr 2a01:4f9:aaaa::5ed dnat ip6 to 2a01:4f9:c01f:e::5ed
+        ip6 daddr 2a01:4f9:aaaa::7cf dnat ip6 to 2a01:4f9:c01f:e::7cf
     }
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
@@ -129,7 +130,7 @@ set -euo pipefail
 HERE=$1; WORK=$2; cd "$WORK"
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 CLIENT=149.56.212.201; OTHER=149.56.212.202; BASE=77.42.49.79
-C6=2001:41d0:1:2::5; X6=2001:41d0:9::5; B6=2a01:4f9:aaaa::2; PUB6=2a01:4f9:aaaa::5ed
+C6=2001:41d0:1:2::5; X6=2001:41d0:9::5; B6=2a01:4f9:aaaa::2; PUB6=2a01:4f9:aaaa::5ed; PUB6B=2a01:4f9:aaaa::7cf
 ROUTED6=2a01:4f9:bbbb::99          # destino enrutado a la base que NO es local
 ID1517=2a01:4f9:c01f:e::5ed; ID1999=2a01:4f9:c01f:e::7cf
 nft -f conf.nft
@@ -167,7 +168,7 @@ def udp(addr, p):    # una por dirección: así la respuesta sale de la misma di
     s.bind((addr, p))
     while True:
         d, a = s.recvfrom(100); s.sendto(b"pong", a)
-for p in (3389, 22):
+for p in (3389, 22, 21517):    # 21517: servicio DIRECTO de la VM 1999 en su public6
     threading.Thread(target=tcp, args=(p,), daemon=True).start()
 for a in ("10.99.0.2", "10.99.0.3"):
     threading.Thread(target=udp, args=(a, 3389), daemon=True).start()
@@ -215,7 +216,7 @@ echo '{"main": "2a01:4f9:aaaa::2", "entries": []}' > ipv6-policy.json
 UB() { python3 ub.py "$HERE/neuravps-unblock-ip" "$WORK" "$@" || true; }
 must() { local d=$1; shift; "$@" || { echo "FAIL $d"; exit 1; }; echo "  ok  $d"; }
 # calienta vecinos/ND
-for d in $B6 $PUB6 $ROUTED6; do probe $CPID tcp $C6 $d 21999 >/dev/null; probe $CPID tcp $X6 $d 21999 >/dev/null; done
+for d in $B6 $PUB6 $PUB6B $ROUTED6; do probe $CPID tcp $C6 $d 21999 >/dev/null; probe $CPID tcp $X6 $d 21999 >/dev/null; done
 probe $CPID tcp $CLIENT $BASE 21999 >/dev/null; probe $CPID tcp $OTHER $BASE 21999 >/dev/null
 
 echo "-- 0) sin modo cerrado todo llega (camino de reenvío real)"
@@ -252,6 +253,7 @@ expect $CPID tcp $X6 $ROUTED6 21517 blocked              # destino enrutado no l
 expect $CPID tcp $X6 $B6 21999 ok
 expect $CPID tcp $C6 $PUB6 3389 ok                       # IPv6 directa: su lista
 expect $CPID tcp $X6 $PUB6 3389 blocked
+expect $CPID tcp $X6 $PUB6B 21517 ok                     # IPv6 directa de OTRA VM (abierta) en el mismo nº de puerto
 expect $VPID tcp $ID1517 2001:41d0:9::5 8443 ok          # la salida v6 de la VM cerrada sigue funcionando
 expect $VPID tcp 10.99.0.3 $BASE 21517 blocked           # VM 1999 -> VM 1517 por el VIP (TCP)
 expect $VPID udp 10.99.0.3 $BASE 21517 blocked           # ... y UDP
