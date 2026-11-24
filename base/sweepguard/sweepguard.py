@@ -385,7 +385,8 @@ class Exempt:
 
 
 def customer_trusted(family):
-    """[(red, puerto)] de `cust_trust`: IPs de confianza que el cliente fijo en
+    """[(red, puerto)] de `cust_trust` (elementos addr . proto . puerto; aqui el
+    protocolo no importa: los detectores de conexiones cuentan TCP): IPs de confianza que el cliente fijo en
     el panel para los puertos de UNA VM (neuravps-unblock-ip trust-set,
     24/11/2026). La cadena las acepta antes de bf_auto, bf_seen y los
     limitadores; aqui ningun detector las cuenta, asi que ni se bloquea a esa
@@ -396,9 +397,9 @@ def customer_trusted(family):
         # sin timeout nft da {"concat": [...]}; con timeout/contador, {"elem": {"val": ...}}
         val = e.get("elem", {}).get("val") if isinstance(e, dict) and "elem" in e else e
         cat = val.get("concat") if isinstance(val, dict) else None
-        if not cat or len(cat) != 2:
+        if not cat or len(cat) != 3:          # addr . proto . puerto
             continue
-        a, port = cat
+        a, _proto, port = cat
         try:
             if isinstance(a, str):
                 net = ipaddress.ip_network(a)

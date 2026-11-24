@@ -14,10 +14,12 @@
 #
 # Este script:
 #   1. crea `cust_trust` en las dos tablas rdpguard: v4 `ipv4_addr .
-#      inet_service`, v6 igual con `flags interval` (admite /64). Sin caducidad;
+#      inet_proto . inet_service`, v6 igual con `flags interval` (admite /64).
+#      Sin caducidad. Por entrada: TCP a 1xxxx/2xxxx/3xxxx y UDP solo a 2xxxx;
 #   2. inserta UNA regla por familia justo ANTES de la de `cust_allow`:
-#        meta l4proto { tcp, udp } ip  saddr . th dport @cust_trust accept
-#        meta l4proto { tcp, udp } ip6 saddr . th dport @cust_trust accept
+#        fib daddr type local ip  saddr . meta l4proto . th dport @cust_trust accept
+#        fib daddr type local ip6 saddr . meta l4proto . th dport @cust_trust accept
+#      (solo destinos locales de la base: main y VIPs, donde están los forwards)
 #      Así queda DESPUÉS de bf_allow, de las reglas del invitado y de
 #      `bf_static` (un bloqueo manual manda) y ANTES de cust_allow, bf_auto,
 #      bf_seen y los limitadores (bf_src, bf_port, bf). Aunque la IP acabe en
@@ -49,10 +51,14 @@ UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 UNIT=neuravps-cust-trust-restore.service
 HERE=$(cd "$(dirname "$0")" && pwd)
 COM="IPs de confianza del cliente: solo los puertos de ESA VM (neuravps-unblock-ip trust-set)"
-SETDEF4="type ipv4_addr . inet_service; size 262144;"
-SETDEF6="type ipv6_addr . inet_service; flags interval; size 262144;"
-RULE4="meta l4proto { tcp, udp } ip saddr . th dport @cust_trust accept"
-RULE6="meta l4proto { tcp, udp } ip6 saddr . th dport @cust_trust accept"
+TRUST_STATE=${TRUST_STATE:-/var/lib/neuravps-sweepguard/cust_trust.json}
+SETDEF4="type ipv4_addr . inet_proto . inet_service; size 262144;"
+SETDEF6="type ipv6_addr . inet_proto . inet_service; flags interval; size 262144;"
+# Solo hacia direcciones DE LA BASE (main y VIPs: donde viven los forwards). Las
+# IPv6 públicas directas de cada VM (inet neura_ipv6, public6) no son locales y
+# quedan fuera: el mismo número de puerto hacia otra VM no se exime.
+RULE4="fib daddr type local ip saddr . meta l4proto . th dport @cust_trust accept"
+RULE6="fib daddr type local ip6 saddr . meta l4proto . th dport @cust_trust accept"
 
 echo "=== cust_trust en $(hostname) ==="
 
@@ -61,9 +67,12 @@ echo "=== cust_trust en $(hostname) ==="
 CH4=$(nft list chain ip rdpguard pre)
 CH6=$(nft list chain ip6 rdpguard pre)
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
-if has "$CH4" "@cust_trust" && has "$CH6" "@cust_trust"; then
+FRESH=0
+if has "$CH4" "@cust_trust" && has "$CH6" "@cust_trust" \
+   && nft list set ip rdpguard cust_trust >/dev/null 2>&1 && nft list set ip6 rdpguard cust_trust >/dev/null 2>&1; then
   echo "  [vivo] ya estaba"
 else
+  FRESH=1
   if has "$CH4" "@cust_trust" || has "$CH6" "@cust_trust" \
      || nft list set ip rdpguard cust_trust >/dev/null 2>&1 || nft list set ip6 rdpguard cust_trust >/dev/null 2>&1; then
     echo "  !! estado a medias (set o regla de una sola familia) — revisa a mano, no toco nada"; exit 1
@@ -101,6 +110,7 @@ for fam, need_static in (("ip", True), ("ip6", False)):
     au = idx("saddr @bf_auto", "drop")
     seen = idx("add @bf_seen")
     assert "@bf_auto" not in rules[tr], f"{fam}: la regla de cust_trust no debe exigir bf_auto"
+    assert "fib daddr type local" in rules[tr], f"{fam}: la regla de cust_trust no acota el destino"
     assert w < tr < ca < au < seen, f"{fam}: orden incorrecto allow={w} trust={tr} cust_allow={ca} auto={au} seen={seen}"
     lim = [i for i, l in enumerate(rules) if "limit rate" in l]
     assert all(tr < i for i in lim), f"{fam}: un limitador va antes que cust_trust"
@@ -109,14 +119,30 @@ for fam, need_static in (("ip", True), ("ip6", False)):
     print(f"  [orden] {fam}: bf_allow -> {'bf_static -> ' if need_static else ''}cust_trust -> cust_allow -> bf_auto -> bf_seen/limitadores OK")
 PY
 
-# --- 2) persistencia (acotada a cada tabla) -------------------------------------
-if grep -q "@cust_trust" "$CONF"; then
+# --- 2) persistencia (acotada a cada tabla; fichero hermano + nft -c + mv) -------
+CONF_STATE=$(python3 - "$CONF" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+def block(head):
+    i = s.index(head); rest = s[i + len(head):]
+    c = [k for k in (rest.find("\ntable "), rest.find("\ninclude ")) if k >= 0]
+    return s[i:i + len(head) + (min(c) if c else len(rest))]
+got = [("set cust_trust {" in b) + ("@cust_trust accept" in b)
+       for b in (block("table ip rdpguard {"), block("table ip6 rdpguard {"))]
+print("complete" if got == [2, 2] else "absent" if got == [0, 0] else "partial")
+PY
+)
+if [ "$CONF_STATE" = complete ]; then
   echo "  [conf] ya estaba"
+elif [ "$CONF_STATE" = partial ]; then
+  echo "  !! $CONF tiene cust_trust a medias (alguna tabla sin set o sin regla) — revisa a mano"; exit 1
 else
   BK="$CONF.bak.custtrust.$(date +%Y%m%d-%H%M%S)"
+  NEW="$CONF.custtrust.new"
   cp -a "$CONF" "$BK"
+  cp -a "$CONF" "$NEW"
   echo "  [conf] copia en $BK"
-  python3 - "$CONF" "$COM" "$RULE4" "$RULE6" <<'PY'
+  python3 - "$NEW" "$COM" "$RULE4" "$RULE6" <<'PY'
 import re, sys
 conf, com, rule4, rule6 = sys.argv[1:]
 s = open(conf).read()
@@ -134,9 +160,9 @@ def patch(s, head, atype, flags, text):
     assert "chain pre {" in b and "cust_trust" not in b, f"{head}: sin chain pre o cust_trust ya presente"
     anchors = re.findall(r"\n( +)[^\n]*@cust_allow accept[^\n]*\n", b)
     assert len(anchors) == 1, f"{head}: regla de cust_allow no única/ausente (deploy_customer_allow.sh)"
-    setdef = (f"    # cust_trust: IPs de confianza del cliente (IP . puerto de UNA VM),\n"
+    setdef = (f"    # cust_trust: IPs de confianza del cliente (IP . proto . puerto de UNA VM),\n"
               f"    # sin caducidad; elementos en cust_trust.json (deploy_customer_trust.sh).\n"
-              f"    set cust_trust {{\n        type {atype} . inet_service\n"
+              f"    set cust_trust {{\n        type {atype} . inet_proto . inet_service\n"
               + (f"        flags {flags}\n" if flags else "")
               + f"        size 262144\n    }}\n")
     b = b.replace("    chain pre {", setdef + "    chain pre {", 1)
@@ -147,13 +173,17 @@ def patch(s, head, atype, flags, text):
 
 s = patch(s, "table ip rdpguard {", "ipv4_addr", "", rule4)
 s = patch(s, "table ip6 rdpguard {", "ipv6_addr", "interval", rule6)
-open(conf, "w").write(s)
-print("  [conf] set y regla escritos en las dos tablas rdpguard")
+with open(conf, "w") as fh:
+    fh.write(s)
+    fh.flush()
+print("  [conf] set y regla escritos en las dos tablas rdpguard (fichero hermano)")
 PY
-  if nft -c -f "$CONF"; then
-    echo "  [conf] sintaxis OK (solo comprobada, NO cargada)"
+  if nft -c -f "$NEW"; then
+    sync "$NEW" 2>/dev/null || true
+    mv -f "$NEW" "$CONF"
+    echo "  [conf] sintaxis OK (solo comprobada, NO cargada); publicada con mv"
   else
-    echo "  !! la conf no valida — restauro la copia"; cp -a "$BK" "$CONF"; exit 1
+    rm -f "$NEW"; echo "  !! la conf nueva no valida — $CONF sin tocar"; exit 1
   fi
 fi
 
@@ -207,7 +237,15 @@ if [ "$SKIP_SYSTEMD" != 1 ]; then
   echo "  [unit] habilitado (no se arranca ahora)"
 fi
 
-# --- 5) el set, desde el estado que haya (vacío en una base nueva) ----------------
+# --- 5) el set ---------------------------------------------------------------------
+# En un despliegue NUEVO (no había set vivo) un cust_trust.json que quede de antes
+# (rollback, base reutilizada) puede traer confianza de VMs que cambiaron de dueño
+# mientras tanto: se aparta y el set empieza vacío hasta la reconciliación de
+# NeuraVPS (trusted_ips_reconcile, cada hora; o lanzarla a mano).
+if [ "$FRESH" = 1 ] && [ -e "$TRUST_STATE" ]; then
+  mv "$TRUST_STATE" "$TRUST_STATE.stale.$(date +%Y%m%d-%H%M%S)"
+  echo "  [estado] cust_trust.json anterior apartado: se llena con la reconciliación"
+fi
 if [ "$SKIP_INSTALL" != 1 ] && [ "${SKIP_RESTORE:-0}" != 1 ]; then
   "$SBIN/neuravps-unblock-ip" trust-restore | sed 's/^/  [estado] /'
   "$SBIN/neuravps-unblock-ip" trust-status | sed 's/^/  [estado] /'

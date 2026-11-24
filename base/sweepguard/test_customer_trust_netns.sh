@@ -143,7 +143,8 @@ def udp(p):
         d, a = s.recvfrom(100); s.sendto(b"pong", a)
 for p in (11302, 21302, 31302, 21999, 31999):
     threading.Thread(target=tcp, args=(p,), daemon=True).start()
-threading.Thread(target=udp, args=(21302,), daemon=True).start()
+for p in (21302, 31302):
+    threading.Thread(target=udp, args=(p,), daemon=True).start()
 threading.Event().wait()
 PY
 SPID=$!
@@ -201,20 +202,24 @@ cp sbin/sweepguard.py sweepguard.viejo
 CONF=conf.nft SKIP_INSTALL=1 STATE=$WORK/state.ca bash "$HERE/deploy_customer_allow.sh" > deploy0.out 2>&1 || { cat deploy0.out; exit 1; }
 cp conf.nft conf.orig
 CONF=conf.nft STATE=$WORK/state SBIN=$WORK/sbin UNIT_DIR=$WORK/units SKIP_SYSTEMD=1 SKIP_RESTORE=1 \
-  bash "$HERE/deploy_customer_trust.sh" > deploy.out 2>&1 || { cat deploy.out; exit 1; }
+  TRUST_STATE=$WORK/cust_trust.json bash "$HERE/deploy_customer_trust.sh" > deploy.out 2>&1 || { cat deploy.out; exit 1; }
 grep -E "\[(vivo|orden|conf|py|unit)\]" deploy.out
-grep -q "trust-restore" units/neuravps-cust-trust-restore.service && echo "  ok  unidad escrita"
+{ grep -q "trust-restore" units/neuravps-cust-trust-restore.service; } || { echo "FAIL unidad escrita"; exit 1; }; echo "  ok  unidad escrita"
 OUT2=$(CONF=conf.nft STATE=$WORK/state SBIN=$WORK/sbin UNIT_DIR=$WORK/units SKIP_SYSTEMD=1 SKIP_RESTORE=1 \
-  bash "$HERE/deploy_customer_trust.sh")
+  TRUST_STATE=$WORK/cust_trust.json bash "$HERE/deploy_customer_trust.sh")
 case "$OUT2" in *"[vivo] ya estaba"*"[conf] ya estaba"*) echo "  ok  idempotente" ;; *) echo "FAIL no idempotente"; exit 1 ;; esac
 
 echo "-- 1) trust-set 1302 y la IP en bf_auto"
 UB trust-set 1302 $CLIENT,2001:41d0:1:2::/64 | tee o1 | tail -1
-[ "$(jget 'd["pairs"]' < o1)" = 6 ] && echo "  ok  6 pares"
+{ [ "$(jget 'd["pairs"]' < o1)" = 8 ]; } || { echo "FAIL 8 pares (TCP x3 + UDP RDP, v4 y v6)"; exit 1; }; echo "  ok  8 pares (TCP x3 + UDP RDP, v4 y v6)"
 nft add element ip rdpguard bf_auto "{ $CLIENT }"
 for p in 11302 21302 31302; do expect tcp $p ok; done
 expect udp 21302 ok
+expect udp 31302 blocked       # UDP solo al RDP
 expect tcp 21999 blocked
+nft list chain ip rdpguard pre | grep -q "fib daddr type local ip saddr . meta l4proto . th dport @cust_trust accept" \
+  || { echo "FAIL regla v4 sin acotar destino"; exit 1; }
+echo "  ok  regla acotada a destinos locales"
 echo "-- 2) fuera de bf_auto: sin limitador hacia SU VM, con limitador hacia otra"
 nft delete element ip rdpguard bf_auto "{ $CLIENT }"
 n=$(burst 31302 60); [ "$n" = 60 ] && echo "  ok  60/60 a 31302" || { echo "FAIL 31302 $n/60"; exit 1; }
@@ -243,45 +248,47 @@ assert ("2001:41d0:1:2::abcd", 21999) not in ex6
 print("  ok  Exempt v4 y v6 /64:", len(ex), len(ex6))
 PY
 echo "-- 5) rechazos: bf_static y nuestras"
-UB trust-check 45.155.205.9 | tail -1 | grep -q '"reason": "static"' && echo "  ok  static"
-UB trust-check 77.42.49.200 | tail -1 | grep -q '"reason": "ours"' && echo "  ok  ours v4"
-UB trust-check 2a01:4f9:aaaa::/64 | tail -1 | grep -q '"reason": "ours"' && echo "  ok  ours v6"
-UB trust-check 10.0.0.1 | tail -1 | grep -q bad_request && echo "  ok  privada"
-UB trust-check 2001:41d0::/48 | tail -1 | grep -q bad_request && echo "  ok  /48"
-UB trust-check 1.2.3.0/24 | tail -1 | grep -q bad_request && echo "  ok  rango v4"
+{ UB trust-check 45.155.205.9 | tail -1 | grep -q '"reason": "static"'; } || { echo "FAIL static"; exit 1; }; echo "  ok  static"
+{ UB trust-check 77.42.49.200 | tail -1 | grep -q '"reason": "ours"'; } || { echo "FAIL ours v4"; exit 1; }; echo "  ok  ours v4"
+{ UB trust-check 2a01:4f9:aaaa::/64 | tail -1 | grep -q '"reason": "ours"'; } || { echo "FAIL ours v6"; exit 1; }; echo "  ok  ours v6"
+{ UB trust-check 10.0.0.1 | tail -1 | grep -q bad_request; } || { echo "FAIL privada"; exit 1; }; echo "  ok  privada"
+{ UB trust-check 2001:41d0::/48 | tail -1 | grep -q bad_request; } || { echo "FAIL /48"; exit 1; }; echo "  ok  /48"
+{ UB trust-check 1.2.3.0/24 | tail -1 | grep -q bad_request; } || { echo "FAIL rango v4"; exit 1; }; echo "  ok  rango v4"
 UB trust-set 1302 $CLIENT,45.155.205.9,2001:41d0:1:2::/64,2001:41d0:1:2::7 > o5 || true
-grep -q '"45.155.205.9": "static"' o5 && grep -q '"2001:41d0:1:2::7": "covered"' o5 && echo "  ok  trust-set filtra static y /128 cubierta"
+{ grep -q '"45.155.205.9": "static"' o5 && grep -q '"2001:41d0:1:2::7": "covered"' o5; } || { echo "FAIL trust-set filtra static y /128 cubierta"; exit 1; }; echo "  ok  trust-set filtra static y /128 cubierta"
 nft add element ip rdpguard bf_static "{ $CLIENT }"
 expect tcp 21302 blocked
 nft delete element ip rdpguard bf_static "{ $CLIENT }"
 echo "  ok  bf_static manda sobre la confianza"
 echo "-- 6) revoke-vm, trust-sync, trust-restore, trust-status"
-UB revoke-vm 1302 | tail -1 | grep -q '"trustRemoved": 1' && echo "  ok  revoke-vm quita la confianza"
+{ UB revoke-vm 1302 | tail -1 | grep -q '"trustRemoved": 1'; } || { echo "FAIL revoke-vm quita la confianza"; exit 1; }; echo "  ok  revoke-vm quita la confianza"
 nft add element ip rdpguard bf_auto "{ $CLIENT }"
 expect tcp 21302 blocked
 echo '{"vms": {"1302": ["149.56.212.201"], "1999": ["2001:41d0:1:2::/64"]}}' | UB trust-sync | tail -1 | tee o6
-grep -q '"pairs": 6' o6 && echo "  ok  trust-sync 6 pares"
+{ grep -q '"pairs": 8' o6; } || { echo "FAIL trust-sync 8 pares (TCP x3 + UDP RDP, v4 y v6)"; exit 1; }; echo "  ok  trust-sync 8 pares (TCP x3 + UDP RDP, v4 y v6)"
 expect tcp 21302 ok
 nft flush set ip rdpguard cust_trust; nft flush set ip6 rdpguard cust_trust
 expect tcp 21302 blocked
-UB trust-restore | tail -1 | grep -q '"pairs": 6' && echo "  ok  trust-restore"
+{ UB trust-restore | tail -1 | grep -q '"pairs": 8'; } || { echo "FAIL trust-restore"; exit 1; }; echo "  ok  trust-restore"
 expect tcp 21302 ok
 UB trust-status | tail -1
-echo '{"vms": {"1302": ["10.0.0.1"]}}' | UB trust-sync | tail -1 | grep -q '"rejectedCount": 1' && echo "  ok  sync descarta entradas malas"
-echo 'basura' | UB trust-sync | tail -1 | grep -q bad_request && echo "  ok  sync rechaza carga no JSON"
+{ echo '{"vms": {"1302": ["10.0.0.1"]}}' | UB trust-sync | tail -1 | grep -q 'bad_request'; } || { echo "FAIL sync con una entrada mala"; exit 1; }
+{ UB trust-status | tail -1 | grep -q '"ip": 4'; } || { echo "FAIL el set cambió tras una carga mala"; exit 1; }; echo "  ok  sync con una entrada mala: rechazada entera, set intacto"
+{ printf '{"vms": {"1302": ["1.1.1.1"], "1302": []}}' | UB trust-sync | tail -1 | grep -q 'duplicate key'; } || { echo "FAIL clave duplicada"; exit 1; }; echo "  ok  clave duplicada rechazada"
+{ echo 'basura' | UB trust-sync | tail -1 | grep -q bad_request; } || { echo "FAIL sync rechaza carga no JSON"; exit 1; }; echo "  ok  sync rechaza carga no JSON"
 echo "{\"vms\": {\"1302\": [\"$CLIENT\"]}}" | UB trust-sync >/dev/null
 echo "garbage" > cust_trust.json
-UB trust-set 1302 - | tail -1 | grep -q unreadable && echo "  ok  estado roto: no vacía el set"
+{ UB trust-set 1302 - | tail -1 | grep -qE "unreadable|invalid"; } || { echo "FAIL estado roto: no vacía el set"; exit 1; }; echo "  ok  estado roto: no vacía el set"
 expect tcp 21302 ok
 nft delete element ip rdpguard bf_auto "{ $CLIENT }"
 echo "-- 7) rollback"
 CONF=conf.nft STATE=$WORK/state SBIN=$WORK/sbin UNIT_DIR=$WORK/units SKIP_SYSTEMD=1 \
-  bash "$HERE/rollback_customer_trust.sh" > rb.out 2>&1 || { cat rb.out; exit 1; }
+  TRUST_STATE=$WORK/cust_trust.json bash "$HERE/rollback_customer_trust.sh" > rb.out 2>&1 || { cat rb.out; exit 1; }
 grep -E "\[(py|unit|vivo)\]|!!" rb.out
-cmp conf.orig conf.nft && echo "  ok  conf idéntica"
-cmp sbin/sweepguard.py sweepguard.viejo && echo "  ok  sweepguard.py restaurado"
+{ cmp conf.orig conf.nft; } || { echo "FAIL conf idéntica"; exit 1; }; echo "  ok  conf idéntica"
+{ cmp sbin/sweepguard.py sweepguard.viejo; } || { echo "FAIL sweepguard.py restaurado"; exit 1; }; echo "  ok  sweepguard.py restaurado"
 nft list chain ip rdpguard pre | grep -q cust_trust && { echo "FAIL quedan reglas"; exit 1; }
-[ ! -e units/neuravps-cust-trust-restore.service ] && echo "  ok  unidad quitada"
+{ [ ! -e units/neuravps-cust-trust-restore.service ]; } || { echo "FAIL unidad quitada"; exit 1; }; echo "  ok  unidad quitada"
 kill $SPID $CPID 2>/dev/null || true
 echo "NETNS_TRUST_OK"
 INNER

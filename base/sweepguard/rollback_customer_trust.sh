@@ -4,8 +4,10 @@
 # quita lo mismo de /etc/nftables.conf; vuelve a poner sweepguard.py y
 # neuravps-unblock-ip que guardó ESE despliegue (rutas en $STATE) y deshabilita
 # neuravps-cust-trust-restore.service. El estado
-# (/var/lib/neuravps-sweepguard/cust_trust.json) se queda: sin set no hace nada
-# y sirve para volver a desplegar.
+# (/var/lib/neuravps-sweepguard/cust_trust.json) se APARTA (.rolledback.*): con el
+# script anterior, revoke-vm ya no lo mantendría al día, y un redespliegue no debe
+# devolver la confianza de un dueño anterior. Tras redesplegar, la reconciliación
+# de NeuraVPS vuelve a llenarlo desde Firestore.
 #
 # ⚠️ NUNCA se restaura un `nft list ruleset` ni se recarga /etc/nftables.conf.
 #
@@ -20,6 +22,7 @@ STATE=${STATE:-/var/lib/neuravps-sweepguard/cust_trust.deploy}
 SBIN=${SBIN:-/usr/local/sbin}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 UNIT=neuravps-cust-trust-restore.service
+TRUST_STATE=${TRUST_STATE:-/var/lib/neuravps-sweepguard/cust_trust.json}
 
 echo "=== rollback de cust_trust en $(hostname) ==="
 
@@ -45,19 +48,21 @@ rm -f "$TX"
 
 if grep -q "cust_trust" "$CONF"; then
   BK="$CONF.bak.custtrust-rollback.$(date +%Y%m%d-%H%M%S)"
+  NEW="$CONF.custtrust-rollback.new"
   cp -a "$CONF" "$BK"
-  python3 - "$CONF" <<'PY'
+  cp -a "$CONF" "$NEW"
+  python3 - "$NEW" <<'PY'
 import re, sys
 conf = sys.argv[1]
 s = open(conf).read()
 s, n1 = re.subn(r"    # cust_trust: [^\n]*\n    #[^\n]*\n    set cust_trust \{\n(?:        [^\n]*\n)*?    \}\n", "", s)
-s, n2 = re.subn(r" +meta l4proto \{ tcp, udp \} ip6? saddr \. th dport @cust_trust accept comment \"[^\"]*\"\n", "", s)
+s, n2 = re.subn(r" +fib daddr type local ip6? saddr \. meta l4proto \. th dport @cust_trust accept comment \"[^\"]*\"\n", "", s)
 assert "cust_trust" not in s, "quedan restos de cust_trust"
 open(conf, "w").write(s)
 print(f"  [conf] quitados {n1} sets y {n2} reglas")
 PY
-  if nft -c -f "$CONF"; then echo "  [conf] sintaxis OK (no cargada)"
-  else echo "  !! conf no valida — restauro"; cp -a "$BK" "$CONF"; exit 1; fi
+  if nft -c -f "$NEW"; then mv -f "$NEW" "$CONF"; echo "  [conf] sintaxis OK (no cargada); publicada con mv"
+  else rm -f "$NEW"; echo "  !! conf nueva no valida — $CONF sin tocar"; exit 1; fi
 else
   echo "  [conf] nada que quitar"
 fi
@@ -80,6 +85,10 @@ if [ -e "$UNIT_DIR/$UNIT" ]; then
   rm -f "$UNIT_DIR/$UNIT"
   [ "$SKIP_SYSTEMD" = 1 ] || systemctl daemon-reload
   echo "  [unit] $UNIT quitado"
+fi
+if [ -e "$TRUST_STATE" ]; then
+  mv "$TRUST_STATE" "$TRUST_STATE.rolledback.$(date +%Y%m%d-%H%M%S)"
+  echo "  [estado] cust_trust.json apartado"
 fi
 rm -f /root/sg-cust-trust*.nft 2>/dev/null || true
 echo "ROLLBACK_CUSTTRUST_OK $(hostname)"

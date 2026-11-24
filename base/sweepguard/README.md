@@ -676,11 +676,16 @@ direcciones de privacidad la IPv6 del equipo rota a diario dentro de su /64). Ca
 automatización que abre ~10 SSH a la vez a SU VPS, bloqueado dos veces por hot-port el 24/11 (y el bloqueo
 cortaba todos sus VPS).
 
-* `deploy_customer_trust.sh` crea `cust_trust` (v4 `ipv4_addr . inet_service`; v6 igual con
-  `flags interval` para el /64; sin caducidad) y UNA regla por familia justo antes de la de `cust_allow`:
+* `deploy_customer_trust.sh` crea `cust_trust` (v4 `ipv4_addr . inet_proto . inet_service`; v6 igual con
+  `flags interval` para el /64; sin caducidad; por entrada TCP a 1xxxx/2xxxx/3xxxx y UDP solo a 2xxxx) y UNA
+  regla por familia justo antes de la de `cust_allow`:
 
-      meta l4proto { tcp, udp } ip  saddr . th dport @cust_trust accept
-      meta l4proto { tcp, udp } ip6 saddr . th dport @cust_trust accept
+      fib daddr type local ip  saddr . meta l4proto . th dport @cust_trust accept
+      fib daddr type local ip6 saddr . meta l4proto . th dport @cust_trust accept
+
+  `fib daddr type local`: solo hacia direcciones de la propia base (main y VIPs, donde están los forwards).
+  Las IPv6 públicas directas de cada VM (`inet neura_ipv6`, `public6`) no son locales: el mismo número de
+  puerto hacia otra VM no se exime.
 
   Orden v4: `bf_allow → (invitado) → bf_static → cust_trust → cust_allow → bf_auto → bf_seen → bf_src/bf_port`;
   v6: `bf_allow → (invitado) → cust_trust → cust_allow → bf_auto → bf_seen → bf`. **`bf_static` manda** (y no se
@@ -691,7 +696,11 @@ cortaba todos sus VPS).
   `trust-set <vmid> <entradas>|-`, `trust-sync` (lista completa en JSON por stdin), `trust-restore`,
   `trust-status`; `revoke-vm` también quita la confianza. Fuente de verdad en la base:
   `/var/lib/neuravps-sweepguard/cust_trust.json`; el set se reescribe entero desde ella en UNA transacción
-  (`flush set` + `add element`). Estado ilegible → error, nunca se vacía el set.
+  (`flush set` + `add element`), escribiendo antes el fichero (una revocación sobrevive a un corte). Todo lo
+  que entra (orden, stdin, fichero) pasa la gramática ASCII antes de `ipaddress` y el texto para nft sale de la
+  dirección numérica. Fallo cerrado: estado o carga con UNA entrada mala, o `nuestras4/6` ilegible → error,
+  nada cambia. `trust-sync` lee stdin (bytes, 15 s) antes de tomar el cerrojo. Un despliegue nuevo aparta un
+  `cust_trust.json` previo y el rollback también: lo llena la reconciliación.
 * Persistencia: set y regla en `/etc/nftables.conf`; elementos por `neuravps-cust-trust-restore.service`
   (arranque, tras nftables) y por la reconciliación horaria de NeuraVPS (`trusted_ips_reconcile`, `trust-sync`
   desde Firestore `trusted_ips/`).

@@ -41,6 +41,8 @@ class Entries(unittest.TestCase):
                     "::1", "fe80::1", "fc00::1", "ff02::1", "2001:db8::1",
                     "::ffff:1.2.3.4", "64:ff9b::102:304", "64:ff9b:1::1",
                     "2001:41d0::/48", "2001:41d0:1:2::/96", "2001:41d0:1:2::/0",
+                    "4000::1", "fec0::1", "fe80::1%eth0", "2001:41d0:1:2::5%1",
+                    "1.1.1.1 ", "１.1.1.1", None, 5,
                     "x", "", "1.2.3.4/", "1.2.3.4/a"):
             self.bad(raw)
 
@@ -75,8 +77,40 @@ class Commands(unittest.TestCase):
     def test_elements(self):
         st = {1302: [ub.trust_entry("1.1.1.1"), ub.trust_entry("2001:41d0:1:2::/64")]}
         el = ub.trust_elements(st)
-        self.assertEqual(el["ip"], ["1.1.1.1 . 11302", "1.1.1.1 . 21302", "1.1.1.1 . 31302"])
-        self.assertEqual(el["ip6"][0], "2001:41d0:1:2::/64 . 11302")
+        self.assertEqual(el["ip"], ["1.1.1.1 . tcp . 11302", "1.1.1.1 . tcp . 21302",
+                                    "1.1.1.1 . udp . 21302", "1.1.1.1 . tcp . 31302"])
+        self.assertEqual(el["ip6"][0], "2001:41d0:1:2::/64 . tcp . 11302")
+
+    def test_doc_all_or_nothing(self):
+        P = ub.parse_trust_doc
+        self.assertEqual({k: [ub.entry_text(n) for n in v] for k, v in
+                          P('{"vms": {"1302": ["1.1.1.1"]}}', "x").items()}, {1302: ["1.1.1.1"]})
+        for raw in ('{"vms": {"1302,1999": ["1.1.1.1"]}}', '{"vms": {"01302": []}}',
+                    '{"vms": {"99": []}}', '{"vms": {"1302": ["1.1.1.1"], "1302": []}}',
+                    '{"vms": {"1302": ["1.1.1.1", "10.0.0.1"]}}', '{"vms": {"1302": ["fe80::1%eth0"]}}',
+                    '{"vms": {"1302": [1]}}', '{"vms": {"1302": "1.1.1.1"}}', '[]', 'x'):
+            with self.assertRaises(ub.BadRequest, msg=raw):
+                P(raw, "x")
+
+    def test_state_file_fails_closed(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write('{"vms": {"1302": ["1.1.1.1"], "1999": ["10.0.0.1"]}}')
+        with self.assertRaises(RuntimeError):
+            ub.load_trust_state(fh.name)
+        os.unlink(fh.name)
+        self.assertEqual(ub.load_trust_state(fh.name), {})         # ausente = vacio
+
+    def test_guarded_read_failure_fails_closed(self):
+        class R:
+            returncode, stdout, stderr = 1, "", "Error: No such file"
+        orig = ub.run
+        ub.run = lambda *a, **k: R()
+        try:
+            with self.assertRaises(RuntimeError):
+                ub.TrustChecker().reason(ub.trust_entry("1.1.1.1"))
+        finally:
+            ub.run = orig
 
 
 class SweepguardExempt(unittest.TestCase):
