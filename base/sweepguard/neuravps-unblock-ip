@@ -135,7 +135,6 @@ TRUST_SET = "cust_trust"
 CLOSED_SET = "cust_closed"
 CLOSED_PUB6 = "cust_closed_pub6"
 TRUST_PUB6 = "cust_trust_pub6"
-DIRECT6 = "cust_direct6"    # rango de las IPv6 directas de esta base (main/64 sin la main)
 IPV6_POLICY_STATE = "/var/lib/base-nat/ipv6-policy.json"
 TRUST_STATE = "/var/lib/neuravps-sweepguard/cust_trust.json"
 TRUST_MAX_PER_VM = 10
@@ -751,14 +750,13 @@ def apply_trust(st, path=None):
     for fam in ("ip", "ip6"):
         batch += _fill(fam, TRUST_SET, elems[fam])
     closed_sets = [set_presence(fam, CLOSED_SET) for fam in ("ip", "ip6")] + \
-        [set_presence("ip6", n) for n in (CLOSED_PUB6, TRUST_PUB6, DIRECT6)]
+        [set_presence("ip6", n) for n in (CLOSED_PUB6, TRUST_PUB6)]
     if any(closed_sets) and not all(closed_sets):
         raise RuntimeError("closed-mode sets only partly present (deploy_customer_closed.sh)")
     if all(closed_sets):
         c = closed_elements(st)
         batch += _fill("ip", CLOSED_SET, c["ports"]) + _fill("ip6", CLOSED_SET, c["ports"])
         batch += _fill("ip6", CLOSED_PUB6, c["pub6"]) + _fill("ip6", TRUST_PUB6, c["trust_pub6"])
-        batch += _fill("ip6", DIRECT6, direct6_ranges())
     closed_applied = all(closed_sets) or not st.closed
     # sin los sets (base sin desplegar o tras rollback_customer_closed.sh) las VMs
     # «cerradas» quedan ABIERTAS: no se rompe la lista; se dice en closedApplied
@@ -806,26 +804,6 @@ def public6_prefix():
         return ipaddress.IPv6Network(f"{ipaddress.IPv6Address(main)}/64", strict=False)
     except (ValueError, TypeError):
         raise RuntimeError(f"{IPV6_POLICY_STATE}: bad main {str(main)[:40]!r}")
-
-
-def direct6_ranges():
-    """Rangos de las IPv6 directas de esta base: su /64 principal SIN la main
-    (que es destino de forwards). Vacío si la política IPv6 directa no está."""
-    try:
-        prefix = public6_prefix()
-    except RuntimeError:
-        raise
-    if prefix is None:
-        return []
-    with open(IPV6_POLICY_STATE) as fh:
-        main = ipaddress.IPv6Address(json.load(fh)["main"])
-    lo, hi = prefix.network_address, prefix.broadcast_address
-    out = []
-    if main > lo:
-        out.append(f"{lo.compressed}-{(main - 1).compressed}")
-    if main < hi:
-        out.append(f"{(main + 1).compressed}-{hi.compressed}")
-    return out
 
 
 def closed_elements(st):
@@ -913,7 +891,9 @@ def trust_sync(payload):
     # un fichero corrupto se aparta A MANO (README) y entonces la foto entra.
     st = load_trust_state()
     if gen <= st.sync_gen:
-        out = {"result": "synced", "gen": gen, "staleSnapshot": True, "rejected": {},
+        out = {"result": "synced", "gen": gen, "staleSnapshot": True,
+               "closedMissing": sorted(v for v in payload.get("closed", ()) if v not in st.closed)[:500],
+               "rejected": {},
                "rejectedCount": 0, "staleVms": [], "changedVms": []}
         out.update(apply_trust(st))
         return out
@@ -937,9 +917,13 @@ def trust_sync(payload):
         st.gens.pop(vmid, None)           # su revision pasa a ser la de la foto (suelo)
         rejected.update({f"{vmid}:{k}": v for k, v in rej.items()})
     st.sync_gen = gen
+    # cierres pedidos que esta base NO aplica (lista rechazada entera aquí, u
+    # orden más nueva): NeuraVPS los marca pendientes en esos VPS
+    closed_missing = sorted(v for v in payload.get("closed", ()) if v not in st.closed)
     after = {v: [entry_text(n) for n in l] + (["closed"] if v in st.closed else [])
               for v, l in st.vms.items()}
-    out = {"result": "synced", "gen": gen, "rejected": dict(list(rejected.items())[:50]),
+    out = {"result": "synced", "gen": gen, "closedMissing": closed_missing[:500],
+           "rejected": dict(list(rejected.items())[:50]),
            "rejectedCount": len(rejected), "staleVms": stale[:100],
            "changedVms": sorted(v for v in set(before) | set(after)
                                 if before.get(v) != after.get(v))[:100]}

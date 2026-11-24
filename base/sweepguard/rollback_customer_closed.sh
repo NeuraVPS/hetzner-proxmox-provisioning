@@ -10,7 +10,7 @@ CONF=${CONF:-/etc/nftables.conf}; SKIP_INSTALL=${SKIP_INSTALL:-0}
 STATE=${STATE:-/var/lib/neuravps-sweepguard/cust_closed.deploy}; SBIN=${SBIN:-/usr/local/sbin}
 TX=$(mktemp --suffix=.nft); : > "$TX"
 for fam in ip ip6; do nft list chain $fam rdpguard closed >/dev/null 2>&1 && echo "delete chain $fam rdpguard closed" >> "$TX"; done
-for s in "ip cust_closed" "ip6 cust_closed" "ip6 cust_closed_pub6" "ip6 cust_trust_pub6" "ip6 cust_direct6"; do
+for s in "ip cust_closed" "ip6 cust_closed" "ip6 cust_closed_pub6" "ip6 cust_trust_pub6"; do
   set -- $s; nft list set $1 rdpguard $2 >/dev/null 2>&1 && echo "delete set $1 rdpguard $2" >> "$TX"
 done
 if [ -s "$TX" ]; then nft -c -f "$TX"; nft -f "$TX"; echo "  [vivo] deshecho en una transacción"; else echo "  [vivo] nada"; fi
@@ -21,9 +21,9 @@ if grep -q "cust_closed" "$CONF"; then
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 s = re.sub(r"    # modo cerrado por VPS[^\n]*\n", "", s)
-s = re.sub(r"    set (cust_closed|cust_closed_pub6|cust_trust_pub6|cust_direct6) \{\n(?:        [^\n]*\n)*?    \}\n", "", s)
+s = re.sub(r"    set (cust_closed|cust_closed_pub6|cust_trust_pub6) \{\n(?:        [^\n]*\n)*?    \}\n", "", s)
 s = re.sub(r"    chain closed \{\n(?:        [^\n]*\n)*?    \}\n", "", s)
-assert "cust_closed" not in s and "cust_trust_pub6" not in s and "cust_direct6" not in s, "quedan restos"
+assert "cust_closed" not in s and "cust_trust_pub6" not in s, "quedan restos"
 open(p, "w").write(s)
 PY
   if nft -c -f "$NEW"; then mv -f "$NEW" "$CONF"; echo "  [conf] quitado"; else rm -f "$NEW"; echo "  !! no valida"; exit 1; fi

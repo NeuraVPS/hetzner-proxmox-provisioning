@@ -39,19 +39,21 @@ RULES4=(
   "$O ct original ip saddr . meta l4proto . ct original proto-dst @cust_trust return"
   "$O meta l4proto . ct original proto-dst @cust_closed drop"
 )
-# ip6: primero se clasifica por DESTINO la IPv6 directa (public6, DNAT de
-# inet neura_ipv6): su VM y SOLO su política (su lista en cust_trust_pub6 si
-# está cerrada; si no, nada aquí). Lo demás son forwards por puerto. Sin esto,
-# la lista o el cierre de la VM B (forward 21517) alcanzaría el servicio directo
-# de la VM A en el puerto 21517 de su public6.
+# ip6: la IPv6 directa (public6, DNAT de inet neura_ipv6) se reconoce por su
+# destino y solo se le aplica la política de SU VM. Los forwards por puerto se
+# reconocen porque el DNAT de ip6 nat TRADUCE el puerto (2xxxx→3389, 1xxxx→445,
+# 3xxxx→22: `ct reply proto-src` es el puerto traducido), mientras que el DNAT
+# directo lo conserva. Así la lista o el cierre de la VM B (forward 21517) no
+# alcanzan un servicio directo de la VM A en el 21517 de su public6, sin
+# depender de qué direcciones haya asignadas.
+FWD6="ct reply proto-src { 22, 445, 3389 }"
 RULES6=(
   "iifname \"$JOOL_IF\" ip6 saddr 64:ff9b:1::/96 return"
   "$O ct original ip6 saddr @bf_allow return"
   "$O ct original ip6 daddr @cust_closed_pub6 ct original ip6 saddr . ct original ip6 daddr @cust_trust_pub6 return"
   "$O ct original ip6 daddr @cust_closed_pub6 drop"
-  "$O ct original ip6 daddr @cust_direct6 return"
-  "$O ct original ip6 saddr . meta l4proto . ct original proto-dst @cust_trust return"
-  "$O meta l4proto . ct original proto-dst @cust_closed drop"
+  "$O $FWD6 ct original ip6 saddr . meta l4proto . ct original proto-dst @cust_trust return"
+  "$O $FWD6 meta l4proto . ct original proto-dst @cust_closed drop"
 )
 CHAIN4="type filter hook forward priority -5; policy accept;"
 
@@ -75,7 +77,6 @@ else
     echo "add set ip6 rdpguard cust_closed { type inet_proto . inet_service; size 65536; }"
     echo "add set ip6 rdpguard cust_closed_pub6 { type ipv6_addr; size 65536; }"
     echo "add set ip6 rdpguard cust_trust_pub6 { type ipv6_addr . ipv6_addr; flags interval; size 262144; }"
-    echo "add set ip6 rdpguard cust_direct6 { type ipv6_addr; flags interval; }"
     echo "add chain ip6 rdpguard closed { $CHAIN4 }"
     for r in "${RULES6[@]}"; do echo "add rule ip6 rdpguard closed $r comment \"$COM\""; done
   } > "$TX"
@@ -99,7 +100,8 @@ for fam in ("ip", "ip6"):
     drops = [k for k, l in enumerate(body) if l.endswith(" drop")]
     if fam == "ip6":
         assert at("@bf_allow") < at("@cust_trust_pub6 return") < at("@cust_closed_pub6 drop") \
-            < at("@cust_direct6 return") < at("proto-dst @cust_trust return"), "ip6: la IPv6 directa debe ir antes de los puertos"
+            < at("proto-dst @cust_trust return"), "ip6: la IPv6 directa debe ir antes de los puertos"
+        assert all("ct reply proto-src" in l for l in body if "proto-dst" in l), "ip6: forward sin el puerto traducido"
     assert all("ct direction original ct status dnat" in rules[k] for k in drops), f"{fam}: drop sin acotar a DNAT/original"
     print(f"  [orden] {fam}: closed (forward): bf_allow/lista -> drop solo en DNAT y sentido original OK")
 PY
@@ -114,8 +116,8 @@ def block(head):
 b4, b6 = block("table ip rdpguard {"), block("table ip6 rdpguard {")
 got = [("set cust_closed {" in b4) + ("chain closed {" in b4),
        ("set cust_closed {" in b6) + ("set cust_closed_pub6 {" in b6) + ("set cust_trust_pub6 {" in b6)
-       + ("set cust_direct6 {" in b6) + ("chain closed {" in b6)]
-print("complete" if got == [2, 5] else "absent" if got == [0, 0] else "partial")
+       + ("chain closed {" in b6)]
+print("complete" if got == [2, 4] else "absent" if got == [0, 0] else "partial")
 PY
 )
 if [ "$CONF_STATE" = complete ]; then echo "  [conf] ya estaba"
@@ -147,8 +149,7 @@ S = "    set {} {{\n        type {}\n{}        size {}\n    }}\n"
 s = patch(s, "table ip rdpguard {", [S.format("cust_closed", "inet_proto . inet_service", "", 65536)], r4)
 s = patch(s, "table ip6 rdpguard {", [S.format("cust_closed", "inet_proto . inet_service", "", 65536),
                                      S.format("cust_closed_pub6", "ipv6_addr", "", 65536),
-                                     S.format("cust_trust_pub6", "ipv6_addr . ipv6_addr", "        flags interval\n", 262144),
-                                     "    set cust_direct6 {\n        type ipv6_addr\n        flags interval\n    }\n"], r6)
+                                     S.format("cust_trust_pub6", "ipv6_addr . ipv6_addr", "        flags interval\n", 262144)], r6)
 open(conf, "w").write(s)
 print("  [conf] sets y cadena closed escritos (fichero hermano)")
 PY

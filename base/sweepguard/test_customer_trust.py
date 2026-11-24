@@ -250,6 +250,15 @@ class ClosedMode(Generations):
         self.assertIn("tcp . 21999", closed)
         self.assertNotIn("21302", closed)
 
+    def test_sync_reports_closed_missing(self):
+        class Static:
+            def reason(self, net):
+                return "static" if str(net.network_address) == "45.155.205.9" else None
+        ub.TrustChecker = Static
+        out = ub.trust_sync({"gen": self.g(5, ub.GEN_SYNC), "closed": {1302, 1999},
+                             "vms": {1302: [ub.trust_entry("45.155.205.9")], 1999: self.e}})
+        self.assertEqual(out["closedMissing"], [1302])       # su única IP se rechaza aquí: queda abierta
+
     def test_pub6(self):
         import json as _j
         pol = os.path.join(self.dir, "pol.json")

@@ -734,9 +734,11 @@ infraestructura (`bf_allow`); el resto se descarta.
   (`ct direction original`) y por el puerto que pidió el cliente (`ct original proto-dst`):
   `bf_allow` → return; `saddr . proto . puerto @cust_trust` → return; `proto . puerto @cust_closed` → drop. En ip6
   además `iifname "veth-host" ip6 saddr 64:ff9b:1::/96` → return (IPv4 de Jool, ya decidido en v4) y la IPv6 directa
-  (`ct original ip6 daddr @cust_closed_pub6`, con su lista en `cust_trust_pub6`). En ip6 la IPv6 directa se clasifica
-  PRIMERO por destino (`cust_direct6` = main/64 de la base sin la main): la lista o el cierre de una VM no alcanzan el
-  servicio directo de otra en el mismo número de puerto.
+  (`ct original ip6 daddr @cust_closed_pub6`, con su lista en `cust_trust_pub6`). En ip6 la IPv6 directa se reconoce por su
+  destino y solo se le aplica la política de SU VM; los forwards por puerto se reconocen porque el DNAT de ip6 nat
+  traduce el puerto (`ct reply proto-src { 22, 445, 3389 }`), mientras que el DNAT directo lo conserva: la lista o el
+  cierre de una VM no alcanzan el servicio directo de otra en el mismo número de puerto, y una dirección sin asignar
+  del /64 que reciba un forward por puerto sí queda cubierta.
 * Por qué en forward y no en `pre` (revisión de Codex del 24/11): así cubre exactamente los forwards, se llegue por la
   dirección que se llegue (el DNAT v6 elige por puerto, sin mirar el destino); no toca las respuestas de conexiones que
   inicia la propia VM (SNAT a su public6 o a la base: van en sentido «reply»); y vale igual para TCP y UDP y para el

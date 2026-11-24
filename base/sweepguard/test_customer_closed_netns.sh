@@ -216,7 +216,7 @@ echo '{"main": "2a01:4f9:aaaa::2", "entries": []}' > ipv6-policy.json
 UB() { python3 ub.py "$HERE/neuravps-unblock-ip" "$WORK" "$@" || true; }
 must() { local d=$1; shift; "$@" || { echo "FAIL $d"; exit 1; }; echo "  ok  $d"; }
 # calienta vecinos/ND
-for d in $B6 $PUB6 $PUB6B $ROUTED6; do probe $CPID tcp $C6 $d 21999 >/dev/null; probe $CPID tcp $X6 $d 21999 >/dev/null; done
+for d in $B6 $PUB6 $PUB6B $ROUTED6 2a01:4f9:aaaa::999; do probe $CPID tcp $C6 $d 21999 >/dev/null; probe $CPID tcp $X6 $d 21999 >/dev/null; done
 probe $CPID tcp $CLIENT $BASE 21999 >/dev/null; probe $CPID tcp $OTHER $BASE 21999 >/dev/null
 
 echo "-- 0) sin modo cerrado todo llega (camino de reenvío real)"
@@ -250,6 +250,7 @@ expect $CPID udp $OTHER $BASE 21999 ok
 expect $CPID tcp $C6 $B6 21517 ok
 expect $CPID tcp $X6 $B6 21517 blocked
 expect $CPID tcp $X6 $ROUTED6 21517 blocked              # destino enrutado no local: el DNAT v6 lo reenvía igual
+expect $CPID tcp $X6 2a01:4f9:aaaa::999 21517 blocked    # dirección SIN asignar del /64 de las directas: forward por puerto
 expect $CPID tcp $X6 $B6 21999 ok
 expect $CPID tcp $C6 $PUB6 3389 ok                       # IPv6 directa: su lista
 expect $CPID tcp $X6 $PUB6 3389 blocked
