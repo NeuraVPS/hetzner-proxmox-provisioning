@@ -91,10 +91,33 @@ nft list chain ip6 rdpguard pre | grep -q "64:ff9b:1::/96 accept" && { echo "FAI
 nft add rule ip6 rdpguard pre iifname "eth9" ip6 saddr 64:ff9b:1::/96 accept   # regla ajena parecida
 if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d2.out 2>&1; then
   echo "FAIL despliegue con regla ajena"; exit 1; fi
-grep -q "no son esta" d2.out && echo "  ok  despliegue aborta ante una regla 64:ff9b:1:: ajena"
+grep -q "no son esta" d2.out || { echo "FAIL motivo del aborto"; cat d2.out; exit 1; }
+nft list chain ip6 rdpguard pre | grep -q 'iifname "veth-host" ip6 saddr 64:ff9b:1::/96' && { echo "FAIL insertó la propia pese al conflicto"; exit 1; }
+echo "  ok  despliegue aborta ante una regla 64:ff9b:1:: ajena, sin tocar nada"
 if CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r2.out 2>&1; then
   echo "FAIL rollback con regla ajena"; exit 1; fi
-nft list chain ip6 rdpguard pre | grep -q 'iifname "eth9"' && echo "  ok  rollback aborta y no borra la regla ajena"
+nft list chain ip6 rdpguard pre | grep -q 'iifname "eth9"' || { echo "FAIL rollback borró la regla ajena"; exit 1; }
+echo "  ok  rollback aborta y no borra la regla ajena"
+# regla ajena que CONTIENE el texto propio con una condición delante, y conflicto solo en disco
+nft flush chain ip6 rdpguard pre 2>/dev/null || true; nft -f orig.nft; cp orig.nft conf.nft
+OWN_TXT='iifname "veth-host" ip6 saddr 64:ff9b:1::/96 accept comment "IPv4 traducido (NAT64): ya juzgado en ip rdpguard con la IP real"'
+nft add rule ip6 rdpguard pre tcp dport 1 $OWN_TXT
+if CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r3.out 2>&1; then echo "FAIL rollback con superconjunto"; exit 1; fi
+nft list chain ip6 rdpguard pre | grep -q "tcp dport 1 " || { echo "FAIL borró la regla ajena que contiene el texto"; exit 1; }
+echo "  ok  rollback no confunde una regla ajena que contiene el texto propio"
+nft flush ruleset; nft -f orig.nft; cp orig.nft conf.nft
+sed -i "s|    chain pre {|    # $OWN_TXT\n    chain pre {|" conf.nft     # solo como comentario en disco
+sed -i "0,/add @bf_seen/s||add @bf_seen|" conf.nft
+python3 - conf.nft <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index("table ip6 rdpguard {"); j = s.index("chain pre {", i)
+s = s[:j] + "chain pre {\n        iifname \"eth9\" ip6 saddr 64:ff9b:1::/96 accept" + s[j + len("chain pre {"):]
+open(p, "w").write(s)
+PY
+if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d3.out 2>&1; then echo "FAIL deploy con conflicto en disco"; exit 1; fi
+nft list chain ip6 rdpguard pre | grep -q '64:ff9b:1::/96' && { echo "FAIL tocó lo vivo con conflicto en disco"; exit 1; }
+echo "  ok  conflicto solo en disco: aborta sin tocar lo vivo (y un comentario no cuenta como regla)"
 kill $SP $J $X 2>/dev/null || true
 echo "NETNS_NAT64_OK"
 INNER

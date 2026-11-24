@@ -35,26 +35,28 @@ ROUTE=$(ip -6 route show 64:ff9b:1::/96 2>/dev/null || true); [ "${SKIP_ROUTE_CH
 case "$ROUTE" in *"dev $JOOL_IF"*) echo "  [ruta] 64:ff9b:1::/96 por $JOOL_IF OK" ;;
   *) echo "  !! 64:ff9b:1::/96 no va por $JOOL_IF ($ROUTE) — aborto"; exit 1 ;; esac
 
-CH=$(nft list chain ip6 rdpguard pre)
-# La regla se reconoce por su texto EXACTO (interfaz, prefijo, veredicto y
-# comentario propios); cualquier otra que se le parezca aborta.
-N_OWN=$(grep -cF "$RULE comment \"$COM\"" <<<"$CH" || true)
-N_ANY=$(grep -c "64:ff9b:1::/96" <<<"$CH" || true)
-if [ "$N_ANY" != "$N_OWN" ] || [ "$N_OWN" -gt 1 ]; then
-  echo "  !! hay reglas con 64:ff9b:1::/96 que no son esta (o duplicadas): $N_ANY / $N_OWN — revisa a mano"; exit 1
+HERE=$(cd "$(dirname "$0")" && pwd)
+OWN="$RULE comment \"$COM\""
+census() { python3 "$HERE/nat64_rule_census.py" "$1" "$2" "$OWN"; }
+# Todo se valida ANTES de tocar nada: en vivo y en disco solo puede haber, como
+# mucho, la regla PROPIA (línea idéntica); cualquier otra con 64:ff9b:1::/96 aborta.
+LIVE=$(mktemp); nft -a list chain ip6 rdpguard pre > "$LIVE"
+read -r L_OWN L_ANY L_H < <(census live "$LIVE"); rm -f "$LIVE"
+read -r C_OWN C_ANY _ < <(census disk "$CONF")
+if [ "$L_ANY" != "$L_OWN" ] || [ "$L_OWN" -gt 1 ] || [ "$C_ANY" != "$C_OWN" ] || [ "$C_OWN" -gt 1 ]; then
+  echo "  !! reglas con 64:ff9b:1::/96 que no son esta (o duplicadas): vivo $L_ANY/$L_OWN, disco $C_ANY/$C_OWN — revisa a mano, no toco nada"; exit 1
 fi
-case "$N_OWN" in
-  1) echo "  [vivo] ya estaba" ;;
-  *)
-    A=$(nft -a list chain ip6 rdpguard pre)
-    H=$(awk '/add @bf_seen/{print $NF; exit}' <<<"$A")
-    [ -n "$H" ] || { echo "  !! no encuentro el registro en bf_seen de ip6 rdpguard pre — aborto"; exit 1; }
-    TX=$(mktemp --suffix=.nft)
-    echo "insert rule ip6 rdpguard pre position $H $RULE comment \"$COM\"" > "$TX"
-    nft -c -f "$TX"; nft -f "$TX"; rm -f "$TX"
-    echo "  [vivo] regla insertada antes de bf_seen"
-    ;;
-esac
+if [ "$L_OWN" = 1 ]; then
+  echo "  [vivo] ya estaba"
+else
+  A=$(nft -a list chain ip6 rdpguard pre)
+  H=$(awk '/add @bf_seen/{print $NF; exit}' <<<"$A")
+  [ -n "$H" ] || { echo "  !! no encuentro el registro en bf_seen de ip6 rdpguard pre — aborto"; exit 1; }
+  TX=$(mktemp --suffix=.nft)
+  echo "insert rule ip6 rdpguard pre position $H $RULE comment \"$COM\"" > "$TX"
+  nft -c -f "$TX"; nft -f "$TX"; rm -f "$TX"
+  echo "  [vivo] regla insertada antes de bf_seen"
+fi
 
 python3 - <<'PY'
 import subprocess
@@ -68,11 +70,7 @@ assert a < x < seen < lim, f"orden incorrecto auto={a} nat64={x} seen={seen} bf=
 print("  [orden] bf_auto -> exención NAT64 (solo veth-host) -> bf_seen -> @bf OK")
 PY
 
-N_OWN=$(grep -cF "$RULE comment \"$COM\"" "$CONF" || true)
-N_ANY=$(grep -c "64:ff9b:1::/96" "$CONF" || true)
-if [ "$N_ANY" != "$N_OWN" ] || [ "$N_OWN" -gt 1 ]; then
-  echo "  !! $CONF tiene reglas con 64:ff9b:1::/96 que no son esta (o duplicadas) — revisa a mano"; exit 1
-elif [ "$N_OWN" = 1 ]; then
+if [ "$C_OWN" = 1 ]; then
   echo "  [conf] ya estaba"
 else
   BK="$CONF.bak.nat64lim.$(date +%Y%m%d-%H%M%S)"; NEW="$CONF.nat64lim.new"
