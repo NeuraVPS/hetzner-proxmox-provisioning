@@ -53,7 +53,9 @@ class Commands(unittest.TestCase):
         self.assertEqual((v, vmids, [ub.entry_text(n) for n in ents]),
                          ("trust-set", [1302], ["149.56.212.201", "2001:41d0:1:2::/64"]))
         self.assertEqual(ub.parse_command("trust-set 1302 -")[1], [])
-        self.assertEqual(ub.parse_command("trust-set 1302 - gen=7000000000000001")[3], 7000000000000001)
+        self.assertEqual(ub.parse_command("trust-set 1302 - gen=7000000000000001")[3], (7000000000000001, False))
+        self.assertEqual(ub.parse_command("trust-set 1302 1.1.1.1 closed gen=7000000000000001")[3],
+                         (7000000000000001, True))
         self.assertEqual(ub.parse_command("trust-sync")[0], "trust-sync")
         self.assertEqual(ub.parse_command("trust-check 1.1.1.1")[0], "trust-check")
 
@@ -224,6 +226,146 @@ class Generations(unittest.TestCase):
         self.assertNotIn("1.1.1.1", self.live())
         ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))                  # otro: ya no cambia nada,
         self.assertEqual(len(self.batches), n + 2)                          # pero repara el set igual
+
+
+class ClosedMode(Generations):
+    def test_closed_needs_entries_and_follows_order(self):
+        out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+        self.assertTrue(out["closed"])
+        self.assertIn("add element ip rdpguard cust_closed { tcp . 11302, tcp . 21302, udp . 21302, tcp . 31302 }",
+                      self.live())
+        out = ub.trust_set(1302, [], self.g(2, ub.GEN_SET), closed=True)        # sin lista: queda abierta
+        self.assertEqual((out["closed"], out["closedRefused"]), (False, "no_entries"))
+        self.assertNotIn("add element ip rdpguard cust_closed", self.live())
+        ub.trust_set(1302, self.e, self.g(3, ub.GEN_SET), closed=True)
+        ub.revoke_trust([1302], self.g(4, ub.GEN_REVOKE))                      # VM reasignada: se abre
+        self.assertNotIn("21302", self.live())
+        self.assertEqual(ub.load_trust_state().closed, set())
+
+    def test_sync_closed(self):
+        ub.trust_sync({"gen": self.g(5, ub.GEN_SYNC), "vms": {1302: self.e, 1999: self.e}, "closed": {1999}})
+        st = ub.load_trust_state()
+        self.assertEqual(st.closed, {1999})
+        closed = [l for l in self.live().splitlines() if "add element ip rdpguard cust_closed" in l][0]
+        self.assertIn("tcp . 21999", closed)
+        self.assertNotIn("21302", closed)
+
+    def test_sync_reports_closed_missing(self):
+        class Static:
+            def reason(self, net):
+                return "static" if str(net.network_address) == "45.155.205.9" else None
+        ub.TrustChecker = Static
+        out = ub.trust_sync({"gen": self.g(5, ub.GEN_SYNC), "closed": {1302, 1999},
+                             "vms": {1302: [ub.trust_entry("45.155.205.9")], 1999: self.e}})
+        self.assertEqual(out["closedMissing"], [1302])       # su única IP se rechaza aquí: queda abierta
+
+    def test_pub6(self):
+        import json as _j
+        pol = os.path.join(self.dir, "pol.json")
+        with open(pol, "w") as fh:
+            _j.dump({"main": "2a01:4f9:2a:2d56::2"}, fh)
+        saved, ub.IPV6_POLICY_STATE = ub.IPV6_POLICY_STATE, pol
+        try:
+            ub.trust_set(1517, [ub.trust_entry("2001:41d0:1:2::/64"), ub.trust_entry("1.1.1.1")],
+                         self.g(1, ub.GEN_SET), closed=True)
+            self.assertIn("2a01:4f9:2a:2d56::5ed . 2a01:4f9:c01f:e::5ed", self.live())   # (directa . su identidad)
+            self.assertIn("2001:41d0:1:2::/64 . 2a01:4f9:2a:2d56::5ed", self.live())
+        finally:
+            ub.IPV6_POLICY_STATE = saved
+
+    def _ct_run(self, rows, fail_list=False, fail_del=False):
+        calls = []
+        orig = ub.run
+
+        class R:
+            def __init__(self, out="", err="", rc=0):
+                self.returncode, self.stdout, self.stderr = rc, out, err
+
+        def run(cmd, stdin=None):
+            if cmd[0] == "conntrack" and cmd[1] == "-L":
+                if fail_list:
+                    return R(err="conntrack: Operation not permitted", rc=1)
+                fam = cmd[cmd.index("-f") + 1]; proto = cmd[cmd.index("-p") + 1]
+                key = cmd[cmd.index("--orig-port-dst") + 1] if "--orig-port-dst" in cmd else cmd[cmd.index("-d") + 1]
+                return R("\n".join(rows.get((fam, proto, key), [])))
+            if cmd[0] == "conntrack" and cmd[1] == "-D":
+                calls.append(cmd)
+                if fail_del:
+                    return R(err="conntrack: Operation failed", rc=1)
+                return R(err="conntrack v1.4.8: 1 flow entries have been deleted.")
+            if cmd[:3] == ["nft", "-j", "list"] and cmd[-1] == "bf_allow":
+                elem = '["95.216.102.179"]' if cmd[4] == "ip" else "[]"
+                return R('{"nftables": [{"set": {"name": "bf_allow", "elem": %s}}]}' % elem)
+            return orig(cmd, stdin)
+        return run, calls
+
+    def test_cut_flows_on_close(self):
+        rows = {("ipv4", "tcp", "21302"): [
+            "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1",
+            "tcp 6 300 ESTABLISHED src=1.1.1.1 dst=77.42.49.79 sport=2 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=2",
+            "tcp 6 300 ESTABLISHED src=95.216.102.179 dst=77.42.49.79 sport=3 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=3",
+            # salida de un invitado a un servidor externo :21302 (sin DNAT): no se toca
+            "tcp 6 300 ESTABLISHED src=10.64.1.2 dst=5.6.7.8 sport=4 dport=21302 src=5.6.7.8 dst=91.98.53.130 sport=21302 dport=4"],
+            ("ipv6", "tcp", "21302"): [
+            # directa de OTRA VM en el mismo puerto (puerto sin traducir): no se toca
+            "tcp 6 300 ESTABLISHED src=2001:db8:9::1 dst=2a01:4f9:2a:2d56::7cf sport=5 dport=21302 src=2a01:4f9:c01f:e::7cf dst=2001:db8:9::1 sport=21302 dport=5",
+            # forward v6 de esta VM (puerto traducido a 3389): se corta
+            "tcp 6 300 ESTABLISHED src=2001:db8:9::1 dst=2a01:4f9:2a:2d56::2 sport=6 dport=21302 src=2a01:4f9:c01f:e::51e dst=2001:db8:9::1 sport=3389 dport=6"]}
+        run, calls = self._ct_run(rows)
+        ub.run = run
+        try:
+            out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+        finally:
+            ub.run = self.saved[2]
+        self.assertEqual((out["flowsCut"], out["flowsCutOk"]), (2, True))
+        self.assertEqual(sorted(c[c.index("-s") + 1] for c in calls), ["2001:db8:9::1", "8.8.8.8"])
+        self.assertTrue(all("--sport" in c and "--dport" in c and "-d" in c for c in calls))   # tupla completa
+
+    def test_crash_between_policy_and_cut_retries_on_restore(self):
+        orig_cut = ub.cut_flows
+        ub.cut_flows = lambda before, st: (_ for _ in ()).throw(SystemExit("corte de luz"))
+        try:
+            with self.assertRaises(SystemExit):
+                ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+        finally:
+            ub.cut_flows = orig_cut
+        st = ub.load_trust_state()
+        self.assertEqual((st.closed, st.cut_pending), ({1302}, {1302}))     # guardado junto con la política
+        rows = {("ipv4", "tcp", "21302"): [
+            "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1"]}
+        run, calls = self._ct_run(rows)
+        ub.run = run
+        try:
+            out = ub.trust_restore()
+        finally:
+            ub.run = self.saved[2]
+        self.assertEqual((out["flowsCutOk"], len(calls)), (True, 1))
+        self.assertEqual(ub.load_trust_state().cut_pending, set())
+
+    def test_cut_flows_failure_stays_pending_and_retries(self):
+        rows = {("ipv4", "tcp", "21302"): [
+            "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1"]}
+        run, calls = self._ct_run(rows, fail_list=True)
+        ub.run = run
+        try:
+            out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+            self.assertEqual(out["flowsCutOk"], False)
+            self.assertEqual(ub.load_trust_state().cut_pending, {1302})
+            run2, calls2 = self._ct_run(rows, fail_del=True)
+            ub.run = run2
+            out = ub.trust_set(1302, self.e, self.g(2, ub.GEN_SET), closed=True)   # sin cambios: reintenta
+            self.assertEqual((out["flowsCutOk"], len(calls2)), (False, 1))
+            run3, calls3 = self._ct_run(rows)
+            ub.run = run3
+            out = ub.trust_restore()
+            self.assertEqual((out["flowsCutOk"], len(calls3)), (True, 1))
+            self.assertEqual(ub.load_trust_state().cut_pending, set())
+        finally:
+            ub.run = self.saved[2]
+
+    def test_doc_closed_requires_list(self):
+        with self.assertRaises(ub.BadRequest):
+            ub.parse_trust_doc('{"gen": 7000000000000001, "vms": {}, "closed": ["1302"]}', "x")
 
 
 class SweepguardExempt(unittest.TestCase):

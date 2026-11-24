@@ -723,6 +723,39 @@ Probar sin tocar las bases: `test_customer_trust_netns.sh` (v4+v6, nft real). De
 `rollback_customer_trust.sh` (dirigido; deja el estado para volver a desplegar). Al sustituir una base:
 `deploy_customer_trust.sh` y esperar a la reconciliación (o lanzarla) para llenar el set.
 
+## Modo cerrado por VPS — `cust_closed` (2026-11-24)
+
+Casilla del panel «Bloquear todas las conexiones desde IPs fuera de esta lista». En los puertos públicos de una VM
+cerrada (TCP 1xxxx/2xxxx/3xxxx, UDP 2xxxx y su IPv6 pública directa) solo entran su lista de confianza y la
+infraestructura (`bf_allow`); el resto se descarta.
+
+* `deploy_customer_closed.sh` (requiere cust_trust) crea una cadena `closed` en el hook **forward** de cada tabla
+  rdpguard. Solo mira conexiones que la base DNATeó (`ct status dnat`), solo en su sentido ORIGINAL
+  (`ct direction original`) y por el puerto que pidió el cliente (`ct original proto-dst`):
+  `bf_allow` → return; `saddr . proto . puerto @cust_trust` → return; `proto . puerto @cust_closed` → drop. En ip6
+  además `iifname "veth-host" ip6 saddr 64:ff9b:1::/96` → return (IPv4 de Jool, ya decidido en v4) y la IPv6 directa
+  (par `ct original ip6 daddr . ct reply ip6 saddr @cust_closed_pub6` = directa . identidad de ESA VM, con su lista
+  en `cust_trust_pub6`: solo decide si el DNAT llevó de verdad esa dirección a esa VM). En ip6 la IPv6 directa se reconoce por su
+  destino y solo se le aplica la política de SU VM; los forwards por puerto se reconocen porque el DNAT de ip6 nat
+  traduce el puerto (`ct reply proto-src { 22, 445, 3389 }`), mientras que el DNAT directo lo conserva: la lista o el
+  cierre de una VM no alcanzan el servicio directo de otra en el mismo número de puerto, y una dirección sin asignar
+  del /64 que reciba un forward por puerto sí queda cubierta.
+* Por qué en forward y no en `pre` (revisión de Codex del 24/11): así cubre exactamente los forwards, se llegue por la
+  dirección que se llegue (el DNAT v6 elige por puerto, sin mirar el destino); no toca las respuestas de conexiones que
+  inicia la propia VM (SNAT a su public6 o a la base: van en sentido «reply»); y vale igual para TCP y UDP y para el
+  tráfico de VM a VM por el VIP. La excepción de salida de invitados de `pre` (`10.64/16 meta l4proto != tcp accept`)
+  no le afecta.
+* Pasa: `bf_allow` (bases → conncheck de las bases, DEVEL). No pasan: «Desbloquear mi IP» (cust_allow), las Cloud
+  Functions (sin IP fija: NeuraVPS no les manda SSH/sondas públicas a una VM cerrada) ni VM→VM por el VIP. La consola
+  VNC del panel no usa estos puertos. Al cerrar (o al quitar una IP estando cerrado), `neuravps-unblock-ip` corta en conntrack —y con ello
+  en la flowtable, que se salta las reglas— las sesiones ya establecidas hacia esa VM que no sean de su lista, de
+  bf_allow ni de Jool (`flowsCut`, `flowsCutOk`).
+* `neuravps-unblock-ip trust-set <vmid> <lista> closed gen=…` y `trust-sync` (`"closed": ["<vmid>"]`): cerrado solo
+  con al menos una entrada aceptada (si no, abierta y `closedRefused`); `revoke-vm` abre; sin los sets la VM queda
+  abierta (`closedApplied: false`). IPv6 directa = main/64 de la base + vmid (`/var/lib/base-nat/ipv6-policy.json`).
+* Prueba: `test_customer_closed_netns.sh` con reenvío real (DNAT v4/v6, IPv6 directa, SNAT de salida, VM→VM TCP/UDP,
+  destino v6 enrutado no local, Jool, bf_allow, cust_allow, sync, rollback). Deshacer: `rollback_customer_closed.sh`.
+
 ## Los clientes IPv4 no pasan dos veces por el limitador (2026-11-24)
 
 Un cliente IPv4 se juzga en `ip rdpguard pre` con su IP real (bf_static, cust_trust, bf_auto, bf_seen, bf_src
