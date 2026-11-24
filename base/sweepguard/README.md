@@ -755,3 +755,15 @@ infraestructura (`bf_allow`); el resto se descarta.
   abierta (`closedApplied: false`). IPv6 directa = main/64 de la base + vmid (`/var/lib/base-nat/ipv6-policy.json`).
 * Prueba: `test_customer_closed_netns.sh` con reenvío real (DNAT v4/v6, IPv6 directa, SNAT de salida, VM→VM TCP/UDP,
   destino v6 enrutado no local, Jool, bf_allow, cust_allow, sync, rollback). Deshacer: `rollback_customer_closed.sh`.
+
+## Los clientes IPv4 no pasan dos veces por el limitador (2026-11-24)
+
+Un cliente IPv4 se juzga en `ip rdpguard pre` con su IP real (bf_static, cust_trust, bf_auto, bf_seen, bf_src
+60/min, bf_port 12/min por origen y puerto). Luego vuelve de Jool por `veth-host` como `64:ff9b:1::<VIP>` y
+pasaba otra vez por `ip6 rdpguard pre`, donde `@bf` (12/min, ráfaga 6) trataba a TODOS los clientes IPv4 de una
+VM como una sola fuente: 12 conexiones nuevas por minuto por puerto entre todos, y una IP de confianza con 10 SSH
+simultáneos veía SYN descartados (b0, 24/11: 9 de 12 en 3 s). `deploy_nat64_limiter_exemption.sh` inserta
+`iifname "veth-host" ip6 saddr 64:ff9b:1::/96 accept` justo antes del registro en bf_seen (después de bf_auto):
+solo lo que llega por el enlace de Jool; una 64:ff9b:1:: falseada por la interfaz pública sigue las reglas.
+sweepguard ya ignoraba 64:ff9b:1::/96 en v6. Prueba: `test_nat64_limiter_netns.sh` (paquetes) y
+`test_nat64_limiter_netns.sh <conf real>` (despliegue + rollback). Deshacer: `rollback_nat64_limiter_exemption.sh`.
