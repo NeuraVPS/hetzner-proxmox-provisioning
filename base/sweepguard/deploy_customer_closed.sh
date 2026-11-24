@@ -18,8 +18,9 @@
 #     ct direction original ct status dnat meta l4proto . ct original proto-dst @cust_closed drop
 #   ip6 rdpguard closed: lo mismo con ip6, más
 #     iifname "veth-host" ip6 saddr 64:ff9b:1::/96 return   (IPv4 de Jool: ya decidido en la tabla ip)
-#     ... ct original ip6 daddr @cust_closed_pub6 ct original ip6 saddr . ct original ip6 daddr @cust_trust_pub6 return
-#     ... ct original ip6 daddr @cust_closed_pub6 drop
+#     ... ct original ip6 daddr . ct reply ip6 saddr @cust_closed_pub6 ct original ip6 saddr . ct original ip6 daddr @cust_trust_pub6 return
+#     ... ct original ip6 daddr . ct reply ip6 saddr @cust_closed_pub6 drop
+#     (par «IPv6 directa . identidad de la VM»: solo si el DNAT llevó esa dirección a ESA VM)
 # «Desbloquear mi IP» (cust_allow, en la cadena pre) no abre una VM cerrada: el
 # drop de aquí va aparte. Requiere deploy_customer_trust.sh (usa @cust_trust).
 # Los elementos los escribe neuravps-unblock-ip (trust-set ... closed / trust-sync).
@@ -50,8 +51,8 @@ FWD6="ct reply proto-src { 22, 445, 3389 }"
 RULES6=(
   "iifname \"$JOOL_IF\" ip6 saddr 64:ff9b:1::/96 return"
   "$O ct original ip6 saddr @bf_allow return"
-  "$O ct original ip6 daddr @cust_closed_pub6 ct original ip6 saddr . ct original ip6 daddr @cust_trust_pub6 return"
-  "$O ct original ip6 daddr @cust_closed_pub6 drop"
+  "$O ct original ip6 daddr . ct reply ip6 saddr @cust_closed_pub6 ct original ip6 saddr . ct original ip6 daddr @cust_trust_pub6 return"
+  "$O ct original ip6 daddr . ct reply ip6 saddr @cust_closed_pub6 drop"
   "$O $FWD6 ct original ip6 saddr . meta l4proto . ct original proto-dst @cust_trust return"
   "$O $FWD6 meta l4proto . ct original proto-dst @cust_closed drop"
 )
@@ -75,7 +76,7 @@ else
     echo "add chain ip rdpguard closed { $CHAIN4 }"
     for r in "${RULES4[@]}"; do echo "add rule ip rdpguard closed $r comment \"$COM\""; done
     echo "add set ip6 rdpguard cust_closed { type inet_proto . inet_service; size 65536; }"
-    echo "add set ip6 rdpguard cust_closed_pub6 { type ipv6_addr; size 65536; }"
+    echo "add set ip6 rdpguard cust_closed_pub6 { type ipv6_addr . ipv6_addr; size 65536; }"
     echo "add set ip6 rdpguard cust_trust_pub6 { type ipv6_addr . ipv6_addr; flags interval; size 262144; }"
     echo "add chain ip6 rdpguard closed { $CHAIN4 }"
     for r in "${RULES6[@]}"; do echo "add rule ip6 rdpguard closed $r comment \"$COM\""; done
@@ -148,7 +149,7 @@ def patch(s, head, sets, rules):
 S = "    set {} {{\n        type {}\n{}        size {}\n    }}\n"
 s = patch(s, "table ip rdpguard {", [S.format("cust_closed", "inet_proto . inet_service", "", 65536)], r4)
 s = patch(s, "table ip6 rdpguard {", [S.format("cust_closed", "inet_proto . inet_service", "", 65536),
-                                     S.format("cust_closed_pub6", "ipv6_addr", "", 65536),
+                                     S.format("cust_closed_pub6", "ipv6_addr . ipv6_addr", "", 65536),
                                      S.format("cust_trust_pub6", "ipv6_addr . ipv6_addr", "        flags interval\n", 262144)], r6)
 open(conf, "w").write(s)
 print("  [conf] sets y cadena closed escritos (fichero hermano)")

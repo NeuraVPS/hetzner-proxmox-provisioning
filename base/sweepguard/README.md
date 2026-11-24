@@ -734,7 +734,8 @@ infraestructura (`bf_allow`); el resto se descarta.
   (`ct direction original`) y por el puerto que pidió el cliente (`ct original proto-dst`):
   `bf_allow` → return; `saddr . proto . puerto @cust_trust` → return; `proto . puerto @cust_closed` → drop. En ip6
   además `iifname "veth-host" ip6 saddr 64:ff9b:1::/96` → return (IPv4 de Jool, ya decidido en v4) y la IPv6 directa
-  (`ct original ip6 daddr @cust_closed_pub6`, con su lista en `cust_trust_pub6`). En ip6 la IPv6 directa se reconoce por su
+  (par `ct original ip6 daddr . ct reply ip6 saddr @cust_closed_pub6` = directa . identidad de ESA VM, con su lista
+  en `cust_trust_pub6`: solo decide si el DNAT llevó de verdad esa dirección a esa VM). En ip6 la IPv6 directa se reconoce por su
   destino y solo se le aplica la política de SU VM; los forwards por puerto se reconocen porque el DNAT de ip6 nat
   traduce el puerto (`ct reply proto-src { 22, 445, 3389 }`), mientras que el DNAT directo lo conserva: la lista o el
   cierre de una VM no alcanzan el servicio directo de otra en el mismo número de puerto, y una dirección sin asignar
@@ -747,7 +748,9 @@ infraestructura (`bf_allow`); el resto se descarta.
 * Pasa: `bf_allow` (bases → conncheck de las bases, DEVEL). No pasan: «Desbloquear mi IP» (cust_allow), las Cloud
   Functions (sin IP fija: NeuraVPS no les manda SSH/sondas públicas a una VM cerrada) ni VM→VM por el VIP. La consola
   VNC del panel no usa estos puertos. Las conexiones ya descargadas en la flowtable antes de cerrar siguen hasta que
-  terminen; las nuevas no entran.
+  terminen... **no**: al cerrar (o al quitar una IP estando cerrado) `neuravps-unblock-ip` corta en conntrack —y con
+  ello en la flowtable, que se salta las reglas— las sesiones ya establecidas hacia esa VM que no sean de su lista,
+  de bf_allow ni de Jool (`flowsCut`, `flowsCutOk`).
 * `neuravps-unblock-ip trust-set <vmid> <lista> closed gen=…` y `trust-sync` (`"closed": ["<vmid>"]`): cerrado solo
   con al menos una entrada aceptada (si no, abierta y `closedRefused`); `revoke-vm` abre; sin los sets la VM queda
   abierta (`closedApplied: false`). IPv6 directa = main/64 de la base + vmid (`/var/lib/base-nat/ipv6-policy.json`).

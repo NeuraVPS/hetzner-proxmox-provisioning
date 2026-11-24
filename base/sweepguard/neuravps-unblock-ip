@@ -806,17 +806,123 @@ def public6_prefix():
         raise RuntimeError(f"{IPV6_POLICY_STATE}: bad main {str(main)[:40]!r}")
 
 
+IDENT6 = ipaddress.IPv6Network("2a01:4f9:c01f:e::/64")   # identidad IPv6 de cada VM (base_ipv6_policy.IDENT)
+
+
+def pub6_of(prefix, vmid):
+    return ipaddress.IPv6Address(int(prefix.network_address) + vmid).compressed
+
+
+def ident6_of(vmid):
+    return ipaddress.IPv6Address(int(IDENT6.network_address) + vmid).compressed
+
+
 def closed_elements(st):
-    """Elementos de los sets del modo cerrado para las VMs cerradas."""
+    """Elementos de los sets del modo cerrado para las VMs cerradas.
+    `pub6` son PARES (IPv6 directa . identidad de la VM): la regla solo decide
+    si el DNAT llevó de verdad esa dirección a ESA VM (`ct reply ip6 saddr`),
+    no si la dirección se calculó para un vmid sin IPv6 directa y el tráfico
+    acabó en otra VM por un forward."""
     ports, pub6, tpub6 = [], [], []
     prefix = public6_prefix() if st.closed else None
     for vmid in sorted(st.closed):
         ports += [f"{proto} . {base + vmid}" for proto, base in TRUST_PROTOS]
         if prefix is not None:
-            addr = ipaddress.IPv6Address(int(prefix.network_address) + vmid).compressed
-            pub6.append(addr)
+            addr = pub6_of(prefix, vmid)
+            pub6.append(f"{addr} . {ident6_of(vmid)}")
             tpub6 += [f"{entry_text(n)} . {addr}" for n in st.vms.get(vmid, []) if n.version == 6]
     return {"ports": ports, "pub6": pub6, "trust_pub6": tpub6}
+
+
+_CT_SRC = re.compile(r"\bsrc=([0-9A-Fa-f:.]+)")
+
+
+def _allowed_nets(fam):
+    """Redes de bf_allow de esa familia (infraestructura: no se le cortan sesiones)."""
+    nets = []
+    r = run(["nft", "-j", "list", "set", fam, TABLE, "bf_allow"])
+    if r.returncode != 0:
+        return nets
+    try:
+        objs = json.loads(r.stdout or '{"nftables": []}').get("nftables", [])
+    except ValueError:
+        objs = []
+    for obj in objs:
+        for e in (obj.get("set") or {}).get("elem", []) or []:
+            try:
+                if isinstance(e, str):
+                    nets.append(ipaddress.ip_network(e))
+                elif isinstance(e, dict) and "prefix" in e:
+                    nets.append(ipaddress.ip_network(f"{e['prefix']['addr']}/{e['prefix']['len']}", strict=False))
+                elif isinstance(e, dict) and "range" in e:
+                    lo, hi = (ipaddress.ip_address(x) for x in e["range"])
+                    nets.extend(ipaddress.summarize_address_range(lo, hi))
+            except (ValueError, KeyError, TypeError):
+                continue
+    return nets
+
+
+def _flow_sources(args):
+    """Orígenes (dirección original) de las entradas de conntrack que casan."""
+    r = run(["conntrack", "-L"] + args)
+    out = set()
+    for ln in (r.stdout or "").splitlines():
+        m = _CT_SRC.search(ln)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def cut_flows(before, st):
+    """Corta las sesiones YA establecidas (y con ello su entrada en la flowtable,
+    que se salta las reglas) hacia las VMs que quedan cerradas y cuya política
+    cambió (se cierran, o pierden una IP de la lista), salvo las de su lista, las
+    de bf_allow y las de Jool (64:ff9b:1::/96: su lado IPv4 se corta en la tabla
+    ip). Sin esto, una sesión acelerada seguiría pasando tras cerrar.
+    `before`: {vmid: (cerrada, frozenset de textos)} antes del cambio.
+    Devuelve {"flowsCut": n, "flowsCutOk": bool}."""
+    changed = [v for v in sorted(st.closed)
+               if before.get(v) != (True, frozenset(entry_text(n) for n in st.vms.get(v, [])))]
+    if not changed:
+        return {"flowsCut": 0, "flowsCutOk": True}
+    cut, ok = 0, True
+    allow = {"ip": _allowed_nets("ip"), "ip6": _allowed_nets("ip6")}
+    try:
+        prefix = public6_prefix()
+    except RuntimeError:
+        prefix, ok = None, False
+    for vmid in changed:
+        nets = st.vms.get(vmid, [])
+        targets = []
+        for proto, base in TRUST_PROTOS:
+            for fam, cf in (("ip", "ipv4"), ("ip6", "ipv6")):
+                targets.append((fam, ["-f", cf, "-p", proto, "--orig-port-dst", str(base + vmid)],
+                                ["-p", proto, "--orig-port-dst", str(base + vmid)]))
+        if prefix is not None:
+            targets.append(("ip6", ["-f", "ipv6", "-d", pub6_of(prefix, vmid)], ["-d", pub6_of(prefix, vmid)]))
+        for fam, list_args, del_args in targets:
+            try:
+                srcs = _flow_sources(list_args)
+            except Exception:  # noqa: BLE001
+                ok = False
+                continue
+            for src in srcs:
+                try:
+                    ip = ipaddress.ip_address(src)
+                except ValueError:
+                    continue
+                if ip.version == 6 and ip in ipaddress.ip_network("64:ff9b:1::/96"):
+                    continue
+                if any(ip.version == n.version and ip in n for n in nets + allow[fam]):
+                    continue
+                r = run(["conntrack", "-D", "-f", "ipv4" if fam == "ip" else "ipv6", "-s", src] + del_args)
+                m = re.search(r"(\d+) flow entr", (r.stderr or "") + (r.stdout or ""))
+                cut += int(m.group(1)) if m else 0
+    return {"flowsCut": cut, "flowsCutOk": ok}
+
+
+def _snapshot(st):
+    return {v: (v in st.closed, frozenset(entry_text(n) for n in l)) for v, l in st.vms.items()}
 
 
 def trust_check(net):
@@ -836,6 +942,7 @@ def trust_set(vmid, nets, gen, closed=False):
         out = {"result": "stale", "vmid": vmid, "gen": gen, "current": st.last(vmid)}
         out.update(apply_trust(st))
         return out
+    before = _snapshot(st)
     ok, rejected = clean_list(nets, TrustChecker())
     if ok:
         st.vms[vmid] = ok
@@ -851,6 +958,8 @@ def trust_set(vmid, nets, gen, closed=False):
     if closed and not ok:
         out["closedRefused"] = "no_entries"
     out.update(apply_trust(st))
+    if out.get("closedApplied"):
+        out.update(cut_flows(before, st))
     return out
 
 
@@ -893,10 +1002,12 @@ def trust_sync(payload):
     if gen <= st.sync_gen:
         out = {"result": "synced", "gen": gen, "staleSnapshot": True,
                "closedMissing": sorted(v for v in payload.get("closed", ()) if v not in st.closed)[:500],
+               "closedMissingTruncated": len([v for v in payload.get("closed", ()) if v not in st.closed]) > 500,
                "rejected": {},
                "rejectedCount": 0, "staleVms": [], "changedVms": []}
         out.update(apply_trust(st))
         return out
+    snap_before = _snapshot(st)
     before = {v: [entry_text(n) for n in l] + (["closed"] if v in st.closed else [])
               for v, l in st.vms.items()}
     checker = TrustChecker()
@@ -920,14 +1031,18 @@ def trust_sync(payload):
     # cierres pedidos que esta base NO aplica (lista rechazada entera aquí, u
     # orden más nueva): NeuraVPS los marca pendientes en esos VPS
     closed_missing = sorted(v for v in payload.get("closed", ()) if v not in st.closed)
+    closed_missing_truncated = len(closed_missing) > 500
     after = {v: [entry_text(n) for n in l] + (["closed"] if v in st.closed else [])
               for v, l in st.vms.items()}
     out = {"result": "synced", "gen": gen, "closedMissing": closed_missing[:500],
+           "closedMissingTruncated": closed_missing_truncated,
            "rejected": dict(list(rejected.items())[:50]),
            "rejectedCount": len(rejected), "staleVms": stale[:100],
            "changedVms": sorted(v for v in set(before) | set(after)
                                 if before.get(v) != after.get(v))[:100]}
     out.update(apply_trust(st))
+    if out.get("closedApplied"):
+        out.update(cut_flows(snap_before, st))
     return out
 
 

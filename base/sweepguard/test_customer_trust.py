@@ -268,10 +268,46 @@ class ClosedMode(Generations):
         try:
             ub.trust_set(1517, [ub.trust_entry("2001:41d0:1:2::/64"), ub.trust_entry("1.1.1.1")],
                          self.g(1, ub.GEN_SET), closed=True)
-            self.assertIn("2a01:4f9:2a:2d56::5ed", self.live())                 # su IPv6 directa
+            self.assertIn("2a01:4f9:2a:2d56::5ed . 2a01:4f9:c01f:e::5ed", self.live())   # (directa . su identidad)
             self.assertIn("2001:41d0:1:2::/64 . 2a01:4f9:2a:2d56::5ed", self.live())
         finally:
             ub.IPV6_POLICY_STATE = saved
+
+    def test_cut_flows_on_close(self):
+        calls = []
+        orig = ub.run
+
+        class R:
+            def __init__(self, out="", err="", rc=0):
+                self.returncode, self.stdout, self.stderr = rc, out, err
+
+        def run(cmd, stdin=None):
+            if cmd[0] == "conntrack" and cmd[1] == "-L":
+                if "--orig-port-dst" in cmd and cmd[cmd.index("--orig-port-dst") + 1] == "21302" and "ipv4" in cmd and "tcp" in cmd:
+                    return R("tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302\n"
+                             "tcp 6 300 ESTABLISHED src=1.1.1.1 dst=77.42.49.79 sport=2 dport=21302\n"
+                             "tcp 6 300 ESTABLISHED src=95.216.102.179 dst=77.42.49.79 sport=3 dport=21302\n")
+                return R()
+            if cmd[0] == "conntrack" and cmd[1] == "-D":
+                calls.append(cmd)
+                return R(err="conntrack v1.4.8: 1 flow entries have been deleted.")
+            if cmd[:3] == ["nft", "-j", "list"] and cmd[-1] == "bf_allow" and cmd[3] == "set" and cmd[4] == "ip":
+                return R('{"nftables": [{"set": {"name": "bf_allow", "elem": ["95.216.102.179"]}}]}')
+            return orig(cmd, stdin)
+        ub.run = run
+        try:
+            out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+        finally:
+            ub.run = orig
+        self.assertEqual((out["flowsCut"], out["flowsCutOk"]), (1, True))
+        self.assertEqual([c[c.index("-s") + 1] for c in calls], ["8.8.8.8"])   # ni su lista ni bf_allow
+        n = len(calls)
+        ub.run = run
+        try:
+            out = ub.trust_set(1302, self.e, self.g(2, ub.GEN_SET), closed=True)   # sin cambios: no corta
+        finally:
+            ub.run = orig
+        self.assertEqual((out["flowsCut"], len(calls)), (0, n))
 
     def test_doc_closed_requires_list(self):
         with self.assertRaises(ub.BadRequest):
