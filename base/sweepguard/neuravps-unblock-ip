@@ -232,6 +232,17 @@ def run(cmd, stdin=None):
                           timeout=NFT_TIMEOUT)
 
 
+def set_presence(fam, name):
+    """True / False si el set existe o no; RuntimeError si nft no contesta o da
+    otro error (no se confunde «no está» con «no se pudo mirar»)."""
+    r = run(["nft", "-t", "list", "set", fam, TABLE, name])
+    if r.returncode == 0:
+        return True
+    if "No such file or directory" in r.stderr:
+        return False
+    raise RuntimeError(f"nft list set {fam} {name}: {' '.join(r.stderr.split())[:160]}")
+
+
 def set_exists(fam, name):
     # -t: sin elementos (bf_static tiene ~14.000 en v4)
     return run(["nft", "-t", "list", "set", fam, TABLE, name]).returncode == 0
@@ -712,7 +723,7 @@ def apply_trust(st, path=None):
     siempre igual que el fichero (repara un intento anterior a medias)."""
     path = path or TRUST_STATE
     for fam in ("ip", "ip6"):
-        if not set_exists(fam, TRUST_SET):
+        if not set_presence(fam, TRUST_SET):
             raise RuntimeError(f"set {fam} {TABLE} {TRUST_SET} missing (deploy_customer_trust.sh)")
     elems = trust_elements(st.vms)
     batch = ""
@@ -799,10 +810,10 @@ def trust_sync(payload):
     recibieron despues otra orden se quedan como estan. La foto pasa a ser el
     suelo de todas las VMs que no trae."""
     gen, wanted = payload["gen"], payload["vms"]
-    try:
-        st = load_trust_state()
-    except RuntimeError:
-        st = TrustState()        # estado roto: lo sustituye la foto autoritativa
+    # Sin el estado no se conoce el suelo ni las revisiones: una foto atrasada
+    # podria deshacer una revocacion posterior. Se falla (NeuraVPS reintenta);
+    # un fichero corrupto se aparta A MANO (README) y entonces la foto entra.
+    st = load_trust_state()
     if gen <= st.sync_gen:
         out = {"result": "synced", "gen": gen, "staleSnapshot": True, "rejected": {},
                "rejectedCount": 0, "staleVms": [], "changedVms": []}
@@ -862,8 +873,11 @@ def revoke_trust(vmids, gen):
     despues. El set se reescribe SIEMPRE (repara un intento anterior a medias).
     Sin set (base sin desplegar) no hace nada. Devuelve cuantas VMs perdieron
     la confianza."""
-    if not (set_exists("ip", TRUST_SET) and set_exists("ip6", TRUST_SET)):
-        return None
+    present = [set_presence(fam, TRUST_SET) for fam in ("ip", "ip6")]
+    if not any(present):
+        return None               # confirmado: base sin desplegar (no hay nada que quitar)
+    if not all(present):
+        raise RuntimeError(f"{TRUST_SET} only in one family: not revoking half; fix the base")
     st = load_trust_state()
     gone = 0
     for v in vmids:

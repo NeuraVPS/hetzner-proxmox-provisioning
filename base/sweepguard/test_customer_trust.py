@@ -128,6 +128,8 @@ class Generations(unittest.TestCase):
         self.saved = (ub.TRUST_STATE, ub.set_exists, ub.run, ub.TrustChecker)
         ub.TRUST_STATE = os.path.join(self.dir, "cust_trust.json")
         ub.set_exists = lambda fam, name: True
+        self.saved_pres = ub.set_presence
+        ub.set_presence = lambda fam, name: True
         self.batches = []
 
         class R:
@@ -148,6 +150,7 @@ class Generations(unittest.TestCase):
 
     def tearDown(self):
         ub.TRUST_STATE, ub.set_exists, ub.run, ub.TrustChecker = self.saved
+        ub.set_presence = self.saved_pres
 
     def g(self, dus, phase):
         return (self.us + dus) * 4 + phase
@@ -184,6 +187,23 @@ class Generations(unittest.TestCase):
         self.assertEqual(out["staleVms"], [1302])
         self.assertNotIn("1.1.1.1", self.live())
         self.assertTrue(ub.trust_sync({"gen": self.g(9, ub.GEN_SYNC), "vms": {1302: self.e}})["staleSnapshot"])
+
+    def test_revoke_fails_on_unreadable_or_half_sets(self):
+        ub.trust_set(1302, self.e, self.g(0, ub.GEN_SET))
+        ub.set_presence = lambda fam, name: True if fam == "ip" else (_ for _ in ()).throw(RuntimeError("nft"))
+        with self.assertRaises(RuntimeError):
+            ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))
+        ub.set_presence = lambda fam, name: fam == "ip"
+        with self.assertRaises(RuntimeError):
+            ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))
+        ub.set_presence = lambda fam, name: False
+        self.assertIsNone(ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE)))   # base sin desplegar
+
+    def test_sync_fails_if_state_unreadable(self):
+        with open(ub.TRUST_STATE, "w") as fh:
+            fh.write("garbage")
+        with self.assertRaises(RuntimeError):
+            ub.trust_sync({"gen": self.g(10, ub.GEN_SYNC), "vms": {}})
 
     def test_revoke_retry_reapplies_live_set(self):
         ub.trust_set(1302, self.e, self.g(0, ub.GEN_SET))

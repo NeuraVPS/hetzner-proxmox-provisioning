@@ -705,6 +705,10 @@ cortaba todos sus VPS).
   baja del cliente, 2 revocación, 3 reaplicación tras la revocación del mismo evento). Cada VM guarda la de su
   última orden y la última foto completa es el suelo de todas; solo se acepta una orden POSTERIOR (estricto). Una
   orden descartada (`stale`) igualmente reescribe el set desde el fichero.
+* **Estado ilegible** (`cust_trust.json` corrupto): todo falla, también `trust-sync` (sin el suelo una foto
+  atrasada podría deshacer una revocación). Recuperación a mano: `mv cust_trust.json cust_trust.json.broken`
+  y lanzar la reconciliación (o esperar a la siguiente hora). `revoke-vm` falla si `cust_trust` falta en una
+  sola familia o nft no contesta; solo «ausente en las dos» (base sin desplegar) es `trustRemoved: null`.
 * Persistencia: set y regla en `/etc/nftables.conf`; elementos por `neuravps-cust-trust-restore.service`
   (arranque, tras nftables) y por la reconciliación horaria de NeuraVPS (`trusted_ips_reconcile`, `trust-sync`
   desde Firestore `trusted_ips/`).

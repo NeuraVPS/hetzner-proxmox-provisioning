@@ -52,7 +52,7 @@ class FakeBase:
             return Done(1, err="conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted.\n")
         assert cmd[0] == "nft", cmd
         if cmd[1:3] == ["-t", "list"]:
-            return Done(0 if (cmd[4], cmd[6]) in self.sets else 1)
+            return Done(0) if (cmd[4], cmd[6]) in self.sets else Done(1, err="Error: No such file or directory")
         if cmd[1:3] == ["-j", "list"]:
             fam, name = cmd[4], cmd[6]
             if (fam, name) not in self.sets:
