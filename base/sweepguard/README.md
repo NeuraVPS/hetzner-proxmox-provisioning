@@ -747,10 +747,9 @@ infraestructura (`bf_allow`); el resto se descarta.
   no le afecta.
 * Pasa: `bf_allow` (bases → conncheck de las bases, DEVEL). No pasan: «Desbloquear mi IP» (cust_allow), las Cloud
   Functions (sin IP fija: NeuraVPS no les manda SSH/sondas públicas a una VM cerrada) ni VM→VM por el VIP. La consola
-  VNC del panel no usa estos puertos. Las conexiones ya descargadas en la flowtable antes de cerrar siguen hasta que
-  terminen... **no**: al cerrar (o al quitar una IP estando cerrado) `neuravps-unblock-ip` corta en conntrack —y con
-  ello en la flowtable, que se salta las reglas— las sesiones ya establecidas hacia esa VM que no sean de su lista,
-  de bf_allow ni de Jool (`flowsCut`, `flowsCutOk`).
+  VNC del panel no usa estos puertos. Al cerrar (o al quitar una IP estando cerrado), `neuravps-unblock-ip` corta en conntrack —y con ello
+  en la flowtable, que se salta las reglas— las sesiones ya establecidas hacia esa VM que no sean de su lista, de
+  bf_allow ni de Jool (`flowsCut`, `flowsCutOk`).
 * `neuravps-unblock-ip trust-set <vmid> <lista> closed gen=…` y `trust-sync` (`"closed": ["<vmid>"]`): cerrado solo
   con al menos una entrada aceptada (si no, abierta y `closedRefused`); `revoke-vm` abre; sin los sets la VM queda
   abierta (`closedApplied: false`). IPv6 directa = main/64 de la base + vmid (`/var/lib/base-nat/ipv6-policy.json`).
