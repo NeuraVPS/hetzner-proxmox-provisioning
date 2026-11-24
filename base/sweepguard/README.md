@@ -722,3 +722,15 @@ salta. Solo retrasa SYN (el TCP reintenta); no bloquea ni cuenta para sweepguard
 Probar sin tocar las bases: `test_customer_trust_netns.sh` (v4+v6, nft real). Deshacer:
 `rollback_customer_trust.sh` (dirigido; deja el estado para volver a desplegar). Al sustituir una base:
 `deploy_customer_trust.sh` y esperar a la reconciliación (o lanzarla) para llenar el set.
+
+## Los clientes IPv4 no pasan dos veces por el limitador (2026-11-24)
+
+Un cliente IPv4 se juzga en `ip rdpguard pre` con su IP real (bf_static, cust_trust, bf_auto, bf_seen, bf_src
+60/min, bf_port 12/min por origen y puerto). Luego vuelve de Jool por `veth-host` como `64:ff9b:1::<VIP>` y
+pasaba otra vez por `ip6 rdpguard pre`, donde `@bf` (12/min, ráfaga 6) trataba a TODOS los clientes IPv4 de una
+VM como una sola fuente: 12 conexiones nuevas por minuto por puerto entre todos, y una IP de confianza con 10 SSH
+simultáneos veía SYN descartados (b0, 24/11: 9 de 12 en 3 s). `deploy_nat64_limiter_exemption.sh` inserta
+`iifname "veth-host" ip6 saddr 64:ff9b:1::/96 accept` justo antes del registro en bf_seen (después de bf_auto):
+solo lo que llega por el enlace de Jool; una 64:ff9b:1:: falseada por la interfaz pública sigue las reglas.
+sweepguard ya ignoraba 64:ff9b:1::/96 en v6. Prueba: `test_nat64_limiter_netns.sh` (paquetes) y
+`test_nat64_limiter_netns.sh <conf real>` (despliegue + rollback). Deshacer: `rollback_nat64_limiter_exemption.sh`.
