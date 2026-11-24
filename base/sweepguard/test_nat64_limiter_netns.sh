@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Prueba de deploy/rollback_nat64_limiter_exemption.sh con nft y paquetes de
+# verdad, sin root (netns de usuario). Uso: test_nat64_limiter_netns.sh <copia de nftables.conf>
+# (sin las líneas include). Comprueba que 30 SYN seguidos desde 64:ff9b:1::x por
+# `veth-host` pasan todos (sin @bf) y que desde otra interfaz con la MISMA
+# dirección falseada el limitador sigue cortando; y que el rollback deja la conf igual.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd); CONF_IN=${1:-}
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+if [ -n "$CONF_IN" ]; then
+  # conf real: solo despliegue + rollback (sus tablas de filtrado no dejan pasar
+  # los paquetes de esta topología de prueba)
+  grep -v "^include " "$CONF_IN" > "$W/conf.nft"; cp "$W/conf.nft" "$W/orig.nft"
+  unshare -rn bash -c "cd $W && nft -f conf.nft && CONF=conf.nft SKIP_ROUTE_CHECK=1 bash $HERE/deploy_nat64_limiter_exemption.sh | grep -E '\\[|OK' && CONF=conf.nft bash $HERE/rollback_nat64_limiter_exemption.sh | tail -1 && cmp orig.nft conf.nft && echo REALCONF_OK"
+  exit 0
+fi
+cat > "$W/conf.nft" <<'NFT'
+flush ruleset
+table ip6 rdpguard {
+    set bf_allow { type ipv6_addr; flags interval; }
+    set bf_auto { type ipv6_addr; flags dynamic,timeout; timeout 24h; size 65536; }
+    set bf_seen { type ipv6_addr . inet_service; flags dynamic,timeout; timeout 6h; size 65536; }
+    set bf { type ipv6_addr . inet_service; flags dynamic,timeout; timeout 10m; size 65536; }
+    chain pre {
+        type filter hook prerouting priority mangle; policy accept;
+        ip6 saddr @bf_allow accept
+        ip6 saddr @bf_auto counter drop comment "auto-blocked RDP port sweeper (expires)"
+        tcp dport 20000-39999 tcp flags & (syn | ack) == syn add @bf_seen { ip6 saddr . tcp dport } comment "record (source,port) for the sweep detector"
+        tcp dport 20000-39999 tcp flags & (syn | ack) == syn add @bf { ip6 saddr . tcp dport limit rate over 12/minute burst 6 packets } counter drop
+    }
+}
+NFT
+cp "$W/conf.nft" "$W/orig.nft"
+cat > "$W/inner.sh" <<'INNER'
+set -euo pipefail
+HERE=$1; W=$2; cd "$W"
+trap 'kill $(jobs -p) 2>/dev/null; pkill -P $$ 2>/dev/null || true' EXIT
+nft -f conf.nft
+ip link set lo up
+B6=2a01:4f9:aaaa::2
+ip -6 addr add $B6/128 dev lo
+mkns() { unshare -n sleep 600 >/dev/null 2>&1 & echo $!; }
+J=$(mkns); X=$(mkns); sleep 0.3
+ip link add veth-host type veth peer name vj netns /proc/$J/ns/net
+ip link add vx type veth peer name vy netns /proc/$X/ns/net
+ip link set veth-host up; ip link set vx up
+ip -6 addr add fd00::1/64 dev veth-host nodad; ip -6 addr add fd01::1/64 dev vx nodad
+for p in "$J vj fd00::2 fd00::1" "$X vy fd01::2 fd01::1"; do set -- $p
+  nsenter --net=/proc/$1/ns/net sh -c "ip link set lo up; ip link set $2 up; ip -6 addr add $3/64 dev $2 nodad; \
+    ip -6 addr add 64:ff9b:1::4d2a:314f/128 dev lo; ip -6 route add default via $4"; done
+ip -6 route add 64:ff9b:1::4d2a:314f/128 via fd00::2 dev veth-host
+python3 -c "
+import socket
+s=socket.socket(socket.AF_INET6); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('$B6',21517)); s.listen(256)
+while True:
+    c,_=s.accept(); c.close()" >/dev/null 2>&1 & SP=$!
+sleep 0.5
+burst() { nsenter --net=/proc/$1/ns/net python3 -c "
+import socket
+ok=0
+for _ in range(30):
+    s=socket.socket(socket.AF_INET6); s.settimeout(0.3); s.bind(('64:ff9b:1::4d2a:314f',0))
+    try: s.connect(('$B6',21517)); ok+=1
+    except OSError: pass
+    s.close()
+print(ok)"; }
+n=$(burst $J); [ "$n" -lt 15 ] || { echo "FAIL antes: $n/30 sin limitador"; exit 1; }; echo "  ok  antes, por veth-host: $n/30 (limitador compartido)"
+nft flush set ip6 rdpguard bf 2>/dev/null || true
+CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d.out 2>&1 || { cat d.out; exit 1; }
+grep -E "\[|NAT64LIM_OK" d.out | grep -v "^  \s*\(ip\|tcp\|meta\|fib\|type\|chain\)" | head -8
+n=$(burst $J); [ "$n" = 30 ] || { echo "FAIL veth-host $n/30"; exit 1; }; echo "  ok  por veth-host 30/30 (sin @bf)"
+ip -6 route del 64:ff9b:1::4d2a:314f/128; ip -6 route add 64:ff9b:1::4d2a:314f/128 via fd01::2 dev vx
+nft flush set ip6 rdpguard bf
+n=$(burst $X); [ "$n" -lt 15 ] || { echo "FAIL falseada por otra interfaz $n/30"; exit 1; }; echo "  ok  misma dirección por otra interfaz: $n/30 (limitador)"
+CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r.out 2>&1 || { cat r.out; exit 1; }
+cmp orig.nft conf.nft && echo "  ok  rollback: conf idéntica"
+nft list chain ip6 rdpguard pre | grep -q "64:ff9b:1::/96 accept" && { echo "FAIL regla viva tras rollback"; exit 1; }
+kill $SP $J $X 2>/dev/null || true
+echo "NETNS_NAT64_OK"
+INNER
+unshare -rn bash ${TRACE:+-x} "$W/inner.sh" "$HERE" "$W"
