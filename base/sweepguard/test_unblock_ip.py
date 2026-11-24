@@ -52,7 +52,7 @@ class FakeBase:
             return Done(1, err="conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted.\n")
         assert cmd[0] == "nft", cmd
         if cmd[1:3] == ["-t", "list"]:
-            return Done(0 if (cmd[4], cmd[6]) in self.sets else 1)
+            return Done(0) if (cmd[4], cmd[6]) in self.sets else Done(1, err="Error: No such file or directory")
         if cmd[1:3] == ["-j", "list"]:
             fam, name = cmd[4], cmd[6]
             if (fam, name) not in self.sets:
@@ -331,7 +331,12 @@ class RevokeVm(unittest.TestCase):
         self.b = FakeBase()
 
     def test_parse(self):
-        self.assertEqual(ub.parse_command("revoke-vm 1671,483,1671"), ("revoke-vm", None, [483, 1671], False))
+        v, ip, vmids, gen = ub.parse_command("revoke-vm 1671,483,1671")
+        self.assertEqual((v, ip, vmids), ("revoke-vm", None, [483, 1671]))
+        self.assertIsInstance(gen, int)                      # sin gen=: la hora de la base
+        self.assertEqual(ub.parse_command("revoke-vm 483 gen=7000000000000002")[3], 7000000000000002)
+        with self.assertRaises(ub.BadRequest):
+            ub.parse_command("revoke-vm 483 gen=9999999999999999")         # del futuro
         for raw in ["revoke-vm", "revoke-vm ", f"revoke-vm {A4}", "revoke-vm 1671 console", "revoke-vm 99",
                     "revoke-vm 1671,", "revoke-vm 01671", "revoke-vm 1671;id", "REVOKE-VM 1671"]:
             with self.assertRaises(ub.BadRequest, msg=raw):

@@ -101,6 +101,14 @@ THEIR VMs only, for 48 h. The chain accepts those pairs only while the IP is in
 `bf_auto`; out of the block they go through `bf_seen` and the rate limits like
 anyone else. Here every detector ignores them while the entry lives, blocked or
 not (see customer_allowed).
+
+Trusted IPs per VPS (2026-11-24)
+--------------------------------
+A customer can trust up to 10 sources (IPv4 /32, IPv6 /128 or /64) for the
+ports of ONE VM from the panel (set `cust_trust`, neuravps-unblock-ip
+trust-set). The chain accepts them before bf_auto, bf_seen and the rate limits;
+here no detector counts those pairs (see customer_trusted / Exempt). Towards
+any other VM the source is judged like anyone else.
 """
 import ipaddress
 import json
@@ -342,10 +350,99 @@ def customer_allowed(family):
     return out
 
 
+TRUST_SET = "cust_trust"
+
+
+class Exempt:
+    """Lo que ningun detector cuenta.
+
+    * Pares exactos (addr, puerto) de `cust_allow`: como siempre, sin mirar el
+      destino; vale para `(src, puerto)` y para `(src, puerto, dst)`.
+    * Redes de `cust_trust` (IPv6 hasta /64) por puerto: SOLO con destino, y
+      solo si ese destino es una direccion LOCAL de la base (main y VIPs, donde
+      viven los forwards), igual que la regla `fib daddr type local` de la
+      cadena. Sin destino (bf_seen) no eximen: lo que la cadena ya acepto no
+      llega a bf_seen, y lo que llega iba a otro destino. Sin la lista de
+      direcciones locales (`local` None) tampoco: fallo estricto."""
+
+    def __init__(self, exact=None, nets=None, local=None):
+        self.exact = set(exact or ())
+        self.nets = defaultdict(list)            # puerto -> [red]
+        for net, port in nets or ():
+            self.nets[port].append(net)
+        self.local = local
+
+    def __contains__(self, item):
+        if tuple(item[:2]) in self.exact:
+            return True
+        if len(item) < 3 or self.local is None:
+            return False
+        addr, port, dst = item
+        nets = self.nets.get(port)
+        if not nets or canon(dst) not in self.local:
+            return False
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        return any(ip.version == n.version and ip in n for n in nets)
+
+    def __bool__(self):
+        return bool(self.exact) or any(self.nets.values())
+
+    def __len__(self):
+        return len(self.exact) + sum(len(v) for v in self.nets.values())
+
+
+def local_addresses():
+    """Direcciones de esta base (`ip -j addr`), canonicas; None si no se pueden leer."""
+    try:
+        r = subprocess.run(["ip", "-j", "addr", "show"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        out = set()
+        for ifc in json.loads(r.stdout):
+            for a in ifc.get("addr_info", []) or []:
+                if a.get("local"):
+                    out.add(canon(a["local"]))
+        return out
+    except Exception:
+        return None
+
+
+def customer_trusted(family):
+    """[(red, puerto)] de `cust_trust` (elementos addr . proto . puerto; aqui el
+    protocolo no importa: los detectores de conexiones cuentan TCP): IPs de confianza que el cliente fijo en
+    el panel para los puertos de UNA VM (neuravps-unblock-ip trust-set,
+    24/11/2026). La cadena las acepta antes de bf_auto, bf_seen y los
+    limitadores; aqui ningun detector las cuenta, asi que ni se bloquea a esa
+    IP por su trafico hacia esa VM ni ese trafico hace «caliente» el puerto.
+    Hacia las demas VMs se la juzga como a cualquiera. Set ausente = vacio."""
+    out = []
+    for e in set_elements(family, TRUST_SET):
+        # sin timeout nft da {"concat": [...]}; con timeout/contador, {"elem": {"val": ...}}
+        val = e.get("elem", {}).get("val") if isinstance(e, dict) and "elem" in e else e
+        cat = val.get("concat") if isinstance(val, dict) else None
+        if not cat or len(cat) != 3:          # addr . proto . puerto
+            continue
+        a, _proto, port = cat
+        try:
+            if isinstance(a, str):
+                net = ipaddress.ip_network(a)
+            elif isinstance(a, dict) and "prefix" in a:
+                net = ipaddress.ip_network(f"{a['prefix']['addr']}/{a['prefix']['len']}", strict=False)
+            else:
+                continue
+            out.append((net, int(port)))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
+
+
 def sweepers(family, cfg, exempt=None):
     """(addr -> distinct port count) for sources over the threshold.
     `exempt`: pares (addr, puerto) de customer_allowed, que no cuentan."""
-    exempt = exempt or set()
+    exempt = exempt if isinstance(exempt, Exempt) else Exempt(exempt or ())
     per_src = defaultdict(set)
     for e in set_elements(family, "bf_seen"):
         val = e.get("elem", {}).get("val") if isinstance(e, dict) else None
@@ -415,13 +512,13 @@ def flood_scan(entries, cfg, est_timeout, sessions=None, exempt=None, now=None):
     nunca mas laxo que eso.
     Devuelve (flooders addr -> n, spared addr -> (n, vivas, vms, epoch sesion))."""
     now = time.time() if now is None else now
-    exempt = exempt or set()
+    exempt = exempt if isinstance(exempt, Exempt) else Exempt(exempt or ())
     total = defaultdict(int)
     live = defaultdict(int)
     vms = defaultdict(set)
     max_idle = cfg["hotPortMaxIdle"]
     for e in entries:
-        if e["proto"] != "tcp" or (e["src"], e["dport"]) in exempt:
+        if e["proto"] != "tcp" or (e["src"], e["dport"], e["dst"]) in exempt:
             continue
         a = e["src"]
         total[a] += 1
@@ -677,7 +774,7 @@ def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None, exempt=Non
     max_idle = cfg["hotPortMaxIdle"]
     memory = cfg["sessionMemorySeconds"]
     sessions = {} if sessions is None else sessions
-    exempt = exempt or set()
+    exempt = exempt if isinstance(exempt, Exempt) else Exempt(exempt or ())
     pair = defaultdict(int)
     per_port = defaultdict(int)
     proven_now = set()
@@ -686,8 +783,8 @@ def hot_port_scan(entries, cfg, est_timeout, sessions=None, now=None, exempt=Non
             proven_now.add(e["src"])
         if e["proto"] != "tcp" or not is_live(e, est_timeout, max_idle):
             continue
-        if (e["src"], e["dport"]) in exempt:
-            continue          # cliente hacia su propia VM (cust_allow): ni suma al puerto
+        if (e["src"], e["dport"], e["dst"]) in exempt:
+            continue          # cliente hacia su propia VM (cust_allow/cust_trust): ni suma al puerto
         pair[(e["src"], e["dport"])] += 1
         per_port[e["dport"]] += 1
     if memory > 0:
@@ -809,7 +906,8 @@ def run_family(family, cfg, sessions=None):
     # tres detectores independientes; la razon se conserva para el log.
     # hot-port va primero porque es el que anota en `sessions` las sesiones RDP
     # que se ven ahora, y diversidad de puertos las consulta.
-    exempt = customer_allowed(family)
+    trusted = customer_trusted(family)
+    exempt = Exempt(customer_allowed(family), trusted, local_addresses() if trusted else None)
     hot = hot_port_abusers(family, cfg, ours, sessions, exempt)
     cand = {}
     for a, n in sweepers(family, cfg, exempt).items():

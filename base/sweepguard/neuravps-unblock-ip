@@ -57,6 +57,38 @@ panel, que NO quita la IP de `bf_auto`:
       entrada vieja dejaria a la IP del dueño anterior llegar a la VM de
       otro. El 443 no se toca (no es de ninguna VM).
 
+IPs de confianza por VPS (24/11/2026)
+-------------------------------------
+El cliente fija en el panel hasta 10 IPs por VPS (IPv4 /32, IPv6 /128 o /64)
+que la base NO filtra hacia los puertos de ESA VM: el set `cust_trust`
+(addr . puerto, sin caducidad) tiene una regla `accept` despues de `bf_static`
+y antes de `cust_allow`, `bf_auto`, `bf_seen` y los limitadores (ver
+deploy_customer_trust.sh), y sweepguard no cuenta esos pares. Para las demas VMs
+esa IP sigue las reglas normales. La fuente de verdad en la base es
+TRUST_STATE ({vmid: [entradas]}); el set se reescribe ENTERO desde ella en una
+sola transaccion (`flush set` + `add element`: atomica, sin hueco).
+
+  trust-check <ip>[/len]
+      Solo lectura: si se puede confiar en esa entrada aqui (`accepted`) o no
+      (`rejected` con `reason`: static = IPv4 en bf_static; ours = solapa con
+      nuestras4/6).
+  trust-set <vmid> <entrada>[,<entrada>...] | trust-set <vmid> -
+      Fija la lista de UNA VM (`-` = vaciarla). Las entradas rechazadas no se
+      aplican y vuelven en `rejected`.
+  trust-sync
+      Lista COMPLETA por stdin, JSON {"vms": {"<vmid>": [entradas]}} (como
+      mucho TRUST_STDIN_MAX bytes). Reemplaza todo. La manda la reconciliacion
+      horaria de NeuraVPS.
+  trust-restore
+      Reaplica TRUST_STATE (al arrancar: neuravps-cust-trust-restore.service).
+  trust-status
+      Solo lectura: VMs y pares en el estado y en el set.
+`revoke-vm` ademas quita la confianza de esas VMs.
+
+Formato de entrada: IPv4 sin prefijo o /32; IPv6 sin prefijo (= /128), /128 o
+/64 (los bits de host se descartan). Nada mas ancho. Se rechaza lo no global,
+IPv4 mapeada, NAT64 y lo que se solape con nuestras direcciones.
+
 Salida: una linea JSON. Codigo 0 si se atendio (sea cual sea el resultado),
 2 si la peticion no es valida, 1 si algo fallo en la base.
 """
@@ -68,6 +100,7 @@ import re
 import subprocess
 import sys
 import syslog
+import time
 
 TABLE = "rdpguard"
 LOCK = "/run/neuravps-unblock-ip.lock"
@@ -75,7 +108,11 @@ LOCK = "/run/neuravps-unblock-ip.lock"
 REQUEST_RE = re.compile(r"\Aunblock ([0-9A-Fa-f:.]{2,45})\Z")
 STATUS_RE = re.compile(r"\Astatus ([0-9A-Fa-f:.]{2,45})\Z")
 ALLOW_RE = re.compile(r"\Aallow-vm ([0-9A-Fa-f:.]{2,45}) ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})( console)?\Z")
-REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})\Z")
+REVOKE_RE = re.compile(r"\Arevoke-vm ([0-9]{1,4}(?:,[0-9]{1,4}){0,63})(?: gen=([0-9]{16}))?\Z")
+_ENTRY = r"[0-9A-Fa-f:.]{2,45}(?:/[0-9]{1,3})?"
+TRUST_CHECK_RE = re.compile(r"\Atrust-check (%s)\Z" % _ENTRY)
+TRUST_SET_RE = re.compile(r"\Atrust-set ([0-9]{1,4}) (-|%s(?:,%s){0,9})(?: gen=([0-9]{16}))?\Z" % (_ENTRY, _ENTRY))
+TRUST_PLAIN = ("trust-sync", "trust-restore", "trust-status")
 NFT_TIMEOUT = 20
 
 CUSTOMER_SET = "cust_allow"
@@ -88,6 +125,15 @@ MAX_VMIDS = 50                  # el cliente con mas servidores tiene 7
 VMID_MIN, VMID_MAX = 100, 9999  # los forwards son 1xxxx/2xxxx/3xxxx
 FORWARD_BASES = (10000, 20000, 30000)   # SMB, RDP, SSH
 CONSOLE_PORT = 443
+
+TRUST_SET = "cust_trust"
+TRUST_STATE = "/var/lib/neuravps-sweepguard/cust_trust.json"
+TRUST_MAX_PER_VM = 10
+TRUST_MAX_VMS = 5000            # ~1.900 VMs en la flota
+TRUST_STDIN_MAX = 1024 * 1024
+TRUST_V6_PREFIXES = (64, 128)
+NAT64_NETS = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+GUARDED = {"ip": "nuestras4", "ip6": "nuestras6"}
 
 
 class BadRequest(ValueError):
@@ -129,6 +175,17 @@ def parse_request(raw):
     return _ip(m.group(1))
 
 
+def _gen_arg(raw, phase):
+    """gen=<rev> de la orden; sin el (a mano, o NeuraVPS anterior), AHORA en la
+    fase de la orden."""
+    if raw is None:
+        return now_gen(phase)
+    g = int(raw)
+    if not gen_ok(g):
+        raise BadRequest("bad gen (future or out of range)")
+    return g
+
+
 def parse_command(raw):
     """Peticion -> (orden, ip, vmids, consola). Lanza BadRequest.
     unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,<vmid>...] [console]
@@ -145,9 +202,20 @@ def parse_command(raw):
         return "allow-vm", _ip(m.group(1)), _vmids(m.group(2)), bool(m.group(3))
     m = REVOKE_RE.match(raw)
     if m:
-        return "revoke-vm", None, _vmids(m.group(1)), False
+        return "revoke-vm", None, _vmids(m.group(1)), _gen_arg(m.group(2), GEN_REVOKE)
+    m = TRUST_CHECK_RE.match(raw)
+    if m:
+        return "trust-check", trust_entry(m.group(1)), [], False
+    m = TRUST_SET_RE.match(raw)
+    if m:
+        vmid = _vmids(m.group(1))
+        ents = [] if m.group(2) == "-" else [trust_entry(t) for t in m.group(2).split(",")]
+        return "trust-set", ents, vmid, _gen_arg(m.group(3), GEN_SET)
+    if raw in TRUST_PLAIN:
+        return raw, None, [], False
     raise BadRequest("expected: unblock <ip> | status <ip> | allow-vm <ip> <vmid>[,...] [console]"
-                     " | revoke-vm <vmid>[,...]")
+                     " | revoke-vm <vmid>[,...] | trust-check <ip>[/len] | trust-set <vmid> <ip>[,...]|-"
+                     " | trust-sync | trust-restore | trust-status")
 
 
 def vm_ports(vmids, console=False):
@@ -162,6 +230,17 @@ def family_of(ip):
 def run(cmd, stdin=None):
     return subprocess.run(cmd, input=stdin, capture_output=True, text=True,
                           timeout=NFT_TIMEOUT)
+
+
+def set_presence(fam, name):
+    """True / False si el set existe o no; RuntimeError si nft no contesta o da
+    otro error (no se confunde «no está» con «no se pudo mirar»)."""
+    r = run(["nft", "-t", "list", "set", fam, TABLE, name])
+    if r.returncode == 0:
+        return True
+    if "No such file or directory" in r.stderr:
+        return False
+    raise RuntimeError(f"nft list set {fam} {name}: {' '.join(r.stderr.split())[:160]}")
 
 
 def set_exists(fam, name):
@@ -332,9 +411,10 @@ def set_pairs(fam, name):
     return out
 
 
-def revoke_vm(vmids):
+def revoke_vm(vmids, gen=None):
     """Quita de cust_allow todas las entradas de los puertos de esas VMs, de
     cualquier IP y en las dos familias."""
+    gen = now_gen(GEN_REVOKE) if gen is None else gen
     ports = set(vm_ports(vmids))
     out = {"vmids": vmids, "removed": 0}
     sets = 0
@@ -359,7 +439,455 @@ def revoke_vm(vmids):
         if left:
             raise RuntimeError(f"{len(left)} entries of {fam} {CUSTOMER_SET} still there")
     out["result"] = "revoked" if sets else "no_set"
+    out["trustRemoved"] = revoke_trust(vmids, gen)
     return out
+
+
+# --- IPs de confianza por VPS (24/11/2026) ------------------------------------
+# Todo lo que entra (orden SSH, stdin, fichero de estado) pasa por trust_entry,
+# que exige la gramatica ASCII de _ENTRY ANTES de llamar a ipaddress, y el
+# texto que va a nft se genera desde la direccion numerica (entry_text). Ante
+# cualquier duda se falla cerrado: sin leer nuestras4/6, con un estado roto o
+# una carga con una sola entrada mala, no se toca el set.
+
+_ENTRY_FULL = re.compile(r"\A%s\Z" % _ENTRY)
+_VMID_KEY = re.compile(r"\A[1-9][0-9]{2,3}\Z")
+TRUST_READ_SECONDS = 15
+# Revisiones: microsegundos epoch * 4 + fase. Las pone NeuraVPS con la hora de
+# Firestore (lectura del servidor en la transaccion, o la hora del evento).
+# Cada VM recuerda la de su ultima orden y solo acepta otra POSTERIOR
+# (estricto): una alta atrasada no deshace una revocacion ni una foto vieja una
+# baja. La fase ordena lo que cae en el mismo microsegundo: la foto pierde ante
+# todo, la revocacion gana al alta, y la reaplicacion tras una revocacion del
+# mismo evento va despues de ella.
+GEN_SYNC, GEN_SET, GEN_REVOKE, GEN_REAPPLY = 0, 1, 2, 3
+TRUST_GEN_SKEW = 10 * 60 * 1_000_000 * 4
+# Elementos (proto, base de puerto) por entrada: TCP a SMB/RDP/SSH, UDP solo a
+# RDP (el transporte UDP de RDP; la base solo reenvia UDP en 2xxxx).
+TRUST_PROTOS = (("tcp", 10000), ("tcp", 20000), ("udp", 20000), ("tcp", 30000))
+
+
+def trust_entry(raw):
+    """Texto -> red normalizada (IPv4Network /32 o IPv6Network /64 o /128).
+    Lanza BadRequest. Ver docstring del modulo."""
+    if not isinstance(raw, str) or not _ENTRY_FULL.match(raw):
+        raise BadRequest("bad entry syntax")
+    addr, slash, plen = raw.partition("/")
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        raise BadRequest("not an IP address")
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        raise BadRequest("IPv4-mapped IPv6: use the IPv4 address")
+    if slash:
+        if plen != str(int(plen)):
+            raise BadRequest("bad prefix")
+        plen = int(plen)
+    else:
+        plen = 32 if ip.version == 4 else 128
+    if ip.version == 4 and plen != 32:
+        raise BadRequest("IPv4: only single addresses (/32)")
+    if ip.version == 6 and plen not in TRUST_V6_PREFIXES:
+        raise BadRequest("IPv6: only /128 or /64")
+    net = ipaddress.ip_network(f"{ip}/{plen}", strict=False)
+    if ip.version == 6 and any(net.overlaps(n) for n in NAT64_NETS):
+        raise BadRequest("NAT64 range")
+    na = net.network_address
+    if (not net.is_global or not na.is_global or net.is_multicast or net.is_reserved
+            or na.is_reserved or getattr(na, "is_site_local", False)):
+        raise BadRequest("not a global address")
+    return net
+
+
+def entry_text(net):
+    """Forma canonica de una entrada, desde la direccion NUMERICA (nunca el
+    texto recibido): IPv4 y /128 sin prefijo; /64 con el suyo."""
+    cls = ipaddress.IPv4Address if net.version == 4 else ipaddress.IPv6Address
+    addr = cls(int(net.network_address)).compressed
+    return addr if net.prefixlen == net.max_prefixlen else f"{addr}/{net.prefixlen}"
+
+
+def guarded_nets(fam):
+    """Redes de nuestras4/6. Lanza RuntimeError si no se puede leer el set o
+    trae un elemento que no se entiende: sin esta lista no se acepta nada."""
+    name = GUARDED[fam]
+    r = run(["nft", "-j", "list", "set", fam, TABLE, name])
+    if r.returncode != 0:
+        raise RuntimeError(f"cannot read {fam} {name}: {' '.join(r.stderr.split())[:120]}")
+    found, nets = False, []
+    for obj in json.loads(r.stdout).get("nftables", []):
+        s = obj.get("set")
+        if not s or s.get("name") != name:
+            continue
+        found = True
+        for e in s.get("elem", []) or []:
+            if isinstance(e, str):
+                nets.append(ipaddress.ip_network(e))
+            elif isinstance(e, dict) and "prefix" in e:
+                p = e["prefix"]
+                nets.append(ipaddress.ip_network(f"{p['addr']}/{p['len']}", strict=False))
+            elif isinstance(e, dict) and "range" in e:
+                lo, hi = (ipaddress.ip_address(x) for x in e["range"])
+                nets.extend(ipaddress.summarize_address_range(lo, hi))
+            elif isinstance(e, dict) and "elem" in e and isinstance(e["elem"].get("val"), str):
+                nets.append(ipaddress.ip_network(e["elem"]["val"]))
+            else:
+                raise RuntimeError(f"{fam} {name}: element not understood: {str(e)[:80]}")
+    if not found or not nets:
+        raise RuntimeError(f"{fam} {name} missing or empty")
+    return nets
+
+
+class TrustChecker:
+    """Rechazos que dependen de la base: bf_static (IPv4) y nuestras4/6. Lee
+    cada set una sola vez por peticion."""
+
+    def __init__(self):
+        self._ours = {}
+        self._static = {}
+
+    def reason(self, net):
+        fam = "ip" if net.version == 4 else "ip6"
+        if fam not in self._ours:
+            self._ours[fam] = guarded_nets(fam)
+            self._static[fam] = set_exists(fam, "bf_static")
+        if any(net.overlaps(n) for n in self._ours[fam]):
+            return "ours"
+        if self._static[fam] and in_set(fam, "bf_static", entry_text(net).split("/")[0]):
+            return "static"
+        return None
+
+
+def clean_list(nets, checker):
+    """Lista de UNA VM -> (aceptadas [red], rechazadas {texto: motivo}).
+    Sin duplicados, sin /128 cubiertas por un /64 de la misma lista (el set de
+    intervalos no admite solapes), y como mucho TRUST_MAX_PER_VM."""
+    ok, rejected = [], {}
+    for net in sorted(set(nets), key=lambda n: (n.version, n.prefixlen, int(n.network_address))):
+        if any(net != o and net.subnet_of(o) for o in ok if o.version == net.version):
+            rejected[entry_text(net)] = "covered"
+            continue
+        why = checker.reason(net)
+        if why:
+            rejected[entry_text(net)] = why
+            continue
+        if len(ok) >= TRUST_MAX_PER_VM:
+            rejected[entry_text(net)] = "too_many"
+            continue
+        ok.append(net)
+    return ok, rejected
+
+
+def _no_dup_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise BadRequest(f"duplicate key {str(k)[:12]!r}")
+        d[k] = v
+    return d
+
+
+def now_gen(phase):
+    """Revision de AHORA en la fase dada (ver GEN_*)."""
+    return int(time.time() * 1_000_000) * 4 + phase
+
+
+def gen_ok(g):
+    """Revision valida: entero de 16 cifras y no del futuro (10 min de margen
+    de reloj): una revision del futuro bloquearia todo lo que viniera despues."""
+    return isinstance(g, int) and not isinstance(g, bool) and 10 ** 15 <= g < 10 ** 16 \
+        and g <= now_gen(3) + TRUST_GEN_SKEW
+
+
+class TrustState:
+    """Estado de la base: listas por VM, revision de la ultima orden aplicada
+    a cada VM y la de la ultima foto completa (`sync_gen`), que vale de suelo
+    para toda VM sin revision propia (una foto dice «sin confianza» para todas
+    las que no trae)."""
+
+    def __init__(self, vms=None, gens=None, sync_gen=0):
+        self.vms = vms or {}
+        self.gens = gens or {}
+        self.sync_gen = sync_gen
+
+    def last(self, vmid):
+        return max(self.gens.get(vmid, 0), self.sync_gen)
+
+    def doc(self):
+        # una revision por debajo del suelo ya no aporta nada: se olvida
+        keep = {v: g for v, g in self.gens.items() if v in self.vms or g > self.sync_gen}
+        return json.dumps({"v": 3, "syncGen": self.sync_gen,
+                           "vms": {str(v): [entry_text(n) for n in self.vms[v]] for v in sorted(self.vms)},
+                           "gens": {str(v): keep[v] for v in sorted(keep)}}, sort_keys=True)
+
+
+def parse_trust_doc(raw, what, kind="payload"):
+    """JSON -> dict. TODO o nada: una clave o entrada mala rechaza el documento
+    entero (BadRequest).
+      payload (trust-sync): {"gen": rev, "vms": {"<vmid>": [entradas]}}
+      state (TRUST_STATE):  {"v": 3, "syncGen": rev, "vms": {...}, "gens": {"<vmid>": rev}}
+    Devuelve {"vms": {vmid: [red]}, "gens": {vmid: rev}, "gen": rev|None, "syncGen": rev}."""
+    try:
+        doc = json.loads(raw, object_pairs_hook=_no_dup_keys)
+    except BadRequest:
+        raise
+    except ValueError:
+        raise BadRequest(f"{what} is not JSON")
+    vms = doc.get("vms") if isinstance(doc, dict) else None
+    if not isinstance(vms, dict) or len(vms) > TRUST_MAX_VMS:
+        raise BadRequest(f"{what}: expected {{\"vms\": {{vmid: [entries]}}}}")
+
+    def vmid_key(k):
+        if not isinstance(k, str) or not _VMID_KEY.match(k) or not VMID_MIN <= int(k) <= VMID_MAX:
+            raise BadRequest(f"{what}: bad vmid {str(k)[:12]!r}")
+        return int(k)
+
+    def rev(g, where, allow_zero=False):
+        if allow_zero and g == 0:
+            return 0
+        if not gen_ok(g):
+            raise BadRequest(f"{what}: bad gen {where}")
+        return g
+
+    out = {"vms": {}, "gens": {}, "gen": None, "syncGen": 0}
+    for k, ents in vms.items():
+        if not isinstance(ents, list) or len(ents) > TRUST_MAX_PER_VM:
+            raise BadRequest(f"{what}: vm {k}: expected a list of at most {TRUST_MAX_PER_VM}")
+        out["vms"][vmid_key(k)] = [trust_entry(t) for t in ents]
+    if kind == "payload":
+        out["gen"] = rev(doc.get("gen"), "of payload")
+    else:
+        if doc.get("v") != 3:
+            raise BadRequest(f"{what}: unknown version {str(doc.get('v'))[:8]!r}")
+        out["syncGen"] = rev(doc.get("syncGen", 0), "syncGen", allow_zero=True)
+        gens = doc.get("gens", {})
+        if not isinstance(gens, dict) or len(gens) > 4 * TRUST_MAX_VMS:
+            raise BadRequest(f"{what}: bad gens")
+        for k, g in gens.items():
+            out["gens"][vmid_key(k)] = rev(g, f"for {str(k)[:12]!r}")
+    return out
+
+
+def load_trust_state(path=None):
+    """TrustState desde TRUST_STATE. Ausente = vacio (base nueva); ilegible o
+    con algo invalido = RuntimeError: nunca se reconstruye el set desde un
+    fichero roto."""
+    path = path or TRUST_STATE
+    try:
+        with open(path) as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return TrustState()
+    except OSError as exc:
+        raise RuntimeError(f"{path} unreadable ({exc}); not touching {TRUST_SET}")
+    try:
+        d = parse_trust_doc(raw, path, "state")
+    except BadRequest as exc:
+        raise RuntimeError(f"{path} invalid ({exc}); not touching {TRUST_SET}")
+    return TrustState(d["vms"], d["gens"], d["syncGen"])
+
+
+def trust_elements(vms):
+    """{fam: ["addr . proto . puerto", ...]} de todas las listas."""
+    out = {"ip": [], "ip6": []}
+    for vmid in sorted(vms):
+        for net in vms[vmid]:
+            fam = "ip" if net.version == 4 else "ip6"
+            for proto, base in TRUST_PROTOS:
+                out[fam].append(f"{entry_text(net)} . {proto} . {base + vmid}")
+    return out
+
+
+def _write_atomic(path, text):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)            # el rename tambien tiene que llegar al disco
+    finally:
+        os.close(dfd)
+
+
+def apply_trust(st, path=None):
+    """Publica el estado y reescribe `cust_trust` (las dos familias) en UNA
+    transaccion. Primero el fichero (si se corta despues, al arrancar manda el
+    estado nuevo: una revocacion no se pierde) y luego nft; si nft falla o no
+    contesta, se vuelve a escribir el estado anterior y se lanza. TODA orden
+    termina aqui, tambien las descartadas por atrasadas: el set vivo queda
+    siempre igual que el fichero (repara un intento anterior a medias)."""
+    path = path or TRUST_STATE
+    for fam in ("ip", "ip6"):
+        if not set_presence(fam, TRUST_SET):
+            raise RuntimeError(f"set {fam} {TABLE} {TRUST_SET} missing (deploy_customer_trust.sh)")
+    elems = trust_elements(st.vms)
+    batch = ""
+    for fam in ("ip", "ip6"):
+        batch += f"flush set {fam} {TABLE} {TRUST_SET}\n"
+        lst = elems[fam]
+        for i in range(0, len(lst), 500):
+            batch += f"add element {fam} {TABLE} {TRUST_SET} {{ {', '.join(lst[i:i + 500])} }}\n"
+    try:
+        with open(path) as fh:
+            previous = fh.read()
+    except FileNotFoundError:
+        previous = None
+    _write_atomic(path, st.doc())
+    try:
+        r = run(["nft", "-f", "-"], stdin=batch)
+        err = None if r.returncode == 0 else " ".join(r.stderr.split())[:200]
+    except Exception as exc:  # noqa: BLE001  (TimeoutExpired incluido)
+        err = f"{type(exc).__name__}: {exc}"[:200]
+    if err is not None:
+        if previous is None:
+            os.unlink(path)
+        else:
+            _write_atomic(path, previous)
+        raise RuntimeError(f"nft {TRUST_SET}: {err}")
+    return {"vms": len(st.vms), "pairs": sum(len(v) for v in elems.values())}
+
+
+def trust_check(net):
+    why = TrustChecker().reason(net)
+    return {"entry": entry_text(net), "result": "rejected" if why else "accepted",
+            **({"reason": why} if why else {})}
+
+
+def trust_set(vmid, nets, gen):
+    """Fija la lista de UNA VM si `gen` es POSTERIOR (estricto) a la ultima
+    orden de esa VM o a la ultima foto. Si no, `stale` y la lista no cambia."""
+    st = load_trust_state()
+    if gen <= st.last(vmid):
+        out = {"result": "stale", "vmid": vmid, "gen": gen, "current": st.last(vmid)}
+        out.update(apply_trust(st))
+        return out
+    ok, rejected = clean_list(nets, TrustChecker())
+    if ok:
+        st.vms[vmid] = ok
+    else:
+        st.vms.pop(vmid, None)
+    st.gens[vmid] = gen
+    out = {"result": "set", "vmid": vmid, "entries": [entry_text(n) for n in ok],
+           "rejected": rejected, "gen": gen}
+    out.update(apply_trust(st))
+    return out
+
+
+def read_sync_payload(stream=None, seconds=TRUST_READ_SECONDS):
+    """Lee la carga de trust-sync (BYTES, con plazo) ANTES de tomar el cerrojo:
+    una conexion que no cierra stdin no puede parar la base."""
+    import select
+    fd = (stream or sys.stdin.buffer).fileno()
+    buf, deadline = b"", time.monotonic() + seconds
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise BadRequest("payload read timed out")
+        ready, _, _ = select.select([fd], [], [], left)
+        if not ready:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > TRUST_STDIN_MAX:
+            raise BadRequest(f"payload over {TRUST_STDIN_MAX} bytes")
+    try:
+        text = buf.decode("ascii")
+    except UnicodeDecodeError:
+        raise BadRequest("payload is not ASCII JSON")
+    return parse_trust_doc(text, "payload", "payload")
+
+
+def trust_sync(payload):
+    """Foto completa de NeuraVPS con revision `gen` (anterior a cuando se
+    leyo). Se aplica a cada VM cuya ultima orden sea ANTERIOR a la foto; las que
+    recibieron despues otra orden se quedan como estan. La foto pasa a ser el
+    suelo de todas las VMs que no trae."""
+    gen, wanted = payload["gen"], payload["vms"]
+    # Sin el estado no se conoce el suelo ni las revisiones: una foto atrasada
+    # podria deshacer una revocacion posterior. Se falla (NeuraVPS reintenta);
+    # un fichero corrupto se aparta A MANO (README) y entonces la foto entra.
+    st = load_trust_state()
+    if gen <= st.sync_gen:
+        out = {"result": "synced", "gen": gen, "staleSnapshot": True, "rejected": {},
+               "rejectedCount": 0, "staleVms": [], "changedVms": []}
+        out.update(apply_trust(st))
+        return out
+    before = {v: [entry_text(n) for n in l] for v, l in st.vms.items()}
+    checker = TrustChecker()
+    rejected, stale = {}, []
+    for vmid in sorted(set(st.vms) | set(wanted) | set(st.gens)):
+        if st.gens.get(vmid, 0) >= gen:
+            stale.append(vmid)
+            continue
+        ok, rej = clean_list(wanted.get(vmid, []), checker)
+        if ok:
+            st.vms[vmid] = ok
+        else:
+            st.vms.pop(vmid, None)
+        st.gens.pop(vmid, None)           # su revision pasa a ser la de la foto (suelo)
+        rejected.update({f"{vmid}:{k}": v for k, v in rej.items()})
+    st.sync_gen = gen
+    after = {v: [entry_text(n) for n in l] for v, l in st.vms.items()}
+    out = {"result": "synced", "gen": gen, "rejected": dict(list(rejected.items())[:50]),
+           "rejectedCount": len(rejected), "staleVms": stale[:100],
+           "changedVms": sorted(v for v in set(before) | set(after)
+                                if before.get(v) != after.get(v))[:100]}
+    out.update(apply_trust(st))
+    return out
+
+
+def trust_restore():
+    st = load_trust_state()
+    out = {"result": "restored"}
+    out.update(apply_trust(st))
+    return out
+
+
+def trust_status():
+    st = load_trust_state()
+    live = {}
+    for fam in ("ip", "ip6"):
+        if set_exists(fam, TRUST_SET):
+            r = run(["nft", "-j", "list", "set", fam, TABLE, TRUST_SET])
+            n = 0
+            for obj in json.loads(r.stdout or '{"nftables": []}').get("nftables", []):
+                n += len((obj.get("set") or {}).get("elem", []) or [])
+            live[fam] = n
+    want = trust_elements(st.vms)
+    return {"result": "status", "vms": len(st.vms), "gens": len(st.gens), "syncGen": st.sync_gen,
+            "statePairs": {f: len(v) for f, v in want.items()},
+            "setPairs": live, "trustSet": len(live) == 2}
+
+
+def revoke_trust(vmids, gen):
+    """Revocacion con revision `gen` (fase GEN_REVOKE: gana a un alta de la
+    misma hora). Por VM: solo si `gen` es posterior (estricto) a su ultima
+    orden; una revocacion atrasada no borra la lista que un dueño nuevo guardo
+    despues. El set se reescribe SIEMPRE (repara un intento anterior a medias).
+    Sin set (base sin desplegar) no hace nada. Devuelve cuantas VMs perdieron
+    la confianza."""
+    present = [set_presence(fam, TRUST_SET) for fam in ("ip", "ip6")]
+    if not any(present):
+        return None               # confirmado: base sin desplegar (no hay nada que quitar)
+    if not all(present):
+        raise RuntimeError(f"{TRUST_SET} only in one family: not revoking half; fix the base")
+    st = load_trust_state()
+    gone = 0
+    for v in vmids:
+        if gen <= st.last(v):
+            continue
+        if st.vms.pop(v, None) is not None:
+            gone += 1
+        st.gens[v] = gen
+    apply_trust(st)
+    return gone
 
 
 def main(argv):
@@ -374,10 +902,29 @@ def main(argv):
         syslog.syslog(syslog.LOG_WARNING, f"rejected ({via}): {exc}: {raw[:80]!r}")
         print(json.dumps({"ok": False, "error": "bad_request", "detail": str(exc)}))
         return 2
-    what = str(ip) if ip is not None else ",".join(str(v) for v in vmids)
+    if verb.startswith("trust-"):
+        what = (",".join(str(v) for v in vmids) + " " if vmids else "") + \
+            (",".join(entry_text(n) for n in ip) if isinstance(ip, list)
+             else entry_text(ip) if ip is not None else "")
+    else:
+        what = str(ip) if ip is not None else ",".join(str(v) for v in vmids)
     try:
         if verb == "status":                 # solo lectura: sin cerrojo
             out = status(ip)
+        elif verb == "trust-check":
+            out = trust_check(ip)
+        elif verb == "trust-status":
+            out = trust_status()
+        elif verb.startswith("trust-"):
+            wanted = read_sync_payload() if verb == "trust-sync" else None   # fuera del cerrojo
+            with open(LOCK, "w") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                if verb == "trust-set":
+                    out = trust_set(vmids[0], ip, console)
+                elif verb == "trust-sync":
+                    out = trust_sync(wanted)
+                else:
+                    out = trust_restore()
         else:
             with open(LOCK, "w") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
@@ -386,16 +933,21 @@ def main(argv):
                 elif verb == "allow-vm":
                     out = allow_vm(ip, vmids, console)
                 else:
-                    out = revoke_vm(vmids)
+                    out = revoke_vm(vmids, console)
+    except BadRequest as exc:                # trust-sync: carga por stdin no valida
+        syslog.syslog(syslog.LOG_WARNING, f"rejected {verb} ({via}): {exc}")
+        print(json.dumps({"ok": False, "error": "bad_request", "detail": str(exc)}))
+        return 2
     except Exception as exc:  # noqa: BLE001
         syslog.syslog(syslog.LOG_ERR, f"{verb} {what} ({via}): error {exc}")
         err = {"ok": False, "error": "internal", "detail": str(exc)[:200]}
-        if ip is not None:
+        if ip is not None and not isinstance(ip, list):
             err["ip"] = str(ip)
         print(json.dumps(err))
         return 1
     out["ok"] = True
-    syslog.syslog(syslog.LOG_INFO if verb == "status" else syslog.LOG_NOTICE,
+    syslog.syslog(syslog.LOG_INFO if verb in ("status", "trust-check", "trust-status")
+                  else syslog.LOG_NOTICE,
                   f"{verb} {what} ({via}): {json.dumps(out, sort_keys=True)}")
     print(json.dumps(out, sort_keys=True))
     return 0
