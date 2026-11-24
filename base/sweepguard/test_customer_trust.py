@@ -273,7 +273,7 @@ class ClosedMode(Generations):
         finally:
             ub.IPV6_POLICY_STATE = saved
 
-    def test_cut_flows_on_close(self):
+    def _ct_run(self, rows, fail_list=False, fail_del=False):
         calls = []
         orig = ub.run
 
@@ -283,31 +283,64 @@ class ClosedMode(Generations):
 
         def run(cmd, stdin=None):
             if cmd[0] == "conntrack" and cmd[1] == "-L":
-                if "--orig-port-dst" in cmd and cmd[cmd.index("--orig-port-dst") + 1] == "21302" and "ipv4" in cmd and "tcp" in cmd:
-                    return R("tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302\n"
-                             "tcp 6 300 ESTABLISHED src=1.1.1.1 dst=77.42.49.79 sport=2 dport=21302\n"
-                             "tcp 6 300 ESTABLISHED src=95.216.102.179 dst=77.42.49.79 sport=3 dport=21302\n")
-                return R()
+                if fail_list:
+                    return R(err="conntrack: Operation not permitted", rc=1)
+                fam = cmd[cmd.index("-f") + 1]; proto = cmd[cmd.index("-p") + 1]
+                key = cmd[cmd.index("--orig-port-dst") + 1] if "--orig-port-dst" in cmd else cmd[cmd.index("-d") + 1]
+                return R("\n".join(rows.get((fam, proto, key), [])))
             if cmd[0] == "conntrack" and cmd[1] == "-D":
                 calls.append(cmd)
+                if fail_del:
+                    return R(err="conntrack: Operation failed", rc=1)
                 return R(err="conntrack v1.4.8: 1 flow entries have been deleted.")
-            if cmd[:3] == ["nft", "-j", "list"] and cmd[-1] == "bf_allow" and cmd[3] == "set" and cmd[4] == "ip":
-                return R('{"nftables": [{"set": {"name": "bf_allow", "elem": ["95.216.102.179"]}}]}')
+            if cmd[:3] == ["nft", "-j", "list"] and cmd[-1] == "bf_allow":
+                elem = '["95.216.102.179"]' if cmd[4] == "ip" else "[]"
+                return R('{"nftables": [{"set": {"name": "bf_allow", "elem": %s}}]}' % elem)
             return orig(cmd, stdin)
+        return run, calls
+
+    def test_cut_flows_on_close(self):
+        rows = {("ipv4", "tcp", "21302"): [
+            "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1",
+            "tcp 6 300 ESTABLISHED src=1.1.1.1 dst=77.42.49.79 sport=2 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=2",
+            "tcp 6 300 ESTABLISHED src=95.216.102.179 dst=77.42.49.79 sport=3 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=3",
+            # salida de un invitado a un servidor externo :21302 (sin DNAT): no se toca
+            "tcp 6 300 ESTABLISHED src=10.64.1.2 dst=5.6.7.8 sport=4 dport=21302 src=5.6.7.8 dst=91.98.53.130 sport=21302 dport=4"],
+            ("ipv6", "tcp", "21302"): [
+            # directa de OTRA VM en el mismo puerto (puerto sin traducir): no se toca
+            "tcp 6 300 ESTABLISHED src=2001:db8:9::1 dst=2a01:4f9:2a:2d56::7cf sport=5 dport=21302 src=2a01:4f9:c01f:e::7cf dst=2001:db8:9::1 sport=21302 dport=5",
+            # forward v6 de esta VM (puerto traducido a 3389): se corta
+            "tcp 6 300 ESTABLISHED src=2001:db8:9::1 dst=2a01:4f9:2a:2d56::2 sport=6 dport=21302 src=2a01:4f9:c01f:e::51e dst=2001:db8:9::1 sport=3389 dport=6"]}
+        run, calls = self._ct_run(rows)
         ub.run = run
         try:
             out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
         finally:
-            ub.run = orig
-        self.assertEqual((out["flowsCut"], out["flowsCutOk"]), (1, True))
-        self.assertEqual([c[c.index("-s") + 1] for c in calls], ["8.8.8.8"])   # ni su lista ni bf_allow
-        n = len(calls)
+            ub.run = self.saved[2]
+        self.assertEqual((out["flowsCut"], out["flowsCutOk"]), (2, True))
+        self.assertEqual(sorted(c[c.index("-s") + 1] for c in calls), ["2001:db8:9::1", "8.8.8.8"])
+        self.assertTrue(all("--sport" in c and "--dport" in c and "-d" in c for c in calls))   # tupla completa
+
+    def test_cut_flows_failure_stays_pending_and_retries(self):
+        rows = {("ipv4", "tcp", "21302"): [
+            "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1"]}
+        run, calls = self._ct_run(rows, fail_list=True)
         ub.run = run
         try:
-            out = ub.trust_set(1302, self.e, self.g(2, ub.GEN_SET), closed=True)   # sin cambios: no corta
+            out = ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+            self.assertEqual(out["flowsCutOk"], False)
+            self.assertEqual(ub.load_trust_state().cut_pending, {1302})
+            run2, calls2 = self._ct_run(rows, fail_del=True)
+            ub.run = run2
+            out = ub.trust_set(1302, self.e, self.g(2, ub.GEN_SET), closed=True)   # sin cambios: reintenta
+            self.assertEqual((out["flowsCutOk"], len(calls2)), (False, 1))
+            run3, calls3 = self._ct_run(rows)
+            ub.run = run3
+            out = ub.trust_restore()
+            self.assertEqual((out["flowsCutOk"], len(calls3)), (True, 1))
+            self.assertEqual(ub.load_trust_state().cut_pending, set())
         finally:
-            ub.run = orig
-        self.assertEqual((out["flowsCut"], len(calls)), (0, n))
+            ub.run = self.saved[2]
 
     def test_doc_closed_requires_list(self):
         with self.assertRaises(ub.BadRequest):
