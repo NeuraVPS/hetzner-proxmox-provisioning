@@ -292,7 +292,7 @@ echo "-- 6) revoke-vm, trust-sync, trust-restore, trust-status"
 { UB revoke-vm 1302 | tail -1 | grep -q '"trustRemoved": 1'; } || { echo "FAIL revoke-vm quita la confianza"; exit 1; }; echo "  ok  revoke-vm quita la confianza"
 nft add element ip rdpguard bf_auto "{ $CLIENT }"
 expect tcp 21302 blocked
-echo "{\"gen\": $(date +%s%3N), \"vms\": {\"1302\": [\"149.56.212.201\"], \"1999\": [\"2001:41d0:1:2::/64\"]}}" | UB trust-sync | tail -1 | tee o6
+echo "{\"gen\": $(( $(date +%s%6N) * 4 )), \"vms\": {\"1302\": [\"149.56.212.201\"], \"1999\": [\"2001:41d0:1:2::/64\"]}}" | UB trust-sync | tail -1 | tee o6
 { grep -q '"pairs": 8' o6; } || { echo "FAIL trust-sync 8 pares (TCP x3 + UDP RDP, v4 y v6)"; exit 1; }; echo "  ok  trust-sync 8 pares (TCP x3 + UDP RDP, v4 y v6)"
 expect tcp 21302 ok
 nft flush set ip rdpguard cust_trust; nft flush set ip6 rdpguard cust_trust
@@ -300,11 +300,11 @@ expect tcp 21302 blocked
 { UB trust-restore | tail -1 | grep -q '"pairs": 8'; } || { echo "FAIL trust-restore"; exit 1; }; echo "  ok  trust-restore"
 expect tcp 21302 ok
 UB trust-status | tail -1
-{ echo "{\"gen\": $(date +%s%3N), \"vms\": {\"1302\": [\"10.0.0.1\"]}}" | UB trust-sync | tail -1 | grep -q 'bad_request'; } || { echo "FAIL sync con una entrada mala"; exit 1; }
+{ echo "{\"gen\": $(( $(date +%s%6N) * 4 )), \"vms\": {\"1302\": [\"10.0.0.1\"]}}" | UB trust-sync | tail -1 | grep -q 'bad_request'; } || { echo "FAIL sync con una entrada mala"; exit 1; }
 { UB trust-status | tail -1 | grep -q '"ip": 4'; } || { echo "FAIL el set cambió tras una carga mala"; exit 1; }; echo "  ok  sync con una entrada mala: rechazada entera, set intacto"
-{ printf '{"gen": %s, "vms": {"1302": ["1.1.1.1"], "1302": []}}' "$(date +%s%3N)" | UB trust-sync | tail -1 | grep -q 'duplicate key'; } || { echo "FAIL clave duplicada"; exit 1; }; echo "  ok  clave duplicada rechazada"
+{ printf '{"gen": %s, "vms": {"1302": ["1.1.1.1"], "1302": []}}' "$(( $(date +%s%6N) * 4 ))" | UB trust-sync | tail -1 | grep -q 'duplicate key'; } || { echo "FAIL clave duplicada"; exit 1; }; echo "  ok  clave duplicada rechazada"
 { echo 'basura' | UB trust-sync | tail -1 | grep -q bad_request; } || { echo "FAIL sync rechaza carga no JSON"; exit 1; }; echo "  ok  sync rechaza carga no JSON"
-echo "{\"gen\": $(date +%s%3N), \"vms\": {\"1302\": [\"$CLIENT\"]}}" | UB trust-sync >/dev/null
+echo "{\"gen\": $(( $(date +%s%6N) * 4 )), \"vms\": {\"1302\": [\"$CLIENT\"]}}" | UB trust-sync >/dev/null
 echo "garbage" > cust_trust.json
 { UB trust-set 1302 - | tail -1 | grep -qE "unreadable|invalid"; } || { echo "FAIL estado roto: no vacía el set"; exit 1; }; echo "  ok  estado roto: no vacía el set"
 expect tcp 21302 ok

@@ -53,7 +53,7 @@ class Commands(unittest.TestCase):
         self.assertEqual((v, vmids, [ub.entry_text(n) for n in ents]),
                          ("trust-set", [1302], ["149.56.212.201", "2001:41d0:1:2::/64"]))
         self.assertEqual(ub.parse_command("trust-set 1302 -")[1], [])
-        self.assertEqual(ub.parse_command("trust-set 1302 - gen=1764000000000")[3], 1764000000000)
+        self.assertEqual(ub.parse_command("trust-set 1302 - gen=7000000000000001")[3], 7000000000000001)
         self.assertEqual(ub.parse_command("trust-sync")[0], "trust-sync")
         self.assertEqual(ub.parse_command("trust-check 1.1.1.1")[0], "trust-check")
 
@@ -62,7 +62,7 @@ class Commands(unittest.TestCase):
                     "trust-set 1302 " + ",".join(f"1.1.1.{i}" for i in range(1, 12)),
                     "trust-set 1302 1.1.1.1;id", "trust-sync x", "trust-restore now",
                     "trust-check 10.0.0.1", "trust-set 01302 1.1.1.1",
-                    "trust-set 1302 1.1.1.1 gen=176400000000", "trust-set 1302 1.1.1.1 gen=9999999999999"):
+                    "trust-set 1302 1.1.1.1 gen=700000000000000", "trust-set 1302 1.1.1.1 gen=9999999999999999"):
             with self.assertRaises(ub.BadRequest, msg=raw):
                 ub.parse_command(raw)
 
@@ -85,11 +85,11 @@ class Commands(unittest.TestCase):
 
     def test_doc_all_or_nothing(self):
         P = ub.parse_trust_doc
-        d = P('{"gen": 1764000000000, "vms": {"1302": ["1.1.1.1"]}}', "x")
+        d = P('{"gen": 7000000000000001, "vms": {"1302": ["1.1.1.1"]}}', "x")
         self.assertEqual(({k: [ub.entry_text(n) for n in v] for k, v in d["vms"].items()}, d["gen"]),
-                         ({1302: ["1.1.1.1"]}, 1764000000000))
-        for raw in ('{"vms": {"1302": ["1.1.1.1"]}}', '{"gen": 9999999999999, "vms": {}}',
-                    '{"gen": true, "vms": {}}', '{"gen": "1764000000000", "vms": {}}','{"vms": {"1302,1999": ["1.1.1.1"]}}', '{"vms": {"01302": []}}',
+                         ({1302: ["1.1.1.1"]}, 7000000000000001))
+        for raw in ('{"vms": {"1302": ["1.1.1.1"]}}', '{"gen": 9999999999999999, "vms": {}}',
+                    '{"gen": true, "vms": {}}', '{"gen": "7000000000000001", "vms": {}}','{"vms": {"1302,1999": ["1.1.1.1"]}}', '{"vms": {"01302": []}}',
                     '{"vms": {"99": []}}', '{"vms": {"1302": ["1.1.1.1"], "1302": []}}',
                     '{"vms": {"1302": ["1.1.1.1", "10.0.0.1"]}}', '{"vms": {"1302": ["fe80::1%eth0"]}}',
                     '{"vms": {"1302": [1]}}', '{"vms": {"1302": "1.1.1.1"}}', '[]', 'x'):
@@ -104,7 +104,8 @@ class Commands(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ub.load_trust_state(fh.name)
         os.unlink(fh.name)
-        self.assertEqual(ub.load_trust_state(fh.name), ({}, {}))   # ausente = vacio
+        st = ub.load_trust_state(fh.name)                          # ausente = vacio
+        self.assertEqual((st.vms, st.gens, st.sync_gen), ({}, {}, 0))
 
     def test_guarded_read_failure_fails_closed(self):
         class R:
@@ -119,12 +120,10 @@ class Commands(unittest.TestCase):
 
 
 class Generations(unittest.TestCase):
-    """Orden de las operaciones: una orden atrasada no deshace una posterior."""
+    """Orden de las operaciones: revision = us*4 + fase; todo estricto."""
 
     def setUp(self):
         import tempfile
-        global T0
-        T0 = ub.now_ms() - 60000
         self.dir = tempfile.mkdtemp()
         self.saved = (ub.TRUST_STATE, ub.set_exists, ub.run, ub.TrustChecker)
         ub.TRUST_STATE = os.path.join(self.dir, "cust_trust.json")
@@ -144,32 +143,50 @@ class Generations(unittest.TestCase):
             def reason(self, net):
                 return None
         ub.TrustChecker = NoBase
+        self.us = int(ub.time.time() * 1_000_000) - 60_000_000
+        self.e = [ub.trust_entry("1.1.1.1")]
 
     def tearDown(self):
         ub.TRUST_STATE, ub.set_exists, ub.run, ub.TrustChecker = self.saved
 
+    def g(self, dus, phase):
+        return (self.us + dus) * 4 + phase
+
     def live(self):
         return self.batches[-1]
 
-    def test_stale_set_after_revoke(self):
-        e = [ub.trust_entry("1.1.1.1")]
-        self.assertEqual(ub.trust_set(1302, e, (T0 + 0))["result"], "set")
-        ub.revoke_trust([1302], (T0 + 5000))                 # VM reasignada
+    def test_set_then_late_revoke_keeps_new_list(self):
+        self.assertEqual(ub.trust_set(1302, self.e, self.g(10, ub.GEN_SET))["result"], "set")
+        self.assertEqual(ub.revoke_trust([1302], self.g(5, ub.GEN_REVOKE)), 0)     # revocacion atrasada
+        self.assertIn("1.1.1.1", self.live())
+
+    def test_revoke_then_late_set_is_stale(self):
+        ub.trust_set(1302, self.e, self.g(0, ub.GEN_SET))
+        ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))
+        self.assertEqual(ub.trust_set(1302, self.e, self.g(5, ub.GEN_SET))["result"], "stale")
         self.assertNotIn("1.1.1.1", self.live())
-        out = ub.trust_set(1302, e, (T0 + 3000))             # alta del dueño anterior, atrasada
-        self.assertEqual(out["result"], "stale")
-        self.assertNotIn("1.1.1.1", self.live())
-        self.assertEqual(ub.trust_set(1302, e, (T0 + 6000))["result"], "set")   # posterior: entra
+
+    def test_same_microsecond_revoke_wins_and_reapply_follows(self):
+        ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))
+        self.assertEqual(ub.trust_set(1302, self.e, self.g(10, ub.GEN_SET))["result"], "stale")
+        self.assertEqual(ub.trust_set(1302, self.e, self.g(10, ub.GEN_REAPPLY))["result"], "set")
+        self.assertEqual(ub.trust_set(1302, self.e, self.g(10, ub.GEN_REAPPLY))["result"], "stale")  # empate = no
+
+    def test_sync_is_a_floor_for_unknown_vms(self):
+        ub.trust_sync({"gen": self.g(10, ub.GEN_SYNC), "vms": {}})                  # base nueva, foto vacia
+        self.assertEqual(ub.trust_set(1999, self.e, self.g(5, ub.GEN_SET))["result"], "stale")
+        self.assertEqual(ub.trust_set(1999, self.e, self.g(11, ub.GEN_SET))["result"], "set")
 
     def test_sync_does_not_undo_newer_remove(self):
-        ub.trust_set(1302, [ub.trust_entry("1.1.1.1")], (T0 + 0))
-        ub.trust_set(1302, [], (T0 + 9000))                  # el cliente la quita
-        out = ub.trust_sync({"gen": (T0 + 5000), "vms": {1302: [ub.trust_entry("1.1.1.1")]}})
+        ub.trust_set(1302, self.e, self.g(0, ub.GEN_SET))
+        ub.trust_set(1302, [], self.g(20, ub.GEN_SET))                              # el cliente la quita
+        out = ub.trust_sync({"gen": self.g(10, ub.GEN_SYNC), "vms": {1302: self.e}})
         self.assertEqual(out["staleVms"], [1302])
         self.assertNotIn("1.1.1.1", self.live())
+        self.assertTrue(ub.trust_sync({"gen": self.g(9, ub.GEN_SYNC), "vms": {1302: self.e}})["staleSnapshot"])
 
     def test_revoke_retry_reapplies_live_set(self):
-        ub.trust_set(1302, [ub.trust_entry("1.1.1.1")], (T0 + 0))
+        ub.trust_set(1302, self.e, self.g(0, ub.GEN_SET))
         orig = ub.run
 
         def boom(cmd, stdin=None):
@@ -178,12 +195,15 @@ class Generations(unittest.TestCase):
             return orig(cmd, stdin)
         ub.run = boom
         with self.assertRaises(RuntimeError):
-            ub.revoke_trust([1302], (T0 + 5000))
+            ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))
         ub.run = orig
+        self.assertIn("1.1.1.1", open(ub.TRUST_STATE).read())               # el fichero volvio atras
         n = len(self.batches)
-        ub.revoke_trust([1302], (T0 + 6000))                 # reintento: VM ya fuera del fichero
-        self.assertEqual(len(self.batches), n + 1)             # pero el set se reescribe igual
+        ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))                  # mismo reintento
+        self.assertEqual(len(self.batches), n + 1)
         self.assertNotIn("1.1.1.1", self.live())
+        ub.revoke_trust([1302], self.g(10, ub.GEN_REVOKE))                  # otro: ya no cambia nada,
+        self.assertEqual(len(self.batches), n + 2)                          # pero repara el set igual
 
 
 class SweepguardExempt(unittest.TestCase):

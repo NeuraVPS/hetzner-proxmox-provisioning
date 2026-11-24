@@ -334,9 +334,9 @@ class RevokeVm(unittest.TestCase):
         v, ip, vmids, gen = ub.parse_command("revoke-vm 1671,483,1671")
         self.assertEqual((v, ip, vmids), ("revoke-vm", None, [483, 1671]))
         self.assertIsInstance(gen, int)                      # sin gen=: la hora de la base
-        self.assertEqual(ub.parse_command("revoke-vm 483 gen=1764000000000")[3], 1764000000000)
+        self.assertEqual(ub.parse_command("revoke-vm 483 gen=7000000000000002")[3], 7000000000000002)
         with self.assertRaises(ub.BadRequest):
-            ub.parse_command("revoke-vm 483 gen=9999999999999")            # del futuro
+            ub.parse_command("revoke-vm 483 gen=9999999999999999")         # del futuro
         for raw in ["revoke-vm", "revoke-vm ", f"revoke-vm {A4}", "revoke-vm 1671 console", "revoke-vm 99",
                     "revoke-vm 1671,", "revoke-vm 01671", "revoke-vm 1671;id", "REVOKE-VM 1671"]:
             with self.assertRaises(ub.BadRequest, msg=raw):

@@ -701,6 +701,10 @@ cortaba todos sus VPS).
   dirección numérica. Fallo cerrado: estado o carga con UNA entrada mala, o `nuestras4/6` ilegible → error,
   nada cambia. `trust-sync` lee stdin (bytes, 15 s) antes de tomar el cerrojo. Un despliegue nuevo aparta un
   `cust_trust.json` previo y el rollback también: lo llena la reconciliación.
+* **Orden**: cada orden lleva una revisión `gen` = microsegundos (hora de Firestore) × 4 + fase (0 foto, 1 alta/
+  baja del cliente, 2 revocación, 3 reaplicación tras la revocación del mismo evento). Cada VM guarda la de su
+  última orden y la última foto completa es el suelo de todas; solo se acepta una orden POSTERIOR (estricto). Una
+  orden descartada (`stale`) igualmente reescribe el set desde el fichero.
 * Persistencia: set y regla en `/etc/nftables.conf`; elementos por `neuravps-cust-trust-restore.service`
   (arranque, tras nftables) y por la reconciliación horaria de NeuraVPS (`trusted_ips_reconcile`, `trust-sync`
   desde Firestore `trusted_ips/`).
