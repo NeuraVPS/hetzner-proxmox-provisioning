@@ -41,10 +41,12 @@ census() { python3 "$HERE/nat64_rule_census.py" "$1" "$2" "$OWN"; }
 # Todo se valida ANTES de tocar nada: en vivo y en disco solo puede haber, como
 # mucho, la regla PROPIA (línea idéntica); cualquier otra con 64:ff9b:1::/96 aborta.
 LIVE=$(mktemp); nft -a list chain ip6 rdpguard pre > "$LIVE"
-read -r L_OWN L_ANY L_H < <(census live "$LIVE"); rm -f "$LIVE"
-read -r C_OWN C_ANY _ < <(census disk "$CONF")
-if [ "$L_ANY" != "$L_OWN" ] || [ "$L_OWN" -gt 1 ] || [ "$C_ANY" != "$C_OWN" ] || [ "$C_OWN" -gt 1 ]; then
-  echo "  !! reglas con 64:ff9b:1::/96 que no son esta (o duplicadas): vivo $L_ANY/$L_OWN, disco $C_ANY/$C_OWN — revisa a mano, no toco nada"; exit 1
+read -r L_OWN L_ANY L_H L_POS < <(census live "$LIVE"); rm -f "$LIVE"
+L_ANY=$(nft list table ip6 rdpguard | grep -v '^\s*#' | grep -c "64:ff9b:1::/96" || true)   # toda la tabla
+read -r C_OWN C_ANY _ C_POS < <(census disk "$CONF")
+if [ "$L_ANY" != "$L_OWN" ] || [ "$L_OWN" -gt 1 ] || [ "$C_ANY" != "$C_OWN" ] || [ "$C_OWN" -gt 1 ] \
+   || [ "$L_POS" = bad ] || [ "$C_POS" = bad ]; then
+  echo "  !! reglas con 64:ff9b:1::/96 que no son esta (o duplicadas): vivo $L_ANY/$L_OWN ($L_POS), disco $C_ANY/$C_OWN ($C_POS) — revisa a mano, no toco nada"; exit 1
 fi
 if [ "$L_OWN" = 1 ]; then
   echo "  [vivo] ya estaba"

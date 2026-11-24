@@ -118,6 +118,26 @@ PY
 if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d3.out 2>&1; then echo "FAIL deploy con conflicto en disco"; exit 1; fi
 nft list chain ip6 rdpguard pre | grep -q '64:ff9b:1::/96' && { echo "FAIL tocó lo vivo con conflicto en disco"; exit 1; }
 echo "  ok  conflicto solo en disco: aborta sin tocar lo vivo (y un comentario no cuenta como regla)"
+# la regla exacta, pero en OTRA cadena de la tabla
+nft flush ruleset; nft -f orig.nft; cp orig.nft conf.nft
+nft add chain ip6 rdpguard otra
+nft add rule ip6 rdpguard otra $OWN_TXT
+if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d4.out 2>&1; then echo "FAIL deploy con la regla en otra cadena"; exit 1; fi
+if CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r4.out 2>&1; then echo "FAIL rollback con la regla en otra cadena"; exit 1; fi
+nft list chain ip6 rdpguard otra | grep -q "64:ff9b:1::/96" || { echo "FAIL borró la regla de otra cadena"; exit 1; }
+echo "  ok  la regla exacta en otra cadena: deploy y rollback abortan sin tocarla"
+# en disco, en pre pero ANTES de bf_auto: posición mala → aborta
+nft flush ruleset; nft -f orig.nft; cp orig.nft conf.nft
+python3 - conf.nft "$OWN_TXT" <<'PY'
+import sys
+p, own = sys.argv[1:]; s = open(p).read()
+i = s.index("table ip6 rdpguard {"); j = s.index("chain pre {", i); k = s.index("\n", s.index("policy accept", j))
+s = s[:k + 1] + "        " + own + "\n" + s[k + 1:]
+open(p, "w").write(s)
+PY
+if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d5.out 2>&1; then echo "FAIL deploy con posición mala en disco"; exit 1; fi
+grep -q "(bad)" d5.out || { echo "FAIL motivo posición"; cat d5.out; exit 1; }
+echo "  ok  en disco antes de bf_auto: aborta por posición"
 kill $SP $J $X 2>/dev/null || true
 echo "NETNS_NAT64_OK"
 INNER
