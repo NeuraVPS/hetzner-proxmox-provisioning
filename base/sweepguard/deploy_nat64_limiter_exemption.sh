@@ -36,8 +36,15 @@ case "$ROUTE" in *"dev $JOOL_IF"*) echo "  [ruta] 64:ff9b:1::/96 por $JOOL_IF OK
   *) echo "  !! 64:ff9b:1::/96 no va por $JOOL_IF ($ROUTE) — aborto"; exit 1 ;; esac
 
 CH=$(nft list chain ip6 rdpguard pre)
-case "$CH" in
-  *"64:ff9b:1::/96 accept"*) echo "  [vivo] ya estaba" ;;
+# La regla se reconoce por su texto EXACTO (interfaz, prefijo, veredicto y
+# comentario propios); cualquier otra que se le parezca aborta.
+N_OWN=$(grep -cF "$RULE comment \"$COM\"" <<<"$CH" || true)
+N_ANY=$(grep -c "64:ff9b:1::/96" <<<"$CH" || true)
+if [ "$N_ANY" != "$N_OWN" ] || [ "$N_OWN" -gt 1 ]; then
+  echo "  !! hay reglas con 64:ff9b:1::/96 que no son esta (o duplicadas): $N_ANY / $N_OWN — revisa a mano"; exit 1
+fi
+case "$N_OWN" in
+  1) echo "  [vivo] ya estaba" ;;
   *)
     A=$(nft -a list chain ip6 rdpguard pre)
     H=$(awk '/add @bf_seen/{print $NF; exit}' <<<"$A")
@@ -54,13 +61,18 @@ import subprocess
 r = [l.strip() for l in subprocess.run(["nft", "list", "chain", "ip6", "rdpguard", "pre"],
      capture_output=True, text=True, check=True).stdout.splitlines()]
 i = lambda s: next(k for k, l in enumerate(r) if s in l)
-x, a, seen, lim = i("64:ff9b:1::/96 accept"), i("saddr @bf_auto"), i("add @bf_seen"), i("add @bf {")
+own = [k for k, l in enumerate(r) if l.startswith('iifname "veth-host" ip6 saddr 64:ff9b:1::/96 accept comment "IPv4 traducido (NAT64)')]
+assert len(own) == 1, f"regla propia: {len(own)} (debe haber exactamente una)"
+x, a, seen, lim = own[0], i("saddr @bf_auto"), i("add @bf_seen"), i("add @bf {")
 assert a < x < seen < lim, f"orden incorrecto auto={a} nat64={x} seen={seen} bf={lim}"
-assert 'iifname "veth-host"' in r[x] or "iifname" in r[x], "la exención no exige la interfaz de Jool"
 print("  [orden] bf_auto -> exención NAT64 (solo veth-host) -> bf_seen -> @bf OK")
 PY
 
-if grep -q "64:ff9b:1::/96 accept" "$CONF"; then
+N_OWN=$(grep -cF "$RULE comment \"$COM\"" "$CONF" || true)
+N_ANY=$(grep -c "64:ff9b:1::/96" "$CONF" || true)
+if [ "$N_ANY" != "$N_OWN" ] || [ "$N_OWN" -gt 1 ]; then
+  echo "  !! $CONF tiene reglas con 64:ff9b:1::/96 que no son esta (o duplicadas) — revisa a mano"; exit 1
+elif [ "$N_OWN" = 1 ]; then
   echo "  [conf] ya estaba"
 else
   BK="$CONF.bak.nat64lim.$(date +%Y%m%d-%H%M%S)"; NEW="$CONF.nat64lim.new"

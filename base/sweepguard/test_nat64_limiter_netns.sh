@@ -11,7 +11,20 @@ if [ -n "$CONF_IN" ]; then
   # conf real: solo despliegue + rollback (sus tablas de filtrado no dejan pasar
   # los paquetes de esta topología de prueba)
   grep -v "^include " "$CONF_IN" > "$W/conf.nft"; cp "$W/conf.nft" "$W/orig.nft"
-  unshare -rn bash -c "cd $W && nft -f conf.nft && CONF=conf.nft SKIP_ROUTE_CHECK=1 bash $HERE/deploy_nat64_limiter_exemption.sh | grep -E '\\[|OK' && CONF=conf.nft bash $HERE/rollback_nat64_limiter_exemption.sh | tail -1 && cmp orig.nft conf.nft && echo REALCONF_OK"
+  cat > "$W/real.sh" <<'REAL'
+set -euo pipefail
+HERE=$1; cd "$2"
+nft -f conf.nft
+CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d.out 2>&1 || { cat d.out; echo "FAIL deploy"; exit 1; }
+grep -E "\[|OK" d.out | grep -v "^  \s*\(ip\|tcp\|meta\|fib\|type\|chain\)" | head -6
+[ "$(nft list chain ip6 rdpguard pre | grep -c 'iifname "veth-host" ip6 saddr 64:ff9b:1::/96 accept')" = 1 ] || { echo "FAIL regla viva"; exit 1; }
+[ "$(grep -c '64:ff9b:1::/96 accept' conf.nft)" = 1 ] || { echo "FAIL regla en conf"; exit 1; }
+CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r.out 2>&1 || { cat r.out; echo "FAIL rollback"; exit 1; }
+nft list chain ip6 rdpguard pre | grep -q "64:ff9b:1::/96" && { echo "FAIL regla viva tras rollback"; exit 1; }
+cmp orig.nft conf.nft || { echo "FAIL conf distinta tras rollback"; exit 1; }
+echo REALCONF_OK
+REAL
+  unshare -rn bash "$W/real.sh" "$HERE" "$W"
   exit 0
 fi
 cat > "$W/conf.nft" <<'NFT'
@@ -34,7 +47,7 @@ cp "$W/conf.nft" "$W/orig.nft"
 cat > "$W/inner.sh" <<'INNER'
 set -euo pipefail
 HERE=$1; W=$2; cd "$W"
-trap 'kill $(jobs -p) 2>/dev/null; pkill -P $$ 2>/dev/null || true' EXIT
+trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 nft -f conf.nft
 ip link set lo up
 B6=2a01:4f9:aaaa::2
@@ -75,6 +88,13 @@ n=$(burst $X); [ "$n" -lt 15 ] || { echo "FAIL falseada por otra interfaz $n/30"
 CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r.out 2>&1 || { cat r.out; exit 1; }
 cmp orig.nft conf.nft && echo "  ok  rollback: conf idéntica"
 nft list chain ip6 rdpguard pre | grep -q "64:ff9b:1::/96 accept" && { echo "FAIL regla viva tras rollback"; exit 1; }
+nft add rule ip6 rdpguard pre iifname "eth9" ip6 saddr 64:ff9b:1::/96 accept   # regla ajena parecida
+if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d2.out 2>&1; then
+  echo "FAIL despliegue con regla ajena"; exit 1; fi
+grep -q "no son esta" d2.out && echo "  ok  despliegue aborta ante una regla 64:ff9b:1:: ajena"
+if CONF=conf.nft bash "$HERE/rollback_nat64_limiter_exemption.sh" > r2.out 2>&1; then
+  echo "FAIL rollback con regla ajena"; exit 1; fi
+nft list chain ip6 rdpguard pre | grep -q 'iifname "eth9"' && echo "  ok  rollback aborta y no borra la regla ajena"
 kill $SP $J $X 2>/dev/null || true
 echo "NETNS_NAT64_OK"
 INNER
