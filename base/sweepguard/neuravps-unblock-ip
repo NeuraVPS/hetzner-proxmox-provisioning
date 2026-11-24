@@ -956,6 +956,16 @@ def cut_flows(before, st):
     return {"flowsCut": cut, "flowsCutOk": not failed}
 
 
+def _mark_cut_pending(before, st):
+    """Antes de publicar la política: las VMs que quedan cerradas y cuya
+    política cambió entran en cut_pending EN EL MISMO estado que se guarda. Si
+    el proceso se corta antes de cortar sus sesiones, la siguiente orden (o
+    trust-restore al arrancar) lo reintenta; solo cut_flows las quita al
+    lograrlo."""
+    st.cut_pending |= {v for v in st.closed
+                       if before.get(v) != (True, frozenset(entry_text(n) for n in st.vms.get(v, [])))}
+
+
 def _cut_and_save(before, st, applied):
     """cut_flows tras aplicar (solo si el cierre se aplicó en esta base) y, si
     cambió la lista de cortes pendientes, se guarda en el estado (sin tocar nft)."""
@@ -1005,6 +1015,7 @@ def trust_set(vmid, nets, gen, closed=False):
            "rejected": rejected, "gen": gen, "closed": vmid in st.closed}
     if closed and not ok:
         out["closedRefused"] = "no_entries"
+    _mark_cut_pending(before, st)
     out.update(apply_trust(st))
     out.update(_cut_and_save(before, st, out))
     return out
@@ -1088,6 +1099,7 @@ def trust_sync(payload):
            "rejectedCount": len(rejected), "staleVms": stale[:100],
            "changedVms": sorted(v for v in set(before) | set(after)
                                 if before.get(v) != after.get(v))[:100]}
+    _mark_cut_pending(snap_before, st)
     out.update(apply_trust(st))
     out.update(_cut_and_save(snap_before, st, out))
     return out

@@ -321,6 +321,27 @@ class ClosedMode(Generations):
         self.assertEqual(sorted(c[c.index("-s") + 1] for c in calls), ["2001:db8:9::1", "8.8.8.8"])
         self.assertTrue(all("--sport" in c and "--dport" in c and "-d" in c for c in calls))   # tupla completa
 
+    def test_crash_between_policy_and_cut_retries_on_restore(self):
+        orig_cut = ub.cut_flows
+        ub.cut_flows = lambda before, st: (_ for _ in ()).throw(SystemExit("corte de luz"))
+        try:
+            with self.assertRaises(SystemExit):
+                ub.trust_set(1302, self.e, self.g(1, ub.GEN_SET), closed=True)
+        finally:
+            ub.cut_flows = orig_cut
+        st = ub.load_trust_state()
+        self.assertEqual((st.closed, st.cut_pending), ({1302}, {1302}))     # guardado junto con la política
+        rows = {("ipv4", "tcp", "21302"): [
+            "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1"]}
+        run, calls = self._ct_run(rows)
+        ub.run = run
+        try:
+            out = ub.trust_restore()
+        finally:
+            ub.run = self.saved[2]
+        self.assertEqual((out["flowsCutOk"], len(calls)), (True, 1))
+        self.assertEqual(ub.load_trust_state().cut_pending, set())
+
     def test_cut_flows_failure_stays_pending_and_retries(self):
         rows = {("ipv4", "tcp", "21302"): [
             "tcp 6 300 ESTABLISHED src=8.8.8.8 dst=77.42.49.79 sport=1 dport=21302 src=10.0.0.3 dst=77.42.49.79 sport=21302 dport=1"]}
