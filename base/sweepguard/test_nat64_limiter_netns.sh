@@ -138,6 +138,22 @@ PY
 if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d5.out 2>&1; then echo "FAIL deploy con posición mala en disco"; exit 1; fi
 grep -q "(bad)" d5.out || { echo "FAIL motivo posición"; cat d5.out; exit 1; }
 echo "  ok  en disco antes de bf_auto: aborta por posición"
+# primer despliegue con bf_seen ANTES del drop de bf_auto en disco: aborta sin tocar nada
+nft flush ruleset; nft -f orig.nft; cp orig.nft conf.nft
+python3 - conf.nft <<'PY'
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index("table ip6 rdpguard {")
+lines = s[i:].split("\n")
+a = next(k for k, l in enumerate(lines) if "saddr @bf_auto" in l and "drop" in l)
+b = next(k for k, l in enumerate(lines) if "add @bf_seen" in l)
+lines[a], lines[b] = lines[b], lines[a]
+open(p, "w").write(s[:i] + "\n".join(lines))
+PY
+if CONF=conf.nft SKIP_ROUTE_CHECK=1 bash "$HERE/deploy_nat64_limiter_exemption.sh" > d6.out 2>&1; then echo "FAIL deploy con orden malo en disco"; exit 1; fi
+grep -q "no va antes de bf_seen" d6.out || { echo "FAIL motivo orden"; cat d6.out; exit 1; }
+nft list chain ip6 rdpguard pre | grep -q "64:ff9b:1::/96" && { echo "FAIL tocó lo vivo"; exit 1; }
+echo "  ok  primer despliegue con orden malo en disco: aborta sin tocar nada"
 kill $SP $J $X 2>/dev/null || true
 echo "NETNS_NAT64_OK"
 INNER

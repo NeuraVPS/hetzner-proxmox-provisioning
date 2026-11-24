@@ -13,10 +13,10 @@ OWN="$RULE comment \"$COM\""
 HERE=$(cd "$(dirname "$0")" && pwd)
 census() { python3 "$HERE/nat64_rule_census.py" "$1" "$2" "$OWN"; }
 LIVE=$(mktemp); nft -a list chain ip6 rdpguard pre > "$LIVE"
-read -r N_OWN N_ANY H _ < <(census live "$LIVE"); rm -f "$LIVE"
+read -r N_OWN N_ANY H _ _ < <(census live "$LIVE"); rm -f "$LIVE"
 N_ANY=$(nft list table ip6 rdpguard | grep -v '^\s*#' | grep -c "64:ff9b:1::/96" || true)   # toda la tabla
 [ "$N_ANY" = "$N_OWN" ] && [ "$N_OWN" -le 1 ] || { echo "  !! reglas 64:ff9b:1::/96 ajenas o duplicadas en vivo ($N_ANY/$N_OWN) — no toco nada"; exit 1; }
-read -r C_OWN C_ANY _ _ < <(census disk "$CONF")
+read -r C_OWN C_ANY _ _ _ < <(census disk "$CONF")
 [ "$C_ANY" = "$C_OWN" ] && [ "$C_OWN" -le 1 ] || { echo "  !! reglas 64:ff9b:1::/96 ajenas o duplicadas en $CONF ($C_ANY/$C_OWN) — no toco nada"; exit 1; }
 NEW=""
 if [ "$C_OWN" = 1 ]; then

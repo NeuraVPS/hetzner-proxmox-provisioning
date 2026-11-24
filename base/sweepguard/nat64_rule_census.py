@@ -7,7 +7,9 @@
          (otras cadenas incluidas: cualquier otra es conflicto);
   handle el de la propia (vivo) o -;
   pos    ok si la propia está después del drop de bf_auto y antes del
-         registro en bf_seen; bad si no; - si no está.
+         registro en bf_seen; bad si no; - si no está;
+  order  ok si en `pre` hay un drop de bf_auto y va ANTES del registro en
+         bf_seen (el hueco donde se inserta la propia); bad si no.
 Lo usan deploy/rollback_nat64_limiter_exemption.sh."""
 import re
 import sys
@@ -44,4 +46,7 @@ for k, (l, h) in enumerate(pre_lines):
         auto = [j for j, (x, _) in enumerate(pre_lines) if "saddr @bf_auto" in x and "drop" in x]
         seen = [j for j, (x, _) in enumerate(pre_lines) if "add @bf_seen" in x]
         pos = "ok" if auto and seen and auto[-1] < k < seen[0] else "bad"
-print(n_own, n_any, handle, pos)
+auto = [j for j, (x, _) in enumerate(pre_lines) if "saddr @bf_auto" in x and "drop" in x]
+seen = [j for j, (x, _) in enumerate(pre_lines) if "add @bf_seen" in x]
+order = "ok" if auto and seen and auto[-1] < seen[0] else "bad"
+print(n_own, n_any, handle, pos, order)

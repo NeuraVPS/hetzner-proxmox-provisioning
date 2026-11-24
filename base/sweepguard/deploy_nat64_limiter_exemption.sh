@@ -41,9 +41,12 @@ census() { python3 "$HERE/nat64_rule_census.py" "$1" "$2" "$OWN"; }
 # Todo se valida ANTES de tocar nada: en vivo y en disco solo puede haber, como
 # mucho, la regla PROPIA (línea idéntica); cualquier otra con 64:ff9b:1::/96 aborta.
 LIVE=$(mktemp); nft -a list chain ip6 rdpguard pre > "$LIVE"
-read -r L_OWN L_ANY L_H L_POS < <(census live "$LIVE"); rm -f "$LIVE"
+read -r L_OWN L_ANY L_H L_POS L_ORD < <(census live "$LIVE"); rm -f "$LIVE"
 L_ANY=$(nft list table ip6 rdpguard | grep -v '^\s*#' | grep -c "64:ff9b:1::/96" || true)   # toda la tabla
-read -r C_OWN C_ANY _ C_POS < <(census disk "$CONF")
+read -r C_OWN C_ANY _ C_POS C_ORD < <(census disk "$CONF")
+if [ "$L_ORD" != ok ] || [ "$C_ORD" != ok ]; then
+  echo "  !! en ip6 rdpguard pre el drop de bf_auto no va antes de bf_seen (vivo $L_ORD, disco $C_ORD) — no toco nada"; exit 1
+fi
 if [ "$L_ANY" != "$L_OWN" ] || [ "$L_OWN" -gt 1 ] || [ "$C_ANY" != "$C_OWN" ] || [ "$C_OWN" -gt 1 ] \
    || [ "$L_POS" = bad ] || [ "$C_POS" = bad ]; then
   echo "  !! reglas con 64:ff9b:1::/96 que no son esta (o duplicadas): vivo $L_ANY/$L_OWN ($L_POS), disco $C_ANY/$C_OWN ($C_POS) — revisa a mano, no toco nada"; exit 1
@@ -93,6 +96,10 @@ b = b[:m.start() + 1] + f"{m.group(1)}{rule} comment \"{com}\"\n" + b[m.start() 
 open(conf, "w").write(s[:i] + b + s[j:])
 print("  [conf] regla escrita (fichero hermano)")
 PY
+  read -r N_OWN N_ANY _ N_POS _ < <(census disk "$NEW")
+  if [ "$N_OWN" != 1 ] || [ "$N_ANY" != 1 ] || [ "$N_POS" != ok ]; then
+    rm -f "$NEW"; echo "  !! el fichero candidato no deja la regla una vez y entre bf_auto y bf_seen ($N_OWN/$N_ANY/$N_POS) — sin tocar"; exit 1
+  fi
   if nft -c -f "$NEW"; then mv -f "$NEW" "$CONF"; echo "  [conf] sintaxis OK (no cargada); publicada con mv; copia en $BK"
   else rm -f "$NEW"; echo "  !! conf nueva no valida — sin tocar"; exit 1; fi
 fi
