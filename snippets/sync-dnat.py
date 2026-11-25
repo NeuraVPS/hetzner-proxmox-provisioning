@@ -352,7 +352,9 @@ def _api_finalize(pending):
             logger.warning(f"node-boot: could not finalize maintenance ({e}); the watchdog will retry")
             try:
                 BOOT_FINALIZE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                BOOT_FINALIZE_FILE.write_text(json.dumps(dict(pending, tries=pending["tries"] + 1)))
+                tmp = BOOT_FINALIZE_FILE.with_name(BOOT_FINALIZE_FILE.name + ".tmp")
+                tmp.write_text(json.dumps(dict(pending, tries=pending["tries"] + 1)))
+                os.replace(tmp, BOOT_FINALIZE_FILE)  # atomic: watch never reads a partial file
             except OSError as write_error:
                 logger.error(f"Could not persist {BOOT_FINALIZE_FILE}: {write_error}")
             return
