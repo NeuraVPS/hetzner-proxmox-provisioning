@@ -596,3 +596,22 @@ def test_retry_cli_does_not_create_a_new_request(sync, monkeypatch):
     with pytest.raises(SystemExit):
         sync.sync_nodes_sync_firewall(attempt=2)
     assert not sync.FW_SYNC_PENDING.exists()
+
+
+def test_retry_leaves_a_new_pending_request_to_its_own_worker(sync, monkeypatch):
+    runs = []
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: runs.append(1) or True)
+    sync.FW_SYNC_PENDING.write_text("new\n")       # only a fresh request exists
+    assert sync.sync_nodes_sync_firewall_worker(attempt=3) == 0
+    assert runs == [] and sync.FW_SYNC_PENDING.exists()
+    assert sync.sync_nodes_sync_firewall_worker() == 0   # its own worker serves it
+    assert runs == [1] and not sync.FW_SYNC_PENDING.exists()
+
+
+def test_retry_does_not_take_pending_after_finishing_in_progress(sync, monkeypatch):
+    runs = []
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: runs.append(1) or True)
+    sync.FW_SYNC_INPROGRESS.write_text("old\n")
+    sync.FW_SYNC_PENDING.write_text("new\n")
+    sync.sync_nodes_sync_firewall_worker(attempt=2)
+    assert runs == [1] and sync.FW_SYNC_PENDING.exists()

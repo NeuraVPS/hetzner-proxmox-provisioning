@@ -2820,18 +2820,20 @@ def sync_nodes_sync_firewall_worker(attempt: int = 0) -> int:
                 time.sleep(5)
         ok = True
         ran = False
-        todo = FW_SYNC_PENDING.exists() or (attempt > 0 and FW_SYNC_INPROGRESS.exists())
+        # A retry only finishes the in-progress request; a new `pending` belongs
+        # to its own fresh worker (attempt 0, full retry budget).
+        todo = FW_SYNC_INPROGRESS.exists() if attempt > 0 else FW_SYNC_PENDING.exists()
         try:
             # Promote the marker BEFORE reading state: a request arriving
             # mid-pass leaves a new marker (and its own worker), so nothing is
             # lost; the in-progress marker only goes away after a good pass.
             while todo:
-                if FW_SYNC_PENDING.exists():
+                if attempt == 0:
                     os.replace(FW_SYNC_PENDING, FW_SYNC_INPROGRESS)
                 ran = True
                 if run_cluster_fw_sync_once():
                     FW_SYNC_INPROGRESS.unlink(missing_ok=True)
-                    todo = FW_SYNC_PENDING.exists()
+                    todo = attempt == 0 and FW_SYNC_PENDING.exists()
                 else:
                     ok = False
                     break
