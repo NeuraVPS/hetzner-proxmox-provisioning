@@ -140,6 +140,34 @@
 # vendor, so the customer is warned first — cold-move runbook).
 # LAB ONLY: NV_LAB_ALLOW_CROSS_VENDOR_LIVE=<vmid> lets that single VMID through,
 # to reproduce the crash on a lab VM. Never on a customer VM.
+#
+# ----- Nada en caliente entre silicios distintos (25/11/2026) -----------------
+# Mismo fabricante no basta. cpu=host/max solo entre vendor|family|model
+# idénticos, y cualquier otro modelo (x86-64-v4…) también solo entre el mismo
+# vendor|family|model (sin modo global para relajarlo). Así, entre AX162
+# (Genoa), AX102 (Raphael) y Kademar (EPYC 9755 Turin) TODO traslado es en
+# frío. Ver _live_silicon_guard. LAB ONLY:
+# NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
+#
+# ----- Traslados en frío (y por qué aquí no hay precopia) ---------------------
+# Si la VM está PARADA, este script hace `remote_migrate` sin --online: PVE
+# copia los discos enteros por el túnel websocket de la API (puerto 8006) con
+# la VM apagada todo el rato, y la deja PARADA en destino (no la arranca). No
+# hay precopia. Por un enlace no-Hetzner eso es caro: en el piloto Kademar
+# (08/11) ese mismo túnel tardó 1 h 05 min con un disco de 146 GB (en caliente;
+# en frío, ese tiempo sería todo corte). Con precopia ZFS (snapshot + `zfs send` con la VM
+# encendida, apagado ordenado, incremental, config al destino) el corte fue de
+# 38 s / 18 s.
+# Esa precopia ya existe y está probada en producción (6 traslados EX44→AX162,
+# 01/10-18/11): el kit rtmig_* (rtmig_send.sh base|incr|verify|resume y
+# rtmig_cutover.sh shutdown|park|push|start|rollback, nodo→nodo por SSH directo
+# con ~/.ssh/neuravps_id y el IPSET hosts-ipv6). Tras `rtmig_cutover.sh start`
+# se ejecuta ESTE script, que entra por la rama «VM is already on dest» y solo
+# reconcilia NAT, hookscript, Firestore, sonda RDP y reloj (w32tm). No se
+# duplica aquí: el kit aparca la config del origen (nadie puede arrancarla) y
+# conserva sus zvols para el rollback, cosa que el flujo de `remote_migrate
+# --delete` de este script no hace. El kit está en scripts/coldmove/ (README.md
+# con el flujo y el rollback) desde el 25/11/2026.
 
 set -euo pipefail
 
@@ -490,14 +518,50 @@ _node_cpu_sig() {
   ' 2>/dev/null
 }
 
-# Reads the raw CPU feature `flags` line (space-separated) of one node via the
-# given multiplexed ssh fn. Used by the upgrade/downgrade direction decision:
-# the destination is migration-safe iff its flags are a SUPERSET of the source's
-# (the source guest can only be using flags the source host has). Prints empty
-# on error.
-_node_cpu_flags() {
-  local ssh_fn="$1"
-  "$ssh_fn" 'grep -m1 "^flags" /proc/cpuinfo | cut -d: -f2' 2>/dev/null
+# LIVE migrations only, AFTER _live_cross_vendor_guard (so same vendor here).
+# Regla vigente (25/11/2026, alta del nodo Kademar 2× EPYC 9755 «Turin», AMD
+# familia 26 modelo 2, frente a los AX162 «Genoa» 25/17 y los AX102 «Raphael»
+# 25/97): nada en caliente entre silicios distintos.
+#   - cpu=host/max: el invitado ve la CPUID real del nodo → solo con
+#     vendor|family|model IDÉNTICO (EPYC 9454 y 9454P son ambos 25|17). Hasta
+#     el 25/11 se dejaba pasar un destino «superconjunto de flags»; ya no.
+#   - cualquier otro modelo (x86-64-v*, kvm64, con nombre): mismo
+#     vendor|family|model también (revisión del PR #291): Genoa 25|17 ↔
+#     Raphael 25|97 ↔ Turin 26|2 son silicios distintos y se rechazan. Cambio
+#     de comportamiento: AX162 → AX102-SQX (0000260/0000261) con CPU genérica
+#     ya no va en caliente (el defrag no hizo ninguno del 04/11 al 25/11: 176
+#     AX102→AX102 y 40 AX162→AX162). El defrag aplica la misma regla
+#     (cpu_move_ok). No hay modo global para relajarla (LIVE_SILICON_MATCH solo
+#     admite «model»; el antiguo «family» se quitó en la 2.ª revisión).
+# Firma ilegible → se rechaza (no se adivina). Único escape, SOLO de
+# laboratorio y por VMID: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<esta VMID>.
+# Args: firma origen, firma destino ("vendor|family|model") y modelo de CPU.
+LIVE_SILICON_MATCH="${LIVE_SILICON_MATCH:-model}"
+_live_silicon_guard() {
+  local src_sig="$1" dst_sig="$2" cpu_model="$3" lc why="" sv sf sm dv df dm
+  IFS='|' read -r sv sf sm <<< "$src_sig"
+  IFS='|' read -r dv df dm <<< "$dst_sig"
+  [[ -n "$sv" && "$sf" =~ ^[0-9]+$ && "$sm" =~ ^[0-9]+$ && -n "$dv" && "$df" =~ ^[0-9]+$ && "$dm" =~ ^[0-9]+$ ]] \
+    || _die "Firma de CPU ilegible (origen '${src_sig}', destino '${dst_sig}'): no se puede descartar un cambio de silicio en caliente. Para la VM (con el cliente avisado) y repite en FRÍO, o reintenta. Abortado antes de tocar la VM."
+  lc=$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')
+  if [[ "$lc" == "host" || "$lc" == "max" ]]; then
+    [[ "$src_sig" == "$dst_sig" ]] \
+      || why="cpu=${cpu_model} enseña al invitado la CPU real y origen ${SRC_NODE} [${src_sig//|/ }] y destino ${DST_NODE} [${dst_sig//|/ }] son silicios distintos (vendor family model)"
+  else
+    [[ "$LIVE_SILICON_MATCH" == model ]] \
+      || _die "LIVE_SILICON_MATCH solo admite 'model' (vale '${LIVE_SILICON_MATCH}'): no hay modo global para relajar la regla. Para una VM de laboratorio: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>."
+    [[ "$sv" == "$dv" && "$sf" == "$df" && "$sm" == "$dm" ]] \
+      || why="cpu=${cpu_model}: cambia el silicio (origen ${SRC_NODE} [${src_sig//|/ }], destino ${DST_NODE} [${dst_sig//|/ }]; regla vendor|family|model)"
+  fi
+  if [[ -z "$why" ]]; then
+    _ok "Silicio compatible para migrar en caliente: [${src_sig//|/ }] → [${dst_sig//|/ }], cpu=${cpu_model} (regla: mismo vendor|family|model)."
+    return 0
+  fi
+  if [[ -n "${NV_LAB_ALLOW_CROSS_SILICON_LIVE:-}" && "${NV_LAB_ALLOW_CROSS_SILICON_LIVE}" == "${VMID}" ]]; then
+    _warn "LAB OVERRIDE NV_LAB_ALLOW_CROSS_SILICON_LIVE=${VMID}: dejo pasar en caliente: ${why}. Solo VMs de laboratorio."
+    return 0
+  fi
+  _die "Cambio de silicio — se rechaza la migración EN CALIENTE de la VM ${VMID}: ${why}. Regla: nada en caliente entre fabricantes ni entre silicios distintos. Única vía: traslado en FRÍO con el cliente avisado (VM parada; con disco grande o enlace lento, kit de precopia ZFS + este script para rutas y Firestore, ver cabecera «Traslados en frío»). No cambies el modelo de CPU para esquivarlo: cambia el Hardware ID de SQX (política 10/10: solo en frío, con CHANGE_CPU=1 y el cliente avisado). Abortado antes de tocar la VM."
 }
 
 # LIVE migrations only: refuse AMD<->Intel for ANY cpu model. Args: source and
@@ -519,6 +583,39 @@ _live_cross_vendor_guard() {
   _die "CPU vendor mismatch — refusing LIVE migration. Source ${SRC_NODE} is ${src_vendor}, dest ${DST_NODE} is ${dst_vendor}; VM ${VMID} runs cpu=${cpu_model}. This is refused for EVERY cpu model, x86-64-v4/v3 included: a named model does not hide the vendor (the guest keeps the one it booted on), and on 2026-10-10 a live AMD→Intel move with x86-64-v4 crashed Windows (BugCheck 0xA) ~20 s after resume, 2 of 2. Changing the cpu model does not fix it. The only way across vendors is OFFLINE: stop the VM (customer warned first — the SQX Hardware ID changes with the vendor) and re-run. Aborting before any VM state is touched."
 }
 
+# OFFLINE (VM parada) — constancia del aviso de Hardware ID (25/11/2026, revisión
+# del PR #291). En frío cualquier CPU arranca, pero el invitado verá la del
+# destino. Con un modelo genérico (x86-64-v*) el Hardware ID de SQX no cambia;
+# con cpu=host/max, otro modelo con nombre o sin línea cpu (kvm64), si cambia
+# vendor|family|model, sí. Igual que el kit scripts/coldmove (push), se exige
+# ACK_HWID_CHANGE=<esta VMID> y CPU_NOTICE='<cuándo y por dónde se avisó>'. Este
+# script nunca cambia la CPU (política 10/10). Firma ilegible → se rechaza.
+_cold_hwid_guard() {
+  local src_sig="$1" dst_sig="$2" cpu_model="$3" lc
+  lc=$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')
+  [[ "$lc" =~ ^x86-64-v[0-9]+(-[a-z0-9]+)?$ ]] && return 0
+  [[ "$src_sig" =~ ^[^|]+\|[0-9]+\|[0-9]+$ && "$dst_sig" =~ ^[^|]+\|[0-9]+\|[0-9]+$ ]] \
+    || _die "Firma de CPU ilegible (origen '${src_sig}', destino '${dst_sig}') para una VM parada con cpu=${cpu_model}: no se puede saber si cambia el Hardware ID. Reintenta. Abortado antes de tocar la VM."
+  [[ "$src_sig" == "$dst_sig" ]] && return 0
+  if [[ "${ACK_HWID_CHANGE:-}" == "${VMID}" && -n "${CPU_NOTICE:-}" ]]; then
+    _warn "ACK_HWID_CHANGE=${VMID}: traslado en frío con cpu=${cpu_model} de [${src_sig//|/ }] a [${dst_sig//|/ }]; el Hardware ID de SQX cambiará (aviso al cliente: ${CPU_NOTICE})."
+    return 0
+  fi
+  _die "VM ${VMID} parada con cpu=${cpu_model}: el silicio cambia (${SRC_NODE} [${src_sig//|/ }] → ${DST_NODE} [${dst_sig//|/ }]) y el invitado verá la CPU nueva al arrancar, así que el Hardware ID de SQX y las licencias del Market cambiarán. Hace falta dejar constancia del aviso al cliente: ACK_HWID_CHANGE=${VMID} CPU_NOTICE='<cuándo y por dónde se avisó>'. Abortado antes de tocar la VM."
+}
+
+# OFFLINE: una VM x86-64-v4 no arranca en un nodo sin AVX-512 (PVE pone
+# `enforce`), y remote_migrate --delete ya habría borrado el origen. Se rechaza
+# antes de copiar nada (2.ª revisión del PR #291). Flags ilegibles → se rechaza.
+_cold_avx512_guard() {
+  local cpu_model="$1" flags="$2" f
+  [[ "$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')" == x86-64-v4* ]] || return 0
+  [[ -n "${flags// /}" ]] || _die "No pude leer las flags de CPU de ${DST_NODE} para una VM ${cpu_model} parada: no se puede saber si arrancará allí. Abortado antes de tocar la VM."
+  for f in avx512f avx512bw avx512cd avx512dq avx512vl; do
+    grep -qw "$f" <<< "$flags" || _die "VM ${VMID} con cpu=${cpu_model}: ${DST_NODE} no tiene ${f} y la VM no arrancaría allí (y remote_migrate --delete borra el origen). Elige un destino con AVX-512, o traslado en frío con el kit (CHANGE_CPU=1 pone x86-64-v3, con el cliente avisado). Abortado antes de tocar la VM."
+  done
+}
+
 # Reads Windows' boot time over the guest agent, on whichever node holds the VM
 # (ssh fn = src_ssh before the move, dst_ssh after). Prints
 # "OK <boot_epoch> <guest_now_epoch> <node_now_epoch>" or "FAIL <reason>"; never
@@ -529,9 +626,13 @@ _live_cross_vendor_guard() {
 # NV-RUN-<nonce> first, the SAME pid is polled until that line shows up, a
 # foreign result is discarded and polled again, and after 3 it gives up. Never
 # relaunches. Short -Command line on purpose (no -EncodedCommand: Defender).
+# Optional 3rd arg "resync" (25/11/2026): same runner, but the guest runs
+# `w32tm /resync` and the result is "OK <exitcode> <output>" (see
+# _guest_time_resync).
 _GUEST_BOOT_PY=$(cat <<'PY'
 import json, os, subprocess, sys, time
 vmid, budget = sys.argv[1], float(sys.argv[2])
+mode = sys.argv[3] if len(sys.argv) > 3 else "boot"
 nonce = os.urandom(16).hex()
 end = time.monotonic() + budget
 
@@ -550,9 +651,13 @@ def js(raw):
 def short(raw):
     return " ".join((raw or "").split())[:160]
 
-ps = ("'NV-RUN-%s';$o=Get-CimInstance Win32_OperatingSystem;"
-      "'BOOT:'+([DateTimeOffset]$o.LastBootUpTime).ToUnixTimeSeconds();"
-      "'NOW:'+([DateTimeOffset](Get-Date)).ToUnixTimeSeconds();'NV-END-%s'") % (nonce, nonce)
+if mode == "resync":
+    ps = (r"'NV-RUN-%s';$o=(w32tm /resync 2>&1|Out-String) -replace '\s+',' ';"
+          r"'RC:'+$LASTEXITCODE;'OUT:'+$o.Trim();'NV-END-%s'") % (nonce, nonce)
+else:
+    ps = ("'NV-RUN-%s';$o=Get-CimInstance Win32_OperatingSystem;"
+          "'BOOT:'+([DateTimeOffset]$o.LastBootUpTime).ToUnixTimeSeconds();"
+          "'NOW:'+([DateTimeOffset](Get-Date)).ToUnixTimeSeconds();'NV-END-%s'") % (nonce, nonce)
 try:
     raw = qm("exec", vmid, "--synchronous", "0", "--",
              "powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
@@ -583,6 +688,17 @@ while True:
             print("FAIL foreign-result pid=%s" % pid); sys.exit()
         continue
     break
+if mode == "resync":
+    rc, out = None, ""
+    for line in rest.splitlines():
+        k, _, v = line.strip().partition(":")
+        if k == "RC" and v.strip().lstrip("-").isdigit():
+            rc = int(v.strip())
+        elif k == "OUT":
+            out = v.strip()
+    if "NV-END-" + nonce not in rest or rc is None:
+        print("FAIL unreadable exitcode=%s %s" % (d.get("exitcode"), short(rest))); sys.exit()
+    print(("OK %d %s" % (rc, short(out))).rstrip()); sys.exit()
 vals = {}
 for line in rest.splitlines():
     k, _, v = line.strip().partition(":")
@@ -600,6 +716,34 @@ _guest_boot_read() {
     "OK "*|"FAIL "*) printf '%s\n' "$out" ;;
     *) printf 'FAIL node-error %s\n' "${out:0:120}" ;;
   esac
+}
+
+# `w32tm /resync` in a Windows guest that is RUNNING on dest after the move
+# (25/11/2026). Each live pause leaves the guest clock behind (piloto Kademar
+# 08/11: −2.0 s and −4.4 s) and MetaTrader/brokers notice. Best-effort: never
+# fails the script. Args: <ssh_fn> <live 0|1>. After a live move a failure is a
+# _warn; otherwise (cold move just booted: QGA may not be up yet and Windows
+# syncs at startup anyway) only an _info. GUEST_TIME_RESYNC=0 turns it off.
+GUEST_TIME_RESYNC="${GUEST_TIME_RESYNC:-1}"
+GUEST_TIME_RESYNC_BUDGET_S="${GUEST_TIME_RESYNC_BUDGET_S:-45}"
+_guest_time_resync() {
+  local ssh_fn="$1" live="${2:-0}" out msg
+  [[ "$GUEST_TIME_RESYNC" == "1" ]] || return 0
+  out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${GUEST_TIME_RESYNC_BUDGET_S}' resync" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+  case "$out" in
+    "OK 0"|"OK 0 "*)
+      _ok "Reloj del invitado resincronizado (w32tm /resync): ${out#OK 0}"
+      return 0 ;;
+    "OK "*)   msg="w32tm /resync en la VM ${VMID} devolvió rc=$(cut -d' ' -f2 <<<"$out"): $(cut -d' ' -f3- <<<"$out")" ;;
+    "FAIL "*) msg="no se pudo lanzar w32tm /resync en la VM ${VMID} por el guest agent (${out})" ;;
+    *)        msg="no se pudo lanzar w32tm /resync en la VM ${VMID} (nodo: ${out:0:120})" ;;
+  esac
+  if [[ "$live" == "1" ]]; then
+    _warn "${msg}. El reloj de Windows puede ir unos segundos atrasado tras la pausa de la migración; se corrige solo en la siguiente sincronización de w32time, o a mano: qm guest exec ${VMID} -- w32tm /resync"
+  else
+    _info "${msg} (traslado en frío: Windows sincroniza al arrancar; no es un fallo)."
+  fi
+  return 0
 }
 
 # After a LIVE move: wait until the guest has run GUEST_REBOOT_SETTLE_S on dest,
@@ -728,6 +872,105 @@ _apt_dist_upgrade() {
   else
     _die "apt dist-upgrade on ${label} produced no success marker — aborting (QEMU parity not guaranteed)."
   fi
+}
+
+# ----- Clase de memoria del nodo: por nodeType, no por el nombre (25/11/2026) ---
+# Decide dos cosas que antes se sacaban del NOMBRE (*AX162* / *EX44*): el globo
+# de una VPS E al cambiar de clase y si se copia el historial del reconciliador
+# de globo. Con el nodo Kademar (0000266-KDM-9755, nodeType SQX, solo vps-e) el
+# nombre no dice nada: caía en «other», no se adaptaba el globo y una E de
+# EX44 (memory 61440, globo = memory) llegaba con globo = 60 GB a una caja
+# compartida. La fuente de verdad del tipo de nodo es proxmox_nodes.nodeType,
+# puesto a mano (regla de Iván del 04/11; el defrag ya lo usa así):
+#   SQX   → «shared»:    caja SQX multi-VM con reconciliador; suelo de globo de
+#                        la E = VPSE_BALLOON_MIN_MB (AX162, AX102-SQX, Kademar).
+#   VPS-E → «dedicated»: EX44 de una sola E; globo = memory (no se desinfla).
+#   otro (MT5…) → «other»: no se toca nada.
+# Si Firestore no contesta, respaldo por nombre (*AX162*/*-KDM-* → shared,
+# *EX44* → dedicated) y se avisa: nunca peor que antes.
+NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0
+# Rellena NODE_TYPE_SRC / NODE_TYPE_DST una sola vez.
+_node_types_load() {
+  (( _NODE_TYPES_LOADED == 1 )) && return 0
+  _NODE_TYPES_LOADED=1
+  local out
+  out=$(timeout 60 python3 - "$SRC_NODE" "$DST_NODE" <<'PYNT' 2>/dev/null
+import os, sys
+import firebase_admin
+from firebase_admin import credentials, firestore
+creds = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(credentials.Certificate(creds))
+db = firestore.client()
+for node in sys.argv[1:3]:
+    snap = db.collection("proxmox_nodes").document(node).get()
+    if not snap.exists:
+        t = "NO-DOC"
+    else:
+        t = str((snap.to_dict() or {}).get("nodeType") or "").strip().replace(" ", "_") or "NO-FIELD"
+    print("NT %s %s" % (node, t))
+PYNT
+) || true
+  NODE_TYPE_SRC=$(awk -v n="$SRC_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
+  NODE_TYPE_DST=$(awk -v n="$DST_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
+  if [[ -z "$NODE_TYPE_SRC" || -z "$NODE_TYPE_DST" ]]; then
+    _warn "No pude leer proxmox_nodes.nodeType de ${SRC_NODE}/${DST_NODE} en Firestore; la clase de memoria sale del nombre (respaldo)."
+    return 0
+  fi
+  local n t
+  for n in SRC DST; do
+    t="NODE_TYPE_${n}"; local node_var="${n}_NODE"
+    case "${!t}" in
+      NO-DOC)   _warn "proxmox_nodes/${!node_var} no existe en Firestore; su clase de memoria sale del nombre (respaldo)." ;;
+      NO-FIELD) _warn "proxmox_nodes/${!node_var} no tiene nodeType; su clase de memoria sale del nombre (respaldo)." ;;
+    esac
+  done
+}
+# <node_id> <nodeType|""> → shared | dedicated | other
+_mem_class() {
+  local node="$1" nt
+  nt=$(printf '%s' "${2:-}" | tr '[:lower:]' '[:upper:]')
+  case "$nt" in
+    SQX)   echo shared; return ;;
+    VPS-E) echo dedicated; return ;;
+    ""|-|NO-DOC|NO-FIELD) ;;        # sin dato: respaldo por nombre
+    *)     echo other; return ;;
+  esac
+  case "$node" in
+    *AX162*|*-KDM-*) echo shared ;;
+    *EX44*)          echo dedicated ;;
+    *)               echo other ;;
+  esac
+}
+
+# ----- Globo de la VPS E al cambiar de clase de memoria -----------------------
+# (03/07 EX44↔AX162; por nodeType desde el 25/11/2026.) Dedicated (EX44) =
+# balloon == memory; shared (SQX multi-VM) = suelo VPSE_BALLOON_MIN_MB. La RAM
+# (memory) no se toca. rc 0 = hecho o no hacía falta; rc 1 = falló el qm set.
+VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-47104}"
+_vpse_balloon_adapt() {
+  local src_fam dst_fam mem_mb target
+  _node_types_load
+  src_fam=$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC"); dst_fam=$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")
+  _info "vps-e: clase de memoria ${SRC_NODE}=${src_fam} (nodeType ${NODE_TYPE_SRC:-?}) → ${DST_NODE}=${dst_fam} (nodeType ${NODE_TYPE_DST:-?})."
+  [[ "$src_fam" != "$dst_fam" && "$dst_fam" != "other" ]] || return 0
+  mem_mb=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+  if [[ "$dst_fam" == "shared" ]]; then target="$VPSE_BALLOON_MIN_MB"; else target="${mem_mb:-61440}"; fi
+  if dst_ssh "qm set '${VMID}' --balloon '${target}'" >/dev/null 2>&1; then
+    _ok "vps-e balloon adapted for ${dst_fam} dest: balloon=${target} MiB (memory=${mem_mb:-?}, sin cambiar)."
+    return 0
+  fi
+  _warn "Could not set balloon=${target} on dest — set it manually: qm set ${VMID} --balloon ${target}"
+  return 1
+}
+BALLOON_PENDING_DIR="${MIGRATE_STATE_DIR:-/var/lib/migrate_vm}/balloon-pending"
+_balloon_mark() {
+  mkdir -p "$BALLOON_PENDING_DIR" 2>/dev/null \
+    && printf '%s %s\n' "$SRC_NODE" "$DST_NODE" > "$BALLOON_PENDING_DIR/${VMID}" 2>/dev/null \
+    || _warn "No pude dejar la marca de globo pendiente en $BALLOON_PENDING_DIR (si la ejecución se corta, el globo de la VPS E habrá que ajustarlo a mano)."
+}
+_balloon_unmark() {
+  rm -f "$BALLOON_PENDING_DIR/${VMID}" 2>/dev/null || true
 }
 
 # ----- Embedded Firestore helper (writes servers/{proxmoxId == VMID}) ----------
@@ -892,6 +1135,24 @@ PY
     fi
   else
     _ok "Source equals destination — nothing to do."
+  fi
+  # Globo de VPS E pendiente de una ejecución anterior cortada tras mover rutas/Firestore.
+  if [[ -f "$BALLOON_PENDING_DIR/${VMID}" ]]; then
+    read -r _bp_src _bp_dst < "$BALLOON_PENDING_DIR/${VMID}" || true
+    if [[ -n "${RC_DST_NODE:-}" && "${_bp_dst:-}" == "$RC_DST_NODE" ]]; then
+      SRC_NODE="$_bp_src"; DST_NODE="$_bp_dst"
+      DST_IPV6=$(DST_NODE="$DST_NODE" PVE_NODES_FILE="$PVE_NODES_FILE" python3 -c 'import json,os; print(json.load(open(os.environ["PVE_NODES_FILE"])).get(os.environ["DST_NODE"],""))' 2>/dev/null || true)
+      if [[ -n "$DST_IPV6" ]]; then
+        SSH_CTL_DIR=$(mktemp -d -t mvm.XXXXXX)
+        _info "Globo de VPS E pendiente de una ejecución anterior (${SRC_NODE} → ${DST_NODE}): lo termino."
+        if _vpse_balloon_adapt; then _balloon_unmark; fi
+        _ssh_close
+      else
+        _warn "Globo de VPS E pendiente para ${DST_NODE}, pero no encuentro su IP en $PVE_NODES_FILE: ajústalo a mano."
+      fi
+    else
+      _warn "Hay una marca de globo pendiente para la VM ${VMID} hacia ${_bp_dst:-?}, pero la VM está en ${RC_DST_NODE:-?}: no la aplico (revisa $BALLOON_PENDING_DIR/${VMID})."
+    fi
   fi
   exit 0
 fi
@@ -1544,37 +1805,23 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   # bloquear migraciones perfectamente validas — y son justo las cajas mas
   # cargadas, donde el agente se cae, las que mas falta tienen de moverse.)
 
-  # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
-  # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
-  # migration restores that vCPU state verbatim on the destination. The rule that
-  # decides success is DIRECTIONAL: the migration restores iff the DEST CPU is a
-  # feature SUPERSET of the source's.
-  #   - SAME cpu / UPGRADE (dest has >= the source's features) → restores fine.
-  #   - DOWNGRADE (dest is MISSING a feature the running guest has) → QEMU aborts
-  #     at the resume handshake ON THE DEST ("kvm: Restoring registers after init:
-  #     Failed to set special registers: Invalid argument") and the VM lands
-  #     STOPPED on dest. This is exactly what hit VMs 708/1670: an EPYC 9454 Genoa
-  #     guest pushed onto an EPYC 7401P Naples node (Naples lacks AVX-512 etc.).
-  # `pvesh remote_migrate` does NO cross-node CPU check, so we do it here — BEFORE
-  # the dist-upgrade and any disk copy, so a block is a clean no-op abort.
-  #
-  # How we decide: first compare vendor+family+model (from /proc/cpuinfo, NOT the
-  # marketing name — EPYC 9454 and 9224 are both AMD family 25 model 17 "Genoa"
-  # and identical here). If they match → identical CPU → allow. If they differ we
-  # don't block blindly (older→newer is the SAFE direction): we compare the actual
-  # CPU feature FLAGS — if dest is missing any non-trivial flag the source has it's
-  # a DOWNGRADE → block; otherwise it's an upgrade/lateral → allow (with a warning;
-  # the guest keeps presenting the source CPU until it's rebooted on dest).
-  # Unreadable flags → block. Offline (stopped) source skips all of this — a
-  # cold boot on dest picks up dest's features in any direction.
-  #
-  # CROSS-VENDOR (AMD<->Intel) is refused for EVERY cpu model, in both
-  # directions, before the host/max branch (2026-10-10). The old belief that
-  # named/baseline models (kvm64, x86-64-v2/-v3/-v4, …) are migration-safe "by
-  # design" holds for the feature set, NOT for the vendor: the guest keeps the
-  # vendor of the node it booted on, and two live AMD→Intel moves of an
-  # x86-64-v4 Windows VM bugchecked (0xA) ~20 s after resume. Within one
-  # vendor, named models still skip the flag comparison below.
+  # 0a) CPU pre-check — ONLINE migrations only (a stopped guest cold-boots on
+  # dest and picks up dest's CPU in any direction; only a LIVE migration
+  # restores vCPU state verbatim). `pvesh remote_migrate` does NO cross-node CPU
+  # check, so it is done here — BEFORE the dist-upgrade and any disk copy, so a
+  # block is a clean no-op abort. Two guards, in this order:
+  #   1. _live_cross_vendor_guard: AMD<->Intel refused for EVERY cpu model
+  #      (2026-10-10: two live AMD→Intel moves of an x86-64-v4 Windows VM
+  #      bugchecked 0xA ~20 s after resume; a named model does not hide the
+  #      vendor).
+  #   2. _live_silicon_guard (25/11/2026): only between identical
+  #      vendor|family|model, whatever the cpu model (no global relax switch;
+  #      lab override per VMID only). Signatures come from
+  #      /proc/cpuinfo, NOT the marketing name (EPYC 9454 and 9454P are both
+  #      25|17). This replaced the old "dest is a feature-flag superset" rule
+  #      for cpu=host (VMs 708/1670, Genoa→Naples, 2026): a superset no longer
+  #      authorises a live move — different silicon goes cold, customer warned.
+  # Unreadable signature → refused (never guessed).
   if [[ -n "$ONLINE_FLAG" ]]; then
     CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
     CPU_MODEL=""
@@ -1605,56 +1852,18 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
         CPU_MODEL="$_run_model"
       fi
     fi
-    _cpu_lc=$(printf '%s' "$CPU_MODEL" | tr '[:upper:]' '[:lower:]')
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
     _live_cross_vendor_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
-    if [[ "$_cpu_lc" == "host" || "$_cpu_lc" == "max" ]]; then
-      _info "VM uses cpu=${CPU_MODEL} (host passthrough) on a LIVE migration — verifying source/dest CPU compatibility…"
-      if [[ "$SRC_CPU_SIG" == "$DST_CPU_SIG" ]]; then
-        _ok "CPU identical — source and dest are both [${SRC_CPU_SIG//|/ }] (vendor family model); live cpu=host migration is safe."
-      else
-        # CPUs differ, same vendor (cross-vendor already refused above): decide
-        # upgrade-vs-downgrade by comparing actual feature flags.
-        _info "CPUs differ (src [${SRC_CPU_SIG//|/ }] → dst [${DST_CPU_SIG//|/ }]); comparing feature flags to tell an upgrade from a downgrade…"
-        SRC_FLAGS=$(_node_cpu_flags src_ssh || true)
-        DST_FLAGS=$(_node_cpu_flags dst_ssh || true)
-        [[ -n "${SRC_FLAGS// /}" && -n "${DST_FLAGS// /}" ]] || _die "Could not read CPU feature flags from source and/or dest for the upgrade/downgrade decision. Refusing to guess. Stop the VM and migrate OFFLINE (safe in any direction), or pick a same/newer-generation dest. Aborting before any VM state is touched."
-        # Set-diff with a noise ignore-list: security mitigations, p-state/power,
-        # and Linux-synthetic flags vary host-to-host for reasons unrelated to
-        # migratable guest state. MISSING = real features the source has that the
-        # dest lacks → non-empty means DOWNGRADE. Only flags we're certain are
-        # non-ISA are ignored, so a real ISA gap (e.g. avx512*) is never masked.
-        _flagcmp=$(SRC_FLAGS="$SRC_FLAGS" DST_FLAGS="$DST_FLAGS" python3 - <<'PY' 2>/dev/null || true
-import os
-IGNORE = set('''
-ibpb ibrs ibrs_enhanced ibrs_fw stibp spec_ctrl intel_stibp amd_ibpb amd_ibrs
-ssbd amd_ssbd amd_stibp virt_ssbd ssb_no pti kaiser md_clear flush_l1d
-arch_capabilities tsx_async_abort srbds mmio_stale_data spec_store_bypass
-gather_data_sampling bhi rfds reg_file_data_sampling rsb_ctxsw retpoline
-cpb hw_pstate amd_pstate hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req
-hwp_hint aperfmperf dtherm ida arat pln pts tm tm2 acpi est eist epb ibs irperf
-cpuid cpuid_fault rep_good nopl eagerfpu xtopology amd_dcm extd_apicid
-amd_lbr_v2 amd_lbr_pmc_freeze
-sme sev sev_es sev_snp sme_coherent
-'''.split())
-src = set(os.environ.get("SRC_FLAGS", "").split())
-dst = set(os.environ.get("DST_FLAGS", "").split())
-print("MISSING:" + "".join(" " + f for f in sorted((src - dst) - IGNORE)))
-print("GAINED:"  + "".join(" " + f for f in sorted((dst - src) - IGNORE)))
-PY
-)
-        [[ "$_flagcmp" == *MISSING:* ]] || _die "Feature-flag comparison failed (could not run the flag diff). Refusing to guess direction. Stop the VM and migrate OFFLINE. Aborting before any VM state is touched."
-        _missing=$(printf '%s\n' "$_flagcmp" | sed -n 's/^MISSING://p')
-        _gained=$(printf '%s\n' "$_flagcmp" | sed -n 's/^GAINED://p')
-        if [[ -n "$_missing" ]]; then
-          _die "CPU DOWNGRADE blocked — dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is MISSING feature(s) the running guest has:${_missing}. Live-migrating a cpu=host guest onto a CPU that lacks these makes QEMU die at the resume handshake and leaves VM ${VMID} STOPPED on dest (the VMs 708/1670 failure). Options: (1) migrate to a same-or-newer generation dest (a superset of the source); (2) stop the VM and re-run — OFFLINE migration is safe in any direction; do NOT change the VM's cpu model to get around this: it changes the SQX Hardware ID and the customer loses the licence (operator policy 2026-10-10: CPU changes only in cold moves with the customer warned, see the cold-move RUNBOOK CHANGE_CPU=1). Aborting before any VM state is touched."
-        fi
-        _warn "Cross-generation UPGRADE: dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is a feature superset of source ${SRC_NODE} [${SRC_CPU_SIG//|/ }]${_gained:+ (dest adds:${_gained})} — live cpu=host migration permitted. NOTE: VM ${VMID} keeps presenting the SOURCE CPU until it is rebooted on dest, so it won't use the new features until then."
-      fi
-    else
-      _info "VM cpu model=${CPU_MODEL:-<proxmox default>} (not host passthrough), same CPU vendor (${SRC_CPU_SIG%%|*}) — feature-flag check not required."
-    fi
+    _live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
+  else
+    # Offline: la CPU que verá el invitado es la de la config (sección principal).
+    CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+    _cpu_first="${CPU_RAW%%,*}"; CPU_MODEL="${_cpu_first#cputype=}"
+    SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
+    DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
+    _cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-kvm64}"
+    _cold_avx512_guard "${CPU_MODEL:-kvm64}" "$(dst_ssh 'grep -m1 "^flags" /proc/cpuinfo' 2>/dev/null || true)"
   fi
 
   # 0b) Converge packages on BOTH nodes before migrating so dest pve-qemu-kvm is
@@ -1876,7 +2085,10 @@ PY
 
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   BALLOON_HISTORY=""
-  if [[ "$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162* ]]; then
+  # Historial del reconciliador de globo: solo entre dos cajas «shared» (antes,
+  # solo entre dos *AX162*; ver _mem_class).
+  _node_types_load
+  if [[ "$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC")" == shared && "$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")" == shared ]]; then
     BALLOON_HISTORY=$(_balloon_state_retry src_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py export-state '${VMID}' '${SRC_NODE}'") || BALLOON_HISTORY=""
     [[ "$BALLOON_HISTORY" =~ ^[A-Za-z0-9+/=]+$ ]] || BALLOON_HISTORY=""
     [[ -n "$BALLOON_HISTORY" ]] || _warn "Balloon history unavailable; destination will re-learn conservatively."
@@ -2042,42 +2254,6 @@ if [[ -n "${MEMORY_INTENDED_MB:-}" ]]; then
   fi
 fi
 
-# VPS-E balloon adaptation across the EX44<->AX162 boundary (operator,
-# 2026-07-03). Dedicated EX44s run the vps-e with balloon == memory (the whole
-# box is theirs; no deflation). Shared AX162s pack vps-e with ballooning down
-# to the plan's ram_min so KSM/zswap can breathe. Cross-family moves
-# are offline-only (Intel<->AMD blocks live), so the qm set lands cleanly on a
-# stopped VM. Same-family moves no-op. VM is a vps-e iff its name is "E-*".
-#
-# 46 GB, NO 18. Este bloque nacio el 03-07-2026 con ram_min=18 GB, y el
-# 25-07-2026 el operador subio ram_min a 46 precisamente porque 18 estaba mal:
-# la colocacion reservaba 18 GB para un VPS E cuyo uso real es ~46 (mediana
-# medida 41,8 GB, p90 55,5 sobre los 149 vivos), metia un tercero donde no
-# cabia y el balloon-reconciler se quedaba sin presupuesto para alimentarlos
-# -> cliente estrangulado. La constante se quedo con el valor refutado tres
-# semanas despues de refutarlo. Corregida el 22-08-2026 al migrar la vm288,
-# que aterrizo con suelo de 18 GB.
-#
-# El suelo es un MINIMO, no una asignacion: en un nodo sin sobrecomprometer
-# dejarlo bajo no quita ni un MB (medido el mismo dia en la vecina vm1704,
-# suelo 18 GB y actual=61340). El dano aparece cuando el nodo se llena, que
-# es justo cuando el cliente menos puede permitirselo.
-VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-47104}"
-_vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
-if [[ "$_vm_name" == E-* ]]; then
-  _fam() { case "$1" in *EX44*) echo EX44 ;; *AX162*) echo AX162 ;; *) echo other ;; esac; }
-  _src_fam=$(_fam "$SRC_NODE"); _dst_fam=$(_fam "$DST_NODE")
-  if [[ "$_src_fam" != "$_dst_fam" && "$_dst_fam" != "other" ]]; then
-    _mem_mb=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
-    if [[ "$_dst_fam" == "AX162" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"; else _target_balloon="${_mem_mb:-61440}"; fi
-    if dst_ssh "qm set '${VMID}' --balloon '${_target_balloon}'" >/dev/null 2>&1; then
-      _ok "vps-e balloon adapted for ${_dst_fam} dest: balloon=${_target_balloon} MiB (memory=${_mem_mb:-?})."
-    else
-      _warn "Could not set balloon=${_target_balloon} on dest — set it manually: qm set ${VMID} --balloon ${_target_balloon}"
-    fi
-  fi
-fi
-
 # ---- El invitado NO se toca ------------------------------------------------
 # Su IPv6 es <IDENT>::<vmid> y su puerta de enlace fe80::1, iguales en TODA la
 # flota, asi que una migracion no cambia nada dentro de Windows. Ese era el
@@ -2114,6 +2290,12 @@ dst_ssh "qm set '${VMID}' --hookscript '${HOOKSCRIPT}'" >/dev/null 2>&1 \
 # disparador (medido: `Sync proxmoxId=243 done` sin mover nada). Un
 # sync-base-nat anterior a ese parámetro lo rechaza con rc=2: entonces se
 # repite sin él, como antes.
+# VPS E: marca persistente de «globo pendiente» ANTES de tocar rutas y Firestore (2.ª revisión del
+# PR #291). Si algo corta la ejecución entre aquí y el ajuste del globo, Firestore ya dice el nodo
+# nuevo y el reintento sale por SRC_EQ_DST: allí se lee esta marca y se termina el ajuste.
+_vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+if [[ "$_vm_name" == E-* ]]; then _balloon_mark; fi
+
 NAT_OK=0
 if [[ -x "$SYNC_BASE_NAT" ]]; then
   _info "Reconciling local NAT via $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6} node=${DST_NODE}…"
@@ -2153,6 +2335,47 @@ if (( NAT_OK == 1 )); then
   fi
 else
   _warn "Skipping Firestore nodeId update (NAT reconcile failed). Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} once $SYNC_BASE_NAT is working."
+fi
+
+# (Va DESPUÉS de NAT y Firestore desde el 25/11/2026: lee proxmox_nodes en
+# Firestore —hasta 60 s— y en la rama «already on dest» la VM ya corre; las
+# rutas del cliente no esperan por el globo.)
+# VPS-E balloon adaptation across the EX44<->AX162 boundary (operator,
+# 2026-07-03). Dedicated EX44s run the vps-e with balloon == memory (the whole
+# box is theirs; no deflation). Shared AX162s pack vps-e with ballooning down
+# to the plan's ram_min so KSM/zswap can breathe. Cross-class moves are cold
+# (Intel<->AMD and Zen4<->Zen5 block live); with the rtmig cold kit this script
+# runs after the VM was started on dest, and `qm set --balloon` with the balloon
+# device already on changes the config at once (the reconciler does the rest).
+# Same-class moves no-op. VM is a vps-e iff its name is "E-*".
+#
+# 46 GB, NO 18. Este bloque nacio el 03-07-2026 con ram_min=18 GB, y el
+# 25-07-2026 el operador subio ram_min a 46 precisamente porque 18 estaba mal:
+# la colocacion reservaba 18 GB para un VPS E cuyo uso real es ~46 (mediana
+# medida 41,8 GB, p90 55,5 sobre los 149 vivos), metia un tercero donde no
+# cabia y el balloon-reconciler se quedaba sin presupuesto para alimentarlos
+# -> cliente estrangulado. La constante se quedo con el valor refutado tres
+# semanas despues de refutarlo. Corregida el 22-08-2026 al migrar la vm288,
+# que aterrizo con suelo de 18 GB.
+#
+# El suelo es un MINIMO, no una asignacion: en un nodo sin sobrecomprometer
+# dejarlo bajo no quita ni un MB (medido el mismo dia en la vecina vm1704,
+# suelo 18 GB y actual=61340). El dano aparece cuando el nodo se llena, que
+# es justo cuando el cliente menos puede permitirselo.
+# RAM (memory) NO se toca: las E de EX44 conservan sus 60 GB (Iván, 11/11).
+# La marca de «globo pendiente» se pone antes del NAT (ver _balloon_mark) y se
+# quita aquí cuando el ajuste se ha hecho o no hacía falta; si la ejecución se
+# corta en medio, el reintento entra por la rama SRC_EQ_DST y lo termina.
+if [[ "${_vm_name:-}" == E-* ]]; then
+  if _vpse_balloon_adapt; then _balloon_unmark; fi
+fi
+
+# Reloj del invitado (25/11/2026): tras dejar la VM arrancada en destino, en
+# caliente o en frío, `w32tm /resync` por el guest agent. Va después de rutas y
+# Firestore (no retrasa al cliente) y antes de la sonda RDP y de la comprobación
+# de reinicio (el ajuste son segundos; la tolerancia de esa comprobación, 120 s).
+if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
+  _guest_time_resync dst_ssh "$( [[ -n "$RESUMED_AT" ]] && echo 1 || echo 0 )"
 fi
 
 # Comprobacion de alcance: se llama al RDP (3389) del invitado por su IPv6

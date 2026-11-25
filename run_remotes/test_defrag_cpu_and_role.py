@@ -27,6 +27,8 @@ EPYC_P = {"vendor": "AuthenticAMD", "family": "25", "model": "17", "stepping": "
 EPYC = dict(EPYC_P, name="AMD EPYC 9454 48-Core Processor")
 RYZEN = {"vendor": "AuthenticAMD", "family": "25", "model": "97", "stepping": "2",
          "name": "AMD Ryzen 9 7950X3D 16-Core Processor", "avx512": True}
+TURIN = {"vendor": "AuthenticAMD", "family": "26", "model": "2", "stepping": "1",
+         "name": "AMD EPYC 9755 128-Core Processor", "avx512": True}
 INTEL = {"vendor": "GenuineIntel", "family": "6", "model": "183", "stepping": "1",
          "name": "13th Gen Intel(R) Core(TM) i5-13500", "avx512": False}
 
@@ -95,11 +97,24 @@ class CpuRule(unittest.TestCase):
         for cpu in ("host", "kvm64", "EPYC-Genoa", "max", "", None):
             self.assertFalse(df.vm_cpu_generic(cpu), cpu)
 
-    def test_generic_vm_moves_within_the_vendor(self):
-        self.assertTrue(df.cpu_move_ok("x86-64-v4", EPYC, RYZEN))
-        self.assertTrue(df.cpu_move_ok("x86-64-v4", RYZEN, EPYC_P))
+    def test_generic_vm_moves_only_within_the_same_silicon_model(self):
+        # 25/11/2026 (review of PR #291): vendor+family+model, generic CPU too
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, RYZEN))   # AX162 -> AX102(-SQX)
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", RYZEN, EPYC_P))
+        self.assertTrue(df.cpu_move_ok("x86-64-v4", EPYC, EPYC_P))    # 9454 = 9454P (25/17)
+        self.assertTrue(df.cpu_move_ok("x86-64-v4", RYZEN, dict(RYZEN, stepping="1")))  # stepping only matters for host
         self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, INTEL))   # never live AMD<->Intel
         self.assertFalse(df.cpu_move_ok("x86-64-v3", INTEL, EPYC))
+
+    def test_generic_vm_never_changes_cpu_family(self):
+        # 25/11/2026: Zen4 (AX162/AX102, family 25) <-> Zen5 Turin (Kademar,
+        # family 26) is cold-only, as migrate_vm.sh's _live_silicon_guard.
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, TURIN))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", TURIN, EPYC))
+        self.assertFalse(df.cpu_move_ok("x86-64-v3", RYZEN, TURIN))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC, family="")))
+        self.assertTrue(df.cpu_move_ok("x86-64-v4", TURIN, dict(TURIN)))
+        self.assertFalse(df.cpu_move_ok("host", EPYC, TURIN))
 
     def test_host_vm_needs_the_same_silicon(self):
         self.assertFalse(df.cpu_move_ok("host", EPYC, RYZEN))    # AX162 -> AX102
@@ -110,9 +125,9 @@ class CpuRule(unittest.TestCase):
         self.assertFalse(df.cpu_move_ok("kvm64", EPYC, RYZEN))
 
     def test_v4_needs_avx512_on_the_destination(self):
-        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(RYZEN, avx512=False)))
-        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(RYZEN, avx512=None)))
-        self.assertTrue(df.cpu_move_ok("x86-64-v3", EPYC, dict(RYZEN, avx512=False)))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC_P, avx512=False)))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC_P, avx512=None)))
+        self.assertTrue(df.cpu_move_ok("x86-64-v3", EPYC, dict(EPYC_P, avx512=False)))
 
     def test_running_host_passthrough_wins_over_config(self):
         # config rewritten to v4 while the guest still runs `-cpu host`
