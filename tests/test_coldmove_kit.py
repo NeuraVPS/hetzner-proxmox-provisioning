@@ -810,6 +810,20 @@ class SecondReview(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("no es la que comprobó shutdown", out(r))
             self.assertTrue(k.src_conf.exists())
 
+    def test_an_edit_during_parks_remote_checks_keeps_the_config_on_the_origin(self):
+        # cores 8→4 while park probes the destination: nothing is parked, the origin keeps its config
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+            r = k.run("rtmig_cutover.sh", "park", FAKE_SSH_SIDE_EFFECT_MATCH="PROBE-END",
+                      FAKE_SSH_SIDE_EFFECT=f"sed -i 's/^cores: 8$/cores: 4/' {k.src_conf}")
+            self.assertEqual(r.returncode, 1); self.assertIn("cambió desde que la comprobó shutdown", out(r))
+            self.assertTrue(k.src_conf.exists()); self.assertIn("cores: 4", k.src_conf.read_text())
+            self.assertFalse((k.work / f"{VMID}.conf.src").exists())
+            self.assertFalse((k.work / f"{VMID}.conf.staging").exists())
+            self.assertEqual(k.read(f"work/{VMID}.state"), "")              # no «parked» state
+            r = k.run("rtmig_cutover.sh", "push", FINAL)
+            self.assertEqual(r.returncode, 1); self.assertFalse(k.dst_conf.exists())
+
     def test_after_reverting_the_pending_change_the_move_works(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncores: 4\n")

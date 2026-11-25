@@ -342,10 +342,27 @@ case "$CMD" in
     else
       log "este nodo no tiene reconciliador de globo: no hay historial que exportar"
     fi
-    cp -a "$CONF" "$WORK/${VMID}.conf.src"
-    [[ -f "$FW" ]] && cp -a "$FW" "$WORK/${VMID}.fw.src"
-    cmp -s "$CONF" "$WORK/${VMID}.conf.src" || die "la copia de la config no coincide"
-    if [[ -f "$FW" ]]; then cmp -s "$FW" "$WORK/${VMID}.fw.src" || die "la copia del .fw no coincide"; fi
+    # Copia PROVISIONAL, y solo si es exactamente la config que comprobó shutdown (y la del origen en
+    # este momento) se promueve a la copia aparcada. Si algo cambió durante la sonda del destino o el
+    # export, la config se queda en el origen y la provisional se descarta.
+    STG_CONF="$WORK/${VMID}.conf.staging"; STG_FW="$WORK/${VMID}.fw.staging"
+    rm -f "$STG_CONF" "$STG_FW"
+    discard_staging() { rm -f "$STG_CONF" "$STG_FW"; die "$1. La config se queda en el origen; no se ha aparcado nada. Revísala; para seguir, arranca la VM (qm start ${VMID}) y repite el corte desde shutdown"; }
+    cp -a "$CONF" "$STG_CONF" || discard_staging "no pude copiar la config"
+    [[ -f "$FW" ]] && { cp -a "$FW" "$STG_FW" || discard_staging "no pude copiar el .fw"; }
+    STG_SHA=$(sha256sum < "$STG_CONF" | cut -d' ' -f1)
+    if [[ -f "$WORK/${VMID}.shutdown-conf-sha" && "$STG_SHA" != "$(head -1 "$WORK/${VMID}.shutdown-conf-sha")" ]]; then
+      discard_staging "la config de la VM ${VMID} cambió desde que la comprobó shutdown"
+    fi
+    [[ "$(conf_uuid "$STG_CONF")" == "$UUID" && "$(disk_inventory "$STG_CONF")" == "$DISKS" ]] \
+      || discard_staging "la config de la VM ${VMID} cambió durante el park (UUID o discos)"
+    # Y el origen sigue siendo exactamente esa copia justo antes de aparcarla.
+    cmp -s "$CONF" "$STG_CONF" || discard_staging "la config de la VM ${VMID} cambió durante el park"
+    if [[ -f "$FW" || -f "$STG_FW" ]]; then
+      [[ -f "$FW" && -f "$STG_FW" ]] && cmp -s "$FW" "$STG_FW" || discard_staging "el .fw de la VM ${VMID} cambió durante el park"
+    fi
+    [[ -f "$STG_FW" ]] && mv "$STG_FW" "$WORK/${VMID}.fw.src"
+    mv "$STG_CONF" "$WORK/${VMID}.conf.src"
     # El estado se abre ANTES de quitar la config: si algo cae aquí, push verá la config en origen y parará.
     rm -f "$STATE"
     state_set "VMID=${VMID}" "UUID=${UUID}" "SRC_NODE=$(src_node)" "DST_NODE=${DST_NODE}" "DST=${DST}" \

@@ -89,6 +89,9 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
           a la comprobada.
         - Tras el apagado se compara otra vez. Si alguien metió un cambio pendiente durante el
           apagado, PVE lo aplica al parar: `shutdown` lo detecta y `park` no aparca esa config;
+        - `park` copia primero a un fichero provisional. Solo lo promueve a la copia aparcada si su
+          sha256 es el que comprobó `shutdown`, y si el origen sigue siendo idéntico. Si no, la
+          config se queda en el origen y lo provisional se descarta;
       - inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
         libre.
 
