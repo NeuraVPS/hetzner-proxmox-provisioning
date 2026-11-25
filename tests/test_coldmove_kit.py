@@ -71,7 +71,7 @@ print(os.environ["FAKE_HOST_" + os.environ.get("FAKE_SIDE", "src").upper()])
 '''
 
 FAKE_QM = r'''#!/usr/bin/env python3
-import os, sys
+import os, re, sys
 side = os.environ.get("FAKE_SIDE", "src"); root = os.environ["FAKE_ROOT"]
 pve = os.environ.get("PVE_ETC", "/nonexistent")
 a = sys.argv[1:]
@@ -89,6 +89,19 @@ elif a[0] == "config":
 elif a[0] == "shutdown":
     if os.environ.get("FAKE_SHUTDOWN_FAIL"): sys.exit(255)
     open(stf, "w").write("stopped")
+    # like PVE (QemuServer vm_stop_cleanup): the pending changes are applied when the VM stops
+    lines = open(conf).read().splitlines(); main, pend, rest, sec = [], {}, [], "main"
+    for l in lines:
+        if l.startswith("["): sec = l.strip()
+        if sec == "main": main.append(l)
+        elif sec == "[PENDING]":
+            if not l.startswith("[") and ":" in l: pend[l.split(":", 1)[0]] = l
+        else: rest.append(l)
+    if pend:
+        dels = [x for x in re.split(r"[ ,]+", pend.pop("delete", "delete:").split(":", 1)[1]) if x]
+        main = [l for l in main if l.split(":", 1)[0] not in pend and l.split(":", 1)[0] not in dels]
+        main = [l for l in main if l.strip()] + list(pend.values())
+        open(conf, "w").write("\n".join(main + ([""] + rest if rest else [])) + "\n")
 elif a[0] == "start":
     if os.environ.get("FAKE_QM_START_FAIL") == side: sys.exit(1)
     if not os.path.exists(conf): sys.exit(2)
@@ -730,26 +743,36 @@ class SecondReview(unittest.TestCase):
             self.assertEqual(k.state()["PHASE"], "rolledback")
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
 
-    def test_pending_cpu_decides_before_shutdown(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            conf = CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncpu: host\n"
-            k = Kit(tmp, conf=conf); k.ok("rtmig_send.sh", "base", "rtmig-a")
-            r = k.run("rtmig_cutover.sh", "shutdown", "60")
-            self.assertEqual(r.returncode, 1); self.assertIn("cpu=host", out(r))
-            self.assertNotIn("shutdown", k.read("qm.log"))
-        with tempfile.TemporaryDirectory() as tmp:
-            conf = CONF.format(cpu="host") + "\n[PENDING]\ndelete: cpu\n"            # → kvm64 on next boot
-            k = Kit(tmp, conf=conf, dst_cpu=GENOA, run_cpu="host"); k.ok("rtmig_send.sh", "base", "rtmig-a")
-            r = k.run("rtmig_cutover.sh", "shutdown", "60")
-            self.assertEqual(r.returncode, 1); self.assertIn("corría con host y arrancará con kvm64", out(r))
-            k.ok("rtmig_cutover.sh", "shutdown", "60", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo")
+    def test_pending_changes_are_refused_before_shutdown(self):
+        # PVE applies [PENDING] when the VM stops (QemuServer vm_stop_cleanup / _do_vm_stop): the config
+        # validated before the shutdown would not be the one parked and published. Refused up front.
+        for pend in ("cores: 4", "cpu: host", "delete: cpu", "balloon: 2048", "memory: 4096\ndelete: balloon"):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\n" + pend + "\n")
+                k.ok("rtmig_send.sh", "base", "rtmig-a")
+                r = k.run("rtmig_cutover.sh", "shutdown", "60", ACK_HWID_CHANGE=VMID, CPU_NOTICE="x")
+                self.assertEqual(r.returncode, 1, pend); self.assertIn("cambios pendientes ([PENDING])", out(r))
+                self.assertIn("--revert", out(r))
+                self.assertNotIn("shutdown", k.read("qm.log"))
+                self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
 
-    def test_pending_balloon_blocks_setting_one(self):
+    def test_after_reverting_the_pending_change_the_move_works(self):
         with tempfile.TemporaryDirectory() as tmp:
-            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\nballoon: 2048\n")
-            k.to_final()
-            r = k.run("rtmig_cutover.sh", "push", FINAL, "47104")
-            self.assertEqual(r.returncode, 1); self.assertIn("PENDIENTE de balloon", out(r))
+            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncores: 4\n")
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            self.assertEqual(k.run("rtmig_cutover.sh", "shutdown", "60").returncode, 1)
+            k.src_conf.write_text(CONF.format(cpu="x86-64-v4"))           # qm set --revert cores
+            k.ok("rtmig_cutover.sh", "shutdown", "60"); k.ok("rtmig_cutover.sh", "park")
+            self.assertIn("cores: 8", k.read(f"work/{VMID}.conf.src"))
+            k.ok("rtmig_cutover.sh", "rollback")
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+
+    def test_the_fake_applies_pending_on_stop_like_pve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncores: 4\ndelete: tablet\n")
+            subprocess.run(["qm", "shutdown", VMID], env=k.env, check=True)
+            c = k.src_conf.read_text()
+            self.assertIn("cores: 4", c); self.assertNotIn("[PENDING]", c); self.assertNotIn("cores: 8", c)
 
     def test_conf_set_key_ignores_snapshot_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -809,9 +832,11 @@ class ThirdReview(unittest.TestCase):
             self.assertTrue(list(k.work.glob(f"{VMID}.fw.dst-*")))
             self.assertTrue(list(k.work.glob(f"{VMID}.conf.dst-*")))
 
-    def test_running_host_with_pending_v4_needs_the_ack(self):
+    def test_running_host_with_a_different_configured_model_needs_the_ack(self):
+        # the config already says x86-64-v4 (edited without [PENDING]) but QEMU still runs `host`:
+        # the next boot changes the Hardware ID even on the same silicon
+        conf = CONF.format(cpu="x86-64-v4")
         with tempfile.TemporaryDirectory() as tmp:
-            conf = CONF.format(cpu="host") + "\n[PENDING]\ncpu: x86-64-v4\n"
             k = Kit(tmp, conf=conf, dst_cpu=GENOA, run_cpu="host"); k.ok("rtmig_send.sh", "base", "rtmig-a")
             r = k.run("rtmig_cutover.sh", "shutdown", "60")
             self.assertEqual(r.returncode, 1); self.assertIn("corría con host y arrancará con x86-64-v4", out(r))

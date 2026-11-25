@@ -2,7 +2,8 @@
 # rtmig_cutover.sh — pasos del corte de un traslado en frío con precopia ZFS (ver README.md).
 # Se ejecuta EN EL NODO ORIGEN (root). Habla con el destino por SSH directo nodo→nodo.
 #
-#   shutdown [timeout_s]     comprobaciones previas (discos, CPU/licencias, destino libre) y
+#   shutdown [timeout_s]     comprobaciones previas (sin cambios [PENDING], discos, CPU/licencias,
+#                            destino libre) y
 #                            qm shutdown ORDENADO (nunca stop/forceStop). Si vence el tiempo, sale
 #                            con error y la VM SIGUE encendida: decide una persona.
 #   park                     con la VM parada: guarda el historial del reconciliador de globo
@@ -258,6 +259,12 @@ case "$CMD" in
     no_active_transfer
     probe src
     [[ "$P_CONF" == present && "$P_STATUS" == running ]] || die "la VM ${VMID} no está 'running' en origen (config ${P_CONF}, estado ${P_STATUS})"
+    # Cambios pendientes: PVE los aplica al parar la VM (QemuServer vm_stop_cleanup / _do_vm_stop), así
+    # que la config que se valida aquí no sería la que se aparca y se publica. Se exige una config sin
+    # [PENDING] ni «delete:» pendientes ANTES de apagar.
+    if awk '/^\[PENDING\]/{f=1} END{exit f?0:1}' "$CONF"; then
+      die "la config de la VM ${VMID} tiene cambios pendientes ([PENDING]) que PVE aplicaría al apagarla: la config validada no sería la que se traslada. Aplícalos (reiniciando la VM) o revíertelos (qm set ${VMID} --revert <claves>) y vuelve a lanzar shutdown. No se ha tocado nada"
+    fi
     # Comprobaciones previas, ANTES de apagar: inventario de discos, CPU/licencias y destino libre.
     DISKS=$(detect_disks)
     RUN_CPU=$(running_cpu)
