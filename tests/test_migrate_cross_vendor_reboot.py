@@ -116,12 +116,14 @@ RAPHAEL = "AuthenticAMD|25|97"
 
 class SiliconGuard(unittest.TestCase):
     """25/11/2026 (Kademar, EPYC 9755 Turin = AMD 26|2): nothing LIVE across
-    silicon. cpu=host only between identical vendor|family|model; any other
-    model only within the same family (Zen4 25 <-> Zen5 26 refused)."""
+    silicon. Since the review of PR #291 every cpu model needs identical
+    vendor|family|model (LIVE_SILICON_MATCH=model by default); =family relaxes
+    generic models to the same family, by hand only."""
+
+    DEFAULT = re.search(r'(?m)^LIVE_SILICON_MATCH="\$\{LIVE_SILICON_MATCH:-\w+\}"$', SCRIPT).group()
 
     def guard(self, src, dst, model="x86-64-v4", env=None):
-        return run_bash(_fn("_live_silicon_guard")
-                        + 'LIVE_SILICON_MATCH="${LIVE_SILICON_MATCH:-family}"\n'
+        return run_bash(_fn("_live_silicon_guard") + self.DEFAULT + "\n"
                         + f'_live_silicon_guard "{src}" "{dst}" "{model}"\necho PASSED\n', env)
 
     def assertRefused(self, r, *needles):
@@ -132,7 +134,7 @@ class SiliconGuard(unittest.TestCase):
 
     def test_genoa_to_turin_refused_for_v4_both_ways(self):
         for src, dst in ((AMD, TURIN), (TURIN, AMD)):
-            self.assertRefused(self.guard(src, dst), "EN CALIENTE", "FRÍO", "familia")
+            self.assertRefused(self.guard(src, dst), "EN CALIENTE", "FRÍO", "silicio")
 
     def test_host_needs_identical_silicon(self):
         self.assertRefused(self.guard(AMD, TURIN, "host"), "silicios distintos", "FRÍO")
@@ -144,18 +146,23 @@ class SiliconGuard(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("PASSED", r.stdout)
 
-    def test_same_family_generic_moves_still_pass(self):
-        # today's fleet: AX162 Genoa 25|17 and AX102 Raphael 25|97
-        for model in ("x86-64-v4", "x86-64-v3", "kvm64", "<proxmox default>"):
-            r = self.guard(AMD, RAPHAEL, model)
-            self.assertEqual(r.returncode, 0, (model, r.stderr))
-        r = self.guard(TURIN, TURIN)
-        self.assertEqual(r.returncode, 0, r.stderr)
+    def test_default_is_model(self):
+        self.assertIn('LIVE_SILICON_MATCH:-model', self.DEFAULT)
 
-    def test_model_mode_is_stricter(self):
-        env = {"LIVE_SILICON_MATCH": "model"}
-        self.assertRefused(self.guard(AMD, RAPHAEL, env=env), "LIVE_SILICON_MATCH=model")
-        self.assertEqual(self.guard(AMD, AMD, env=env).returncode, 0)
+    def test_genoa_raphael_refused_by_default_even_generic(self):
+        # behaviour change (PR #291 review): AX162 Genoa 25|17 <-> AX102 Raphael 25|97
+        for model in ("x86-64-v4", "x86-64-v3", "kvm64", "<proxmox default>"):
+            self.assertRefused(self.guard(AMD, RAPHAEL, model), "vendor|family|model")
+            self.assertRefused(self.guard(RAPHAEL, AMD, model))
+        for sig in (AMD, RAPHAEL, TURIN):
+            r = self.guard(sig, sig)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_family_mode_relaxes_generic_only(self):
+        env = {"LIVE_SILICON_MATCH": "family"}
+        self.assertEqual(self.guard(AMD, RAPHAEL, env=env).returncode, 0)
+        self.assertRefused(self.guard(AMD, TURIN, env=env), "familia")
+        self.assertRefused(self.guard(AMD, RAPHAEL, "host", env=env), "silicios distintos")
         self.assertRefused(self.guard(AMD, AMD, env={"LIVE_SILICON_MATCH": "nope"}),
                            "solo admite")
 
@@ -526,6 +533,48 @@ FAKE_FIRESTORE_NODES = textwrap.dedent("""\
     """)
 
 
+class ColdHwidGuard(unittest.TestCase):
+    """PR #291 review: the direct cold path (stopped VM, offline remote_migrate)
+    asks for the same HWID-change acknowledgement as the coldmove kit."""
+
+    def guard(self, src, dst, model, env=None):
+        return run_bash(_fn("_cold_hwid_guard")
+                        + f'_cold_hwid_guard "{src}" "{dst}" "{model}"\necho PASSED\n', env)
+
+    def test_generic_models_need_nothing(self):
+        for m in ("x86-64-v4", "x86-64-v3", "X86-64-V4"):
+            r = self.guard(AMD, TURIN, m)
+            self.assertEqual(r.returncode, 0, (m, r.stderr))
+        self.assertEqual(self.guard("", "", "x86-64-v4").returncode, 0)
+
+    def test_host_same_silicon_passes(self):
+        self.assertEqual(self.guard(AMD, AMD, "host").returncode, 0)
+
+    def test_host_kvm64_named_to_other_silicon_need_ack_and_notice(self):
+        for m in ("host", "kvm64", "EPYC-Genoa", "max"):
+            r = self.guard(AMD, TURIN, m)
+            self.assertEqual(r.returncode, 1, m)
+            self.assertIn("ACK_HWID_CHANGE=777", r.stderr)
+        r = self.guard(AMD, TURIN, "host", {"ACK_HWID_CHANGE": "777"})
+        self.assertEqual(r.returncode, 1)                     # notice missing
+        r = self.guard(AMD, TURIN, "host", {"ACK_HWID_CHANGE": "1", "CPU_NOTICE": "x"})
+        self.assertEqual(r.returncode, 1)                     # other vmid
+        r = self.guard(AMD, TURIN, "host", {"ACK_HWID_CHANGE": "777", "CPU_NOTICE": "correo 20/11"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("correo 20/11", r.stderr)
+
+    def test_unreadable_signature_refused_for_host(self):
+        self.assertEqual(self.guard("", TURIN, "host").returncode, 1)
+
+    def test_wired_in_the_offline_branch_before_anything_is_copied(self):
+        call = SCRIPT.index('_cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"')
+        live = SCRIPT.index('_live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"')
+        self.assertLess(live, call)
+        self.assertIn("  else\n", SCRIPT[live:call])
+        self.assertLess(call, SCRIPT.index('_apt_dist_upgrade src_ssh "source ${SRC_NODE}"'))
+        self.assertLess(call, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
+
+
 class NodeMemClass(unittest.TestCase):
     """25/11/2026: the VPS-E balloon and the balloon-history copy follow
     proxmox_nodes.nodeType, not the node NAME (0000266-KDM-9755 fell into
@@ -576,16 +625,26 @@ class NodeMemClass(unittest.TestCase):
         self.assertIn("CLS=dedicated>shared", r.stdout)
         self.assertNotIn("WARN", r.stderr)
 
-    def test_missing_doc_or_field_falls_back_to_the_name(self):
+    def test_missing_doc_or_field_falls_back_to_the_name_and_warns(self):
         r = self.load({"0000181-EX44": {}})
-        self.assertIn("SRC=- DST=-", r.stdout)
+        self.assertIn("SRC=NO-FIELD DST=NO-DOC", r.stdout)
         self.assertIn("CLS=dedicated>shared", r.stdout)
+        self.assertIn("WARN: proxmox_nodes/0000181-EX44 no tiene nodeType", r.stderr)
+        self.assertIn("WARN: proxmox_nodes/0000266-KDM-9755 no existe en Firestore", r.stderr)
 
     def test_firestore_down_warns_once_and_falls_back(self):
         r = self.load({}, fail=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("CLS=dedicated>shared", r.stdout)
         self.assertEqual(r.stderr.count("WARN: No pude leer proxmox_nodes.nodeType"), 1)
+
+    def test_vpse_balloon_after_nat_and_firestore(self):
+        # PR #291 review: the Firestore read (up to 60 s) must not delay the
+        # customer's routes in the "already on dest" branch.
+        e = SCRIPT.index('if [[ "$_vm_name" == E-* ]]; then')
+        self.assertLess(SCRIPT.index('_info "Updating Firestore servers/'), e)
+        self.assertLess(SCRIPT.index('"$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" "node=${DST_NODE}"'), e)
+        self.assertLess(e, SCRIPT.index("\n  _guest_reboot_postcheck\n"))
 
     def test_wiring_no_name_patterns_left(self):
         self.assertNotIn('"$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162*', SCRIPT)

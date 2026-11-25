@@ -232,7 +232,8 @@ def dest_allows(dn, vm):
 # CPU (operator rule 2026-11-04, safe mode). The SQX licence Hardware ID and a
 # live migration's survival both depend on the CPU the guest SEES:
 #   * a guest with a GENERIC model (x86-64-v2/v3/v4) sees the same virtual CPU
-#     on every host of the vendor -> any same-vendor destination;
+#     on every host of the vendor, but since 25/11/2026 it still only moves
+#     live to the same silicon model (vendor + family + model, see below);
 #   * anything else (`cpu: host`, a named model, the kvm64 default of a config
 #     without a cpu line) sees the host -> only a destination whose CPU is the
 #     SAME silicon: vendor + family + model + stepping, from /proc/cpuinfo.
@@ -240,8 +241,8 @@ def dest_allows(dn, vm):
 #     Ryzen 7950X3D (25/97/2) is not, so a host guest never moves AX162<->AX102.
 #   * live AMD<->Intel is never allowed, generic or not (x86-64-v4 Windows
 #     bugchecked ~20 s after resuming on Intel, 10/10/2026).
-#   * a generic guest also needs the same CPU family (25/11/2026: Zen4 25 <->
-#     Zen5 26, e.g. AX162 <-> Kademar Turin, is cold-only).
+#   * a generic guest also needs the same silicon model, vendor + family +
+#     model (25/11/2026): AX162 <-> AX102 <-> Kademar Turin are cold-only.
 # Everything unknown -> no move: an unreadable VM config or an unprobed node
 # never yields a destination.
 GENERIC_CPU_RE = re.compile(r"^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$")
@@ -260,11 +261,15 @@ def cpu_move_ok(vm_cpu, src_sig, dst_sig):
     if not src_sig.get("vendor") or src_sig.get("vendor") != dst_sig.get("vendor"):
         return False
     if vm_cpu_generic(vm_cpu):
-        # Same CPU FAMILY too (25/11/2026, Kademar EPYC 9755 Turin = family 26
-        # next to the Zen4 family-25 AX162/AX102): nothing live across silicon
-        # generations. migrate_vm.sh refuses it (_live_silicon_guard), so
-        # planning it would only produce a failed move. Unknown -> no.
-        if not src_sig.get("family") or src_sig.get("family") != dst_sig.get("family"):
+        # Same SILICON too: vendor + family + model (25/11/2026, review of PR
+        # #291): nothing live between different silicon models, generic CPU
+        # included — Genoa 25/17, Raphael 25/97 and Kademar's Turin 26/2 are
+        # three. migrate_vm.sh refuses it (_live_silicon_guard,
+        # LIVE_SILICON_MATCH=model), so planning it would only produce a failed
+        # move. Behaviour change: AX162 -> AX102-SQX (260/261) no longer moves
+        # live (0 such moves 04/11-25/11). Unknown -> no.
+        if not all(src_sig.get(k) not in (None, "") and src_sig.get(k) == dst_sig.get(k)
+                   for k in ("vendor", "family", "model")):
             return False
         # x86-64-v4 needs AVX-512 on the destination (PVE adds `enforce`: the
         # guest would refuse to run); unknown -> no.
