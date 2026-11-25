@@ -54,6 +54,7 @@ echo {SERVICE} | base64 -d > /etc/systemd/system/nvx-node64.service
 echo {TIMER} | base64 -d > /etc/systemd/system/nvx-node64.timer
 mkdir -p /etc/neuravps /etc/systemd/system/nvx-node64.service.d
 printf '%s\\n' {excluir} > /etc/neuravps/node64-guard-allow-vmids
+case "$(hostname)" in {sin64pat}) : > /etc/neuravps/node64-guard-sin64 ;; *) rm -f /etc/neuravps/node64-guard-sin64 ;; esac
 printf '[Service]\\nEnvironment=MODE={modo}\\n' > /etc/systemd/system/nvx-node64.service.d/mode.conf
 systemctl daemon-reload
 systemctl enable nvx-node64.service nvx-node64.timer >/dev/null 2>&1 || echo ENABLE=fallo
@@ -70,10 +71,11 @@ nft list table bridge nvxnode64b >/dev/null 2>&1 && nft delete table bridge nvxn
 """
 
 
-def _node_script(accion, modo, excluir):
+def _node_script(accion, modo, excluir, sin64=()):
     if accion == "instalar":
         body = _INSTALA_SH.format(PY=PY, SERVICE=SERVICE, TIMER=TIMER, modo=modo,
-                                  excluir=" ".join(excluir))
+                                  excluir=" ".join(excluir),
+                                  sin64pat="|".join(sorted(sin64)) or "__ninguno__")
     elif accion == "quitar":
         body = _QUITAR_SH
     else:
@@ -95,11 +97,13 @@ def veredicto(accion, modo, sin64, n, d):
                     and d.get("SERVICIO") == "enabled" and d.get("ULTIMA") == "success")
         if n in sin64:
             return unidades and d.get("NODE64") == "-" and d.get("TABLA") == "no"
-        return unidades and d.get("TABLA") == "si" and d.get("MODO") == modo
+        return (unidades and d.get("TABLA") == "si" and d.get("MODO") == modo
+                and d.get("N64OK") == "si")
     # mirar
     if n in sin64:
         return d.get("NODE64") == "-" and d.get("TABLA") == "no"
-    return d.get("TABLA") in ("si", "no") and d.get("NODE64") not in ("error", "-")
+    return d.get("NODE64") not in ("error", "-") and (
+        d.get("TABLA") == "no" or (d.get("TABLA") == "si" and d.get("N64OK") == "si"))
 
 
 def main():
@@ -117,7 +121,7 @@ def main():
     excluir = [x.strip() for x in a.excluir.split(",") if x.strip().isdigit()]
     sin64 = set(x.strip() for x in a.sin64.split(",") if x.strip())
     accion = "mirar" if a.solo_mirar else "quitar" if a.quitar else "instalar"
-    orden = f"echo {_node_script(accion, a.modo, excluir)} | base64 -d | bash"
+    orden = f"echo {_node_script(accion, a.modo, excluir, sin64)} | base64 -d | bash"
 
     r = subprocess.run(["ssh", "-n", a.base, "cat /var/lib/base-nat/pve_nodes.json"],
                        capture_output=True, text=True, timeout=120)
@@ -161,7 +165,7 @@ def main():
             c["ok" if bien else "MAL"] += 1
             if not bien:
                 malos.append((n, d))
-            if any(int(d.get(k, 0) or 0) for k in ("FINAL", "SALIDA", "EXCL", "AJENA")):
+            if any(int(d.get(k, 0) or 0) for k in ("FINAL", "SALIDA", "EXCL", "AJENA", "SPOOF")):
                 casados.append((n, d))
     print(f"  ok={c['ok']}  MAL={c['MAL']}")
     for n, d in malos:
@@ -171,7 +175,7 @@ def main():
               " del invitado con origen node64, EXCL=a una VM excluida, AJENA=a su direccion en otro puerto):")
         for n, d in casados:
             print(f"    {n:<26} FINAL={d.get('FINAL')} SALIDA={d.get('SALIDA')} EXCL={d.get('EXCL')}"
-                  f" AJENA={d.get('AJENA')} INFRA={d.get('INFRA')} EST={d.get('EST')}")
+                  f" AJENA={d.get('AJENA')} SPOOF={d.get('SPOOF')} INFRA={d.get('INFRA')} EST={d.get('EST')}")
     return 1 if malos else 0
 
 

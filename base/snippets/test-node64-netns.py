@@ -28,6 +28,7 @@ STRANGER = "2001:db8:aaaa::7"
 BASE_HOST, BASE_SNAT = "2001:db8:bbbb::2", "2001:db8:bbbb::5ed"   # base ::2 / cliente vmid 1517 via SNAT
 OTHER_HOST, OTHER_GUEST = "2001:db8:cccc::2", "2001:db8:cccc::99"
 TRANSIT = "2001:db8:eeee:ffff::3"
+ID_OK, ID_RESV = "2a01:4f9:c01f:e::589", "2a01:4f9:c01f:e::2"   # IDENT normal / reservada (::2)
 
 
 def sh(*cmd, data=None, check=True, env=None):
@@ -63,7 +64,8 @@ def main():
     qd.mkdir()
     (qd / "520.conf").write_text("name: a\nnet0: virtio=52:54:00:00:00:01,bridge=vmbr0,firewall=0\n")
     env = dict(os.environ, NVX_NODE64_CLUSTER_FW=str(fw), NVX_NODE64_EXCL=str(tmp / "allow"),
-               NVX_NODE64_STATE=str(tmp / "state.nft"), NVX_NODE64_QEMU_DIR=str(qd))
+               NVX_NODE64_STATE=str(tmp / "state.nft"), NVX_NODE64_QEMU_DIR=str(qd),
+               NVX_NODE64_SIN64=str(tmp / "sin64"))
     fails = []
 
     def check(name, ok):
@@ -102,11 +104,15 @@ def main():
         for a in (STRANGER, BASE_HOST, BASE_SNAT, OTHER_HOST, OTHER_GUEST, TRANSIT):
             n(inet, "ip", "-6", "addr", "add", f"{a}/128", "dev", "lo")
         n(inet, "ip", "-6", "route", "add", f"{N64}::/64", "via", WAN_NODE)
+        n(inet, "ip", "-6", "route", "add", "2a01:4f9:c01f:e::/64", "via", WAN_NODE)
+        sh("ip", "-6", "route", "add", "2a01:4f9:c01f:e::/64", "dev", "vmbr0")
         n(tun, "ip", "-6", "addr", "add", "fd00:7::2/64", "dev", "eth0", "nodad")
         n(tun, "ip", "-6", "addr", "add", f"{TRANSIT}/128", "dev", "lo")
         n(tun, "ip", "-6", "route", "add", "default", "via", "fd00:7::1")
         n(ga, "ip", "-6", "addr", "add", f"{EXCL}/64", "dev", "eth0", "nodad")
         n(gb, "ip", "-6", "addr", "add", f"{LEGACY}/64", "dev", "eth0", "nodad")
+        for a in (ID_OK, ID_RESV):
+            n(gb, "ip", "-6", "addr", "add", f"{a}/64", "dev", "eth0", "nodad")
         for pid in (ga, gb):
             n(pid, "ip", "-6", "route", "add", "default", "via", f"{N64}::1")
         sh("sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
@@ -165,6 +171,9 @@ except Exception as e:print("ERR",type(e).__name__)
             check("desconocido -> excluida residente (vmid 520)", tcp(inet, STRANGER, EXCL))
             check("invitado sale desde la heredada (respuesta)", tcp(gb, LEGACY, STRANGER))
             check("desconocido -> host del nodo (input)", tcp(inet, STRANGER, WAN_NODE))
+            check("invitado sale con su IDENT normal", tcp(gb, ID_OK, STRANGER))
+            check("invitado sale con IDENT reservada ::2 (suplantaria a la base)",
+                  tcp(gb, ID_RESV, STRANGER) != closed)
 
         print("== sin guarda");  matrix(False)
         # Conexion ENTRANTE abierta durante count: debe morir al armar drop.
@@ -182,6 +191,18 @@ except Exception as e:print("MUERTA",type(e).__name__)
         m = mirar(); print("  ", m)
         check("count: tabla completa", "TABLA=si MODO=count" in m)
         check("count registra los intentos de fuera", "FINAL=0" not in m)
+        def vecina_con_excluida(closed):
+            n(ga, "ip", "-6", "addr", "del", f"{EXCL}/64", "dev", "eth0")
+            n(gb, "ip", "-6", "addr", "add", f"{EXCL}/64", "dev", "eth0", "nodad")
+            sh("ip", "-6", "neigh", "flush", "dev", "vmbr0")
+            time.sleep(.5)
+            ok = tcp(inet, STRANGER, EXCL) != closed
+            n(gb, "ip", "-6", "addr", "del", f"{EXCL}/64", "dev", "eth0")
+            n(ga, "ip", "-6", "addr", "add", f"{EXCL}/64", "dev", "eth0", "nodad")
+            sh("ip", "-6", "neigh", "flush", "dev", "vmbr0")
+            time.sleep(.5)
+            return ok
+        check("count: vecina con la direccion de la excluida SI recibe (solo cuenta)", vecina_con_excluida(False))
         r = run()
         print("== MODE=drop:", r.stdout.strip(), r.stderr.strip());  matrix(True)
         hold.stdin.write("\n"); hold.stdin.flush()
@@ -190,17 +211,10 @@ except Exception as e:print("MUERTA",type(e).__name__)
         m = mirar(); print("  ", m)
         check("drop: tabla completa y cuenta", "TABLA=si MODO=drop" in m and "FINAL=0" not in m)
         check("salida nueva desde node64 contada", "SALIDA=0" not in m)
-        # La vecina B se pone la direccion de la excluida (A la suelta): no debe recibir.
-        n(ga, "ip", "-6", "addr", "del", f"{EXCL}/64", "dev", "eth0")
-        n(gb, "ip", "-6", "addr", "add", f"{EXCL}/64", "dev", "eth0", "nodad")
-        sh("ip", "-6", "neigh", "flush", "dev", "vmbr0")
-        time.sleep(.5)
-        check("vecina con la direccion de la excluida -> NO recibe", not tcp(inet, STRANGER, EXCL))
-        check("contador nv-excl-ajena", "AJENA=0" not in mirar())
-        n(gb, "ip", "-6", "addr", "del", f"{EXCL}/64", "dev", "eth0")
-        n(ga, "ip", "-6", "addr", "add", f"{EXCL}/64", "dev", "eth0", "nodad")
-        sh("ip", "-6", "neigh", "flush", "dev", "vmbr0")
-        time.sleep(.5)
+        check("drop: vecina con la direccion de la excluida NO recibe", vecina_con_excluida(True))
+        m = mirar()
+        check("contadores nv-excl-ajena y nv-spoof", "AJENA=0" not in m and "SPOOF=0" not in m)
+        check("N64OK=si", "N64OK=si" in m)
         # Pasadas sin cambios: no tocan la tabla.
         fin = lambda: int(mirar().split("FINAL=")[1].split()[0])
         f1 = fin()
@@ -250,7 +264,18 @@ except Exception as e:print("MUERTA",type(e).__name__)
         run()
         sh("ip", "-6", "addr", "del", f"{N64}::1/64", "dev", "vmbr0")
         r = run()
-        check("vmbr0 sin /64 (Kademar) quita y no pone nada",
+        check("vmbr0 sin /64 y SIN marcador -> error y conserva", r.returncode == 1 and
+              sh("nft", "list", "table", "inet", "nvxnode64", check=False).returncode == 0)
+        (tmp / "allow").rename(tmp / "allow.x")
+        sh("ip", "-6", "addr", "add", f"{N64}::1/64", "dev", "vmbr0", "nodad")
+        r = run()
+        check("lista de excluidas desaparecida con tabla -> error y conserva", r.returncode == 1 and
+              tcp(inet, STRANGER, EXCL))
+        (tmp / "allow.x").rename(tmp / "allow")
+        sh("ip", "-6", "addr", "del", f"{N64}::1/64", "dev", "vmbr0")
+        (tmp / "sin64").write_text("")
+        r = run()
+        check("vmbr0 sin /64 CON marcador (Kademar) quita y no pone nada",
               "nada que guardar" in r.stdout and "nvxnode64" not in sh("nft", "list", "tables").stdout)
     finally:
         for p in procs:

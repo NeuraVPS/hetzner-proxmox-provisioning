@@ -1400,6 +1400,12 @@ cat > /mnt/usr/local/sbin/nvx-node64.py <<'NVXEOF'
 # (MODE=count). Ademas nv-salida cuenta (sin cortar nunca) las conexiones NUEVAS
 # que un invitado abre hacia fuera con origen en el /64 del nodo.
 #
+# nv-spoof: descarta lo que un invitado envia por vmbr0 con ORIGEN en las
+# direcciones reservadas de la IDENT (::1, ::2 y el transito /112). La base hace
+# `snat prefix` de la IDENT a su /64 conservando el sufijo, asi que un invitado
+# con IDENT ::2 saldria a Internet como la propia base (::2) y pasaria por
+# nv-infra en cualquier nodo. Ninguna VM usa esas direcciones (vmid >= 100).
+#
 # Reconciliable: lo lanza un timer cada 5 min, con cerrojo. Solo reconstruye las
 # tablas (una transaccion nft atomica) si el conjunto calculado cambia o si la
 # estructura viva no es la esperada (un `flush ruleset`, un reinicio), asi que
@@ -1429,6 +1435,10 @@ CLUSTER_FW = os.environ.get("NVX_NODE64_CLUSTER_FW", "/etc/pve/firewall/cluster.
 EXCL_FILE = os.environ.get("NVX_NODE64_EXCL", "/etc/neuravps/node64-guard-allow-vmids")
 QEMU_DIR = os.environ.get("NVX_NODE64_QEMU_DIR", "/etc/pve/local/qemu-server")
 STATE = os.environ.get("NVX_NODE64_STATE", "/run/nvx-node64.nft")
+# Marcador persistente: este nodo NO tiene /64 propio en vmbr0 (Kademar). Sin el,
+# un vmbr0 sin /64 es un error y la guarda vigente se conserva.
+SIN64 = os.environ.get("NVX_NODE64_SIN64", "/etc/neuravps/node64-guard-sin64")
+IDENT_RESERVADAS = ["2a01:4f9:c01f:e::1", "2a01:4f9:c01f:e::2", "2a01:4f9:c01f:e:ffff::/112"]
 LOCK = STATE + ".lock"
 # Solo si NO hay tabla puesta y cluster.fw no se puede leer (primer arranque sin
 # pmxcfs): las bases vigentes (25/11/2026). Con tabla puesta, un fallo de lectura
@@ -1525,11 +1535,13 @@ def infra_nets(sets):
     return dedup(hosts), dedup(tun)
 
 
-def excl_vms():
+def excl_vms(hay_tabla=False):
     """{vmid: [puertos del puente]} de las excluidas QUE RESIDEN aqui."""
     try:
         lines = open(EXCL_FILE).read().split()
     except FileNotFoundError:
+        if hay_tabla:  # la lista la escriben install.sh y el despliegue: si falta, algo va mal
+            raise Fallo(f"falta {EXCL_FILE}")
         return {}
     except OSError as e:
         raise Fallo(f"lista de excluidas: {e}")
@@ -1555,6 +1567,8 @@ def excl_vms():
 def ruleset(mode, p64, infra, infra_tun, excl):
     final = "counter drop" if mode == "drop" else \
         'counter limit rate 6/minute log prefix "nvx-node64 in: " level info'
+    ajena = "counter drop" if mode == "drop" else "counter"
+    spoof = ajena
     salida_log = "" if mode == "drop" else \
         ' limit rate 6/minute log prefix "nvx-node64 out: " level info'
     el = lambda xs: f"elements = {{ {', '.join(xs)} }}" if xs else ""
@@ -1575,8 +1589,10 @@ table inet {TABLE} {{
     set infra6 {{ type ipv6_addr; {el([str(n.network_address) for n in infra])} }}
     set infra6tun {{ type ipv6_addr; flags interval; auto-merge; {el([str(n) for n in infra_tun])} }}
     set excl6 {{ type ipv6_addr; {el(ex_addr)} }}
+    set ident_resv {{ type ipv6_addr; flags interval; elements = {{ {', '.join(IDENT_RESERVADAS)} }} }}
     chain guarda {{
         type filter hook forward priority filter; policy accept;
+        iifname "vmbr0" ip6 saddr @ident_resv {spoof} comment "nv-spoof"
         oifname "vmbr0" ip6 daddr @node64 jump entrada
         iifname "vmbr0" oifname != "vmbr0" ip6 saddr @node64 ct state new counter{salida_log} comment "nv-salida"
     }}
@@ -1595,13 +1611,13 @@ table bridge {BTABLE} {{
     set excl_own {{ type ipv6_addr . ifname; {el(ex_own)} }}
     chain salida {{
         type filter hook output priority filter; policy accept;
-        ip6 daddr @excl6 ip6 daddr . oifname != @excl_own counter drop comment "nv-excl-ajena"
+        ip6 daddr @excl6 ip6 daddr . oifname != @excl_own {ajena} comment "nv-excl-ajena"
     }}
 }}
 """
 
 
-ESPERADAS = {"nv-salida", "nv-excl", "nv-infra", "nv-infra-tun", "nv-est", "nv-rel", "nv-final"}
+ESPERADAS = {"nv-spoof", "nv-salida", "nv-excl", "nv-infra", "nv-infra-tun", "nv-est", "nv-rel", "nv-final"}
 
 
 def estado():
@@ -1631,7 +1647,23 @@ def estado():
                     if "counter" in e:
                         c[rule["comment"]] = e["counter"]["packets"]
     ok = jump and ESPERADAS <= set(c) and "nv-excl-ajena" in c
-    return mode, c, ok
+    return mode, c, ok, set64()
+
+
+def set64():
+    """Prefijos que la tabla viva guarda de verdad (conjunto node64)."""
+    r = sh("nft", "-j", "list", "set", "inet", TABLE, "node64")
+    out = set()
+    if r.returncode != 0:
+        return out
+    for o in json.loads(r.stdout).get("nftables", []):
+        for e in (o.get("set") or {}).get("elem", []) or []:
+            e = e.get("elem", {}).get("val", e) if isinstance(e, dict) and "elem" in e else e
+            if isinstance(e, dict) and "prefix" in e:
+                out.add(f"{e['prefix']['addr']}/{e['prefix']['len']}")
+            elif isinstance(e, str):
+                out.add(e)
+    return out
 
 
 def unit(prop, name):
@@ -1641,9 +1673,10 @@ def unit(prop, name):
 
 def mirar():
     try:
-        p64 = ",".join(map(str, node64_prefixes())) or "-"
+        vivos = node64_prefixes()
+        p64 = ",".join(map(str, vivos)) or "-"
     except Fallo:
-        p64 = "error"
+        vivos, p64 = None, "error"
     st = estado()
     tail = (f"TIMER={unit('is-enabled', 'nvx-node64.timer')} "
             f"TIMERACT={unit('is-active', 'nvx-node64.timer')} "
@@ -1653,8 +1686,9 @@ def mirar():
         br = "si" if sh("nft", "list", "table", "bridge", BTABLE).returncode == 0 else "no"
         print(f"TABLA=no BR={br} NODE64={p64} {tail}")
         return
-    mode, c, ok = st
-    print(f"TABLA={'si' if ok else 'incompleta'} MODO={mode} NODE64={p64} "
+    mode, c, ok, s64 = st
+    n64ok = "si" if vivos and s64 == {str(n) for n in vivos} else "no"
+    print(f"TABLA={'si' if ok else 'incompleta'} MODO={mode} NODE64={p64} N64OK={n64ok} SPOOF={c.get('nv-spoof', 0)} "
           f"EXCL={c.get('nv-excl', 0)} AJENA={c.get('nv-excl-ajena', 0)} "
           f"INFRA={c.get('nv-infra', 0) + c.get('nv-infra-tun', 0)} "
           f"EST={c.get('nv-est', 0) + c.get('nv-rel', 0)} FINAL={c.get('nv-final', 0)} "
@@ -1675,9 +1709,11 @@ def aplicar(mode):
     st = estado()
     p64 = node64_prefixes()          # Fallo => no se toca nada
     if not p64:
+        if not os.path.exists(SIN64):
+            raise Fallo(f"vmbr0 sin /64 propio y sin el marcador {SIN64}")
         if st is not None or sh("nft", "list", "table", "bridge", BTABLE).returncode == 0:
             quitar()
-        print("nvx-node64: vmbr0 sin /64 propio; nada que guardar")
+        print("nvx-node64: vmbr0 sin /64 propio (marcado); nada que guardar")
         return 0
     try:
         sets = ipsets()
@@ -1686,18 +1722,19 @@ def aplicar(mode):
             raise                    # conserva la tabla puesta
         sets = {"base": [ipaddress.ip_network(x) for x in BASE_FALLBACK]}
     infra, infra_tun = infra_nets(sets)
-    text = ruleset(mode, p64, infra, infra_tun, excl_vms())
+    text = ruleset(mode, p64, infra, infra_tun, excl_vms(st is not None))
     try:
         prev = open(STATE).read()
     except OSError:
         prev = None
-    if st is not None and st[2] and st[0] == mode and prev == text:
+    if st is not None and st[2] and st[0] == mode and prev == text \
+            and st[3] == {str(n) for n in p64}:
         return 0
     r = sh("nft", "-f", "-", inp=text)
     if r.returncode != 0:
         raise Fallo(f"nft: {r.stderr.strip()[:300]}")
     st = estado()
-    if st is None or not st[2] or st[0] != mode:
+    if st is None or not st[2] or st[0] != mode or st[3] != {str(n) for n in p64}:
         raise Fallo("la tabla no quedo como se esperaba")
     with open(STATE + ".tmp", "w") as f:
         f.write(text)

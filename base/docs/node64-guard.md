@@ -24,15 +24,27 @@ nodo pasa solo si:
 
 | regla (comentario) | qué deja pasar |
 |---|---|
-| `nv-excl` | destino = dirección derivada de un vmid de `/etc/neuravps/node64-guard-allow-vmids` (las `ipv6Enabled=true` del 25/11: 520, 1306, 1712, 1713) |
-| `nv-infra` | origen en `[IPSET base]` de `cluster.fw` (más una copia fija en el script) o `::1`/`::2` de cada /64 de `hosts-ipv6` (los hosts, no el /64 entero: incluye invitados) |
-| `nv-est` | `ct state established,related`: respuestas a lo que inicia la VM |
+| `nv-excl` | destino = dirección derivada de un vmid de `/etc/neuravps/node64-guard-allow-vmids` (las `ipv6Enabled=true` del 25/11: 520, 1306, 1712, 1713) **que reside en el nodo**; la tabla `bridge nvxnode64b` (`nv-excl-ajena`) solo la entrega al puerto de esa VM (`tap<vmid>iN`/`fwpr<vmid>pN`) |
+| `nv-infra` | origen = `::1`/`::2` de cada /64 de `[IPSET base]` y de `hosts-ipv6` en `cluster.fw` (hosts, nunca el /64: el de la base es también el SNAT de salida de clientes y el de los nodos incluye invitados) |
+| `nv-infra-tun` | prefijos más largos que /64 de `[IPSET base]` (tránsito /112), solo si entran por `tun-*` |
+| `nv-est` / `nv-rel` | `ct direction reply` + `established` (respuestas a lo que inicia la VM) y `related` (ICMPv6, PMTU). Una conexión entrante abierta antes de armar no sobrevive |
 | `nv-final` | lo demás: `drop` (MODE=drop) o solo contador + log limitado `nvx-node64 in:` (MODE=count) |
 
-Además `nv-salida` cuenta (sin cortar) lo que sale de `vmbr0` hacia fuera con origen en
-el /64 del nodo (incluye las respuestas). **No se corta la salida**: un invitado con
+`nv-spoof` (antes de todo): descarta lo que un invitado envía por `vmbr0` con origen en la
+IDENT reservada (`::1`, `::2`, tránsito `/112`). La base hace `snat prefix` de la IDENT a
+su /64 conservando el sufijo: un invitado con IDENT `::2` saldría como la base y pasaría
+por `nv-infra` en cualquier nodo. Ninguna VM usa esas direcciones (vmid ≥ 100). En
+MODE=count, `nv-spoof` y `nv-excl-ajena` solo cuentan.
+
+Además `nv-salida` cuenta (sin cortar) las conexiones nuevas que salen de `vmbr0` hacia
+fuera con origen en el /64 del nodo. **No se corta la salida**: un invitado con
 dirección node64 sigue pudiendo salir por la uplink del nodo (fuera de pools y de
 «Internet apagado»); es otro hueco, sin tratar aquí.
+
+Ante un error leyendo el estado (`ip`, `vmbr0`, `cluster.fw`, lista de excluidas) la pasada
+**no toca** lo puesto y sale con error (`ULTIMA=exit-code` en `--mirar`). Un `vmbr0` sin /64
+solo se acepta con el marcador `/etc/neuravps/node64-guard-sin64` (el despliegue lo pone en
+los nodos de `--sin64`, hoy solo 0000266-KDM-9755).
 
 `MODE` va por drop-in (`/etc/systemd/system/nvx-node64.service.d/mode.conf`). El timer
 reaplica cada 5 min, pero solo reconstruye la tabla (en una transacción atómica) si el
@@ -51,14 +63,19 @@ python3 /usr/local/sbin/nvx-node64.py --mirar
 journalctl -k | grep nvx-node64          # en modo count, quién llega
 ```
 
-`FINAL` = intentos de fuera descartados (o que se descartarían); `SALIDA` = paquetes
-salientes con origen node64; `EXCL` = tráfico a una VM excluida.
+`FINAL` = intentos de fuera descartados (o que se descartarían); `SALIDA` = conexiones
+nuevas que abre un invitado con origen node64; `EXCL` = tráfico a una VM excluida;
+`AJENA` = a la dirección de una excluida por otro puerto; `SPOOF` = invitado con origen
+IDENT reservado; `N64OK=si` = el conjunto vivo coincide con el /64 de `vmbr0`.
+
+Nodos nuevos: `install.sh` los deja en `drop` a propósito (no tienen VMs heredadas).
 
 ## Marcha atrás
 
 - Toda la flota: `scripts/despliega-node64.py --quitar` (para y deshabilita timer y
   servicio y borra la tabla; los ficheros quedan inertes).
 - Un nodo: `systemctl disable --now nvx-node64.timer nvx-node64.service; python3 /usr/local/sbin/nvx-node64.py --quitar`
+  (o `--nodos <nodo> --quitar` desde el sandbox).
 - Volver a solo contar sin quitar: `--modo count`.
 
 ## Pruebas
