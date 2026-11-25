@@ -63,7 +63,15 @@ case "$(hostname)" in {sin64pat}) : > /etc/neuravps/node64-guard-sin64 ;; *) rm 
 echo {SERVICE} | base64 -d > /etc/systemd/system/nvx-node64.service
 echo {TIMER} | base64 -d > /etc/systemd/system/nvx-node64.timer
 systemctl daemon-reload || echo RELOAD=fallo
-systemctl show -p Environment --value nvx-node64.service | grep -q "SALIDA_MODE={smodo}" || echo DROPIN=no_cargado
+ENVV=$(systemctl show -p Environment --value nvx-node64.service)
+case " $ENVV " in *" MODE={modo} "*) ;; *) echo DROPIN=no_cargado ;; esac
+case " $ENVV " in *" SALIDA_MODE={smodo} "*) ;; *) echo DROPIN=no_cargado ;; esac
+# Si el drop-in no esta cargado con los dos valores exactos, NO se toca el
+# ejecutable ni se aplica: el nodo queda como estaba y sale MAL.
+if [ ! -s /etc/systemd/system/nvx-node64.service.d/mode.conf ] || ! systemctl show -p Environment --value nvx-node64.service | tr ' ' '\\n' | grep -qx "SALIDA_MODE={smodo}" \
+   || ! systemctl show -p Environment --value nvx-node64.service | tr ' ' '\\n' | grep -qx "MODE={modo}"; then
+  echo ABORTADO=dropin
+else
 # 2) Despues, el ejecutable (sustitucion atomica).
 echo {PY} | base64 -d > /usr/local/sbin/nvx-node64.py.new && chmod 755 /usr/local/sbin/nvx-node64.py.new \
   && mv /usr/local/sbin/nvx-node64.py.new /usr/local/sbin/nvx-node64.py || echo INSTALAR=fallo
@@ -71,6 +79,7 @@ systemctl enable nvx-node64.service nvx-node64.timer >/dev/null 2>&1 || echo ENA
 systemctl start nvx-node64.timer >/dev/null 2>&1 || echo TIMERSTART=fallo
 # A traves de la unidad: serializado con el timer (y el script lleva cerrojo).
 systemctl start nvx-node64.service >/dev/null 2>&1 || echo APLICAR=fallo
+fi
 """
 
 _QUITAR_SH = """\
@@ -96,7 +105,7 @@ def _node_script(accion, modo, excluir, sin64=(), smodo="count"):
 def veredicto(accion, modo, sin64, n, d, smodo="count"):
     if "ERROR" in d or d.get("NVXFIN") != "1":
         return False
-    if any(k in d for k in ("INSTALAR", "ENABLE", "TIMERSTART", "APLICAR", "DROPIN", "RELOAD")):
+    if any(k in d for k in ("INSTALAR", "ENABLE", "TIMERSTART", "APLICAR", "DROPIN", "RELOAD", "ABORTADO")):
         return False
     if accion == "quitar":
         return (d.get("TABLA") == "no" and d.get("BR", "no") == "no"
