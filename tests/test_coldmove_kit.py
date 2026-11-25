@@ -823,6 +823,17 @@ class SecondReview(unittest.TestCase):
             self.assertEqual(k.read(f"work/{VMID}.state"), "")              # no «parked» state
             r = k.run("rtmig_cutover.sh", "push", FINAL)
             self.assertEqual(r.returncode, 1); self.assertFalse(k.dst_conf.exists())
+            # the source has a balloon reconciler: the discarded park left no balloon-state behind,
+            # so the retry (start → shutdown → park) goes through
+            self.assertFalse((k.work / f"{VMID}.balloon-state").exists())
+            self.assertFalse((k.work / f"{VMID}.balloon-state.staging").exists())
+            subprocess.run(["qm", "start", VMID], env=k.env, check=True)
+            k.ok("rtmig_cutover.sh", "shutdown", "60")
+            r = k.ok("rtmig_cutover.sh", "park")
+            self.assertIn("historial del globo exportado", r.stdout)
+            self.assertTrue((k.work / f"{VMID}.balloon-state").exists())
+            self.assertIn("cores: 4", k.read(f"work/{VMID}.conf.src"))
+            self.assertEqual(k.state()["PHASE"], "parked"); self.assertFalse(k.src_conf.exists())
 
     def test_after_reverting_the_pending_change_the_move_works(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -334,8 +334,8 @@ case "$CMD" in
     # aparcar. Solo si este nodo tiene reconciliador (en un EX44 no hay historial que llevar).
     if has_reconciler_src; then
       if B=$(python3 "$NV_RAM_GUARD" export-state "$VMID" "$(src_node)" 2>/dev/null) && [[ "$B" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-        printf '%s\n' "$B" > "$WORK/${VMID}.balloon-state"
-        log "historial del globo exportado a $WORK/${VMID}.balloon-state"
+        BALLOON_EXPORT="$B"   # se escribe solo si el park sale adelante (ver más abajo)
+        log "historial del globo exportado"
       else
         warn "no pude exportar el historial del globo (el destino lo reaprenderá de forma conservadora)"
       fi
@@ -346,8 +346,8 @@ case "$CMD" in
     # este momento) se promueve a la copia aparcada. Si algo cambió durante la sonda del destino o el
     # export, la config se queda en el origen y la provisional se descarta.
     STG_CONF="$WORK/${VMID}.conf.staging"; STG_FW="$WORK/${VMID}.fw.staging"
-    rm -f "$STG_CONF" "$STG_FW"
-    discard_staging() { rm -f "$STG_CONF" "$STG_FW"; die "$1. La config se queda en el origen; no se ha aparcado nada. Revísala; para seguir, arranca la VM (qm start ${VMID}) y repite el corte desde shutdown"; }
+    rm -f "$STG_CONF" "$STG_FW" "$WORK/${VMID}.balloon-state.staging"
+    discard_staging() { rm -f "$STG_CONF" "$STG_FW" "$WORK/${VMID}.balloon-state.staging"; die "$1. La config se queda en el origen; no se ha aparcado nada. Revísala; para seguir, arranca la VM (qm start ${VMID}) y repite el corte desde shutdown"; }
     cp -a "$CONF" "$STG_CONF" || discard_staging "no pude copiar la config"
     [[ -f "$FW" ]] && { cp -a "$FW" "$STG_FW" || discard_staging "no pude copiar el .fw"; }
     STG_SHA=$(sha256sum < "$STG_CONF" | cut -d' ' -f1)
@@ -360,6 +360,12 @@ case "$CMD" in
     cmp -s "$CONF" "$STG_CONF" || discard_staging "la config de la VM ${VMID} cambió durante el park"
     if [[ -f "$FW" || -f "$STG_FW" ]]; then
       [[ -f "$FW" && -f "$STG_FW" ]] && cmp -s "$FW" "$STG_FW" || discard_staging "el .fw de la VM ${VMID} cambió durante el park"
+    fi
+    # Validado: se promueven las copias, y el historial del globo (si se exportó) se escribe ahora, no
+    # antes: un park descartado no deja nada con nombre definitivo que bloquee el reintento.
+    if [[ -n "${BALLOON_EXPORT:-}" ]]; then
+      printf '%s\n' "$BALLOON_EXPORT" > "$WORK/${VMID}.balloon-state.staging"
+      mv "$WORK/${VMID}.balloon-state.staging" "$WORK/${VMID}.balloon-state"
     fi
     [[ -f "$STG_FW" ]] && mv "$STG_FW" "$WORK/${VMID}.fw.src"
     mv "$STG_CONF" "$WORK/${VMID}.conf.src"
