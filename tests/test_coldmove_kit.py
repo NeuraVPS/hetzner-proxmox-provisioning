@@ -40,6 +40,10 @@ if os.environ.get("FAKE_SSH_DIE_AFTER") and os.environ["FAKE_SSH_DIE_AFTER"] in 
     open(dead, "w").close()
 if fail and fail in cmd:
     sys.stderr.write("Connection closed by remote host\n"); sys.exit(255)
+se_m, se_c = os.environ.get("FAKE_SSH_SIDE_EFFECT_MATCH"), os.environ.get("FAKE_SSH_SIDE_EFFECT")
+if se_m and se_c and se_m in cmd and not os.path.exists(os.path.join(root, "side-effect-done")):
+    open(os.path.join(root, "side-effect-done"), "w").close()
+    subprocess.run(["bash", "-c", se_c])                  # something else edits a file meanwhile
 if host == os.environ.get("FAKE_JUMP", "-"):
     env = dict(os.environ)
 elif host == "root@" + os.environ.get("FAKE_SRC_IP", "-"):
@@ -88,6 +92,8 @@ elif a[0] == "config":
     sys.stdout.write(open(conf).read())
 elif a[0] == "shutdown":
     if os.environ.get("FAKE_SHUTDOWN_FAIL"): sys.exit(255)
+    if os.environ.get("FAKE_QM_ADD_PENDING_ON_STOP"):      # someone runs `qm set` while it stops
+        open(conf, "a").write("\n[PENDING]\n" + os.environ["FAKE_QM_ADD_PENDING_ON_STOP"] + "\n")
     open(stf, "w").write("stopped")
     # like PVE (QemuServer vm_stop_cleanup): the pending changes are applied when the VM stops
     lines = open(conf).read().splitlines(); main, pend, rest, sec = [], {}, [], "main"
@@ -755,6 +761,54 @@ class SecondReview(unittest.TestCase):
                 self.assertIn("--revert", out(r))
                 self.assertNotIn("shutdown", k.read("qm.log"))
                 self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+
+    def test_pending_header_is_matched_like_pve(self):
+        # QemuServer: /^\[PENDING\]\s*$/i
+        for hdr in ("[pending]", "[Pending]  ", "[PENDING]\t", "[PeNdInG]"):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n" + hdr + "\ncores: 4\n")
+                k.ok("rtmig_send.sh", "base", "rtmig-a")
+                r = k.run("rtmig_cutover.sh", "shutdown", "60")
+                self.assertEqual(r.returncode, 1, repr(hdr)); self.assertIn("cambios pendientes", out(r))
+                self.assertNotIn("shutdown", k.read("qm.log"))
+        with tempfile.TemporaryDirectory() as tmp:                    # a snapshot is not a pending change
+            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[pending-snap]\ncores: 4\n")
+            k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+
+    def test_a_failed_read_never_means_clean(self):
+        # only the pending check's awk fails (rc 2, transient): the VM must NOT be stopped
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncores: 4\n")
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            shim = k.t / "shim"; shim.mkdir()
+            real = subprocess.run(["bash", "-c", "command -v awk"], capture_output=True, text=True).stdout.strip()
+            (shim / "awk").write_text('#!/bin/bash\ncase "$*" in *"[pending]"*) echo "awk: read error" >&2; exit 2;; esac\nexec %s "$@"\n' % real)
+            (shim / "awk").chmod(0o755)
+            r = k.run("rtmig_cutover.sh", "shutdown", "60", PATH=f"{shim}:{k.env['PATH']}")
+            self.assertEqual(r.returncode, 1); self.assertIn("no pude leer la config", out(r))
+            self.assertNotIn("shutdown", k.read("qm.log"))
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertIn("[PENDING]", k.src_conf.read_text())             # nothing applied
+
+    def test_an_edit_during_the_remote_checks_aborts_before_stopping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60", FAKE_SSH_SIDE_EFFECT_MATCH="PROBE-END",
+                      FAKE_SSH_SIDE_EFFECT=f"printf '\\n[PENDING]\\ncores: 4\\n' >> {k.src_conf}")
+            self.assertEqual(r.returncode, 1)
+            self.assertTrue("cambios pendientes" in out(r) or "cambió mientras" in out(r), out(r))
+            self.assertNotIn("shutdown", k.read("qm.log"))
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+
+    def test_a_pending_change_applied_during_the_stop_is_detected_and_park_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60", FAKE_QM_ADD_PENDING_ON_STOP="cores: 2")
+            self.assertEqual(r.returncode, 1); self.assertIn("cambió durante el apagado", out(r))
+            self.assertIn("cores: 2", k.src_conf.read_text())             # PVE applied it on stop
+            r = k.run("rtmig_cutover.sh", "park")
+            self.assertEqual(r.returncode, 1); self.assertIn("no es la que comprobó shutdown", out(r))
+            self.assertTrue(k.src_conf.exists())
 
     def test_after_reverting_the_pending_change_the_move_works(self):
         with tempfile.TemporaryDirectory() as tmp:

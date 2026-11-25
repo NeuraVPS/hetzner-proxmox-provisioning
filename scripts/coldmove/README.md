@@ -79,10 +79,16 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
    los discos, usa la misma base, verifica por guid y limpia de forma idempotente.
 3. **Corte, a la hora pactada:**
    1. `./rtmig_cutover.sh shutdown 600`: primero las comprobaciones previas, **antes de apagar**:
-      - que la config **no tenga cambios pendientes** (`[PENDING]` ni `delete:` pendientes). PVE los
-        aplica al parar la VM, así que la config validada no sería la que se traslada. Si los hay,
-        se aplican (reiniciando la VM) o se revierten (`qm set <VMID> --revert <claves>`) y se
-        vuelve a lanzar;
+      - que la config **no tenga cambios pendientes**: ninguna sección `[PENDING]`, reconocida como
+        en PVE, sin distinguir mayúsculas y con espacios finales. PVE los aplica al parar la VM, así
+        que la config validada no sería la que se traslada.
+        - Si los hay, se aplican (reiniciando la VM) o se revierten (`qm set <VMID> --revert
+          <claves>`) y se vuelve a lanzar.
+        - Si la config no se puede leer bien, también aborta.
+        - Justo antes de `qm shutdown` se vuelve a leer: tiene que seguir limpia y ser idéntica (sha256)
+          a la comprobada.
+        - Tras el apagado se compara otra vez. Si alguien metió un cambio pendiente durante el
+          apagado, PVE lo aplica al parar: `shutdown` lo detecta y `park` no aparca esa config;
       - inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
         libre.
 
