@@ -93,6 +93,26 @@ put_heredoc() { # put_heredoc <fichero> <destino> <modo>
   put "$tmp" "$2" "$3"; rm -f "$tmp"
 }
 
+# Cerrojo comun de net / confirm / vuelta atras: nunca dos a la vez.
+NET_LOCK=/run/nv-adopt-net.lock
+net_lock() { exec 9>"$NET_LOCK"; flock -w 120 9 || die "no consigo el cerrojo $NET_LOCK (¿otra fase de red en marcha?)"; }
+
+# `ifreload -a` quita de `lo` la /32 propia del nodo (10.65.x.y) que pone
+# neuravps-tunnels.sh, porque `lo` es una interfaz gestionada por ifupdown2. Sin
+# ella la tabla 102 no tiene origen. Tras cualquier ifreload, se reaplican los
+# tuneles (idempotente) y se comprueba.
+node_v4() { printf '10.65.%d.%d' $(( 10#$NODE_ID / 256 )) $(( 10#$NODE_ID % 256 )); }
+reapply_tunnels() {
+  [ -x /usr/local/sbin/neuravps-tunnels.sh ] || return 0
+  /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1 || log "AVISO: neuravps-tunnels.sh rc!=0 tras ifreload"
+  check_node_v4 || return 1
+}
+check_node_v4() {
+  local v4; v4="$(node_v4)"
+  ip -4 addr show dev lo | grep -q "inet ${v4}/32" || { log "falta ${v4}/32 en lo"; return 1; }
+  ip -4 route get 1.1.1.1 from "$v4" 2>/dev/null | grep -q 'dev tun-' || { log "sin ruta por tunel con origen $v4 (tabla 102)"; return 1; }
+}
+
 # Guarda de invitados: qm y pct tienen que responder y estar vacios. Un fallo de
 # qm NO cuenta como «0 VMs». Ademas el nodo tiene que ser independiente (sin
 # corosync): renombrar o cambiar la config de cluster en un cluster es otra cosa.
@@ -170,6 +190,7 @@ phase_hostname() {
 phase_net() {
   log "== net"
   require_no_guests
+  net_lock
   # Una sola transaccion a la vez: si hay una vuelta atras pendiente, no se pisa su copia.
   if [ -e "$STATE/net-pending" ] || systemctl is-active --quiet nv-adopt-net-rollback.timer; then
     die "hay una transaccion de red pendiente ($(cat "$STATE/net-pending" 2>/dev/null)); ejecuta confirm o espera a la vuelta atras"
@@ -240,14 +261,26 @@ PY
   # tocar nada.
   cat > "$STATE/net-rollback.sh" <<EOF
 #!/bin/bash
+# Vuelta atras de adoptar-nodo-externo.sh net. Con el mismo cerrojo que net/confirm.
+exec 9>"$NET_LOCK"; flock -w 300 9 || { logger -t nv-adopt "vuelta atras: sin cerrojo"; exit 1; }
+[ -e "$STATE/net-pending" ] || { logger -t nv-adopt "vuelta atras: nada pendiente (ya confirmado)"; exit 0; }
+echo "rollback-en-curso \$(date -u +%FT%TZ)" > "$STATE/net-rollback-running"
+ok=1
 for f in 99-neuravps-ra.conf 99-neuravps-proxyarp.conf 99-neuravps-forwarding.conf 99-neuravps-uplink-ra.conf; do
-  if grep -qx "\$f" "$snap/sysctl.list"; then cp -a "$snap/sysctl.d/\$f" /etc/sysctl.d/; else rm -f "/etc/sysctl.d/\$f"; fi
+  if grep -qx "\$f" "$snap/sysctl.list"; then cp -a "$snap/sysctl.d/\$f" /etc/sysctl.d/ || ok=0; else rm -f "/etc/sysctl.d/\$f"; fi
 done
-cp -a "$snap/interfaces" /etc/network/interfaces
+cp -a "$snap/interfaces" /etc/network/interfaces || ok=0
 sysctl -q --system
-ifreload -a
-rm -f "$STATE/net-pending"
-logger -t nv-adopt "red restaurada desde $snap (sin confirmar)"
+ifreload -a || ok=0
+[ -x /usr/local/sbin/neuravps-tunnels.sh ] && /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1
+rm -f "$STATE/net-rollback-running"
+if [ "\$ok" = 1 ]; then
+  rm -f "$STATE/net-pending"
+  logger -t nv-adopt "red restaurada desde $snap (sin confirmar)"
+else
+  logger -t nv-adopt "vuelta atras INCOMPLETA desde $snap: net-pending se conserva, revisa a mano"
+  exit 1
+fi
 EOF
   chmod 755 "$STATE/net-rollback.sh"
   systemctl reset-failed nv-adopt-net-rollback.timer nv-adopt-net-rollback.service 2>/dev/null || true
@@ -277,12 +310,16 @@ EOF
   done
   sleep 3
   ip -6 addr show dev "$UPLINK" scope global | grep -q "inet6 ${NODE_V6}/128" || die "NODE_V6 no quedo en $UPLINK (la vuelta atras restaurara la red)"
+  reapply_tunnels || die "los tuneles no quedaron bien tras ifreload (la vuelta atras restaurara la red)"
   ip -br addr show dev "$UPLINK"; ip -br addr show dev vmbr0
   ip -6 route show default
   log "ENI aplicado. Comprueba desde una sesion SSH NUEVA y ejecuta: $0 confirm"
 }
 
 phase_confirm() {
+  net_lock
+  [ ! -e "$STATE/net-rollback-running" ] || die "hay una vuelta atras en curso o incompleta ($STATE/net-rollback-running); revisa la red antes"
+  systemctl is-active --quiet nv-adopt-net-rollback.service && die "la vuelta atras se esta ejecutando ahora mismo; no la interrumpo"
   [ -e "$STATE/net-pending" ] || systemctl is-active --quiet nv-adopt-net-rollback.timer \
     || die "no hay transaccion de red pendiente (¿ya vencio la vuelta atras?)"
   systemctl stop nv-adopt-net-rollback.timer nv-adopt-net-rollback.service 2>/dev/null || true
@@ -370,6 +407,7 @@ EOF
     [ "$(cat /sys/class/net/$f/mtu 2>/dev/null)" = "$TUN_MTU" ] || die "$f no tiene MTU $TUN_MTU"
   done
   for f in nvx-mss nvx-aisla nvx-aisla-l3; do systemctl is-active --quiet "$f" || die "$f no esta activo"; done
+  check_node_v4 || die "falta la direccion propia del nodo o su ruta por el tunel (tabla 102)"
   ip -br link show type ip6gre | grep tun-
   ip -6 rule; ip rule
   nft list table inet nvxmss | grep maxseg
@@ -448,36 +486,50 @@ phase_node() {
   done
   [ -s /etc/default/neuravps-boot-stagger ] || die "falta /etc/default/neuravps-boot-stagger (arranque escalonado)"
   # Relevo del cortafuegos: se instala el de PVE, se valida y SOLO entonces se
-  # retira el del piloto. Copias de lo que se pisa.
-  local hostfw="/etc/pve/nodes/$(hostname)/host.fw"
-  [ -e /etc/pve/firewall/cluster.fw ] && cp -a /etc/pve/firewall/cluster.fw "$STATE/cluster.fw.bak-$TS"
-  [ -e "$hostfw" ] && cp -a "$hostfw" "$STATE/host.fw.bak-$TS"
-  cp "$CLUSTER_FW" /etc/pve/firewall/cluster.fw || die "no pude escribir cluster.fw"
+  # retira el del piloto. Si algo falla, se reponen cluster.fw y host.fw tal
+  # cual estaban (o su ausencia) y se recarga.
+  local hostfw="/etc/pve/nodes/$(hostname)/host.fw" fwbak="$STATE/fw-bak-$TS"
+  mkdir -p "$fwbak" || die "no pude crear $fwbak"
+  if [ -e /etc/pve/firewall/cluster.fw ]; then cp -a /etc/pve/firewall/cluster.fw "$fwbak/cluster.fw" || die "no pude respaldar cluster.fw"; else : > "$fwbak/cluster.fw.absent"; fi
+  if [ -e "$hostfw" ]; then cp -a "$hostfw" "$fwbak/host.fw" || die "no pude respaldar host.fw"; else : > "$fwbak/host.fw.absent"; fi
+  fw_restore_die() {
+    log "cortafuegos candidato RECHAZADO: $*; repongo la configuracion anterior ($fwbak)"
+    if [ -e "$fwbak/cluster.fw.absent" ]; then rm -f /etc/pve/firewall/cluster.fw; else cp "$fwbak/cluster.fw" /etc/pve/firewall/cluster.fw; fi
+    if [ -e "$fwbak/host.fw.absent" ]; then rm -f "$hostfw"; else cp "$fwbak/host.fw" "$hostfw"; fi
+    pve-firewall restart >/dev/null 2>&1 || true
+    die "$* (configuracion anterior repuesta; el cortafuegos del piloto, si lo habia, sigue puesto)"
+  }
+  cp "$CLUSTER_FW" /etc/pve/firewall/cluster.fw || fw_restore_die "no pude escribir cluster.fw"
   if [ -n "${HOST_FW_V4:-}" ]; then
     {
       echo "[OPTIONS]"; echo; echo "enable: 1"; echo
       echo "[RULES]"; echo
       for ip in $HOST_FW_V4; do echo "IN SSH(ACCEPT) -source $ip -log nolog # base (IPv4, respaldo)"; done
-    } > "$hostfw" || die "no pude escribir host.fw"
+    } > "$hostfw" || fw_restore_die "no pude escribir host.fw"
     log "host.fw: SSH por IPv4 desde $HOST_FW_V4"
   fi
-  local diag; diag="$(pve-firewall compile 2>&1 >/dev/null | grep -i -E 'unable|error|parse' || true)"
+  local diag rc
+  diag="$(pve-firewall compile 2>&1 >/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || fw_restore_die "pve-firewall compile rc=$rc: $diag"
   if [ -n "$diag" ]; then
     # El cluster.fw canonico de la flota arrastra hoy un error conocido (25/11,
-    # linea 258, tarea aparte). Solo se acepta con ALLOW_FW_DIAG=<texto exacto>.
+    # linea 258, tarea aparte). Solo se acepta si TODO el stderr es exactamente
+    # ALLOW_FW_DIAG.
     if [ -n "${ALLOW_FW_DIAG:-}" ] && [ "$diag" = "$(printf '%b' "$ALLOW_FW_DIAG")" ]; then
       log "AVISO: pve-firewall con diagnostico conocido y aceptado: $diag"
     else
-      log "pve-firewall compile: $diag"
-      die "el cortafuegos de PVE no compila limpio; el del piloto sigue puesto (ALLOW_FW_DIAG para aceptar un diagnostico conocido)"
+      fw_restore_die "pve-firewall compile no sale limpio: $diag (ALLOW_FW_DIAG para aceptar un diagnostico exacto conocido)"
     fi
   fi
-  pve-firewall restart || die "pve-firewall restart fallo; el del piloto sigue puesto"
+  pve-firewall restart || fw_restore_die "pve-firewall restart fallo"
   sleep 3
-  pve-firewall status | grep -q 'enabled/running' || die "pve-firewall no esta enabled/running; el del piloto sigue puesto"
-  iptables -S INPUT | grep -q -- '-j PVEFW-INPUT' || die "sin PVEFW-INPUT en INPUT; el del piloto sigue puesto"
-  iptables -S PVEFW-HOST-IN | grep -v PVESIG | tail -1 | grep -q -E -- '-j (DROP|PVEFW-Drop)' || die "PVEFW-HOST-IN no acaba en DROP; el del piloto sigue puesto"
-  ip6tables -S PVEFW-HOST-IN | grep -v PVESIG | tail -1 | grep -q -E -- '-j (DROP|PVEFW-Drop)' || die "PVEFW-HOST-IN (v6) no acaba en DROP; el del piloto sigue puesto"
+  pve-firewall status | grep -q 'enabled/running' || fw_restore_die "pve-firewall no esta enabled/running"
+  local t
+  for t in iptables ip6tables; do
+    $t -S INPUT | grep -q -- '-j PVEFW-INPUT' || fw_restore_die "$t: INPUT no salta a PVEFW-INPUT"
+    $t -S PVEFW-INPUT | grep -q -- '-j PVEFW-HOST-IN' || fw_restore_die "$t: PVEFW-INPUT no salta a PVEFW-HOST-IN"
+    $t -S PVEFW-HOST-IN | grep -v PVESIG | tail -1 | grep -q -E -- '-j (DROP|PVEFW-Drop)' || fw_restore_die "$t: PVEFW-HOST-IN no acaba en DROP"
+  done
   # Ahora si: fuera el piloto (cortafuegos propio y sonda).
   systemctl disable --now nvpilot-fw.service nvprobe.service >/dev/null 2>&1 || true
   nft delete table inet nvpilot 2>/dev/null || true
