@@ -1,18 +1,24 @@
-"""Hard VM cap of an SQX node as a defrag destination (Kademar 0000266, 25/11).
+"""A node with a hard VM cap is never a defrag/relief destination (25/11/2026).
 
 proxmox_nodes.max_vm on an SQX node is a hard VM-count limit (26 vps-e on
-the Kademar box, raised by editing the field). Placement honours it in
-NeuraVPS auto_provision.sqx_vm_cap; the defrag must not push a node past it
-either. Nodes without the field (every SQX and MT5 node on 25/11) and VPS-E
-nodes (max_vm == 1, never part of the defrag) keep their behaviour."""
-import importlib.util
-from pathlib import Path
-import unittest
+Kademar 0000266). Operator decision after review: such a node is NEVER chosen
+as a destination by pick_dest (defrag phases and relief alike) — its entries
+are controlled manual moves. It may still be a source. Nodes without the field
+(every SQX and MT5 node on 25/11) and VPS-E nodes (max_vm == 1, outside the
+defrag) keep their behaviour.
 
-PATH = Path(__file__).with_name('neuravps-defrag.py')
-spec = importlib.util.spec_from_file_location('defrag_vm_cap', PATH)
-df = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(df)
+The end-to-end cases run the real main() (and therefore the real pick_dest)
+with the fake Firestore / fake SSH harness of test_defrag_mt_ram_gate.
+"""
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import test_defrag_mt_ram_gate as h  # noqa: E402  (harness: run_main, df)
+
+df = h.df
 
 
 class NodeVmCap(unittest.TestCase):
@@ -28,49 +34,92 @@ class NodeVmCap(unittest.TestCase):
             self.assertIsNone(df.node_vm_cap(d), d)
 
     def test_only_sqx_nodes(self):
-        # MT5 legacy max_vm and dedicated VPS-E (max_vm 1) are not touched.
         self.assertIsNone(df.node_vm_cap({"nodeType": "MT5", "max_vm": 48}))
         self.assertIsNone(df.node_vm_cap({"nodeType": "VPS-E", "max_vm": 1}))
         self.assertIsNone(df.node_vm_cap({"max_vm": 1}))
         self.assertIsNone(df.node_vm_cap(None))
 
-
-class DestVmSlot(unittest.TestCase):
-    def test_uncapped_always_ok(self):
-        self.assertTrue(df.dest_vm_slot_ok({"vm_cap": None, "n_cap": 500}))
-        self.assertTrue(df.dest_vm_slot_ok({}))
-
-    def test_capped(self):
-        self.assertTrue(df.dest_vm_slot_ok({"vm_cap": 26, "n_cap": 25}))
-        self.assertFalse(df.dest_vm_slot_ok({"vm_cap": 26, "n_cap": 26}))
-        self.assertFalse(df.dest_vm_slot_ok({"vm_cap": 26, "n_cap": 27}))
+    def test_dest_capped(self):
+        self.assertTrue(df.dest_capped({"vm_cap": 26}))
+        self.assertFalse(df.dest_capped({"vm_cap": None}))
+        self.assertFalse(df.dest_capped({}))
 
 
-class Wiring(unittest.TestCase):
-    """pick_dest and book live inside main(); check the wiring in the source."""
-
-    def setUp(self):
-        src = PATH.read_text()
-        self.main = src[src.index('def main():'):]
-
-    def test_pick_dest_checks_the_slot(self):
-        body = self.main[self.main.index('def pick_dest('):]
-        body = body[:body.index('\n    def ', 10)]
-        self.assertIn('if not dest_vm_slot_ok(dn):', body)
-
-    def test_node_state_and_booking_track_the_count(self):
-        self.assertIn('"vm_cap": node_vm_cap(d), "n_cap": 0', self.main)
-        self.assertIn('if d.get("provisioningStatus") != "failed":\n'
-                      '            n["n_cap"] += 1', self.main)
-        book = self.main[self.main.index('def book('):]
-        book = book[:book.index('\n    # ')]
-        self.assertIn('sn["n_cap"] -= 1', book)
-        self.assertIn('dn["n_cap"] += 1', book)
-
-    def test_consolidation_rollback_restores_the_count(self):
-        self.assertIn('v["n_cap"]) for k, v in nodes.items()}', self.main)
-        self.assertIn('nodes[k]["n_cap"] = nc', self.main)
+SRC, KDM, AX = "0000300-AX162", "0000266-KDM-9755", "0000301-AX162"
 
 
-if __name__ == '__main__':
+def sqx_store(kdm_cap=26, ax_frozen=False, src_over=True, kdm_over=False):
+    """Three SQX nodes, base 100 GB (commit cap 150, op floor cap 90).
+    SRC holds 10 vps-a (160 GB > 150: over the gate) when src_over.
+    KDM (fuller, the best fit) and AX both have room for a vps-a.
+    kdm_over: KDM itself over the gate, AX the only destination."""
+    nodes = {
+        SRC: {"nodeType": "SQX", "max_base_ram": 100.0, "ip": "n300",
+              "location": "Falkenstein"},
+        KDM: {"nodeType": "SQX", "max_base_ram": 100.0, "ip": "n266",
+              "location": "Falkenstein"},
+        AX: {"nodeType": "SQX", "max_base_ram": 100.0, "ip": "n301",
+             "location": "Falkenstein", "frozen": ax_frozen},
+    }
+    if kdm_cap is not None:
+        nodes[KDM]["max_vm"] = kdm_cap
+    servers, vid = {}, 2000
+
+    def add(nid, n, ram=16, fl=5.0, plan="vps-a"):
+        nonlocal vid
+        for _ in range(n):
+            vid += 1
+            servers[f"s{vid}"] = {"nodeId": nid, "proxmoxId": vid, "memoryGb": ram,
+                                  "ramFloorGb": fl, "cores": 4, "status": "running",
+                                  "serverType": plan}
+    add(SRC, 10 if src_over else 5)                 # 160 GB (or 80)
+    add(KDM, 10 if kdm_over else 6, ram=16.0)       # 160 (over) or 96 -> ch 54
+    add(AX, 4, ram=16.0)                            # 64 -> ch 86
+    return {"config": {"defrag": {"enabled": True, "dryRun": False,
+                                  "maxMovesPerRun": 40}},
+            "proxmox_nodes": nodes, "servers": servers}
+
+
+def dests(doc):
+    return [p.split()[1].split("->")[1] for p in (doc or {}).get("planned") or []]
+
+
+def srcs(doc):
+    return [p.split()[1].split("->")[0] for p in (doc or {}).get("planned") or []]
+
+
+class PickDestEndToEnd(unittest.TestCase):
+    def test_premise_without_cap_the_kademar_box_is_the_best_fit(self):
+        _, doc, log = h.run_main(sqx_store(kdm_cap=None))
+        self.assertTrue(dests(doc), log)
+        self.assertEqual(set(dests(doc)), {"0000266"}, doc and doc["planned"])
+
+    def test_capped_node_never_receives(self):
+        _, doc, log = h.run_main(sqx_store())
+        self.assertTrue(dests(doc), log)
+        self.assertNotIn("0000266", dests(doc))
+        self.assertEqual(set(dests(doc)), {"0000301"})
+
+    def test_capped_node_is_not_a_destination_even_with_free_slots(self):
+        # 6 VMs on a cap of 26: plenty of slots, still refused.
+        _, doc, _ = h.run_main(sqx_store(kdm_cap=26))
+        self.assertNotIn("0000266", dests(doc))
+
+    def test_only_the_capped_node_left_means_no_move(self):
+        _, doc, log = h.run_main(sqx_store(ax_frozen=True))
+        self.assertEqual(dests(doc), [], log)
+        self.assertIn("0000300-AX162", log)     # still reported as over-gate
+
+    def test_capped_node_can_be_a_source(self):
+        _, doc, log = h.run_main(sqx_store(src_over=False, kdm_over=True))
+        self.assertIn("0000266", srcs(doc), log)
+        self.assertTrue(dests(doc))
+        self.assertNotIn("0000266", dests(doc))
+
+    def test_invalid_cap_behaves_as_uncapped(self):
+        _, doc, _ = h.run_main(sqx_store(kdm_cap="x"))
+        self.assertEqual(set(dests(doc)), {"0000266"})
+
+
+if __name__ == "__main__":
     unittest.main()
