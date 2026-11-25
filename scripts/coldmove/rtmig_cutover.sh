@@ -332,6 +332,7 @@ case "$CMD" in
     [[ "$P_FW" == absent ]] || die "el destino ${DST_NODE} tiene un .fw de la VM ${VMID} sin config: no es de este traslado; revísalo"
     # Historial del reconciliador de globo: export-state necesita la config viva, así que va ANTES de
     # aparcar. Solo si este nodo tiene reconciliador (en un EX44 no hay historial que llevar).
+    BALLOON_EXPORT=''   # nunca heredada del entorno
     if has_reconciler_src; then
       if B=$(python3 "$NV_RAM_GUARD" export-state "$VMID" "$(src_node)" 2>/dev/null) && [[ "$B" =~ ^[A-Za-z0-9+/=]+$ ]]; then
         BALLOON_EXPORT="$B"   # se escribe solo si el park sale adelante (ver más abajo)
