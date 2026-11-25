@@ -1,0 +1,10 @@
+[Unit]
+Description=NeuraVPS: reconcilia la guarda del /64 propio del nodo
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
