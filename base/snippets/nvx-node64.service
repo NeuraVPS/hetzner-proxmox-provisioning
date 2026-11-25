@@ -1,0 +1,16 @@
+[Unit]
+Description=NeuraVPS: guarda del /64 propio del nodo (entrada directa a VMs)
+# ⚠️ Mismo motivo que nvx-aisla.service: /etc/nftables.conf empieza por
+# `flush ruleset`. NI Requires= NI Wants= sobre nftables.service. After= conserva
+# el orden; el timer repone la tabla si un flush la borra (<= 5 min) y PartOf=
+# la repone si alguien reinicia nftables mientras corre.
+After=nftables.service network-online.target pve-firewall.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+# MODE lo fija el operador por drop-in (Environment=MODE=count|drop); defecto drop.
+ExecStart=/usr/bin/python3 /usr/local/sbin/nvx-node64.py
+
+[Install]
+WantedBy=multi-user.target
