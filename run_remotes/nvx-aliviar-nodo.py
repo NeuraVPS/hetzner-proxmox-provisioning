@@ -32,8 +32,9 @@ SALVAGUARDAS
   · El destino tiene que ser del MISMO tipo (nodeType, no el nombre), admitir
     el plan de la VM (allowedServerTypes), tener una CPU compatible con la de
     la VM (una `cpu: host` solo va a la misma CPU; sin dato no se mueve),
-    pasar el gate de disco del 80% (el mismo que la venta y el defrag) y tener
-    holgura de cores.
+    pasar el gate de disco del 80% (el mismo que la venta y el defrag), no estar
+    ya dañado de CPU (cpu_ok: contención > 50 ms/s reciente o, en MT, p95
+    laborable >= 85 %; el mismo criterio que el defrag) y tener holgura de cores.
   · Se mueve de UNA EN UNA, remidiendo el pool despues de cada una. Un fallo
     para la tanda en vez de arrastrarla.
 """
@@ -44,6 +45,13 @@ import sys
 import time
 
 DISK_REAL_MAX_PCT = 80.0     # mismo umbral que auto_provision y el defrag
+# Guarda de CPU del destino, la MISMA que neuravps-defrag.py (cpu_ok /
+# weekday_cpu_ok) y auto_provision._mt5_cpu_ok: hasta el 25/11/2026 esta
+# herramienta elegia destino solo por disco y cores, y en una flota MT limitada
+# por CPU eso podia mandar una VM al nodo que mas sufre (tiene cores "libres").
+CPU_MAX_MS = 50.0            # contención involuntaria por vCPU (ms/s)
+CPU_MAX_AGE_H = 6.0          # medida mas vieja no decide (falla abierto)
+MT_WEEKDAY_P95_MAX = 85.0    # p95 laborable; perfil de <= 48 h
 NODES_FILE = "/var/lib/base-nat/pve_nodes.json"
 CRED = "/etc/firebase-credentials.json"
 LOG = "/var/log/nvx-aliviar-nodo.log"
@@ -183,10 +191,37 @@ def permitidos(n):
     return frozenset(str(x).strip() for x in raw if isinstance(x, str) and str(x).strip())
 
 
+def cpu_ok(n, now=None):
+    """False si el destino ya esta por encima del umbral de daño de CPU.
+
+    Falla ABIERTO como el defrag: sin medida, o con medida rancia, no bloquea.
+    Un dato ausente no puede dejar sin destino a un nodo que se esta llenando."""
+    now = time.time() if now is None else now
+    if str(n.get("nodeType") or "").strip() == "MT5":
+        at, p95 = n.get("cpuProfileAt"), n.get("cpuWeekdayP95Pct")
+        try:
+            if (at is not None and p95 is not None
+                    and 0 <= now - float(at) <= 48 * 3600
+                    and float(p95) >= MT_WEEKDAY_P95_MAX):
+                return False
+        except (TypeError, ValueError):
+            pass
+    ms = n.get("cpuContentionMsS")
+    if ms is None:
+        return True
+    at = n.get("cpuContentionAt")
+    try:
+        if at is not None and (now - float(at)) / 3600.0 > CPU_MAX_AGE_H:
+            return True
+        return float(ms) <= CPU_MAX_MS
+    except (TypeError, ValueError):
+        return True
+
+
 def elige_destino(nid_origen, vmid, db, reservado):
     """Mismo criterio que el defrag: mismo TIPO de nodo (nodeType, nunca el
     nombre), plan admitido por el destino (allowedServerTypes), CPU compatible
-    con la de la VM, gate de disco y holgura de cores. Se prefiere el pool MAS
+    con la de la VM, gate de disco, sin daño de CPU (cpu_ok) y holgura de cores. Se prefiere el pool MAS
     VACIO — el objetivo es repartir presion, no compactar. `reservado`
     descuenta lo ya prometido a destinos en esta tanda, porque zpoolCapPct solo
     se refresca una vez al dia (06:00 UTC) y sin eso las seis migraciones irian
@@ -234,6 +269,8 @@ def elige_destino(nid_origen, vmid, db, reservado):
         if pct >= DISK_REAL_MAX_PCT:
             continue
         if int(n.get("max_cores") or 0) - usados.get(nd.id, 0) - cores_vm < 0:
+            continue
+        if not cpu_ok(n):
             continue
         if mejor is not None and pct >= mejor[1]:
             continue
