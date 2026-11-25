@@ -110,7 +110,7 @@ reapply_tunnels() {
 check_node_v4() {
   local v4; v4="$(node_v4)"
   ip -4 addr show dev lo | grep -q "inet ${v4}/32" || { log "falta ${v4}/32 en lo"; return 1; }
-  ip -4 route get 1.1.1.1 from "$v4" 2>/dev/null | grep -q 'dev tun-' || { log "sin ruta por tunel con origen $v4 (tabla 102)"; return 1; }
+  ip -4 route get 1.1.1.1 from "$v4" 2>/dev/null | grep -q 'dev tun-.* table 102' || { log "sin ruta por tunel con origen $v4 (tabla 102)"; return 1; }
 }
 
 # Guarda de invitados: qm y pct tienen que responder y estar vacios. Un fallo de
@@ -281,7 +281,7 @@ ifreload -a || { ok=0; why="\$why ifreload"; }
 if [ -x /usr/local/sbin/neuravps-tunnels.sh ]; then
   /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1 || { ok=0; why="\$why tunnels"; }
   ip -4 addr show dev lo | grep -q "inet $(node_v4)/32" || { ok=0; why="\$why lo/32"; }
-  ip -4 route get 1.1.1.1 from $(node_v4) 2>/dev/null | grep -q 'dev tun-' || { ok=0; why="\$why tabla102"; }
+  ip -4 route get 1.1.1.1 from $(node_v4) 2>/dev/null | grep -q 'dev tun-.* table 102' || { ok=0; why="\$why tabla102"; }
 fi
 if [ "\$ok" = 1 ]; then
   rm -f "$STATE/net-pending" "$STATE/net-rollback-running"
