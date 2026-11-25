@@ -413,6 +413,27 @@ def test_failed_restart_is_retried_next_pass(sync, node_env):
     assert "NVFW-UNCHANGED" in _run_node(sync, node_env, GOOD).stdout
 
 
+def test_server_without_pve_is_skipped_not_rejected(sync, tmp_path):
+    """A new node still in Hetzner Rescue: no pve-firewall, no /etc/pve."""
+    import hashlib
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = sync.node_fw_apply_script(hashlib.sha256(GOOD.encode()).hexdigest(), BASES)
+    env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+    if Path("/etc/pve").exists() or subprocess.run(["bash", "-c", "command -v pve-firewall"], env=env,
+                                                    capture_output=True).returncode == 0:
+        pytest.skip("test host has PVE")
+    r = subprocess.run(["bash", "-c", script], input=GOOD, capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and "NVFW-NOTPVE" in r.stdout and "NVFW-REJECT" not in r.stdout
+
+
+def test_not_pve_state_does_not_fail_the_pass(sync, monkeypatch):
+    class R:
+        returncode, stdout, stderr = 0, "NVFW-NOTPVE rescue\n", ""
+    monkeypatch.setattr(sync.subprocess, "run", lambda *a, **k: R())
+    assert sync.push_cluster_fw_to_node("n", "2001:db8::2", GOOD, "true")[0] == "not_pve"
+
+
 def test_node_gets_base_addresses(sync):
     script = sync.node_fw_apply_script("0" * 64, BASES)
     assert all(b in script for b in BASES)
