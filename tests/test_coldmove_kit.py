@@ -80,6 +80,7 @@ elif a[0] == "shutdown":
     if os.environ.get("FAKE_SHUTDOWN_FAIL"): sys.exit(255)
     open(stf, "w").write("stopped")
 elif a[0] == "start":
+    if os.environ.get("FAKE_QM_START_FAIL") == side: sys.exit(1)
     if not os.path.exists(conf): sys.exit(2)
     open(stf, "w").write("running")
 else:
@@ -116,7 +117,11 @@ elif a[0] == "set":
     pass
 elif a[0] == "get":
     prop = a[a.index("value") + 1]; ds, sn = split(a[-1])
-    if ds not in st or (sn and sn not in st[ds]["snaps"]): sys.exit(1)
+    fail = os.environ.get("FAKE_ZFS_FAIL_MATCH")
+    if fail and side == "dst" and fail in " ".join(a):
+        sys.stderr.write("internal error: Input/output error\n"); sys.exit(1)
+    if ds not in st or (sn and sn not in st[ds]["snaps"]):
+        sys.stderr.write("cannot open '%s': dataset does not exist\n" % a[-1]); sys.exit(1)
     if prop == "guid":
         if not sn: sys.exit(1)
         print(st[ds]["snaps"][sn])
@@ -448,17 +453,19 @@ class Phases(unittest.TestCase):
     def test_fw_write_failure_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
-            r = k.run("rtmig_cutover.sh", "push", FINAL, FAKE_SSH_FAIL_MATCH="cat > \"${PVE_ETC:-/etc/pve}/firewall/")
+            r = k.run("rtmig_cutover.sh", "push", FINAL, FAKE_SSH_FAIL_MATCH="firewall/4242.fw.rtmig-tmp")
             self.assertEqual(r.returncode, 1); self.assertIn("la config NO se ha publicado", out(r))
-            self.assertFalse(k.dst_conf.exists()); self.assertEqual(k.state()["PHASE"], "parked")
+            self.assertFalse(k.dst_conf.exists()); self.assertEqual(k.state()["PHASE"], "publishing")
+            k.ok("rtmig_cutover.sh", "push", FINAL)                     # retried from «publishing»
+            self.assertEqual(k.state()["PHASE"], "pushed")
 
     def test_truncated_publish_is_detected_and_withdrawn(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
-            r = k.run("rtmig_cutover.sh", "push", FINAL,
-                      FAKE_SSH_TRUNCATE_MATCH="cat > \"${PVE_ETC:-/etc/pve}/qemu-server/")
-            self.assertEqual(r.returncode, 1); self.assertIn("no llegó entera", out(r))
-            self.assertFalse(k.dst_conf.exists()); self.assertEqual(k.state()["PHASE"], "parked")
+            r = k.run("rtmig_cutover.sh", "push", FINAL, FAKE_SSH_TRUNCATE_MATCH="qemu-server/4242.conf.rtmig-tmp")
+            self.assertEqual(r.returncode, 1); self.assertIn("no se publicó (BADSHA)", out(r))
+            self.assertFalse(k.dst_conf.exists()); self.assertEqual(k.state()["PHASE"], "publishing")
+            self.assertFalse((k.t / f"dst/etc/pve/qemu-server/{VMID}.conf.rtmig-tmp").exists())
             k.ok("rtmig_cutover.sh", "push", FINAL)                     # a clean retry works
             self.assertEqual(k.state()["PHASE"], "pushed")
 
@@ -581,7 +588,7 @@ class Rollback(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
             r = k.run("rtmig_cutover.sh", "rollback", FAKE_SSH_FAIL_MATCH="written@")
-            self.assertEqual(r.returncode, 1); self.assertIn("indeterminado", out(r))
+            self.assertEqual(r.returncode, 1); self.assertIn("INDETERMINADO", out(r))
             self.assertFalse(k.src_conf.exists())
 
     def test_ssh_failing_while_parking_dest_config(self):
@@ -598,6 +605,161 @@ class Rollback(unittest.TestCase):
             k.ok("rtmig_cutover.sh", "shutdown", "60")
             k.ok("rtmig_cutover.sh", "park")
             self.assertEqual(k.state()["PHASE"], "parked")
+
+
+class SecondReview(unittest.TestCase):
+    """2nd review of PR #291."""
+
+    def test_zfs_error_on_dest_is_indeterminate_not_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            r = k.run("rtmig_cutover.sh", "rollback", FAKE_ZFS_FAIL_MATCH="written@")
+            self.assertEqual(r.returncode, 1); self.assertIn("zfs falló en el destino", out(r))
+            self.assertFalse(k.src_conf.exists()); self.assertTrue(k.dst_conf.exists())
+
+    def test_disk_vanished_on_dest_after_push_is_indeterminate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            p = k.t / "dst/zfs.json"; st = json.loads(p.read_text())
+            del st[f"rpool/data/vm-{VMID}-disk-0"]; p.write_text(json.dumps(st))
+            r = k.run("rtmig_cutover.sh", "rollback")
+            self.assertEqual(r.returncode, 1); self.assertIn("INDETERMINADO", out(r))
+            self.assertFalse(k.src_conf.exists())
+
+    def test_state_bound_to_the_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final()
+            self.assertEqual(k.state()["POOLDS"], "rpool/data")
+            r = k.run("rtmig_cutover.sh", "push", FINAL, POOLDS="tank/vms")
+            self.assertEqual(r.returncode, 1); self.assertIn("es del pool rpool/data", out(r))
+
+    def test_rollback_never_removes_a_foreign_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final()                                   # parked: nothing published yet
+            foreign = CONF.format(cpu="host").replace("uuid=1111", "uuid=aaaa")
+            k.dst_conf.write_text(foreign)
+            r = k.run("rtmig_cutover.sh", "rollback")
+            self.assertEqual(r.returncode, 1); self.assertIn("no es nuestra", out(r))
+            self.assertEqual(k.dst_conf.read_text(), foreign); self.assertFalse(k.src_conf.exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            k.dst_conf.write_text(CONF.format(cpu="host").replace("uuid=1111", "uuid=bbbb"))
+            r = k.run("rtmig_cutover.sh", "rollback")
+            self.assertEqual(r.returncode, 1); self.assertIn("no es la de este traslado", out(r))
+            self.assertIn("uuid=bbbb", k.dst_conf.read_text())
+
+    def test_rollback_never_removes_a_foreign_fw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final()
+            fw = k.t / f"dst/etc/pve/firewall/{VMID}.fw"; fw.write_text("[OPTIONS]\nenable: 0\n")
+            r = k.run("rtmig_cutover.sh", "rollback")
+            self.assertEqual(r.returncode, 1); self.assertIn(".fw de la VM 4242 en destino que no es de este traslado", out(r))
+            self.assertTrue(fw.exists())
+
+    def test_close_checks_the_remote_uuid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_started()
+            k.dst_conf.write_text(k.dst_conf.read_text().replace("uuid=1111", "uuid=cccc"))
+            r = k.run("rtmig_cutover.sh", "close")
+            self.assertEqual(r.returncode, 1); self.assertIn("no es la de este traslado", out(r))
+
+    def test_stale_dest_fw_when_source_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp)
+            (k.t / f"src/etc/pve/firewall/{VMID}.fw").unlink()
+            k.to_final()
+            (k.t / f"dst/etc/pve/firewall/{VMID}.fw").write_text("[OPTIONS]\nenable: 1\n")
+            r = k.run("rtmig_cutover.sh", "push", FINAL)
+            self.assertEqual(r.returncode, 1); self.assertIn("no es de este traslado", out(r))
+            self.assertFalse(k.dst_conf.exists())
+
+    def test_fw_hash_recorded_and_verified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            fw = k.read(f"src/etc/pve/firewall/{VMID}.fw") or k.read(f"work/{VMID}.fw.src")
+            self.assertEqual(k.state()["FW_SHA"], hashlib.sha256(fw.encode()).hexdigest())
+
+    def test_start_reconciles_when_the_confirmation_was_lost(self):
+        for phase in ("starting", "pushed"):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+                (k.t / f"dst/state-{VMID}").write_text("running")       # it did start
+                st = k.read(f"work/{VMID}.state").replace("PHASE=pushed", f"PHASE={phase}")
+                (k.work / f"{VMID}.state").write_text(st)
+                r = k.ok("rtmig_cutover.sh", "start")
+                self.assertIn("ya está running en destino: reconcilio", r.stdout)
+                self.assertEqual(k.state()["PHASE"], "started")
+                self.assertNotIn("dst start", k.read("qm.log"))
+
+    def test_close_from_starting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_started()
+            st = k.read(f"work/{VMID}.state").replace("PHASE=started", "PHASE=starting")
+            (k.work / f"{VMID}.state").write_text(st)
+            k.ok("rtmig_cutover.sh", "close")
+            self.assertEqual(k.state()["PHASE"], "done")
+
+    def test_rollback_is_reentrant_if_the_source_start_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            r = k.run("rtmig_cutover.sh", "rollback", FAKE_QM_START_FAIL="src")
+            self.assertEqual(r.returncode, 1); self.assertIn("fase rollingback", out(r))
+            self.assertEqual(k.state()["PHASE"], "rollingback")
+            self.assertTrue(k.src_conf.exists()); self.assertFalse(k.dst_conf.exists())
+            r = k.ok("rtmig_cutover.sh", "rollback")
+            self.assertIn("rollback a medias", r.stdout)
+            self.assertEqual(k.state()["PHASE"], "rolledback")
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+
+    def test_pending_cpu_decides_before_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncpu: host\n"
+            k = Kit(tmp, conf=conf); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("cpu=host", out(r))
+            self.assertNotIn("shutdown", k.read("qm.log"))
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = CONF.format(cpu="host") + "\n[PENDING]\ndelete: cpu\n"            # → kvm64
+            k = Kit(tmp, conf=conf, dst_cpu=GENOA); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            self.assertEqual(k.run("rtmig_cutover.sh", "shutdown", "60").returncode, 0)
+
+    def test_pending_balloon_blocks_setting_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\nballoon: 2048\n")
+            k.to_final()
+            r = k.run("rtmig_cutover.sh", "push", FINAL, "47104")
+            self.assertEqual(r.returncode, 1); self.assertIn("PENDIENTE de balloon", out(r))
+
+    def test_conf_set_key_ignores_snapshot_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[snap1]\nballoon: 47104\ncpu: host\n")
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL, "47104")
+            main, _, snap = k.dst_conf.read_text().partition("[snap1]")
+            self.assertIn("balloon: 47104", main)                      # added to the main section
+            self.assertIn("cpu: host", snap); self.assertEqual(snap.count("balloon:"), 1)
+
+    def test_repeating_incr_after_all_disks_arrived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp)
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            k.ok("rtmig_send.sh", "incr", "auto", "rtmig-b")
+            r = k.ok("rtmig_send.sh", "incr", "auto", "rtmig-b", DROP_PREV="1")   # same order again
+            self.assertIn("PREV=@rtmig-a", r.stdout); self.assertEqual(r.stdout.count("VERIFY OK"), 3)
+            r = k.ok("rtmig_send.sh", "incr", "auto", "rtmig-b", DROP_PREV="1")   # cleanup idempotent
+            r = k.run("rtmig_send.sh", "incr", "rtmig-x", "rtmig-b")
+            self.assertEqual(r.returncode, 1); self.assertIn("ya se lanzó con PREV=@rtmig-a", out(r))
+
+    def test_verify_validates_the_snapshot_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = Kit(tmp).run("rtmig_send.sh", "verify", "x';id;'")
+            self.assertEqual(r.returncode, 1); self.assertIn("debe empezar por rtmig-", out(r))
+
+    def test_dst_must_be_canonical_and_without_zone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp)
+            for bad in ("2001:db8:2:0::2", "fe80::1%eth0", "2001:DB8:2::2", " 2001:db8:2::2"):
+                r = k.run("rtmig_send.sh", "base", "rtmig-a", DST=bad)
+                self.assertEqual(r.returncode, 2, bad); self.assertIn("canónica", out(r))
 
 
 class CpuGuard(unittest.TestCase):
@@ -680,6 +842,11 @@ class Deploy(unittest.TestCase):
     def test_copies_and_compares_hashes(self):
         r = self.deploy()
         self.assertEqual(r.returncode, 0, out(r)); self.assertEqual(r.stdout.count("md5 iguales"), 2)
+
+    def test_zone_or_non_canonical_ip_rejected_before_writing(self):
+        for bad in ("fe80::1%eth0", "2001:db8:1:0::2"):
+            r = self.deploy(SRC=bad)
+            self.assertEqual(r.returncode, 2, bad); self.assertIn("canónica", out(r))
 
     def test_hash_mismatch_fails(self):
         r = self.deploy(FAKE_SSH_TRUNCATE_MATCH="cat > ")

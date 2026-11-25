@@ -33,8 +33,18 @@ NV_RECONCILER="${NV_RECONCILER:-/usr/local/sbin/neuravps-balloon-reconciler.sh}"
 
 # ---- validación de todo lo que acaba dentro de una orden remota -----------------------------------
 [[ "$VMID" =~ ^[1-9][0-9]*$ ]] || { echo "VMID no válida: $VMID" >&2; exit 2; }
-python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1])' "$DST" 2>/dev/null \
-  || { echo "DST tiene que ser una IP literal (proxmox_nodes.ip), no '$DST'" >&2; exit 2; }
+# IP literal, canónica (como la escribe ipaddress) y sin zona (%eth0): es lo que se mete en ssh.
+canon_ip() {
+  python3 -c '
+import ipaddress, sys
+s = sys.argv[1]
+try:
+    ip = ipaddress.ip_address(s)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if "%" not in s and str(ip) == s else 1)' "$1" 2>/dev/null
+}
+canon_ip "$DST" || { echo "DST tiene que ser una IP literal canónica y sin zona (proxmox_nodes.ip), no '$DST'" >&2; exit 2; }
 [[ "$DST_NODE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { echo "DST_NODE no válido: $DST_NODE" >&2; exit 2; }
 [[ "$WORK" =~ ^/[A-Za-z0-9._/-]+$ && "$WORK" != *..* ]] || { echo "WORK no válido (ruta absoluta, sin espacios ni ..): $WORK" >&2; exit 2; }
 [[ "$POOLDS" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]] || { echo "POOLDS no válido: $POOLDS" >&2; exit 2; }
@@ -82,39 +92,63 @@ probe_cmd() {
 P="\${PVE_ETC:-/etc/pve}"; C="\$P/qemu-server/${VMID}.conf"
 if [ -f "\$P/.version" ] && [ -d "\$P/qemu-server" ]; then echo PVE=ok; else echo PVE=bad; fi
 if [ -e "\$C" ]; then echo CONF=present; echo "SHA=\$(sha256sum < "\$C" | cut -d' ' -f1)"; else echo CONF=absent; fi
-if [ -e "\$P/firewall/${VMID}.fw" ]; then echo FW=present; else echo FW=absent; fi
+if [ -e "\$C" ]; then echo "UUID=\$(sed -n '/^\[/q; s/^smbios1:.*uuid=\([0-9A-Fa-f-]*\).*/\1/p' "\$C" | head -1)"; fi
+F="\$P/firewall/${VMID}.fw"
+if [ -e "\$F" ]; then echo FW=present; echo "FWSHA=\$(sha256sum < "\$F" | cut -d' ' -f1)"; else echo FW=absent; fi
 st=\$(qm status ${VMID} 2>/dev/null | awk '{print \$2}'); echo "STATUS=\${st:-none}"
 echo PROBE-END
 EOF
 }
-# probe <src|dst> → P_CONF (present|absent), P_SHA, P_FW, P_STATUS; muere si la respuesta no es completa.
+# probe <src|dst> → P_CONF (present|absent), P_SHA, P_UUID, P_FW (present|absent), P_FWSHA, P_STATUS;
+# muere si la respuesta no es completa.
 probe() {
   local where="$1" out line
-  P_CONF=""; P_SHA=""; P_FW=""; P_STATUS=""; local pve="" endok=0
+  P_CONF=""; P_SHA=""; P_UUID=""; P_FW=""; P_FWSHA=""; P_STATUS=""; local pve="" endok=0
   if [[ "$where" == dst ]]; then out=$(dst "$(probe_cmd)" 2>/dev/null) || true
   else out=$(PVE_ETC="$PVE_ETC" bash -c "$(probe_cmd)" 2>/dev/null) || true; fi
   while IFS= read -r line; do
     case "$line" in
       PVE=*) pve="${line#PVE=}" ;; CONF=*) P_CONF="${line#CONF=}" ;; SHA=*) P_SHA="${line#SHA=}" ;;
+      UUID=*) P_UUID="${line#UUID=}" ;; FWSHA=*) P_FWSHA="${line#FWSHA=}" ;;
       FW=*) P_FW="${line#FW=}" ;; STATUS=*) P_STATUS="${line#STATUS=}" ;; PROBE-END) endok=1 ;;
     esac
   done <<< "$out"
   local name; [[ "$where" == dst ]] && name="destino ${DST_NODE}" || name="origen $(src_node)"
   (( endok )) || die "estado INDETERMINADO en ${name}: la consulta no terminó (¿SSH cortado?). No se ha tocado nada; repite cuando responda"
   [[ "$pve" == ok ]] || die "estado INDETERMINADO en ${name}: /etc/pve no está disponible (pmxcfs). No se ha tocado nada"
-  [[ "$P_CONF" == present || "$P_CONF" == absent ]] || die "estado INDETERMINADO en ${name}: respuesta rara (${out//$'\n'/ })"
+  [[ ( "$P_CONF" == present || "$P_CONF" == absent ) && ( "$P_FW" == present || "$P_FW" == absent ) ]] \
+    || die "estado INDETERMINADO en ${name}: respuesta rara (${out//$'\n'/ })"
   if [[ "$P_CONF" == present && "$P_STATUS" == none ]]; then
     die "estado INDETERMINADO en ${name}: hay config de la VM ${VMID} pero qm status no responde"
   fi
 }
 
-# Consulta remota de una propiedad ZFS con respuesta explícita: imprime el valor, o ABSENT si el
-# objeto no existe; muere si el SSH falla.
+# Consulta remota de una propiedad ZFS con respuesta explícita: imprime el valor, o ABSENT SOLO si ZFS
+# dice que el objeto no existe («dataset does not exist»). Cualquier otro error de zfs, o el SSH
+# caído, es estado INDETERMINADO y se muere.
 dst_zget() {   # <prop> <objeto> [-p]
-  local out
-  out=$(dst "if v=\$(zfs get -H ${3:-} -o value '$1' '$2' 2>/dev/null); then echo \"VAL=\$v\"; else echo VAL=ABSENT; fi; echo Q-END" 2>/dev/null) || true
-  [[ "$out" == *Q-END* ]] || die "no pude consultar $1 de $2 en el destino (SSH): estado indeterminado"
-  sed -n 's/^VAL=//p' <<< "$out" | head -1
+  local out val
+  [[ "$1" =~ ^[a-z_@:.A-Za-z0-9-]+$ && "$2" =~ ^[A-Za-z0-9_./@:-]+$ && "${3:-}" =~ ^(-p)?$ ]] \
+    || die "consulta ZFS con parámetros raros: $*"
+  out=$(dst "if o=\$(zfs get -H ${3:-} -o value '$1' '$2' 2>&1); then echo \"VAL=\$o\"; elif printf '%s' \"\$o\" | grep -q 'dataset does not exist'; then echo VAL=ABSENT; else echo \"ERR=\$(printf '%s' \"\$o\" | head -1)\"; fi; echo Q-END" 2>/dev/null) || true
+  [[ "$out" == *Q-END* ]] || die "no pude consultar $1 de $2 en el destino (SSH): estado INDETERMINADO"
+  if grep -q '^ERR=' <<< "$out"; then
+    die "zfs falló en el destino al leer $1 de $2 ($(sed -n 's/^ERR=//p' <<< "$out")): estado INDETERMINADO"
+  fi
+  val=$(sed -n 's/^VAL=//p' <<< "$out" | head -1)
+  [[ -n "$val" ]] || die "respuesta vacía de zfs en el destino para $1 de $2: estado INDETERMINADO"
+  printf '%s\n' "$val"
+}
+
+# Publicación segura de un fichero en /etc/pve del destino: se escribe a <final>.rtmig-tmp, se
+# comprueba allí su sha256 y solo entonces se renombra (mv -n: nunca pisa) a la ruta final. pmxcfs
+# hace atómico el rename (es lo que usa el propio PVE). Imprime PUBLISHED, BADSHA, EXISTS, WRITEFAIL,
+# MVFAIL o NOANSWER (SSH sin respuesta completa). <fichero local> <ruta final expandible en destino>
+dst_publish() {
+  local f="$1" final="$2" sha out
+  sha=$(sha256sum < "$f" | cut -d' ' -f1)
+  out=$(dst_in "T=\"${final}.rtmig-tmp\"; rm -f \"\$T\"; if ! cat > \"\$T\"; then rm -f \"\$T\"; echo PUB=WRITEFAIL; elif [ \"\$(sha256sum < \"\$T\" | cut -d' ' -f1)\" != '${sha}' ]; then rm -f \"\$T\"; echo PUB=BADSHA; elif [ -e \"${final}\" ]; then rm -f \"\$T\"; echo PUB=EXISTS; elif mv -n \"\$T\" \"${final}\" && [ ! -e \"\$T\" ]; then echo PUB=PUBLISHED; else rm -f \"\$T\"; echo PUB=MVFAIL; fi; echo PUB-END" < "$f" 2>/dev/null) || true
+  if [[ "$out" == *PUB-END* ]]; then sed -n 's/^PUB=//p' <<< "$out" | head -1; else echo NOANSWER; fi
 }
 
 # ---- fichero de estado (fases ligadas a VM, UUID, origen, destino, snapshot) ---------------------
@@ -139,6 +173,7 @@ require_state() {
   (( ok )) || die "fase actual '${ph}', y este paso necesita: $*"
   [[ "$(state_get VMID)" == "$VMID" ]] || die "el estado es de la VM $(state_get VMID), no de ${VMID}"
   [[ "$(state_get SRC_NODE)" == "$(src_node)" ]] || die "el estado es de un traslado desde $(state_get SRC_NODE), no desde $(src_node)"
+  [[ "$(state_get POOLDS)" == "$POOLDS" ]] || die "el estado es del pool $(state_get POOLDS), no de ${POOLDS}"
   [[ "$(state_get DST_NODE)" == "$DST_NODE" && "$(state_get DST)" == "$DST" ]] \
     || die "el estado es de un traslado hacia $(state_get DST_NODE) ($(state_get DST)), no hacia ${DST_NODE} (${DST})"
   [[ -f "$WORK/${VMID}.conf.src" ]] || die "falta la config aparcada $WORK/${VMID}.conf.src"

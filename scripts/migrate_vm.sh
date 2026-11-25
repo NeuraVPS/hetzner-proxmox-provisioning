@@ -144,7 +144,7 @@
 # ----- Nada en caliente entre silicios distintos (25/11/2026) -----------------
 # Mismo fabricante no basta. cpu=host/max solo entre vendor|family|model
 # idénticos, y cualquier otro modelo (x86-64-v4…) también solo entre el mismo
-# vendor|family|model (LIVE_SILICON_MATCH=model, por defecto). Así, entre AX162
+# vendor|family|model (sin modo global para relajarlo). Así, entre AX162
 # (Genoa), AX102 (Raphael) y Kademar (EPYC 9755 Turin) TODO traslado es en
 # frío. Ver _live_silicon_guard. LAB ONLY:
 # NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
@@ -526,15 +526,15 @@ _node_cpu_sig() {
 #     vendor|family|model IDÉNTICO (EPYC 9454 y 9454P son ambos 25|17). Hasta
 #     el 25/11 se dejaba pasar un destino «superconjunto de flags»; ya no.
 #   - cualquier otro modelo (x86-64-v*, kvm64, con nombre): mismo
-#     vendor|family|model también (LIVE_SILICON_MATCH=model, por defecto desde
-#     la revisión del PR #291): Genoa 25|17 ↔ Raphael 25|97 ↔ Turin 26|2 son
-#     silicios distintos y se rechazan. Cambio de comportamiento: AX162 →
-#     AX102-SQX (0000260/0000261) con CPU genérica ya no va en caliente (el
-#     defrag no hizo ninguno del 04/11 al 25/11: 176 AX102→AX102 y 40
-#     AX162→AX162). LIVE_SILICON_MATCH=family relaja a «misma familia» (solo a
-#     mano). El defrag aplica la misma regla (cpu_move_ok).
-# Firma ilegible → se rechaza (no se adivina). Escape SOLO de laboratorio:
-# NV_LAB_ALLOW_CROSS_SILICON_LIVE=<esta VMID>. Nunca en VMs de cliente.
+#     vendor|family|model también (revisión del PR #291): Genoa 25|17 ↔
+#     Raphael 25|97 ↔ Turin 26|2 son silicios distintos y se rechazan. Cambio
+#     de comportamiento: AX162 → AX102-SQX (0000260/0000261) con CPU genérica
+#     ya no va en caliente (el defrag no hizo ninguno del 04/11 al 25/11: 176
+#     AX102→AX102 y 40 AX162→AX162). El defrag aplica la misma regla
+#     (cpu_move_ok). No hay modo global para relajarla (LIVE_SILICON_MATCH solo
+#     admite «model»; el antiguo «family» se quitó en la 2.ª revisión).
+# Firma ilegible → se rechaza (no se adivina). Único escape, SOLO de
+# laboratorio y por VMID: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<esta VMID>.
 # Args: firma origen, firma destino ("vendor|family|model") y modelo de CPU.
 LIVE_SILICON_MATCH="${LIVE_SILICON_MATCH:-model}"
 _live_silicon_guard() {
@@ -548,16 +548,13 @@ _live_silicon_guard() {
     [[ "$src_sig" == "$dst_sig" ]] \
       || why="cpu=${cpu_model} enseña al invitado la CPU real y origen ${SRC_NODE} [${src_sig//|/ }] y destino ${DST_NODE} [${dst_sig//|/ }] son silicios distintos (vendor family model)"
   else
-    case "$LIVE_SILICON_MATCH" in
-      family) [[ "$sf" == "$df" ]] \
-                || why="cpu=${cpu_model}: cambia la familia de CPU (origen ${SRC_NODE} familia ${sf}, destino ${DST_NODE} familia ${df}; p. ej. Zen4 25 ↔ Zen5 26)" ;;
-      model)  [[ "$sf" == "$df" && "$sm" == "$dm" ]] \
-                || why="cpu=${cpu_model}: cambia el silicio (origen ${SRC_NODE} [${src_sig//|/ }], destino ${DST_NODE} [${dst_sig//|/ }]; regla vendor|family|model)" ;;
-      *) _die "LIVE_SILICON_MATCH solo admite 'family' o 'model' (vale '${LIVE_SILICON_MATCH}')." ;;
-    esac
+    [[ "$LIVE_SILICON_MATCH" == model ]] \
+      || _die "LIVE_SILICON_MATCH solo admite 'model' (vale '${LIVE_SILICON_MATCH}'): no hay modo global para relajar la regla. Para una VM de laboratorio: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>."
+    [[ "$sv" == "$dv" && "$sf" == "$df" && "$sm" == "$dm" ]] \
+      || why="cpu=${cpu_model}: cambia el silicio (origen ${SRC_NODE} [${src_sig//|/ }], destino ${DST_NODE} [${dst_sig//|/ }]; regla vendor|family|model)"
   fi
   if [[ -z "$why" ]]; then
-    _ok "Silicio compatible para migrar en caliente: [${src_sig//|/ }] → [${dst_sig//|/ }], cpu=${cpu_model} (regla: $( [[ "$lc" == host || "$lc" == max ]] && echo 'host = idéntico' || echo "misma ${LIVE_SILICON_MATCH}" ))."
+    _ok "Silicio compatible para migrar en caliente: [${src_sig//|/ }] → [${dst_sig//|/ }], cpu=${cpu_model} (regla: mismo vendor|family|model)."
     return 0
   fi
   if [[ -n "${NV_LAB_ALLOW_CROSS_SILICON_LIVE:-}" && "${NV_LAB_ALLOW_CROSS_SILICON_LIVE}" == "${VMID}" ]]; then
@@ -605,6 +602,18 @@ _cold_hwid_guard() {
     return 0
   fi
   _die "VM ${VMID} parada con cpu=${cpu_model}: el silicio cambia (${SRC_NODE} [${src_sig//|/ }] → ${DST_NODE} [${dst_sig//|/ }]) y el invitado verá la CPU nueva al arrancar, así que el Hardware ID de SQX y las licencias del Market cambiarán. Hace falta dejar constancia del aviso al cliente: ACK_HWID_CHANGE=${VMID} CPU_NOTICE='<cuándo y por dónde se avisó>'. Abortado antes de tocar la VM."
+}
+
+# OFFLINE: una VM x86-64-v4 no arranca en un nodo sin AVX-512 (PVE pone
+# `enforce`), y remote_migrate --delete ya habría borrado el origen. Se rechaza
+# antes de copiar nada (2.ª revisión del PR #291). Flags ilegibles → se rechaza.
+_cold_avx512_guard() {
+  local cpu_model="$1" flags="$2" f
+  [[ "$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')" == x86-64-v4* ]] || return 0
+  [[ -n "${flags// /}" ]] || _die "No pude leer las flags de CPU de ${DST_NODE} para una VM ${cpu_model} parada: no se puede saber si arrancará allí. Abortado antes de tocar la VM."
+  for f in avx512f avx512bw avx512cd avx512dq avx512vl; do
+    grep -qw "$f" <<< "$flags" || _die "VM ${VMID} con cpu=${cpu_model}: ${DST_NODE} no tiene ${f} y la VM no arrancaría allí (y remote_migrate --delete borra el origen). Elige un destino con AVX-512, o traslado en frío con el kit (CHANGE_CPU=1 pone x86-64-v3, con el cliente avisado). Abortado antes de tocar la VM."
+  done
 }
 
 # Reads Windows' boot time over the guest agent, on whichever node holds the VM
@@ -934,6 +943,36 @@ _mem_class() {
   esac
 }
 
+# ----- Globo de la VPS E al cambiar de clase de memoria -----------------------
+# (03/07 EX44↔AX162; por nodeType desde el 25/11/2026.) Dedicated (EX44) =
+# balloon == memory; shared (SQX multi-VM) = suelo VPSE_BALLOON_MIN_MB. La RAM
+# (memory) no se toca. rc 0 = hecho o no hacía falta; rc 1 = falló el qm set.
+VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-47104}"
+_vpse_balloon_adapt() {
+  local src_fam dst_fam mem_mb target
+  _node_types_load
+  src_fam=$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC"); dst_fam=$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")
+  _info "vps-e: clase de memoria ${SRC_NODE}=${src_fam} (nodeType ${NODE_TYPE_SRC:-?}) → ${DST_NODE}=${dst_fam} (nodeType ${NODE_TYPE_DST:-?})."
+  [[ "$src_fam" != "$dst_fam" && "$dst_fam" != "other" ]] || return 0
+  mem_mb=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+  if [[ "$dst_fam" == "shared" ]]; then target="$VPSE_BALLOON_MIN_MB"; else target="${mem_mb:-61440}"; fi
+  if dst_ssh "qm set '${VMID}' --balloon '${target}'" >/dev/null 2>&1; then
+    _ok "vps-e balloon adapted for ${dst_fam} dest: balloon=${target} MiB (memory=${mem_mb:-?}, sin cambiar)."
+    return 0
+  fi
+  _warn "Could not set balloon=${target} on dest — set it manually: qm set ${VMID} --balloon ${target}"
+  return 1
+}
+BALLOON_PENDING_DIR="${MIGRATE_STATE_DIR:-/var/lib/migrate_vm}/balloon-pending"
+_balloon_mark() {
+  mkdir -p "$BALLOON_PENDING_DIR" 2>/dev/null \
+    && printf '%s %s\n' "$SRC_NODE" "$DST_NODE" > "$BALLOON_PENDING_DIR/${VMID}" 2>/dev/null \
+    || _warn "No pude dejar la marca de globo pendiente en $BALLOON_PENDING_DIR (si la ejecución se corta, el globo de la VPS E habrá que ajustarlo a mano)."
+}
+_balloon_unmark() {
+  rm -f "$BALLOON_PENDING_DIR/${VMID}" 2>/dev/null || true
+}
+
 # ----- Embedded Firestore helper (writes servers/{proxmoxId == VMID}) ----------
 # Requires firebase_admin + /etc/firebase-credentials.json on BASE.
 _firestore_update_servers() {
@@ -1096,6 +1135,24 @@ PY
     fi
   else
     _ok "Source equals destination — nothing to do."
+  fi
+  # Globo de VPS E pendiente de una ejecución anterior cortada tras mover rutas/Firestore.
+  if [[ -f "$BALLOON_PENDING_DIR/${VMID}" ]]; then
+    read -r _bp_src _bp_dst < "$BALLOON_PENDING_DIR/${VMID}" || true
+    if [[ -n "${RC_DST_NODE:-}" && "${_bp_dst:-}" == "$RC_DST_NODE" ]]; then
+      SRC_NODE="$_bp_src"; DST_NODE="$_bp_dst"
+      DST_IPV6=$(DST_NODE="$DST_NODE" PVE_NODES_FILE="$PVE_NODES_FILE" python3 -c 'import json,os; print(json.load(open(os.environ["PVE_NODES_FILE"])).get(os.environ["DST_NODE"],""))' 2>/dev/null || true)
+      if [[ -n "$DST_IPV6" ]]; then
+        SSH_CTL_DIR=$(mktemp -d -t mvm.XXXXXX)
+        _info "Globo de VPS E pendiente de una ejecución anterior (${SRC_NODE} → ${DST_NODE}): lo termino."
+        if _vpse_balloon_adapt; then _balloon_unmark; fi
+        _ssh_close
+      else
+        _warn "Globo de VPS E pendiente para ${DST_NODE}, pero no encuentro su IP en $PVE_NODES_FILE: ajústalo a mano."
+      fi
+    else
+      _warn "Hay una marca de globo pendiente para la VM ${VMID} hacia ${_bp_dst:-?}, pero la VM está en ${RC_DST_NODE:-?}: no la aplico (revisa $BALLOON_PENDING_DIR/${VMID})."
+    fi
   fi
   exit 0
 fi
@@ -1758,8 +1815,8 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   #      bugchecked 0xA ~20 s after resume; a named model does not hide the
   #      vendor).
   #   2. _live_silicon_guard (25/11/2026): only between identical
-  #      vendor|family|model, whatever the cpu model (LIVE_SILICON_MATCH=model;
-  #      =family relaxes generic models to the same family, by hand only). Signatures come from
+  #      vendor|family|model, whatever the cpu model (no global relax switch;
+  #      lab override per VMID only). Signatures come from
   #      /proc/cpuinfo, NOT the marketing name (EPYC 9454 and 9454P are both
   #      25|17). This replaced the old "dest is a feature-flag superset" rule
   #      for cpu=host (VMs 708/1670, Genoa→Naples, 2026): a superset no longer
@@ -1806,6 +1863,7 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
     _cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-kvm64}"
+    _cold_avx512_guard "${CPU_MODEL:-kvm64}" "$(dst_ssh 'grep -m1 "^flags" /proc/cpuinfo' 2>/dev/null || true)"
   fi
 
   # 0b) Converge packages on BOTH nodes before migrating so dest pve-qemu-kvm is
@@ -2232,6 +2290,12 @@ dst_ssh "qm set '${VMID}' --hookscript '${HOOKSCRIPT}'" >/dev/null 2>&1 \
 # disparador (medido: `Sync proxmoxId=243 done` sin mover nada). Un
 # sync-base-nat anterior a ese parámetro lo rechaza con rc=2: entonces se
 # repite sin él, como antes.
+# VPS E: marca persistente de «globo pendiente» ANTES de tocar rutas y Firestore (2.ª revisión del
+# PR #291). Si algo corta la ejecución entre aquí y el ajuste del globo, Firestore ya dice el nodo
+# nuevo y el reintento sale por SRC_EQ_DST: allí se lee esta marca y se termina el ajuste.
+_vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+if [[ "$_vm_name" == E-* ]]; then _balloon_mark; fi
+
 NAT_OK=0
 if [[ -x "$SYNC_BASE_NAT" ]]; then
   _info "Reconciling local NAT via $SYNC_BASE_NAT sync ${VMID} ${EXPECTED_VM_IPV6} node=${DST_NODE}…"
@@ -2298,24 +2362,12 @@ fi
 # dejarlo bajo no quita ni un MB (medido el mismo dia en la vecina vm1704,
 # suelo 18 GB y actual=61340). El dano aparece cuando el nodo se llena, que
 # es justo cuando el cliente menos puede permitirselo.
-VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-47104}"
-_vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
-# Clase por nodeType desde el 25/11/2026 (ver _mem_class): antes, por nombre
-# (*EX44* / *AX162*), y un destino como 0000266-KDM-9755 no se adaptaba. La
 # RAM (memory) NO se toca: las E de EX44 conservan sus 60 GB (Iván, 11/11).
-if [[ "$_vm_name" == E-* ]]; then
-  _node_types_load
-  _src_fam=$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC"); _dst_fam=$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")
-  _info "vps-e: clase de memoria ${SRC_NODE}=${_src_fam} (nodeType ${NODE_TYPE_SRC:-?}) → ${DST_NODE}=${_dst_fam} (nodeType ${NODE_TYPE_DST:-?})."
-  if [[ "$_src_fam" != "$_dst_fam" && "$_dst_fam" != "other" ]]; then
-    _mem_mb=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
-    if [[ "$_dst_fam" == "shared" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"; else _target_balloon="${_mem_mb:-61440}"; fi
-    if dst_ssh "qm set '${VMID}' --balloon '${_target_balloon}'" >/dev/null 2>&1; then
-      _ok "vps-e balloon adapted for ${_dst_fam} dest: balloon=${_target_balloon} MiB (memory=${_mem_mb:-?}, sin cambiar)."
-    else
-      _warn "Could not set balloon=${_target_balloon} on dest — set it manually: qm set ${VMID} --balloon ${_target_balloon}"
-    fi
-  fi
+# La marca de «globo pendiente» se pone antes del NAT (ver _balloon_mark) y se
+# quita aquí cuando el ajuste se ha hecho o no hacía falta; si la ejecución se
+# corta en medio, el reintento entra por la rama SRC_EQ_DST y lo termina.
+if [[ "${_vm_name:-}" == E-* ]]; then
+  if _vpse_balloon_adapt; then _balloon_unmark; fi
 fi
 
 # Reloj del invitado (25/11/2026): tras dejar la VM arrancada en destino, en

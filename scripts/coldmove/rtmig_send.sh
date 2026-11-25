@@ -205,23 +205,41 @@ case "$CMD" in
     ;;
   incr)
     PREV="${2:?PREV}"; NEW="${3:?NEW}"; check_snap_name "$NEW"
-    if [[ "$PREV" == "auto" ]]; then PREV=$(last_common) || die "no hay snapshot rtmig-* común"; log "PREV=auto -> @${PREV}"; fi
+    # La base de cada incremental se guarda la primera vez ($WORK/<VMID>.incr-<NEW>.prev): al repetir
+    # la misma orden tras un corte (aunque ya hayan llegado todos los discos) se usa la misma base,
+    # no «el último común», que entonces sería el propio NEW.
+    PREVF="$WORK/${VMID}.incr-${NEW}.prev"
+    if [[ -f "$PREVF" ]]; then
+      REC=$(head -1 "$PREVF"); check_snap_name "$REC"
+      [[ "$PREV" == auto || "$PREV" == "$REC" ]] || die "este incr ya se lanzó con PREV=@${REC}; no se puede repetir con @${PREV}"
+      PREV="$REC"; log "incr ya empezado antes: PREV=@${PREV} (de ${PREVF})"
+    elif [[ "$PREV" == "auto" ]]; then
+      PREV=$(last_common) || die "no hay snapshot rtmig-* común"
+      [[ "$PREV" != "$NEW" ]] || die "@${NEW} ya está completo en los dos lados y no consta su base: pasa PREV explícito para verificar/limpiar"
+      log "PREV=auto -> @${PREV}"
+    fi
     check_snap_name "$PREV"
     [[ "$PREV" != "$NEW" ]] || die "PREV y NEW son el mismo snapshot"
+    [[ -f "$PREVF" ]] || printf '%s\n' "$PREV" > "$PREVF"
     dst_must_be_free
     snap_all "$NEW"
     for d in $(printf '%s\n' $DISKS | sort -n -r); do send_disk "$d" "$NEW" "$PREV"; done
     verify "$NEW"
-    if [[ "${DROP_PREV:-0}" == "1" ]]; then
+    if [[ "${DROP_PREV:-0}" == "1" ]]; then   # idempotente: solo lo que siga existiendo
       for d in $DISKS; do
-        zfs destroy "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}"
-        dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'"
+        if zfs list -H "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}" >/dev/null 2>&1; then
+          zfs destroy "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}"
+        fi
+        if [[ "$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}")" != ABSENT ]]; then
+          dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" || die "no pude destruir @${PREV} de disk-${d} en destino"
+        fi
       done
       log "@${PREV} destruido en origen y destino (queda @${NEW} como base común)"
     fi
     ;;
   verify)
-    verify "${2:?SNAP}"
+    check_snap_name "${2:?SNAP}"
+    verify "$2"
     ;;
   last)
     last_common || die "no hay snapshot rtmig-* común"

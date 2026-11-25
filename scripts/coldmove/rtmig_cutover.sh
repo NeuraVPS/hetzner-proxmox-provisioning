@@ -58,21 +58,40 @@ reconciler_dst() {
   case "$out" in *REC=yes*) echo yes ;; *REC=no*) echo no ;; *) echo unknown ;; esac
 }
 
-# CPU efectiva de una config (sección principal, sin [snapshots]): la que verá el invitado al arrancar.
-conf_cpu() { awk '/^\[/{exit} /^cpu:/{sub(/^cpu:[ \t]*/,""); sub(/,.*/,""); sub(/^cputype=/,""); print; exit}' "$1"; }
+# CPU con la que ARRANCARÁ la VM: la de [PENDING] si hay un cambio pendiente (qm start lo aplica),
+# ninguna (kvm64) si [PENDING] la borra, y si no, la de la sección principal. Nunca la de un snapshot.
+conf_cpu() {
+  awk 'BEGIN{sec="main"}
+       /^\[/ {sec=$0; next}
+       sec=="main" && /^cpu:/ {m=$0}
+       sec=="[PENDING]" && /^cpu:/ {p=$0}
+       sec=="[PENDING]" && /^delete:/ {s=$0; sub(/^delete:[ \t]*/,"",s); n=split(s,a,/[ ,]+/); for(i=1;i<=n;i++) if(a[i]=="cpu") d=1}
+       END{v = (p!="") ? p : (d ? "" : m); sub(/^cpu:[ \t]*/,"",v); sub(/,.*/,"",v); sub(/^cputype=/,"",v); print v}' "$1"
+}
+# rc 0 si [PENDING] cambia o borra <key>
+pending_touches() {
+  awk -v k="$2" 'BEGIN{sec="main"; t=0}
+       /^\[/ {sec=$0; next}
+       sec=="[PENDING]" && index($0, k ":")==1 {t=1}
+       sec=="[PENDING]" && /^delete:/ {s=$0; sub(/^delete:[ \t]*/,"",s); n=split(s,a,/[ ,]+/); for(i=1;i<=n;i++) if(a[i]==k) t=1}
+       END{exit t ? 0 : 1}' "$1"
+}
 is_generic_cpu() { [[ "$1" =~ ^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$ ]]; }
 
-# Pone «key: value» en la sección principal de una config (sustituye o añade al principio).
+# Pone «key: value» en la sección PRINCIPAL de una config: sustituye la línea si está, o la añade al
+# final de esa sección. Las secciones [PENDING]/[snapshot] no cuentan ni se tocan.
 conf_set_key() {   # <fichero> <key> <value>
   local f="$1" k="$2" v="$3" tmp="$1.tmp.$$"
   awk -v k="$k" -v v="$v" 'BEGIN{done=0; top=1}
-       /^\[/ {top=0}
-       top && index($0, k ":")==1 {print k ": " v; done=1; next}
+       /^\[/ { if (top && !done) {print k ": " v; done=1}; top=0 }
+       top && index($0, k ":")==1 { if (!done) {print k ": " v; done=1}; next }
        {print}
-       END{}' "$f" > "$tmp"
-  if ! grep -q "^${k}: ${v}\$" "$tmp"; then { printf '%s: %s\n' "$k" "$v"; cat "$tmp"; } > "$tmp.2"; mv "$tmp.2" "$tmp"; fi
+       END{ if (top && !done) print k ": " v }' "$f" > "$tmp"
   mv "$tmp" "$f"
 }
+
+# rc 0 si la config del destino (última probe dst) es la de ESTE traslado: presente y con su UUID.
+dst_conf_is_ours() { [[ "$P_CONF" == present && -n "$P_UUID" && "$P_UUID" == "$(state_get UUID)" ]]; }
 
 # Decide la CPU del destino: deja en CPU_NEW la CPU a poner ("" = no tocar) o muere. Sin subshell,
 # para que los mensajes se vean. <conf> <record 0|1>: con 1 deja constancia del ACK en cpu-change.txt.
@@ -144,6 +163,7 @@ case "$CMD" in
     cpu_decision "$CONF" 0
     probe dst
     [[ "$P_CONF" == absent ]] || die "el destino ${DST_NODE} ya tiene config de la VM ${VMID}: no apago"
+    [[ "$P_FW" == absent ]] || die "el destino ${DST_NODE} tiene un .fw de la VM ${VMID}: no es de este traslado; revísalo antes de apagar"
     [[ -n "$(conf_uuid "$CONF")" ]] || die "la config no tiene smbios1 uuid: el kit no puede ligar el traslado a la VM"
     log "previas OK: discos ${DISKS}; cpu ${CPU_OLD}${CPU_NEW:+ → ${CPU_NEW} en push}; destino libre"
     log "qm shutdown ${VMID} --timeout ${T} (ordenado; sin forceStop)"
@@ -168,6 +188,7 @@ case "$CMD" in
     DISKS=$(detect_disks)
     probe dst
     [[ "$P_CONF" == absent ]] || die "el destino ${DST_NODE} ya tiene config de la VM ${VMID}"
+    [[ "$P_FW" == absent ]] || die "el destino ${DST_NODE} tiene un .fw de la VM ${VMID} sin config: no es de este traslado; revísalo"
     # Historial del reconciliador de globo: export-state necesita la config viva, así que va ANTES de
     # aparcar. Solo si este nodo tiene reconciliador (en un EX44 no hay historial que llevar).
     if has_reconciler_src; then
@@ -187,7 +208,7 @@ case "$CMD" in
     # El estado se abre ANTES de quitar la config: si algo cae aquí, push verá la config en origen y parará.
     rm -f "$STATE"
     state_set "VMID=${VMID}" "UUID=${UUID}" "SRC_NODE=$(src_node)" "DST_NODE=${DST_NODE}" "DST=${DST}" \
-              "DISKS=${DISKS}" "PHASE=parked" "PARKED_AT=$(date -u +%FT%TZ)"
+              "DISKS=${DISKS}" "POOLDS=${POOLDS}" "PHASE=parked" "PARKED_AT=$(date -u +%FT%TZ)"
     rm -f "$CONF"; [[ -f "$WORK/${VMID}.fw.src" ]] && rm -f "$FW"
     probe src
     [[ "$P_CONF" == absent ]] || die "qm aún ve la config de la VM en origen"
@@ -197,12 +218,29 @@ case "$CMD" in
   push)
     SNAP="${2:?SNAP final}"; B="${3:-}"; check_snap_name "$SNAP"
     [[ -z "$B" || "$B" =~ ^[0-9]+$ ]] || die "balloon_mb no numérico: $B"
-    require_state parked
+    require_state parked publishing   # publishing = un push anterior se cortó a mitad: se retoma
+    PH=$(state_get PHASE)
     probe src
     [[ "$P_CONF" == absent ]] || die "el origen vuelve a tener config de la VM ${VMID}: no publico en destino (dos configs arrancables)"
     probe dst
-    [[ "$P_CONF" == absent ]] || die "el destino ya tiene config de ${VMID}"
+    if [[ "$PH" == publishing && "$P_CONF" == present ]] && dst_conf_is_ours && [[ "$P_SHA" == "$(state_get CONF_SHA)" ]]; then
+      state_set "PHASE=pushed" "PUSHED_AT=$(date -u +%FT%TZ)"
+      log "la config ya estaba publicada por el push anterior (sha ${P_SHA:0:12}…): fase pushed"
+      exit 0
+    fi
+    [[ "$P_CONF" == absent ]] || die "el destino ya tiene config de ${VMID} y no es la publicada por este traslado"
+    DST_FW_BEFORE="$P_FW"; DST_FWSHA_BEFORE="$P_FWSHA"
+    if [[ "$P_FW" == present ]]; then
+      [[ "$PH" == publishing && "$P_FWSHA" == "$(state_get FW_SHA)" ]] \
+        || die "el destino tiene un .fw de la VM ${VMID} que no es de este traslado: revísalo a mano; no se ha publicado nada"
+    fi
     cpu_decision "$WORK/${VMID}.conf.src" 0
+    if [[ -n "$CPU_NEW" ]] && pending_touches "$WORK/${VMID}.conf.src" cpu; then
+      die "la config tiene un cambio PENDIENTE de cpu: aplícalo o descártalo en origen antes (rollback) y repite"
+    fi
+    if [[ -n "$B" ]] && pending_touches "$WORK/${VMID}.conf.src" balloon; then
+      die "la config tiene un cambio PENDIENTE de balloon: no se puede fijar ${B} sin pisarlo; resuélvelo antes"
+    fi
     DISKS=$(DISKS="" detect_disks)   # inventario COMPLETO de la config aparcada
     [[ "$DISKS" == "$(state_get DISKS)" ]] || die "el inventario de discos (${DISKS}) no es el de park ($(state_get DISKS))"
     for d in $DISKS; do
@@ -210,9 +248,9 @@ case "$CMD" in
       gs=$(zfs get -H -o value guid "${ds}@${SNAP}" 2>/dev/null || true)
       gd=$(dst_zget guid "${ds}@${SNAP}")
       [[ -n "$gs" && "$gs" == "$gd" ]] || die "$ds@$SNAP: guid origen=[$gs] destino=[$gd] — falta la sincronización final"
-      ws=$(zfs get -Hp -o value "written@${SNAP}" "$ds")
+      ws=$(zfs get -Hp -o value "written@${SNAP}" "$ds" 2>/dev/null || true)
       wd=$(dst_zget "written@${SNAP}" "$ds" -p)
-      [[ "$ws" == 0 && "$wd" == 0 ]] || die "$ds: escrito después de @$SNAP origen=${ws} B destino=${wd} B — la final no es la última"
+      [[ "$ws" == 0 && "$wd" == 0 ]] || die "$ds: escrito después de @$SNAP origen=[${ws}] destino=[${wd}] — la final no es la última"
       log "disco OK: $ds@$SNAP guid=$gs, 0 B posteriores en ambos lados"
     done
     # Config final, preparada en local: CPU y balloon ya aplicados. Se publica de una sola vez.
@@ -220,18 +258,27 @@ case "$CMD" in
     [[ -n "$B" ]] && conf_set_key "$WORK/${VMID}.conf.push" balloon "$B"
     [[ -n "$CPU_NEW" ]] && conf_set_key "$WORK/${VMID}.conf.push" cpu "$CPU_NEW"
     PUSH_SHA=$(sha256sum < "$WORK/${VMID}.conf.push" | cut -d' ' -f1)
-    if [[ -f "$WORK/${VMID}.fw.src" ]]; then   # el .fw solo no hace arrancable la VM: va primero
-      dst_in "cat > \"${R_FW}\"" < "$WORK/${VMID}.fw.src" || die "no pude escribir el .fw en el destino; la config NO se ha publicado"
-    fi
-    dst_in "cat > \"${R_CONF}\"" < "$WORK/${VMID}.conf.push" || true
-    probe dst
-    if [[ "$P_CONF" != present || "$P_SHA" != "$PUSH_SHA" ]]; then
-      dst "rm -f \"${R_CONF}\"" 2>/dev/null || true
+    if [[ -f "$WORK/${VMID}.fw.src" ]]; then FW_SHA=$(sha256sum < "$WORK/${VMID}.fw.src" | cut -d' ' -f1); else FW_SHA=none; fi
+    # Intención registrada ANTES de escribir nada en el destino: lo que haya allí con estos hashes es nuestro.
+    state_set "PHASE=publishing" "SNAP=${SNAP}" "CONF_SHA=${PUSH_SHA}" "FW_SHA=${FW_SHA}"
+    if [[ "$FW_SHA" == none ]]; then
+      [[ "$DST_FW_BEFORE" == absent ]] || die "el origen no tiene .fw pero el destino sí (de un push anterior con otro .fw): revísalo; no se ha publicado nada"
+    elif [[ "$DST_FW_BEFORE" == present && "$DST_FWSHA_BEFORE" == "$FW_SHA" ]]; then
+      log ".fw ya publicado por el push anterior (sha ${FW_SHA:0:12}…)"
+    else   # el .fw solo no hace arrancable la VM: va primero
+      r=$(dst_publish "$WORK/${VMID}.fw.src" "$R_FW")
       probe dst
-      [[ "$P_CONF" == absent ]] || die "la config publicada en destino no es la esperada y no pude retirarla: REVISAR A MANO ${DST_NODE}:/etc/pve/qemu-server/${VMID}.conf antes de nada"
-      die "la config no llegó entera al destino (sha distinto); retirada. Repite push"
+      [[ "$r" == PUBLISHED && "$P_FW" == present && "$P_FWSHA" == "$FW_SHA" ]] \
+        || die "el .fw no llegó bien al destino (${r}); la config NO se ha publicado. Repite push o haz rollback"
     fi
-    state_set "PHASE=pushed" "SNAP=${SNAP}" "CONF_SHA=${PUSH_SHA}" "PUSHED_AT=$(date -u +%FT%TZ)"
+    r=$(dst_publish "$WORK/${VMID}.conf.push" "$R_CONF")
+    probe dst
+    if [[ "$r" != PUBLISHED || "$P_CONF" != present || "$P_SHA" != "$PUSH_SHA" ]]; then
+      [[ "$P_CONF" == absent ]] || die "la config del destino no es la esperada tras publicar (${r}): REVISAR A MANO ${DST_NODE}:/etc/pve/qemu-server/${VMID}.conf"
+      die "la config no se publicó (${r}); el destino sigue sin ella. Repite push o haz rollback"
+    fi
+    [[ "$P_UUID" == "$(state_get UUID)" ]] || die "la config publicada no tiene el UUID del traslado: REVISAR A MANO"
+    state_set "PHASE=pushed" "PUSHED_AT=$(date -u +%FT%TZ)"
     [[ -n "$B" ]] && log "balloon=${B} en destino"
     if [[ -n "$CPU_NEW" ]]; then
       log "CHANGE_CPU=1: cpu ${CPU_OLD} -> ${CPU_NEW} en destino (aviso: ${CPU_NOTICE}); la config del origen conserva la antigua (rollback)"
@@ -241,7 +288,7 @@ case "$CMD" in
     elif [[ -n "${ACK_HWID_CHANGE:-}" ]]; then
       cpu_decision "$WORK/${VMID}.conf.src" 1   # deja la constancia, ya publicada
     fi
-    log "config publicada en ${DST_NODE} (sha256 ${PUSH_SHA:0:12}…); fase pushed"
+    log "config publicada en ${DST_NODE} (sha256 ${PUSH_SHA:0:12}…, fw ${FW_SHA:0:12}); fase pushed"
     # Historial del globo: import-state necesita la config ya escrita en el destino.
     if [[ -s "$WORK/${VMID}.balloon-state" ]]; then
       case "$(reconciler_dst)" in
@@ -258,64 +305,96 @@ case "$CMD" in
     dst "qm config $VMID" | grep -E "^(balloon|memory|cores|cpu|scsi0|efidisk0|tpmstate0|net0|hookscript|name):" || true
     ;;
   start)
-    require_state pushed
+    # Reentrante: con la fase «starting» (se perdió la confirmación) o «pushed» y la VM ya en marcha
+    # en destino con la config publicada, solo se reconcilia el estado.
+    require_state pushed starting
     probe src
     [[ "$P_CONF" == absent ]] || die "la VM tiene config en origen: no arranco en destino"
     probe dst
-    [[ "$P_CONF" == present ]] || die "el destino no tiene la config de ${VMID}"
+    dst_conf_is_ours || die "el destino no tiene la config publicada por este traslado (config ${P_CONF}, UUID ${P_UUID:-?}, sha ${P_SHA:0:12})"
     [[ "$P_SHA" == "$(state_get CONF_SHA)" ]] || die "la config del destino no es la publicada por push (sha distinto): revisar a mano"
-    [[ "$P_STATUS" == stopped ]] || die "la VM está '${P_STATUS}' en destino"
-    log "qm start ${VMID} en destino"
-    dst "qm start $VMID" || die "qm start falló en destino"
-    for _ in $(seq 1 20); do probe dst; [[ "$P_STATUS" == "running" ]] && break; sleep 3; done
-    log "estado en destino: ${P_STATUS}"
-    [[ "$P_STATUS" == "running" ]] || die "no llegó a running"
+    if [[ "$P_STATUS" == running ]]; then
+      log "la VM ya está running en destino: reconcilio el estado"
+    else
+      [[ "$P_STATUS" == stopped ]] || die "la VM está '${P_STATUS}' en destino"
+      state_set "PHASE=starting" "START_REQUESTED_AT=$(date -u +%FT%TZ)"
+      log "qm start ${VMID} en destino"
+      dst "qm start $VMID" || warn "qm start devolvió error (o se cortó el SSH): compruebo el estado"
+      for _ in $(seq 1 20); do probe dst; [[ "$P_STATUS" == "running" ]] && break; sleep 3; done
+      log "estado en destino: ${P_STATUS}"
+      [[ "$P_STATUS" == "running" ]] || die "no llegó a running (fase starting; repite start cuando se aclare)"
+    fi
     state_set "PHASE=started" "STARTED_AT=$(date -u +%FT%TZ)"
     log "siguiente paso, en una BASE: migrate_vm.sh ${VMID} <número de ${DST_NODE}> (rama «already on dest»)"
     ;;
   rollback)
-    require_state parked pushed started
+    require_state parked publishing pushed starting started rollingback
     PH=$(state_get PHASE); SNAP=$(state_get SNAP)
-    probe src
-    [[ "$P_CONF" == absent ]] || die "ya hay config de la VM en origen: nada que restaurar"
-    probe dst
-    if [[ "$P_CONF" == present ]]; then
-      [[ "$P_STATUS" == "stopped" ]] || die "la VM está '${P_STATUS}' en destino: apágala ORDENADAMENTE allí primero (qm shutdown), con decisión de una persona"
-    fi
-    # ¿Hubo actividad en destino? Si arrancó allí, o sus discos tienen escrituras posteriores a la
-    # final, volver al origen las PIERDE: hace falta consentimiento expreso.
-    ACTIVITY=""
-    [[ "$PH" == started ]] && ACTIVITY="la VM llegó a arrancar en destino"
-    if [[ -n "$SNAP" ]]; then
-      for d in $(state_get DISKS); do
-        w=$(dst_zget "written@${SNAP}" "${POOLDS}/vm-${VMID}-disk-${d}" -p)
-        [[ "$w" == ABSENT || "$w" == 0 ]] || ACTIVITY="${ACTIVITY:+$ACTIVITY; }disk-${d} tiene ${w} B escritos en destino tras @${SNAP}"
-      done
-    fi
-    if [[ -n "$ACTIVITY" && "${ACK_DISCARD_DEST_WRITES:-}" != "$VMID" ]]; then
-      die "volver al origen PIERDE lo escrito en destino (${ACTIVITY}). Si es lo decidido: ACK_DISCARD_DEST_WRITES=${VMID}. No se ha tocado nada"
-    fi
-    if [[ "$P_CONF" == present || "$P_FW" == present ]]; then
-      dst "mkdir -p '$WORK' && ts=\$(date -u +%Y%m%dT%H%M%SZ) && { [ ! -e \"${R_CONF}\" ] || cp -a \"${R_CONF}\" '$WORK/${VMID}.conf.dst-'\$ts; } && rm -f \"${R_CONF}\" \"${R_FW}\"" \
-        || die "no pude aparcar la config del destino (SSH); no se ha restaurado nada en origen"
+    if [[ "$PH" != rollingback ]]; then
+      probe src
+      [[ "$P_CONF" == absent ]] || die "ya hay config de la VM en origen: nada que restaurar"
       probe dst
-      [[ "$P_CONF" == absent && "$P_FW" == absent ]] || die "la config del destino sigue ahí tras aparcarla: no restauro el origen"
-      log "config del destino aparcada en ${DST_NODE}:$WORK/${VMID}.conf.dst-* (discos de destino intactos)"
+      OURS_CONF=0; OURS_FW=0
+      if [[ "$P_CONF" == present ]]; then
+        [[ "$PH" != parked ]] || die "el destino tiene una config de la VM ${VMID} y este traslado aún no publicó nada: no es nuestra, no la toco"
+        dst_conf_is_ours || die "la config de la VM ${VMID} en destino no es la de este traslado (UUID ${P_UUID:-?} ≠ $(state_get UUID)): no la toco"
+        [[ "$P_STATUS" == "stopped" ]] || die "la VM está '${P_STATUS}' en destino: apágala ORDENADAMENTE allí primero (qm shutdown), con decisión de una persona"
+        OURS_CONF=1
+      fi
+      if [[ "$P_FW" == present ]]; then
+        if (( OURS_CONF )) || [[ "$PH" != parked && "$P_FWSHA" == "$(state_get FW_SHA)" ]]; then OURS_FW=1
+        else die "hay un .fw de la VM ${VMID} en destino que no es de este traslado: no lo toco; revísalo a mano"; fi
+      fi
+      # ¿Hubo actividad en destino? Si arrancó allí, o sus discos tienen escrituras posteriores a la
+      # final, volver al origen las PIERDE: hace falta consentimiento expreso. Cada disco tiene que
+      # dar un entero (verificado en push): ABSENT o un error es estado indeterminado.
+      ACTIVITY=""
+      [[ "$PH" == started || "$PH" == starting ]] && ACTIVITY="la VM llegó (o pudo llegar) a arrancar en destino"
+      if [[ -n "$SNAP" && "$PH" != parked ]]; then
+        for d in $(state_get DISKS); do
+          w=$(dst_zget "written@${SNAP}" "${POOLDS}/vm-${VMID}-disk-${d}" -p)
+          [[ "$w" =~ ^[0-9]+$ ]] || die "disk-${d}: no hay un número de bytes escritos en destino tras @${SNAP} (${w}): estado INDETERMINADO, no restauro"
+          [[ "$w" == 0 ]] || ACTIVITY="${ACTIVITY:+$ACTIVITY; }disk-${d} tiene ${w} B escritos en destino tras @${SNAP}"
+        done
+      fi
+      if [[ -n "$ACTIVITY" && "${ACK_DISCARD_DEST_WRITES:-}" != "$VMID" ]]; then
+        die "volver al origen PIERDE lo escrito en destino (${ACTIVITY}). Si es lo decidido: ACK_DISCARD_DEST_WRITES=${VMID}. No se ha tocado nada"
+      fi
+      if (( OURS_CONF || OURS_FW )); then
+        rmlist=""; (( OURS_CONF )) && rmlist="\"${R_CONF}\""; (( OURS_FW )) && rmlist="${rmlist} \"${R_FW}\""
+        dst "mkdir -p '$WORK' && ts=\$(date -u +%Y%m%dT%H%M%SZ) && { [ ! -e \"${R_CONF}\" ] || cp -a \"${R_CONF}\" '$WORK/${VMID}.conf.dst-'\$ts; } && rm -f ${rmlist}" \
+          || die "no pude aparcar la config del destino (SSH); no se ha restaurado nada en origen"
+        probe dst
+        [[ "$P_CONF" == absent && "$P_FW" == absent ]] || die "la config o el .fw del destino siguen ahí tras aparcarlos: no restauro el origen"
+        log "config del destino aparcada en ${DST_NODE}:$WORK/${VMID}.conf.dst-* (discos de destino intactos)"
+      fi
+      state_set "PHASE=rollingback" "ROLLBACK_FROM=${PH}" ${ACTIVITY:+"DISCARDED=${ACTIVITY}"}
+    else
+      log "rollback a medias (fase rollingback): lo continúo"
+      probe dst
+      [[ "$P_CONF" == absent ]] || die "en fase rollingback el destino vuelve a tener config de la VM: revisar a mano"
     fi
-    cp -a "$WORK/${VMID}.conf.src" "$CONF"
-    [[ -f "$WORK/${VMID}.fw.src" ]] && cp -a "$WORK/${VMID}.fw.src" "$FW"
-    archive_parked rolledback
-    state_set "PHASE=rolledback" "ROLLEDBACK_AT=$(date -u +%FT%TZ)" ${ACTIVITY:+"DISCARDED=${ACTIVITY}"}
-    qm start "$VMID"
+    # Restauración en origen (reentrante).
     probe src
+    if [[ "$P_CONF" == absent ]]; then
+      cp -a "$WORK/${VMID}.conf.src" "$CONF"
+      [[ -f "$WORK/${VMID}.fw.src" ]] && cp -a "$WORK/${VMID}.fw.src" "$FW"
+      probe src
+    fi
+    [[ "$P_CONF" == present && "$P_UUID" == "$(state_get UUID)" ]] || die "la config del origen no es la aparcada (UUID ${P_UUID:-?}): revisar a mano"
+    if [[ "$P_STATUS" != running ]]; then qm start "$VMID" || warn "qm start devolvió error: compruebo el estado"; probe src; fi
+    [[ "$P_STATUS" == running ]] || die "la VM no llegó a running en origen (fase rollingback; repite rollback)"
+    archive_parked rolledback
+    state_set "PHASE=rolledback" "ROLLEDBACK_AT=$(date -u +%FT%TZ)"
     log "VM ${VMID} arrancada de nuevo en ORIGEN; estado: ${P_STATUS}. Si ya corriste migrate_vm.sh hacia el destino, vuelve a correrlo hacia el origen."
     ;;
   close)
-    require_state started
+    require_state started starting
     probe src
     [[ "$P_CONF" == absent ]] || die "el origen tiene config de la VM: no cierro"
     probe dst
-    [[ "$P_CONF" == present ]] || die "el destino no tiene la config de la VM: no cierro"
+    dst_conf_is_ours || die "la config de la VM en destino no es la de este traslado (UUID ${P_UUID:-?}): no cierro"
+    [[ "$P_STATUS" == running ]] || die "la VM no está running en destino (${P_STATUS}): no cierro"
     archive_parked done
     state_set "PHASE=done" "CLOSED_AT=$(date -u +%FT%TZ)"
     log "traslado cerrado (fase done); copia aparcada archivada en $WORK/${VMID}.*.done-*. Los zvols y snapshots @rtmig-* del origen se borran a mano tras el keep"

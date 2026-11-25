@@ -158,13 +158,11 @@ class SiliconGuard(unittest.TestCase):
             r = self.guard(sig, sig)
             self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_family_mode_relaxes_generic_only(self):
-        env = {"LIVE_SILICON_MATCH": "family"}
-        self.assertEqual(self.guard(AMD, RAPHAEL, env=env).returncode, 0)
-        self.assertRefused(self.guard(AMD, TURIN, env=env), "familia")
-        self.assertRefused(self.guard(AMD, RAPHAEL, "host", env=env), "silicios distintos")
-        self.assertRefused(self.guard(AMD, AMD, env={"LIVE_SILICON_MATCH": "nope"}),
-                           "solo admite")
+    def test_no_global_relax_switch(self):
+        # 2nd review of PR #291: «family» was a global escape without a VMID; gone.
+        for v in ("family", "nope"):
+            self.assertRefused(self.guard(AMD, RAPHAEL, env={"LIVE_SILICON_MATCH": v}), "solo admite 'model'")
+        self.assertNotIn("family)", SCRIPT[SCRIPT.index("_live_silicon_guard() {"):SCRIPT.index("_cold_hwid_guard() {")])
 
     def test_unreadable_signature_refused(self):
         for src, dst in (("", AMD), (AMD, "garbage"), ("AuthenticAMD||17", AMD),
@@ -533,6 +531,65 @@ FAKE_FIRESTORE_NODES = textwrap.dedent("""\
     """)
 
 
+V4_FLAGS = "fpu sse avx2 avx512f avx512bw avx512cd avx512dq avx512vl"
+
+
+class ColdAvx512Guard(unittest.TestCase):
+    """2nd review of PR #291: a stopped x86-64-v4 VM cannot be sent (remote_migrate --delete)
+    to a node without AVX-512: it would not boot there."""
+
+    def guard(self, model, flags):
+        return run_bash(_fn("_cold_avx512_guard") + f'_cold_avx512_guard "{model}" "{flags}"\necho PASSED\n')
+
+    def test_v4_needs_avx512(self):
+        self.assertEqual(self.guard("x86-64-v4", V4_FLAGS).returncode, 0)
+        r = self.guard("x86-64-v4", "fpu sse avx2")
+        self.assertEqual(r.returncode, 1); self.assertIn("avx512f", r.stderr)
+        r = self.guard("x86-64-v4", "fpu avx512f avx512bw avx512cd avx512dq")
+        self.assertEqual(r.returncode, 1); self.assertIn("avx512vl", r.stderr)
+        self.assertEqual(self.guard("x86-64-v4", "").returncode, 1)          # unreadable
+
+    def test_other_models_unaffected(self):
+        for m in ("x86-64-v3", "host", "kvm64"):
+            self.assertEqual(self.guard(m, "fpu sse").returncode, 0, m)
+
+    def test_wired_in_the_offline_branch(self):
+        call = SCRIPT.index('_cold_avx512_guard "${CPU_MODEL:-kvm64}"')
+        self.assertLess(SCRIPT.index('_cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"'), call)
+        self.assertLess(call, SCRIPT.index('_apt_dist_upgrade src_ssh "source ${SRC_NODE}"'))
+
+
+class BalloonPending(unittest.TestCase):
+    """2nd review of PR #291: a run cut between routes/Firestore and the VPS-E balloon fix
+    leaves a marker; the retry (SRC_EQ_DST branch) finishes it."""
+
+    def test_mark_unmark(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = (f'BALLOON_PENDING_DIR="{d}/bp"\nSRC_NODE=0000181-EX44 DST_NODE=0000266-KDM-9755\n'
+                    + _fn("_balloon_mark") + _fn("_balloon_unmark")
+                    + '_balloon_mark; cat "$BALLOON_PENDING_DIR/777"; _balloon_unmark; ls "$BALLOON_PENDING_DIR"\n')
+            r = run_bash(body)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "0000181-EX44 0000266-KDM-9755")
+
+    def test_marker_before_nat_cleared_after_firestore(self):
+        mark = SCRIPT.index('if [[ "$_vm_name" == E-* ]]; then _balloon_mark; fi')
+        nat = SCRIPT.index('\nNAT_OK=0\n')
+        fs = SCRIPT.index('_info "Updating Firestore servers/')
+        adapt = SCRIPT.index('if [[ "${_vm_name:-}" == E-* ]]; then\n  if _vpse_balloon_adapt; then _balloon_unmark; fi')
+        self.assertLess(mark, nat); self.assertLess(nat, fs); self.assertLess(fs, adapt)
+
+    def test_src_eq_dst_branch_finishes_a_pending_marker(self):
+        a = SCRIPT.index("if (( SRC_EQ_DST == 1 )); then")
+        block = SCRIPT[a:SCRIPT.index("\n  exit 0\nfi", a)]
+        self.assertIn('if [[ -f "$BALLOON_PENDING_DIR/${VMID}" ]]; then', block)
+        self.assertIn('"${_bp_dst:-}" == "$RC_DST_NODE"', block)
+        self.assertIn("if _vpse_balloon_adapt; then _balloon_unmark; fi", block)
+        # the helpers it calls are defined before that branch runs
+        for fn in ("_vpse_balloon_adapt() {", "_node_types_load() {", "_mem_class() {", "dst_ssh() {", "_ssh_close() {"):
+            self.assertLess(SCRIPT.index(fn), a, fn)
+
+
 class ColdHwidGuard(unittest.TestCase):
     """PR #291 review: the direct cold path (stopped VM, offline remote_migrate)
     asks for the same HWID-change acknowledgement as the coldmove kit."""
@@ -641,7 +698,7 @@ class NodeMemClass(unittest.TestCase):
     def test_vpse_balloon_after_nat_and_firestore(self):
         # PR #291 review: the Firestore read (up to 60 s) must not delay the
         # customer's routes in the "already on dest" branch.
-        e = SCRIPT.index('if [[ "$_vm_name" == E-* ]]; then')
+        e = SCRIPT.index('if [[ "${_vm_name:-}" == E-* ]]; then')
         self.assertLess(SCRIPT.index('_info "Updating Firestore servers/'), e)
         self.assertLess(SCRIPT.index('"$SYNC_BASE_NAT" sync "$VMID" "$EXPECTED_VM_IPV6" "node=${DST_NODE}"'), e)
         self.assertLess(e, SCRIPT.index("\n  _guest_reboot_postcheck\n"))
@@ -652,10 +709,9 @@ class NodeMemClass(unittest.TestCase):
         hist = SCRIPT.index("neuravps-ram-guard.py export-state")
         self.assertIn('_mem_class "$SRC_NODE" "$NODE_TYPE_SRC")" == shared && "$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")" == shared',
                       SCRIPT[hist - 400:hist])
-        e = SCRIPT.index('if [[ "$_vm_name" == E-* ]]; then')
-        block = SCRIPT[e:SCRIPT.index("\nfi\n", e)]
+        block = _fn("_vpse_balloon_adapt")
         self.assertIn("_node_types_load", block)
-        self.assertIn('if [[ "$_dst_fam" == "shared" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"', block)
+        self.assertIn('if [[ "$dst_fam" == "shared" ]]; then target="$VPSE_BALLOON_MIN_MB"', block)
         self.assertNotIn("--memory", block)          # RAM untouched (Iván 11/11)
 
 

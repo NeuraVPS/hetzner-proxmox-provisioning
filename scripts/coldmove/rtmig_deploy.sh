@@ -16,11 +16,24 @@ SRC="${SRC:?SRC (IP del nodo origen)}"; DST="${DST:?DST (IP del nodo destino)}"
 WORK="${WORK:-/root/rtmig}"
 [[ "$JUMP" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || { echo "JUMP no válido: $JUMP" >&2; exit 2; }
 [[ "$WORK" =~ ^/[A-Za-z0-9._/-]+$ && "$WORK" != *..* ]] || { echo "WORK no válido: $WORK" >&2; exit 2; }
+# Las dos IPs se validan ANTES de escribir nada: literales, canónicas y sin zona (%eth0), porque
+# acaban dentro de una orden del shell de la BASE.
+canon_ip() {
+  python3 -c '
+import ipaddress, sys
+s = sys.argv[1]
+try:
+    ip = ipaddress.ip_address(s)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if "%" not in s and str(ip) == s else 1)' "$1" 2>/dev/null
+}
+for N in "$SRC" "$DST"; do canon_ip "$N" || { echo "no es una IP canónica sin zona: $N" >&2; exit 2; }; done
+[[ "$SRC" != "$DST" ]] || { echo "SRC y DST son la misma IP" >&2; exit 2; }
 FILES="rtmig_common.sh rtmig_send.sh rtmig_cutover.sh"
 LOCAL=$(md5sum $FILES)
 rc=0
 for N in "$SRC" "$DST"; do
-  python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1])' "$N" || { echo "no es una IP: $N" >&2; exit 2; }
   ssh "$JUMP" "ssh -o ConnectTimeout=15 root@$N 'mkdir -p $WORK'"
   for f in $FILES; do ssh "$JUMP" "ssh -o ConnectTimeout=15 root@$N 'cat > $WORK/$f'" < "$f"; done
   ssh "$JUMP" "ssh root@$N 'chmod 755 $WORK/rtmig_send.sh $WORK/rtmig_cutover.sh'"

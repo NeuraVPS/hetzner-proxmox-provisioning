@@ -22,8 +22,8 @@ Siempre con el **cliente avisado de la hora del corte**.
 
 **Parámetros comunes, por entorno:**
 - `VMID`.
-- `DST`: la IP del destino, tal cual está en `proxmox_nodes/<nodo>.ip`. En una BASE:
-  `jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json`.
+- `DST`: la IP del destino, tal cual está en `proxmox_nodes/<nodo>.ip`, en forma canónica y sin zona
+  (`%eth0`). En una BASE: `jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json`.
 - `DST_NODE`: el id del nodo destino. Se comprueba con `hostname` antes de hacer nada.
 - Opcionales: `WORK` (por defecto `/root/rtmig`), `SSH_PORT` y `DISKS`. Si se pone `DISKS`, tiene
   que coincidir exactamente con el inventario de la config.
@@ -34,13 +34,24 @@ almacenamiento, el disco de otra VM, `base-`, `vmstate` o una ruta cruda. Los CD
 
 **Fases, estado y cerrojo.** `park` abre `$WORK/<VMID>.state`, que liga el traslado a la VMID, al UUID
 (`smbios1`), al nodo origen, al nodo e IP destino, al inventario y, desde `push`, al snapshot final
-y al sha256 de la config publicada. Las fases son `parked → pushed → started → done`, o
-`rolledback`, y cada paso exige la anterior y los mismos datos. Solo puede correr un proceso del kit
-por VM a la vez (`$WORK/<VMID>.lock`).
+y al sha256 de la config publicada. También liga el pool (`POOLDS`) y el sha256 del `.fw`.
+- Fases: `parked → publishing → pushed → starting → started → done`, o
+  `rollingback → rolledback`.
+- Las fases intermedias (`publishing`, `starting`, `rollingback`) se registran **antes** de actuar:
+  si se pierde la confirmación, se repite la misma orden y el kit reconcilia lo que encuentra. Por
+  ejemplo, si la VM ya está corriendo en destino con la config publicada, `start` solo marca
+  `started`.
+- Cada paso exige la fase anterior y los mismos datos.
+- Solo puede correr un proceso del kit por VM a la vez (`$WORK/<VMID>.lock`).
+- **Nada ajeno se toca.** El kit solo retira del destino una config con el UUID del traslado, y un
+  `.fw` que sea de esa config o tenga el sha256 que publicó. Una config o un `.fw` de otra VM con
+  la misma VMID hacen abortar.
 
 **Respuestas positivas.** Un fallo de SSH nunca se toma por «no hay config». Cada consulta al destino
 tiene que traer su marcador final; si no, el estado es **INDETERMINADO** y el paso aborta sin tocar
-nada.
+nada. En las consultas ZFS solo cuenta como «no existe» el mensaje `dataset does not exist`;
+cualquier otro error de `zfs` también es INDETERMINADO. Un disco ya verificado en `push` que deja de
+dar un número de bytes escritos impide el rollback.
 
 El código no lleva IPs, VMIDs ni credenciales: usa la clave de la flota `~/.ssh/neuravps_id`, que ya
 está en cada nodo.
@@ -63,7 +74,9 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
    están, reanuda el que tiene token y envía los que faltan. Lo mismo vale para `incr`.
 2. **Incrementales en caliente**, hasta que lo pendiente sea poco
    (`./rtmig_send.sh pending` lo estima):
-   `DROP_PREV=1 ./rtmig_send.sh incr auto rtmig-<nueva>`.
+   `DROP_PREV=1 ./rtmig_send.sh incr auto rtmig-<nueva>`. La base de cada incremental se guarda en
+   `$WORK/<VMID>.incr-<nueva>.prev`, así que repetir la misma orden, aunque ya hayan llegado todos
+   los discos, usa la misma base, verifica por guid y limpia de forma idempotente.
 3. **Corte, a la hora pactada:**
    1. `./rtmig_cutover.sh shutdown 600`: primero las comprobaciones previas, **antes de apagar**:
       inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
@@ -75,8 +88,13 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
    4. `./rtmig_cutover.sh push rtmig-final-<fecha> [balloon_mb]`:
       - exige que el origen siga sin config (respuesta positiva);
       - comprueba guid y «0 B escritos después» en cada disco del inventario;
-      - escribe primero el `.fw` y **publica la config al final, de una sola vez**, ya con la CPU y
-        el balloon aplicados. La relee y compara el sha256; si no coincide, la retira y aborta;
+      - escribe primero el `.fw` y **publica la config al final**, ya con la CPU y el balloon
+        aplicados. Cada fichero se escribe a `<ruta>.rtmig-tmp`, se comprueba allí su sha256 y solo
+        entonces se renombra con `mv -n`, que pmxcfs hace atómico. Después se relee y se comparan
+        el sha256 y el UUID;
+      - si el origen no tiene `.fw`, el destino tampoco puede tenerlo;
+      - con un cambio `[PENDING]` de cpu o balloon que haya que fijar, se niega. La CPU que decide
+        la guarda es la que arrancará, es decir, la de `[PENDING]` si la hay;
       - importa el historial del globo, si el destino tiene reconciliador.
       - Una VPS E que viene de un EX44 hacia una caja SQX (AX162, KDM) lleva `47104`.
         `migrate_vm.sh` lo vuelve a ajustar por `nodeType`.
