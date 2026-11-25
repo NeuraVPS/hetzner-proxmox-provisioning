@@ -2655,6 +2655,12 @@ def node_fw_apply_script(digest: str, base_ipv6s: list[str]) -> str:
     bases = " ".join(shlex.quote(str(ipaddress.ip_address(b))) for b in base_ipv6s)
     mark = NODE_FW_APPLIED_MARK
     return (
+        # A server still in Hetzner Rescue (new node between its Firestore doc
+        # and the end of install.sh) has no PVE at all: nothing to validate or
+        # apply, and first_boot.sh installs the canonical file itself. Report it
+        # apart instead of as a rejection (25/11: 3 alerts per pass, retries).
+        "if ! command -v pve-firewall >/dev/null 2>&1 && [ ! -d /etc/pve ]; then "
+        "echo \"NVFW-NOTPVE $(hostname 2>/dev/null)\"; exit 0; fi; "
         "set -u; umask 077; f=/etc/pve/firewall/cluster.fw; "
         "t=$(mktemp /tmp/nv-cluster-fw.XXXXXX) && v=$(mktemp /tmp/nv-fwval.XXXXXX) "
         "|| { echo 'NVFW-FAIL mktemp'; exit 26; }; "
@@ -2678,7 +2684,7 @@ def node_fw_apply_script(digest: str, base_ipv6s: list[str]) -> str:
 
 
 def push_cluster_fw_to_node(node_id: str, ipv6: str, text: str, script: str) -> tuple[str, str]:
-    """('updated'|'unchanged'|'rejected'|'failed', detail)."""
+    """('updated'|'unchanged'|'not_pve'|'rejected'|'failed', detail)."""
     cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
            "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15",
            f"root@{ipv6}", script]
@@ -2692,6 +2698,8 @@ def push_cluster_fw_to_node(node_id: str, ipv6: str, text: str, script: str) -> 
         return "unchanged", ""
     if r.returncode == 0 and "NVFW-UPDATED" in out:
         return "updated", out
+    if r.returncode == 0 and "NVFW-NOTPVE" in out:
+        return "not_pve", out
     if "NVFW-REJECT" in out:
         return "rejected", out
     return "failed", (out or (r.stderr or "").strip())[:300]
@@ -2740,9 +2748,12 @@ def run_cluster_fw_sync_once() -> bool:
         by_state.setdefault(state, []).append(nid)
         if state in ("rejected", "failed"):
             logger.warning("sync-firewall: node %s %s: %s", nid, state, detail)
+        elif state == "not_pve":
+            logger.info("sync-firewall: node %s has no PVE yet (rescue/installing), skipped: %s", nid, detail)
     logger.info(
-        "sync-firewall: done (%d nodes: %d updated, %d unchanged, %d rejected, %d failed; sha256 %s)",
+        "sync-firewall: done (%d nodes: %d updated, %d unchanged, %d without PVE, %d rejected, %d failed; sha256 %s)",
         len(nodes), len(by_state.get("updated", [])), len(by_state.get("unchanged", [])),
+        len(by_state.get("not_pve", [])),
         len(by_state.get("rejected", [])), len(by_state.get("failed", [])),
         hashlib.sha256(text.encode()).hexdigest()[:12],
     )
