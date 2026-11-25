@@ -39,8 +39,12 @@ UPLINK="${UPLINK:-bond0}"
 TUN_MTU="${TUN_MTU:-1456}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 STATE=/root/nv-adopt
-mkdir -p "$STATE"
-log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$STATE/adopt.log"; }
+if [ "$PHASE" = check ]; then
+  log() { echo "[$(date -u +%FT%TZ)] $*"; }        # check: solo lectura, no escribe estado
+else
+  mkdir -p "$STATE"
+  log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$STATE/adopt.log"; }
+fi
 die() { log "ERROR: $*"; exit 1; }
 
 INSTALL_SH="$REPO/install.sh"
@@ -78,8 +82,8 @@ PY
 put() {
   local src=$1 dst=$2 mode=$3
   if [ -e "$dst" ] && cmp -s "$src" "$dst"; then return 0; fi
-  [ -e "$dst" ] && cp -a "$dst" "$STATE/$(echo "$dst" | tr / _).bak-$TS"
-  install -D -m "$mode" "$src" "$dst"
+  if [ -e "$dst" ]; then cp -a "$dst" "$STATE/$(echo "$dst" | tr / _).bak-$TS" || die "no pude respaldar $dst"; fi
+  install -D -m "$mode" "$src" "$dst" || die "no pude instalar $dst"
   log "instalado $dst"
 }
 put_heredoc() { # put_heredoc <fichero> <destino> <modo>
@@ -89,13 +93,24 @@ put_heredoc() { # put_heredoc <fichero> <destino> <modo>
   put "$tmp" "$2" "$3"; rm -f "$tmp"
 }
 
-nvms() { qm list 2>/dev/null | awk 'NR>1' | wc -l; }
+# Guarda de invitados: qm y pct tienen que responder y estar vacios. Un fallo de
+# qm NO cuenta como «0 VMs». Ademas el nodo tiene que ser independiente (sin
+# corosync): renombrar o cambiar la config de cluster en un cluster es otra cosa.
+require_no_guests() {
+  local q c
+  q="$(qm list 2>&1)" || die "qm list fallo: $q"
+  c="$(pct list 2>&1)" || die "pct list fallo: $c"
+  [ -z "$(printf '%s\n' "$q" | awk 'NR>1 && NF')" ] || die "hay VMs en el nodo; esta fase no se ejecuta con invitados"
+  [ -z "$(printf '%s\n' "$c" | awk 'NR>1 && NF')" ] || die "hay contenedores en el nodo; esta fase no se ejecuta con invitados"
+  [ ! -e /etc/pve/corosync.conf ] || die "el nodo esta en un cluster PVE (corosync.conf); no es un nodo independiente"
+}
 
 phase_check() {
+  local bad=0
   log "== check (solo lectura)"
   echo "hostname: $(hostname)  -> $NODE_NAME"
-  echo "VMs: $(nvms)"
-  ip link show "$UPLINK" >/dev/null 2>&1 && echo "uplink $UPLINK: OK" || echo "uplink $UPLINK: NO EXISTE"
+  echo "VMs: $(qm list 2>/dev/null | awk 'NR>1 && NF' | wc -l)  CTs: $(pct list 2>/dev/null | awk 'NR>1 && NF' | wc -l)"
+  ip link show "$UPLINK" >/dev/null 2>&1 && echo "uplink $UPLINK: OK" || { echo "uplink $UPLINK: NO EXISTE"; bad=1; }
   ip -6 addr show | grep -q "inet6 ${NODE_V6}/" && echo "NODE_V6 ya configurada" || echo "NODE_V6 aun no configurada"
   echo "ruta v4: $(ip -4 route show default)"
   echo "MTU v6 hacia la VIP FSN: $(ip -6 route get 2a01:4f8:fff2:95::2 2>/dev/null | grep -o 'mtu [0-9]*' || echo 'sin PMTU cacheado')"
@@ -106,9 +121,11 @@ phase_check() {
   for f in /usr/local/sbin/neuravps-tunnels.sh /usr/local/sbin/neuravps-tunnel-select.sh \
            /usr/local/sbin/neuravps-tunnel-probe.sh /usr/local/sbin/nvx-mss.sh /usr/local/sbin/nvx-aisla.sh \
            /usr/local/sbin/nvx-aisla-l3.sh; do
-    heredoc "$INSTALL_SH" "$f" >/dev/null && echo "extraible: $f" || echo "NO EXTRAIBLE: $f"
+    heredoc "$INSTALL_SH" "$f" >/dev/null && echo "extraible: $f" || { echo "NO EXTRAIBLE: $f"; bad=1; }
   done
+  [ -e /etc/network/interfaces.new ] && { echo "HAY /etc/network/interfaces.new pendiente: revisalo antes de net"; bad=1; }
   pveversion
+  return "$bad"
 }
 
 # ---------------------------------------------------------------------------
@@ -116,7 +133,7 @@ phase_hostname() {
   log "== hostname"
   local old; old="$(hostname)"
   [ "$old" = "$NODE_NAME" ] && { log "ya se llama $NODE_NAME"; return 0; }
-  [ "$(nvms)" -eq 0 ] || die "hay VMs: renombrar un nodo PVE con VMs mueve sus configs; no lo hago"
+  require_no_guests
   [ -d /etc/pve/nodes ] || die "/etc/pve sin montar"
   ls /etc/pve/nodes | grep -qx "$old" || die "no encuentro /etc/pve/nodes/$old"
   cp -a /etc/hosts "$STATE/hosts.bak-$TS"; cp -a /etc/hostname "$STATE/hostname.bak-$TS"
@@ -152,11 +169,23 @@ phase_hostname() {
 # NAT ni el DNAT de DNS del piloto.
 phase_net() {
   log "== net"
-  local eni=/etc/network/interfaces bak="$STATE/interfaces.pre-net-$TS" new="$STATE/interfaces.net-$TS"
-  cp -a "$eni" "$bak"
+  require_no_guests
+  # Una sola transaccion a la vez: si hay una vuelta atras pendiente, no se pisa su copia.
+  if [ -e "$STATE/net-pending" ] || systemctl is-active --quiet nv-adopt-net-rollback.timer; then
+    die "hay una transaccion de red pendiente ($(cat "$STATE/net-pending" 2>/dev/null)); ejecuta confirm o espera a la vuelta atras"
+  fi
+  [ ! -e /etc/network/interfaces.new ] || die "hay /etc/network/interfaces.new (cambios de red pendientes de PVE); revisalo antes"
+  local eni=/etc/network/interfaces snap="$STATE/net-snap-$TS" new="$STATE/interfaces.net-$TS"
+  mkdir -p "$snap/sysctl.d" || die "no pude crear $snap"
+  cp -a "$eni" "$snap/interfaces" || die "no pude respaldar el ENI"
+  local f
+  for f in 99-neuravps-ra.conf 99-neuravps-proxyarp.conf 99-neuravps-forwarding.conf 99-neuravps-uplink-ra.conf; do
+    [ -e "/etc/sysctl.d/$f" ] && { cp -a "/etc/sysctl.d/$f" "$snap/sysctl.d/" || die "no pude respaldar $f"; }
+  done
+  ls "$snap/sysctl.d" > "$snap/sysctl.list"
   local mac; mac="$(printf '%s' "$NODE_V6" | sha256sum)"
   mac="02:${mac:0:2}:${mac:2:2}:${mac:4:2}:${mac:6:2}:${mac:8:2}"
-  python3 - "$eni" "$new" "$UPLINK" "$NODE_V6" "$mac" <<'PY'
+  python3 - "$eni" "$new" "$UPLINK" "$NODE_V6" "$mac" <<'PY' || die "no pude generar el ENI nuevo"
 import re, sys
 src, dst, up, v6, mac = sys.argv[1:6]
 s = open(src).read()
@@ -199,46 +228,66 @@ iface vmbr0 inet static
 open(dst, "w").write(out)
 PY
   [ -s "$new" ] || die "no se genero el ENI nuevo"
-  diff -u "$bak" "$new" | tee "$STATE/interfaces.diff-$TS"
-  # Sysctl: fuera la SLAAC del piloto en el uplink; forwarding/proxy_arp como install.sh.
-  rm -f /etc/sysctl.d/99-neuravps-ra.conf /etc/sysctl.d/99-neuravps-proxyarp.conf
-  put_heredoc "$INSTALL_SH" /etc/sysctl.d/99-neuravps-forwarding.conf 644
-  printf 'net.ipv6.conf.%s.accept_ra = 2\nnet.ipv6.conf.%s.autoconf = 0\n' "$UPLINK" "$UPLINK" > /etc/sysctl.d/99-neuravps-uplink-ra.conf
-  # Vuelta atras automatica: si nadie confirma en 5 min, se restaura el ENI anterior.
+  ifquery -a -i "$new" >/dev/null 2>&1 || die "ifquery rechaza el ENI nuevo ($new)"
+  # Direcciones globales del uplink que no son NODE_V6: solo se quitan las SLAAC
+  # (dinamicas). Una estatica sin clasificar para la fase: puede ser del operador.
+  local extra_static
+  extra_static="$(ip -6 addr show dev "$UPLINK" scope global permanent | sed -n 's#.*inet6 \([0-9a-f:]*\)/.*#\1#p' | grep -vx "$NODE_V6" || true)"
+  [ -z "$extra_static" ] || die "el uplink tiene IPv6 estaticas que no son NODE_V6: $extra_static (clasificalas antes)"
+  diff -u "$snap/interfaces" "$new" | tee "$STATE/interfaces.diff-$TS"
+  # Vuelta atras: restaura el ENI y los sysctl tal cual estaban (incluidos los que
+  # se borran) y quita los que esta fase crea. Se ARMA y se COMPRUEBA antes de
+  # tocar nada.
   cat > "$STATE/net-rollback.sh" <<EOF
 #!/bin/bash
-cp -a "$bak" /etc/network/interfaces
-rm -f /etc/sysctl.d/99-neuravps-uplink-ra.conf
-sysctl -qw net.ipv6.conf.${UPLINK}.autoconf=1
+for f in 99-neuravps-ra.conf 99-neuravps-proxyarp.conf 99-neuravps-forwarding.conf 99-neuravps-uplink-ra.conf; do
+  if grep -qx "\$f" "$snap/sysctl.list"; then cp -a "$snap/sysctl.d/\$f" /etc/sysctl.d/; else rm -f "/etc/sysctl.d/\$f"; fi
+done
+cp -a "$snap/interfaces" /etc/network/interfaces
+sysctl -q --system
 ifreload -a
-logger -t nv-adopt "ENI restaurado desde $bak (sin confirmar)"
+rm -f "$STATE/net-pending"
+logger -t nv-adopt "red restaurada desde $snap (sin confirmar)"
 EOF
   chmod 755 "$STATE/net-rollback.sh"
-  systemctl stop nv-adopt-net-rollback.timer 2>/dev/null || true
-  systemd-run --unit nv-adopt-net-rollback --on-active=300 /bin/bash "$STATE/net-rollback.sh" >/dev/null
-  log "vuelta atras armada (5 min): $STATE/net-rollback.sh"
-  # Se quitan antes las reglas del piloto que el ENI viejo puso en post-up.
+  systemctl reset-failed nv-adopt-net-rollback.timer nv-adopt-net-rollback.service 2>/dev/null || true
+  systemd-run --unit nv-adopt-net-rollback --on-active=300 /bin/bash "$STATE/net-rollback.sh" >/dev/null \
+    || die "no pude armar la vuelta atras; no toco la red"
+  systemctl is-active --quiet nv-adopt-net-rollback.timer || die "el temporizador de vuelta atras no esta activo; no toco la red"
+  echo "$TS $snap" > "$STATE/net-pending"
+  log "vuelta atras armada (5 min): $STATE/net-rollback.sh (copia en $snap)"
+  # --- a partir de aqui, cambios ---
+  rm -f /etc/sysctl.d/99-neuravps-ra.conf /etc/sysctl.d/99-neuravps-proxyarp.conf
+  put_heredoc "$INSTALL_SH" /etc/sysctl.d/99-neuravps-forwarding.conf 644
+  printf 'net.ipv6.conf.%s.accept_ra = 2\nnet.ipv6.conf.%s.autoconf = 0\n' "$UPLINK" "$UPLINK" > /etc/sysctl.d/99-neuravps-uplink-ra.conf \
+    || die "no pude escribir 99-neuravps-uplink-ra.conf"
+  # Reglas EXACTAS del piloto que el ENI viejo puso en post-up (NAT de 10.64/16 por
+  # el uplink y DNAT de los DNS de Hetzner a 1.1.1.1). Nada mas.
   iptables -t nat -D POSTROUTING -s 10.64.0.0/16 -o "$UPLINK" -j MASQUERADE 2>/dev/null
-  while iptables -t nat -S PREROUTING | grep -q -- '--to-destination 1.1.1.1'; do
-    iptables -t nat -S PREROUTING | grep -- '--to-destination 1.1.1.1' | head -1 | sed 's/^-A/-D/' | xargs iptables -t nat || break
-  done
-  install -m 644 "$new" "$eni"
-  rm -f /etc/network/interfaces.new
+  local p d
+  for p in udp tcp; do for d in 185.12.64.1 185.12.64.2; do
+    while iptables -t nat -D PREROUTING -i vmbr0 -d "$d" -p "$p" -m "$p" --dport 53 -j DNAT --to-destination 1.1.1.1 2>/dev/null; do :; done
+  done; done
+  install -m 644 "$new" "$eni" || die "no pude instalar el ENI (la vuelta atras sigue armada)"
   sysctl -q -p /etc/sysctl.d/99-neuravps-forwarding.conf -p /etc/sysctl.d/99-neuravps-uplink-ra.conf
-  ifreload -a
-  # Las direcciones SLAAC no se van solas al poner autoconf=0: se quitan las del uplink
-  # que no sean NODE_V6 (las del /64 de Kademar por RA).
-  ip -6 addr show dev "$UPLINK" scope global | sed -n 's#.*inet6 \([0-9a-f:]*/[0-9]*\).*#\1#p' | while read -r a; do
+  ifreload -a || die "ifreload -a fallo (la vuelta atras restaurara la red en 5 min)"
+  # Las SLAAC no se van solas al poner autoconf=0: se quitan solo las dinamicas.
+  ip -6 addr show dev "$UPLINK" scope global dynamic | sed -n 's#.*inet6 \([0-9a-f:]*/[0-9]*\).*#\1#p' | while read -r a; do
     [ "${a%/*}" = "$NODE_V6" ] || { ip -6 addr del "$a" dev "$UPLINK" && log "quitada $a (SLAAC)"; }
   done
   sleep 3
+  ip -6 addr show dev "$UPLINK" scope global | grep -q "inet6 ${NODE_V6}/128" || die "NODE_V6 no quedo en $UPLINK (la vuelta atras restaurara la red)"
   ip -br addr show dev "$UPLINK"; ip -br addr show dev vmbr0
   ip -6 route show default
   log "ENI aplicado. Comprueba desde una sesion SSH NUEVA y ejecuta: $0 confirm"
 }
 
 phase_confirm() {
+  [ -e "$STATE/net-pending" ] || systemctl is-active --quiet nv-adopt-net-rollback.timer \
+    || die "no hay transaccion de red pendiente (¿ya vencio la vuelta atras?)"
   systemctl stop nv-adopt-net-rollback.timer nv-adopt-net-rollback.service 2>/dev/null || true
+  systemctl is-active --quiet nv-adopt-net-rollback.timer && die "no pude parar la vuelta atras"
+  rm -f "$STATE/net-pending"
   log "vuelta atras cancelada"
   # Red de respaldo del arranque (solo Kademar): si existe nv-netfallback, que su
   # ENI de un solo puerto lleve tambien la red nueva.
@@ -277,6 +326,8 @@ PY
 # ---------------------------------------------------------------------------
 phase_tunnels() {
   log "== tunnels"
+  require_no_guests
+  ip -6 addr show dev "$UPLINK" scope global | grep -q "inet6 ${NODE_V6}/" || die "NODE_V6 no esta en $UPLINK: ejecuta antes net/confirm"
   local f
   for f in /usr/local/sbin/neuravps-tunnels.sh /usr/local/sbin/neuravps-tunnel-select.sh \
            /usr/local/sbin/neuravps-tunnel-probe.sh /usr/local/sbin/nvx-mss.sh \
@@ -314,6 +365,11 @@ EOF
   /usr/local/sbin/neuravps-tunnels.sh || log "AVISO: neuravps-tunnels.sh rc!=0 (normal si las bases aun no tienen el nodo en Firestore)"
   systemctl restart nvx-mss.service nvx-aisla.service nvx-aisla-l3.service
   systemctl start neuravps-tunnels.service neuravps-tunnel-probe.timer
+  for f in tun-fsn tun-hel; do
+    ip -6 tunnel show "$f" 2>/dev/null | grep -q "local ${NODE_V6} " || die "$f no tiene local $NODE_V6"
+    [ "$(cat /sys/class/net/$f/mtu 2>/dev/null)" = "$TUN_MTU" ] || die "$f no tiene MTU $TUN_MTU"
+  done
+  for f in nvx-mss nvx-aisla nvx-aisla-l3; do systemctl is-active --quiet "$f" || die "$f no esta activo"; done
   ip -br link show type ip6gre | grep tun-
   ip -6 rule; ip rule
   nft list table inet nvxmss | grep maxseg
@@ -322,6 +378,11 @@ EOF
 # ---------------------------------------------------------------------------
 phase_node() {
   log "== node"
+  require_no_guests
+  # El cortafuegos se valida ANTES de tocar nada: sin uno valido no se sigue.
+  [ -n "${CLUSTER_FW:-}" ] && [ -s "$CLUSTER_FW" ] || die "falta CLUSTER_FW (el cluster.fw de la flota); sin el no se retira el cortafuegos actual"
+  grep -q '^\[IPSET base\]' "$CLUSTER_FW" && grep -q '^\[IPSET hosts-ipv6\]' "$CLUSTER_FW" && grep -q '^policy_in: DROP' "$CLUSTER_FW" \
+    || die "CLUSTER_FW no parece el cluster.fw de la flota (IPSET base / hosts-ipv6 / policy_in DROP)"
   # Perfil de memoria SQX (el «ad» de first_boot.sh) salvo KSM: con 26-28 VPS E
   # la RAM sobra (1.092-1.176 GB de 1.511) y el limite es la CPU; ksmd la gasta.
   printf 'vm.swappiness=100\nvm.page-cluster=0\n' > /etc/sysctl.d/99-neuravps-memprofile.conf
@@ -378,29 +439,48 @@ phase_node() {
   if [ -e /etc/systemd/system/neuravps-balloon-reconciler.timer ]; then
     log "extras SQX ya instalados"
   else
-    SNIPPETS_SRC="$REPO/snippets" bash "$REPO/run_remotes/install-sqx-node-extras.sh" 2>&1 | tee -a "$STATE/adopt.log"
+    SNIPPETS_SRC="$REPO/snippets" bash "$REPO/run_remotes/install-sqx-node-extras.sh" > "$STATE/sqx-extras-$TS.log" 2>&1
+    local rc=$?; cat "$STATE/sqx-extras-$TS.log" >> "$STATE/adopt.log"
+    [ "$rc" -eq 0 ] || die "install-sqx-node-extras.sh fallo (rc $rc), ver $STATE/sqx-extras-$TS.log"
   fi
-  # Fuera el piloto: cortafuegos propio, sonda y su ruido.
-  systemctl disable --now nvpilot-fw.service nvprobe.service >/dev/null 2>&1 || true
-  nft delete table inet nvpilot 2>/dev/null || true
-  # Cortafuegos de PVE: cluster.fw de la flota (lo entrega la base / el Storage Box)
-  # y host.fw de este nodo con SSH por IPv4 desde las bases (respaldo si falla su IPv6).
-  if [ -n "${CLUSTER_FW:-}" ] && [ -s "$CLUSTER_FW" ]; then
-    grep -q '^\[IPSET base\]' "$CLUSTER_FW" && grep -q '^\[IPSET hosts-ipv6\]' "$CLUSTER_FW" || die "CLUSTER_FW no parece el cluster.fw de la flota"
-    cp "$CLUSTER_FW" /etc/pve/firewall/cluster.fw
-    log "cluster.fw instalado ($(grep -c '' /etc/pve/firewall/cluster.fw) lineas)"
-  else
-    log "AVISO: sin CLUSTER_FW: cortafuegos de PVE sin tocar"
-  fi
+  for f in neuravps-balloon-reconciler.timer neuravps-vm-status-watch.timer neuravps-zswap.service; do
+    systemctl is-active --quiet "$f" || die "$f no esta activo"
+  done
+  [ -s /etc/default/neuravps-boot-stagger ] || die "falta /etc/default/neuravps-boot-stagger (arranque escalonado)"
+  # Relevo del cortafuegos: se instala el de PVE, se valida y SOLO entonces se
+  # retira el del piloto. Copias de lo que se pisa.
+  local hostfw="/etc/pve/nodes/$(hostname)/host.fw"
+  [ -e /etc/pve/firewall/cluster.fw ] && cp -a /etc/pve/firewall/cluster.fw "$STATE/cluster.fw.bak-$TS"
+  [ -e "$hostfw" ] && cp -a "$hostfw" "$STATE/host.fw.bak-$TS"
+  cp "$CLUSTER_FW" /etc/pve/firewall/cluster.fw || die "no pude escribir cluster.fw"
   if [ -n "${HOST_FW_V4:-}" ]; then
     {
       echo "[OPTIONS]"; echo; echo "enable: 1"; echo
       echo "[RULES]"; echo
       for ip in $HOST_FW_V4; do echo "IN SSH(ACCEPT) -source $ip -log nolog # base (IPv4, respaldo)"; done
-    } > /etc/pve/nodes/"$(hostname)"/host.fw
+    } > "$hostfw" || die "no pude escribir host.fw"
     log "host.fw: SSH por IPv4 desde $HOST_FW_V4"
   fi
-  [ -s /etc/pve/firewall/cluster.fw ] && pve-firewall restart
+  local diag; diag="$(pve-firewall compile 2>&1 >/dev/null | grep -i -E 'unable|error|parse' || true)"
+  if [ -n "$diag" ]; then
+    # El cluster.fw canonico de la flota arrastra hoy un error conocido (25/11,
+    # linea 258, tarea aparte). Solo se acepta con ALLOW_FW_DIAG=<texto exacto>.
+    if [ -n "${ALLOW_FW_DIAG:-}" ] && [ "$diag" = "$(printf '%b' "$ALLOW_FW_DIAG")" ]; then
+      log "AVISO: pve-firewall con diagnostico conocido y aceptado: $diag"
+    else
+      log "pve-firewall compile: $diag"
+      die "el cortafuegos de PVE no compila limpio; el del piloto sigue puesto (ALLOW_FW_DIAG para aceptar un diagnostico conocido)"
+    fi
+  fi
+  pve-firewall restart || die "pve-firewall restart fallo; el del piloto sigue puesto"
+  sleep 3
+  pve-firewall status | grep -q 'enabled/running' || die "pve-firewall no esta enabled/running; el del piloto sigue puesto"
+  iptables -S INPUT | grep -q -- '-j PVEFW-INPUT' || die "sin PVEFW-INPUT en INPUT; el del piloto sigue puesto"
+  iptables -S PVEFW-HOST-IN | grep -v PVESIG | tail -1 | grep -q -E -- '-j (DROP|PVEFW-Drop)' || die "PVEFW-HOST-IN no acaba en DROP; el del piloto sigue puesto"
+  ip6tables -S PVEFW-HOST-IN | grep -v PVESIG | tail -1 | grep -q -E -- '-j (DROP|PVEFW-Drop)' || die "PVEFW-HOST-IN (v6) no acaba en DROP; el del piloto sigue puesto"
+  # Ahora si: fuera el piloto (cortafuegos propio y sonda).
+  systemctl disable --now nvpilot-fw.service nvprobe.service >/dev/null 2>&1 || true
+  nft delete table inet nvpilot 2>/dev/null || true
   log "node: hecho"
 }
 

@@ -854,10 +854,12 @@ CANON_FSN="$(transit 0 0)"
 CANON_HEL="$(transit 0 2)"
 
 mk() { # iface remoto direccion_local/127
-  local show cur
+  local show cur curl
   show="$(ip -6 tunnel show "$1" 2>/dev/null)"
   cur="$(printf '%s' "$show" | sed -n 's/.*remote \([0-9a-f:]*\) .*/\1/p')"
-  if [ "$cur" != "$2" ] || ! printf '%s' "$show" | grep -q 'encaplimit none'; then
+  curl="$(printf '%s' "$show" | sed -n 's/.*local \([0-9a-f:]*\) .*/\1/p')"
+  # El extremo local tambien cuenta: si cambia NODE_V6, el tunel se recrea.
+  if [ "$cur" != "$2" ] || [ "$curl" != "$NODE_V6" ] || ! printf '%s' "$show" | grep -q 'encaplimit none'; then
     ip link del "$1" 2>/dev/null
     # `encaplimit none` es OBLIGATORIO: por defecto ip6gre mete una cabecera
     # DSTOPT, el nexthdr pasa a 60 en vez de 47 y las reglas de firewall que
