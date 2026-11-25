@@ -194,6 +194,32 @@ def plan_fits_model(model, plan):
     return False
 
 
+def node_vm_cap(data):
+    """Hard VM-count cap of an SQX node (proxmox_nodes.max_vm), or None.
+
+    Mirror of NeuraVPS auto_provision.sqx_vm_cap (Kademar 0000266, 2026-11-25:
+    26 vps-e, raised by editing max_vm in admin/nodos). Only SQX nodes: on MT5
+    max_vm is a legacy secondary cap that placement already handles by cores,
+    and VPS-E nodes (max_vm == 1) take no part in the defrag. On 2026-11-25 no
+    SQX node carried max_vm, so nothing changes for the existing fleet.
+    Absent / 0 / garbage -> None (no cap, as before)."""
+    if node_model(data) != "SQX":
+        return None
+    try:
+        cap = int((data or {}).get("max_vm"))
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
+def dest_vm_slot_ok(dn):
+    """A destination with a VM cap takes one more VM only while its booked VM
+    count (every non-failed server doc, plus moves planned this run) is below
+    the cap. Nodes without a cap are unaffected."""
+    cap = dn.get("vm_cap")
+    return cap is None or int(dn.get("n_cap") or 0) < cap
+
+
 def dest_allows(dn, vm):
     """A destination with an allow-list only takes the listed plans, and no
     node takes a plan of the other type. A VM with no known plan is refused."""
@@ -761,6 +787,8 @@ def main():
         nodes[nd.id] = {
             "model": model, "ip": d.get("ip") or "", "frozen": bool(d.get("frozen")),
             "allowed": node_allowed(d),
+            # Hard VM cap (SQX max_vm) and the count it is checked against.
+            "vm_cap": node_vm_cap(d), "n_cap": 0,
             "status": str(d.get("status") or "").strip(),
             "g": base_ram(d),
             # PHYSICAL RAM, for the MT RAM gate (v14). `g` is the declared
@@ -802,6 +830,11 @@ def main():
         n["fl"] += fl
         n["cores"] += cores
         n["n_all"] += 1
+        # Same count as the placement's exact check: a failed provisioning
+        # never created its VM; anything else (provisioning, paused, stopped,
+        # skip-listed) occupies a slot.
+        if d.get("provisioningStatus") != "failed":
+            n["n_cap"] += 1
         # 2026-07-13: stopped VMs are migratable too (offline path now wraps
         # the temporary power-on with the vm_no_internet firewall group), so
         # nodes holding stopped trading VMs CAN reach 0%. Paused VMs are the
@@ -906,6 +939,8 @@ def main():
             if dn["model"] != src["model"]:
                 continue   # never SQX<->MT, whatever the caller asked for
             if not dest_allows(dn, vm):
+                continue
+            if not dest_vm_slot_ok(dn):
                 continue
             if not cpu_move_ok(vm_cpu, src.get("sig"), dn.get("sig")):
                 continue
@@ -1051,6 +1086,8 @@ def main():
         dn["ram"] += vm["ram"]
         dn["fl"] += vm["fl"]
         dn["cores"] += vm["cores"]
+        sn["n_cap"] -= 1
+        dn["n_cap"] += 1
         sn["vms"] = [v for v in sn["vms"] if v["vmid"] != vm["vmid"]]
         booked.add(vm["vmid"])
         moves.append((vm["vmid"], src, dst, reason))
@@ -1373,7 +1410,7 @@ def main():
         if len(n["vms"]) != n["n_all"]:
             continue
         planned = []
-        snapshot = {k: (v["ram"], v["fl"], v["cores"], len(v["vms"])) for k, v in nodes.items()}
+        snapshot = {k: (v["ram"], v["fl"], v["cores"], v["n_cap"]) for k, v in nodes.items()}
         ok = True
         for vm in sorted(n["vms"], key=lambda v: -v["ram"]):
             dst = pick_dest(n["model"], vm["ram"], vm["fl"], vm["cores"],
@@ -1385,8 +1422,9 @@ def main():
             planned.append(vm)
         if not ok or len(moves) > max_moves:
             # rollback this node's bookings (couldn't fully empty)
-            for k, (r, f, c, _) in snapshot.items():
+            for k, (r, f, c, nc) in snapshot.items():
                 nodes[k]["ram"], nodes[k]["fl"], nodes[k]["cores"] = r, f, c
+                nodes[k]["n_cap"] = nc
             moves[:] = [m for m in moves if m[1] != nid or "consolid" not in m[3]]
             continue
 
