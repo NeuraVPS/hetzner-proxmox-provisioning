@@ -31,7 +31,14 @@ while i < len(args) and args[i].startswith("-"):
     else: i += 1
 host = args[i]; cmd = " ".join(args[i + 1:])
 root = os.environ["FAKE_ROOT"]
-with open(os.path.join(root, "ssh.log"), "a") as f: f.write(host + " :: " + cmd + "\n")
+with open(os.path.join(root, "ssh.log"), "a") as f:
+    f.write("%s> %s :: %s\n" % (os.environ.get("FAKE_SIDE", "src"), host, cmd.replace("\n", "\\n")))
+if os.environ.get("FAKE_REMOTE"):
+    # a command that arrived over SSH is now opening ANOTHER ssh: in pull mode that would be the
+    # origin (no fleet key) connecting out; in push mode, the destination. Never allowed.
+    with open(os.path.join(root, "nested.log"), "a") as f:
+        f.write("%s -> %s :: %s\n" % (os.environ.get("FAKE_SIDE"), host, cmd))
+    sys.stderr.write("Permission denied (publickey).\n"); sys.exit(255)
 fail = os.environ.get("FAKE_SSH_FAIL_MATCH")
 dead = os.path.join(root, "ssh-dead")          # FAKE_SSH_DIE_AFTER: the link dies after that command
 if os.path.exists(dead):
@@ -40,15 +47,20 @@ if os.environ.get("FAKE_SSH_DIE_AFTER") and os.environ["FAKE_SSH_DIE_AFTER"] in 
     open(dead, "w").close()
 if fail and fail in cmd:
     sys.stderr.write("Connection closed by remote host\n"); sys.exit(255)
+def side_env(side):
+    d = os.path.join(root, side)
+    e = dict(os.environ, FAKE_SIDE=side, PVE_ETC=os.path.join(d, "etc/pve"), CPUINFO=os.path.join(d, "cpuinfo"),
+             NV_RAM_GUARD=os.path.join(d, "ram-guard.py"), NV_RECONCILER=os.path.join(d, "reconciler.sh"),
+             QEMU_PIDDIR=os.path.join(d, "run"), PROC_DIR=os.path.join(d, "proc"))
+    if os.environ.get("FAKE_JUMP_CHAIN") != "1":
+        e["FAKE_REMOTE"] = "1"
+    return e
 if host == os.environ.get("FAKE_JUMP", "-"):
-    env = dict(os.environ)
+    env = dict(os.environ, FAKE_JUMP_CHAIN="1")      # a BASE: it may ssh on to the nodes (deploy)
 elif host == "root@" + os.environ.get("FAKE_SRC_IP", "-"):
-    env = dict(os.environ, FAKE_SIDE="src")
+    env = side_env("src")
 elif host == "root@" + os.environ["FAKE_DST_IP"]:
-    env = dict(os.environ, FAKE_SIDE="dst", PVE_ETC=os.path.join(root, "dst/etc/pve"),
-               CPUINFO=os.path.join(root, "dst/cpuinfo"),
-               NV_RAM_GUARD=os.path.join(root, "dst/ram-guard.py"),
-               NV_RECONCILER=os.path.join(root, "dst/reconciler.sh"))
+    env = side_env("dst")
 else:
     sys.stderr.write("ssh: connect to host %s: No route\n" % host); sys.exit(255)
 lose = os.environ.get("FAKE_SSH_LOSE_MATCH")
@@ -207,9 +219,36 @@ def out(r):
     return r.stdout + r.stderr
 
 
+CURRENT_MODE = "push"     # set per test class (see ModeCase); every scenario runs in both modes
+
+
+class ModeCase(unittest.TestCase):
+    MODE = "push"
+
+    def setUp(self):
+        global CURRENT_MODE
+        CURRENT_MODE = self.MODE
+
+
+def push_only(fn):
+    """The test injects faults on the SSH link to the DESTINATION; in pull mode the destination is
+    local (no link). Pull has its own transport-fault tests on the ORIGIN side (PullMode)."""
+    def wrapper(self, *a, **kw):
+        if self.MODE == "pull":
+            self.skipTest("fault on the ssh link to the destination: push only")
+        return fn(self, *a, **kw)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 class Kit:
+    """push: the kit runs on the source (FAKE_SIDE=src) and talks to dst over ssh.
+    pull: the kit runs on the destination (FAKE_SIDE=dst) and talks to src over ssh."""
+
     def __init__(self, tmp, cpu="x86-64-v4", src_cpu=GENOA, dst_cpu=TURIN,
-                 src_reconciler=True, dst_reconciler=True, conf=None, run_cpu=None):
+                 src_reconciler=True, dst_reconciler=True, conf=None, run_cpu=None, mode=None,
+                 src_host="0000999-AX162-TEST", dst_host="0000266-KDM-9755"):
+        self.mode = mode or CURRENT_MODE
         self.t = Path(tmp)
         b = self.t / "bin"; b.mkdir()
         for name, body in (("ssh", FAKE_SSH), ("hostname", FAKE_HOSTNAME), ("qm", FAKE_QM),
@@ -237,32 +276,63 @@ class Kit:
         # what QEMU runs with on the source (PVE runs x86-64-v* as qemu64,+flags)
         if run_cpu is None:
             run_cpu = "qemu64,+avx512f" if cpu.startswith("x86-64-v") else cpu + ",+kvm_pv_eoi"
-        (self.t / "run").mkdir(); (self.t / "run" / f"{VMID}.pid").write_text("31337\n")
-        (self.t / "proc/31337").mkdir(parents=True)
-        (self.t / "proc/31337/cmdline").write_bytes(
+        self.pidfile = self.t / "src/run" / f"{VMID}.pid"
+        self.pidfile.parent.mkdir(); self.pidfile.write_text("31337\n")
+        (self.t / "src/proc/31337").mkdir(parents=True)
+        (self.t / "src/proc/31337/cmdline").write_bytes(
             b"\0".join([b"/usr/bin/kvm", b"-id", VMID.encode(), b"-cpu", run_cpu.encode(), b"-m", b"61440"]) + b"\0")
         self.work = self.t / "work"
+        self.src_host, self.dst_host = src_host, dst_host
+        here = "src" if self.mode == "push" else "dst"            # where the kit runs
+        key = self.t / here / "neuravps_id"; key.write_text("fleet key\n")
+        d = self.t / here
         self.env = dict(os.environ)
         self.env.update({
             "PATH": f"{b}:{os.environ['PATH']}", "FAKE_ROOT": str(self.t),
-            "FAKE_DST_IP": "2001:db8:2::2", "FAKE_HOST_SRC": "0000999-AX162-TEST",
-            "FAKE_HOST_DST": "0000266-KDM-9755",
-            "VMID": VMID, "DST": "2001:db8:2::2", "DST_NODE": "0000266-KDM-9755",
-            "WORK": str(self.work), "PVE_ETC": str(self.t / "src/etc/pve"),
-            "CPUINFO": str(self.t / "src/cpuinfo"),
-            "NV_RAM_GUARD": str(self.t / "src/ram-guard.py"),
-            "NV_RECONCILER": str(self.t / "src/reconciler.sh"),
-            "QEMU_PIDDIR": str(self.t / "run"), "PROC_DIR": str(self.t / "proc"),
+            "FAKE_SRC_IP": "2001:db8:1::2", "FAKE_DST_IP": "2001:db8:2::2",
+            "FAKE_HOST_SRC": src_host, "FAKE_HOST_DST": dst_host, "FAKE_SIDE": here,
+            "VMID": VMID, "WORK": str(self.work), "RTMIG_MODE": self.mode,
+            "PVE_ETC": str(d / "etc/pve"), "CPUINFO": str(d / "cpuinfo"),
+            "NV_RAM_GUARD": str(d / "ram-guard.py"), "NV_RECONCILER": str(d / "reconciler.sh"),
+            "QEMU_PIDDIR": str(d / "run"), "PROC_DIR": str(d / "proc"), "NV_FLEET_KEY": str(key),
         })
-        for k in ("CHANGE_CPU", "ACK_HWID_CHANGE", "CPU_NOTICE", "RATE", "DISKS", "ZSTD", "FAKE_SIDE",
+        if self.mode == "push":
+            self.env.update({"DST": "2001:db8:2::2", "DST_NODE": dst_host})
+        else:
+            self.env.update({"SRC": "2001:db8:1::2", "SRC_NODE": src_host})
+        for k in ("CHANGE_CPU", "ACK_HWID_CHANGE", "CPU_NOTICE", "RATE", "DISKS", "ZSTD",
+                  "FAKE_REMOTE", "FAKE_JUMP_CHAIN", "FAKE_JUMP",
+                  "DST" if self.mode == "pull" else "SRC", "DST_NODE" if self.mode == "pull" else "SRC_NODE",
                   "ACK_DISCARD_DEST_WRITES", "FAKE_SSH_FAIL_MATCH", "FAKE_SSH_TRUNCATE_MATCH",
                   "FAKE_SSH_LOSE_MATCH", "FAKE_SSH_DIE_AFTER", "FAKE_ZFS_FAIL_MATCH", "FAKE_ZFS_FAIL_SIDE"):
             self.env.pop(k, None)
 
     def run(self, script, *args, **env):
         e = dict(self.env); e.update(env)
-        return subprocess.run(["bash", str(KIT / script), *args], capture_output=True, text=True,
-                              timeout=60, env=e)
+        r = subprocess.run(["bash", str(KIT / script), *args], capture_output=True, text=True,
+                           timeout=60, env=e)
+        nested = self.read("nested.log")
+        assert not nested, "a node reached over SSH opened another ssh:\n" + nested
+        return r
+
+    # the variables that name the OTHER node, in this mode
+    def peer_env(self, ip=None, node=None):
+        e = {}
+        if self.mode == "push":
+            if ip: e.update(DST=ip, FAKE_DST_IP=ip)
+            if node: e["DST_NODE"] = node
+        else:
+            if ip: e.update(SRC=ip, FAKE_SRC_IP=ip)
+            if node: e["SRC_NODE"] = node
+        return e
+
+    @property
+    def peer_host(self):
+        return self.dst_host if self.mode == "push" else self.src_host
+
+    @property
+    def peer_ip_var(self):
+        return "DST" if self.mode == "push" else "SRC"
 
     def ok(self, script, *args, **env):
         r = self.run(script, *args, **env)
@@ -296,7 +366,7 @@ class Kit:
         self.ok("rtmig_cutover.sh", "start")
 
 
-class HappyPath(unittest.TestCase):
+class HappyPath(ModeCase):
     def test_full_cold_move_v4_genoa_to_turin(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
@@ -356,7 +426,7 @@ class HappyPath(unittest.TestCase):
             self.assertNotIn("import-state", k.read("ramguard.log"))
 
 
-class ResumableSend(unittest.TestCase):
+class ResumableSend(ModeCase):
     def test_base_cut_half_way_resumes_with_the_same_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
@@ -406,7 +476,7 @@ class ResumableSend(unittest.TestCase):
             self.assertIn("~60s a RATE=30m", r.stdout)
 
 
-class Inventory(unittest.TestCase):
+class Inventory(ModeCase):
     def test_disks_must_match_the_whole_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
@@ -436,7 +506,7 @@ class Inventory(unittest.TestCase):
             self.assertIn("discos: 0 1 2 3", r.stdout); self.assertEqual(r.stdout.count("VERIFY OK"), 4)
 
 
-class Phases(unittest.TestCase):
+class Phases(ModeCase):
     def test_start_needs_a_complete_push(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
@@ -462,13 +532,14 @@ class Phases(unittest.TestCase):
     def test_state_bound_to_destination_and_uuid(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
-            r = k.run("rtmig_cutover.sh", "push", FINAL, DST="2001:db8:2::3", FAKE_DST_IP="2001:db8:2::3")
-            self.assertEqual(r.returncode, 1); self.assertIn("no hacia", out(r))
+            r = k.run("rtmig_cutover.sh", "push", FINAL, **k.peer_env(ip="2001:db8:9::3"))
+            self.assertEqual(r.returncode, 1); self.assertIn("con el otro nodo en", out(r))
             p = k.work / f"{VMID}.conf.src"
             p.write_text(p.read_text().replace("uuid=1111", "uuid=9999"))
             r = k.run("rtmig_cutover.sh", "push", FINAL)
             self.assertEqual(r.returncode, 1); self.assertIn("no es la de este traslado", out(r))
 
+    @push_only
     def test_fw_write_failure_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
@@ -478,6 +549,7 @@ class Phases(unittest.TestCase):
             k.ok("rtmig_cutover.sh", "push", FINAL)                     # retried from «publishing»
             self.assertEqual(k.state()["PHASE"], "pushed")
 
+    @push_only
     def test_truncated_publish_is_detected_and_withdrawn(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
@@ -500,20 +572,22 @@ class Phases(unittest.TestCase):
                 holder.kill(); holder.wait()
 
 
-class Safety(unittest.TestCase):
+class Safety(ModeCase):
     def test_wrong_destination_name_stops_before_anything(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
-            r = k.run("rtmig_send.sh", "base", "rtmig-x", DST_NODE="0000234-AX162-2-LTD")
-            self.assertEqual(r.returncode, 1); self.assertIn("dice llamarse '0000266-KDM-9755'", out(r))
+            r = k.run("rtmig_send.sh", "base", "rtmig-x", **k.peer_env(node="0000234-AX162-2-LTD"))
+            self.assertEqual(r.returncode, 1); self.assertIn(f"dice llamarse '{k.peer_host}'", out(r))
             self.assertNotIn(" snapshot ", k.read("zfs.log"))
 
     def test_parameters_are_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
-            for env, needle in (({"DST": "nodo-kademar"}, "IP literal"), ({"WORK": "/root/a b"}, "WORK no válido"),
+            node_var = "DST_NODE" if k.mode == "push" else "SRC_NODE"
+            for env, needle in (({k.peer_ip_var: "nodo-kademar"}, "IP literal"), ({"WORK": "/root/a b"}, "WORK no válido"),
                                 ({"WORK": "/root/../etc"}, "WORK no válido"), ({"POOLDS": "rpool/data;rm"}, "POOLDS no válido"),
-                                ({"VMID": "42x"}, "VMID no válida"), ({"DST_NODE": "a b"}, "DST_NODE no válido")):
+                                ({"VMID": "42x"}, "VMID no válida"), ({node_var: "a b"}, f"{node_var} no válido"),
+                                ({"RTMIG_MODE": "both"}, "solo admite push o pull")):
                 r = k.run("rtmig_send.sh", "base", "rtmig-x", **env)
                 self.assertEqual(r.returncode, 2, env); self.assertIn(needle, out(r))
             r = k.run("rtmig_send.sh", "base", "rtmig-x';rm -rf /;'")
@@ -547,7 +621,7 @@ class Safety(unittest.TestCase):
             self.assertTrue(k.src_conf.exists())
 
 
-class Rollback(unittest.TestCase):
+class Rollback(ModeCase):
     def test_rollback_after_push_without_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
@@ -603,6 +677,7 @@ class Rollback(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("qm status no responde", out(r))
             self.assertFalse(k.src_conf.exists())
 
+    @push_only
     def test_written_query_failing_is_indeterminate(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
@@ -610,6 +685,7 @@ class Rollback(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("INDETERMINADO", out(r))
             self.assertFalse(k.src_conf.exists())
 
+    @push_only
     def test_ssh_failing_while_parking_dest_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
@@ -626,14 +702,14 @@ class Rollback(unittest.TestCase):
             self.assertEqual(k.state()["PHASE"], "parked")
 
 
-class SecondReview(unittest.TestCase):
+class SecondReview(ModeCase):
     """2nd review of PR #291."""
 
     def test_zfs_error_on_dest_is_indeterminate_not_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
             r = k.run("rtmig_cutover.sh", "rollback", FAKE_ZFS_FAIL_MATCH="written@")
-            self.assertEqual(r.returncode, 1); self.assertIn("zfs falló en el destino", out(r))
+            self.assertEqual(r.returncode, 1); self.assertIn("zfs falló en destino", out(r))
             self.assertFalse(k.src_conf.exists()); self.assertTrue(k.dst_conf.exists())
 
     def test_disk_vanished_on_dest_after_push_is_indeterminate(self):
@@ -779,11 +855,11 @@ class SecondReview(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
             for bad in ("2001:db8:2:0::2", "fe80::1%eth0", "2001:DB8:2::2", " 2001:db8:2::2"):
-                r = k.run("rtmig_send.sh", "base", "rtmig-a", DST=bad)
+                r = k.run("rtmig_send.sh", "base", "rtmig-a", **{k.peer_ip_var: bad})
                 self.assertEqual(r.returncode, 2, bad); self.assertIn("canónica", out(r))
 
 
-class ThirdReview(unittest.TestCase):
+class ThirdReview(ModeCase):
     """3rd review of PR #291."""
 
     def test_rollback_starts_only_with_conf_and_fw_verified(self):
@@ -828,10 +904,11 @@ class ThirdReview(unittest.TestCase):
 
     def test_unreadable_running_cpu_refuses_shutdown(self):
         with tempfile.TemporaryDirectory() as tmp:
-            k = Kit(tmp); (k.t / "run" / f"{VMID}.pid").unlink()
+            k = Kit(tmp); k.pidfile.unlink()
             r = k.run("rtmig_cutover.sh", "shutdown", "60")
             self.assertEqual(r.returncode, 1); self.assertIn("no pude leer con qué CPU corre", out(r))
 
+    @push_only
     def test_lost_answer_after_rename_still_finishes_the_push(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, cpu="host", dst_cpu=TURIN)
@@ -843,6 +920,7 @@ class ThirdReview(unittest.TestCase):
             self.assertEqual(sum("import-state" in l for l in k.read("ramguard.log").splitlines()), 1)
             self.assertEqual(k.read("work/cpu-change.txt").count("ACK_HWID_CHANGE"), 1)
 
+    @push_only
     def test_resumed_push_runs_the_same_finish_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, cpu="host", dst_cpu=TURIN)
@@ -895,7 +973,7 @@ class ThirdReview(unittest.TestCase):
             k.ok("rtmig_cutover.sh", "shutdown", "60"); k.ok("rtmig_cutover.sh", "park")
 
 
-class CpuGuard(unittest.TestCase):
+class CpuGuard(ModeCase):
     def push(self, cpu, src_cpu=GENOA, dst_cpu=TURIN, **env):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         k = Kit(tmp.name, cpu=cpu, src_cpu=src_cpu, dst_cpu=dst_cpu)
@@ -962,10 +1040,142 @@ class CpuGuard(unittest.TestCase):
         self.assertIn("cpu: x86-64-v3", k.read(f"dst/etc/pve/qemu-server/{VMID}.conf"))
 
 
+class PullMode(unittest.TestCase):
+    """Iván «B+» (25/11/2026): a node of another provider (0000266-KDM-9755) has NO fleet key. Fleet
+    nodes may ssh into it, it may not ssh into any of ours. When it is the ORIGIN the kit runs on the
+    Hetzner destination (RTMIG_MODE=pull) and opens every connection itself."""
+
+    def kademar_origin(self, tmp, **kw):
+        return Kit(tmp, mode="pull", src_host="0000266-KDM-9755", dst_host="0000238-AX162-2-LTD",
+                   src_cpu=TURIN, dst_cpu=GENOA, **kw)
+
+    def test_full_pull_move_from_kademar_never_connects_out_of_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            self.assertFalse((k.t / "src/neuravps_id").exists())          # the origin has no fleet key
+            k.to_started()
+            k.ok("rtmig_cutover.sh", "close")
+            self.assertEqual(k.state()["MODE"], "pull")
+            self.assertEqual((k.state()["SRC_NODE"], k.state()["DST_NODE"]), ("0000266-KDM-9755", "0000238-AX162-2-LTD"))
+            self.assertTrue(k.dst_conf.exists()); self.assertFalse(k.src_conf.exists())
+            self.assertEqual(k.read(f"dst/state-{VMID}").strip(), "running")
+            ssh_lines = k.read("ssh.log").splitlines()
+            self.assertTrue(ssh_lines)
+            # every ssh was opened by the destination, towards the origin, and nothing nested
+            self.assertTrue(all(l.startswith("dst> root@2001:db8:1::2 :: ") for l in ssh_lines), ssh_lines[:3])
+            self.assertEqual(k.read("nested.log"), "")
+            # the work dir (state, parked copy, history) lives on the destination that runs the kit
+            self.assertTrue(list(k.work.glob(f"{VMID}.conf.src.done-*")))
+            # zfs streams: send on the origin, receive on the destination
+            z = k.read("zfs.log").splitlines()
+            self.assertTrue(any(l.startswith("src send ") for l in z)); self.assertTrue(any(l.startswith("dst recv ") for l in z))
+            self.assertFalse(any(l.startswith("dst send ") or l.startswith("src recv ") for l in z))
+
+    def test_pull_rollback_restores_on_kademar_from_the_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            k.ok("rtmig_cutover.sh", "rollback")
+            self.assertTrue(k.src_conf.exists()); self.assertFalse(k.dst_conf.exists())
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertTrue(all(l.startswith("dst> root@2001:db8:1::2 :: ") for l in k.read("ssh.log").splitlines()))
+
+    def test_balloon_history_is_exported_on_the_origin_by_the_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            log = k.read("ramguard.log").splitlines()
+            self.assertEqual(log[0].split()[:4], ["src", "export-state", VMID, "0000266-KDM-9755"])
+            self.assertEqual(log[1].split()[:4], ["dst", "import-state", VMID, "0000238-AX162-2-LTD"])
+
+    def test_push_from_a_node_without_the_fleet_key_points_to_pull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, mode="push", src_host="0000266-KDM-9755", dst_host="0000238-AX162-2-LTD")
+            r = k.run("rtmig_send.sh", "base", "rtmig-a", NV_FLEET_KEY=str(k.t / "src/no-key"))
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("RTMIG_MODE=pull SRC=<IP de este nodo> SRC_NODE=0000266-KDM-9755", out(r))
+            self.assertEqual(k.read("ssh.log"), "")                       # did not even try
+
+    def test_pull_runs_on_the_destination_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            r = k.run("rtmig_send.sh", "base", "rtmig-a", DST_NODE="0000999-OTRO")
+            self.assertEqual(r.returncode, 2); self.assertIn("el kit corre en el DESTINO", out(r))
+            r = k.run("rtmig_send.sh", "base", "rtmig-a", NV_FLEET_KEY=str(k.t / "dst/no-key"))
+            self.assertEqual(r.returncode, 1); self.assertIn("tiene que correr en un nodo de Hetzner", out(r))
+
+    def test_state_of_one_mode_is_not_usable_from_the_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp); k.to_final()
+            st = k.read(f"work/{VMID}.state").replace("MODE=pull", "MODE=push")
+            (k.work / f"{VMID}.state").write_text(st)
+            r = k.run("rtmig_cutover.sh", "push", FINAL)
+            self.assertEqual(r.returncode, 1); self.assertIn("en modo push, no pull", out(r))
+
+    def test_ssh_to_kademar_dropping_during_the_restore_is_resumable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            r = k.run("rtmig_cutover.sh", "rollback", FAKE_SSH_FAIL_MATCH="qemu-server/4242.conf.rtmig-tmp")
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(k.state()["PHASE"], "rollingback")
+            self.assertNotIn("src start", k.read("qm.log"))               # never started half restored
+            k.ok("rtmig_cutover.sh", "rollback")
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertEqual(k.state()["PHASE"], "rolledback")
+
+    def test_ssh_to_kademar_dropping_is_indeterminate_never_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            r = k.run("rtmig_cutover.sh", "rollback", FAKE_SSH_FAIL_MATCH="PROBE-END")
+            self.assertEqual(r.returncode, 1); self.assertIn("INDETERMINADO en origen 0000266-KDM-9755", out(r))
+            self.assertTrue(k.dst_conf.exists()); self.assertFalse(k.src_conf.exists())
+            r = k.run("rtmig_send.sh", "verify", FINAL, FAKE_SSH_FAIL_MATCH="zfs get")
+            self.assertEqual(r.returncode, 1); self.assertIn("VERIFY FAIL", out(r))
+
+    def test_park_cut_while_removing_the_config_on_kademar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+            r = k.run("rtmig_cutover.sh", "park", FAKE_SSH_FAIL_MATCH='rm -f "${PVE_ETC')
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(k.state()["PHASE"], "parked"); self.assertTrue(k.src_conf.exists())
+            r = k.run("rtmig_cutover.sh", "push", FINAL)                    # two bootable configs: refused
+            self.assertEqual(r.returncode, 1); self.assertIn("dos configs arrancables", out(r))
+            r = k.ok("rtmig_cutover.sh", "park")                           # park resumes
+            self.assertIn("park retomado", r.stdout); self.assertFalse(k.src_conf.exists())
+
+    def test_rollback_from_a_park_cut_half_way(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(k.run("rtmig_cutover.sh", "park", FAKE_SSH_FAIL_MATCH='rm -f "${PVE_ETC').returncode, 1)
+            r = k.ok("rtmig_cutover.sh", "rollback")
+            self.assertIn("park a medias", r.stdout)
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertEqual(k.state()["PHASE"], "rolledback")
+
+    def test_nested_ssh_is_detected_by_the_fakes(self):
+        # guard for the guard: a command run over ssh that tries to ssh again is caught
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            env = dict(k.env)
+            r = subprocess.run(["ssh", "root@2001:db8:1::2", "ssh root@2001:db8:2::2 hostname"],
+                               capture_output=True, text=True, env=env)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("src -> root@2001:db8:2::2", k.read("nested.log"))
+
+
+for _cls in (HappyPath, ResumableSend, Inventory, Phases, Safety, Rollback, SecondReview, ThirdReview, CpuGuard):
+    globals()["Pull" + _cls.__name__] = type("Pull" + _cls.__name__, (_cls,), {"MODE": "pull"})
+del _cls
+
+
 class Deploy(unittest.TestCase):
     def deploy(self, **env):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
-        k = Kit(tmp.name)
+        k = Kit(tmp.name, mode="push")
         e = dict(k.env, JUMP="b9", FAKE_JUMP="b9", SRC="2001:db8:1::2", FAKE_SRC_IP="2001:db8:1::2",
                  DST="2001:db8:2::2", WORK=str(k.t / "deploy"))
         e.update(env)

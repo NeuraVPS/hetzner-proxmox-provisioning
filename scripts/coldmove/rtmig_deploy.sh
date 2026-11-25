@@ -30,10 +30,14 @@ sys.exit(0 if "%" not in s and str(ip) == s else 1)' "$1" 2>/dev/null
 }
 for N in "$SRC" "$DST"; do canon_ip "$N" || { echo "no es una IP canónica sin zona: $N" >&2; exit 2; }; done
 [[ "$SRC" != "$DST" ]] || { echo "SRC y DST son la misma IP" >&2; exit 2; }
+# ONLY=dst para el modo pull: el kit solo hace falta en el destino (al origen sin clave de flota solo le
+# llegan órdenes sueltas por SSH). ONLY=src, lo mismo para el origen. Por defecto, los dos.
+case "${ONLY:-}" in "") TARGETS="$SRC $DST" ;; src) TARGETS="$SRC" ;; dst) TARGETS="$DST" ;;
+  *) echo "ONLY solo admite src o dst" >&2; exit 2 ;; esac
 FILES="rtmig_common.sh rtmig_send.sh rtmig_cutover.sh"
 LOCAL=$(md5sum $FILES)
 rc=0
-for N in "$SRC" "$DST"; do
+for N in $TARGETS; do
   ssh "$JUMP" "ssh -o ConnectTimeout=15 root@$N 'mkdir -p $WORK'"
   for f in $FILES; do ssh "$JUMP" "ssh -o ConnectTimeout=15 root@$N 'cat > $WORK/$f'" < "$f"; done
   ssh "$JUMP" "ssh root@$N 'chmod 755 $WORK/rtmig_send.sh $WORK/rtmig_cutover.sh'"
