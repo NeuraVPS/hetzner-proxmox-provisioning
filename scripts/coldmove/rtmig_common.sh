@@ -21,7 +21,10 @@
 #   VMID      (obligatoria) VMID de la VM; es la misma en origen y destino.
 #   push:  DST       IP del nodo DESTINO, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
 #          DST_NODE  id del nodo destino (= hostname = nodo PVE); se comprueba con `hostname` allí.
-#   pull:  SRC       IP del nodo ORIGEN, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
+#   pull:  ALLOC_MEMORY_MB, ALLOC_CORES, ALLOC_DISK_GB  OBLIGATORIAS: la asignación fiable de la VM
+#                    (servers/<doc>), impresa por rtmig_alloc.py en una BASE. La config del origen no
+#                    puede pedir más RAM, núcleos ni disco que esto.
+#          SRC       IP del nodo ORIGEN, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
 #          SRC_NODE  id del nodo origen; se comprueba con `hostname` allí.
 #          DST_NODE  OBLIGATORIO también: este nodo; tiene que ser igual a `hostname` (el corte queda
 #                    ligado al par origen/destino explícito).
@@ -82,17 +85,31 @@ case "$RTMIG_MODE" in
     [[ -n "${DST_NODE:-}" ]] || { echo "en modo pull hace falta DST_NODE explícito (este nodo, ${LOCAL_NODE})" >&2; exit 2; }
     [[ "$DST_NODE" == "$LOCAL_NODE" ]] \
       || { echo "en modo pull el kit corre en el DESTINO: DST_NODE=${DST_NODE} pero este nodo es ${LOCAL_NODE}" >&2; exit 2; }
-    DST_NODE="$LOCAL_NODE"; PEER="$SRC"; PEER_NODE="$SRC_NODE"; PEER_ROLE=src ;;
+    DST_NODE="$LOCAL_NODE"; PEER="$SRC"; PEER_NODE="$SRC_NODE"; PEER_ROLE=src
+    # Asignación FIABLE de la VM (servers/<doc> de Firestore, leída en Hetzner: rtmig_alloc.py): la RAM,
+    # los núcleos y el disco de la VM en el destino salen de aquí, nunca de la config del origen.
+    for v in ALLOC_MEMORY_MB ALLOC_CORES ALLOC_DISK_GB; do
+      [[ "${!v:-}" =~ ^[1-9][0-9]{0,6}$ ]] \
+        || { echo "en modo pull hace falta ${v} (entero) de la asignación fiable: python3 rtmig_alloc.py <VMID> en una BASE" >&2; exit 2; }
+    done ;;
   *) echo "RTMIG_MODE solo admite push o pull (vale '${RTMIG_MODE}')" >&2; exit 2 ;;
 esac
 [[ "$WORK" =~ ^/[A-Za-z0-9._/-]+$ && "$WORK" != *..* ]] || { echo "WORK no válido (ruta absoluta, sin espacios ni ..): $WORK" >&2; exit 2; }
 [[ "$POOLDS" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]] || { echo "POOLDS no válido: $POOLDS" >&2; exit 2; }
+# pull: contenedor propio donde se recibe el flujo del origen no fiable antes de promoverlo.
+RECV_ROOT="${RECV_ROOT:-rpool/rtmig-recv}"
+[[ "$RECV_ROOT" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ && "$RECV_ROOT" != "$POOLDS" && "$RECV_ROOT" != "$POOLDS"/* ]] \
+  || { echo "RECV_ROOT no válido: $RECV_ROOT" >&2; exit 2; }
+RECV_DIR="$RECV_ROOT/$VMID"
 [[ "${SSH_PORT:-22}" =~ ^[0-9]+$ ]] || { echo "SSH_PORT no válido: ${SSH_PORT}" >&2; exit 2; }
 
 # Rutas en la forma que expande el shell de QUIEN ejecuta la orden (local o remoto).
 R_CONF="\${PVE_ETC:-/etc/pve}/qemu-server/${VMID}.conf"
 R_FW="\${PVE_ETC:-/etc/pve}/firewall/${VMID}.fw"
 STATE="$WORK/${VMID}.state"
+# Copia aparcada: un DIRECTORIO que se promueve de una vez (rename atómico) desde el staging.
+PARKED_DIR="$WORK/${VMID}.parked"; CONF_SRC="$PARKED_DIR/conf"; FW_SRC="$PARKED_DIR/fw"
+STAGE_DIR="$WORK/${VMID}.staging"
 
 # -a / ForwardAgent=no / sin reenvíos: el otro nodo (en pull, uno externo) nunca recibe el agente.
 SSHO=(-a -x -o ForwardAgent=no -o ClearAllForwardings=yes
@@ -216,7 +233,7 @@ zget() {   # <src|dst> <prop> <objeto> [-p]
   if [[ "$val" != ABSENT ]]; then
     case "$2" in
       guid) [[ "$val" =~ ^[0-9]{1,20}$ ]] || die "guid con formato raro en ${name} para $3: estado INDETERMINADO" ;;
-      written@*|used|referenced|logicalreferenced)
+      written@*|used|referenced|logicalreferenced|volsize|quota|reservation)
         if [[ "${4:-}" == -p && ! "$val" =~ ^[0-9]{1,18}$ ]]; then
           die "contador $2 con formato raro en ${name} para $3: estado INDETERMINADO"
         fi ;;
@@ -290,6 +307,18 @@ migrate_old_state() {
   log "estado de la versión anterior del kit migrado (MODE=push, PEER=${old_dst})"
 }
 
+# Copia aparcada de versiones anteriores del kit ($WORK/<VMID>.conf.src y .fw.src sueltos): se pasa al
+# directorio aparcado, si no existe ya.
+migrate_old_layout() {
+  [[ -f "$WORK/${VMID}.conf.src" && ! -e "$PARKED_DIR" ]] || return 0
+  mkdir -p "$PARKED_DIR.tmp.$$"
+  mv "$WORK/${VMID}.conf.src" "$PARKED_DIR.tmp.$$/conf"
+  [[ -f "$WORK/${VMID}.fw.src" ]] && mv "$WORK/${VMID}.fw.src" "$PARKED_DIR.tmp.$$/fw"
+  [[ -f "$WORK/${VMID}.balloon-state" ]] && mv "$WORK/${VMID}.balloon-state" "$PARKED_DIR.tmp.$$/balloon-state"
+  mv -T "$PARKED_DIR.tmp.$$" "$PARKED_DIR"
+  log "copia aparcada de la versión anterior del kit pasada a $PARKED_DIR"
+}
+
 # Comprueba que el estado guardado es de ESTE traslado. Args: fases admitidas.
 require_state() {
   local ph; ph=$(state_get PHASE)
@@ -303,16 +332,20 @@ require_state() {
   [[ "$(state_get POOLDS)" == "$POOLDS" ]] || die "el estado es del pool $(state_get POOLDS), no de ${POOLDS}"
   [[ "$(state_get DST_NODE)" == "$DST_NODE" ]] || die "el estado es de un traslado hacia $(state_get DST_NODE), no hacia ${DST_NODE}"
   [[ "$(state_get PEER)" == "$PEER" ]] || die "el estado es de un traslado con el otro nodo en $(state_get PEER), no en ${PEER}"
-  [[ -f "$WORK/${VMID}.conf.src" ]] || die "falta la config aparcada $WORK/${VMID}.conf.src"
-  [[ "$(conf_uuid "$WORK/${VMID}.conf.src")" == "$(state_get UUID)" ]] \
-    || die "la config aparcada no es la de este traslado (UUID $(conf_uuid "$WORK/${VMID}.conf.src") ≠ $(state_get UUID))"
+  [[ "$(state_get UUID)" =~ ^[0-9A-Fa-f-]{36}$ ]] || die "el estado no tiene un UUID válido"
+  # Antes de aparcar (stopping / preparing) todavía no hay copia aparcada.
+  [[ "$ph" == stopping || "$ph" == preparing ]] && return 0
+  migrate_old_layout
+  [[ -f "$CONF_SRC" ]] || die "falta la config aparcada $CONF_SRC"
+  [[ "$(conf_uuid "$CONF_SRC")" == "$(state_get UUID)" ]] \
+    || die "la config aparcada no es la de este traslado (UUID $(conf_uuid "$CONF_SRC") ≠ $(state_get UUID))"
 }
 
 # ---- config e inventario de discos --------------------------------------------------------------
 # Config de la VM en el ORIGEN, en un fichero local: la copia aparcada si ya existe (salvo con «live»);
 # si no, la viva del origen (leída por el lado que toque) en un temporal. Imprime la ruta.
 conf_file() {   # [live]
-  if [[ "${1:-}" != live && -f "$WORK/${VMID}.conf.src" ]]; then echo "$WORK/${VMID}.conf.src"; return 0; fi
+  if [[ "${1:-}" != live && -f "$CONF_SRC" ]]; then echo "$CONF_SRC"; return 0; fi
   mkdir -p "$WORK"
   local t="$WORK/${VMID}.conf.live"
   on src "cat \"${R_CONF}\"" > "$t" 2>/dev/null || { rm -f "$t"; return 1; }
@@ -339,8 +372,12 @@ disk_inventory() {
 }
 
 detect_disks() {   # [live]
-  local f inv want
+  local f
   f=$(conf_file "${1:-}") || die "no hay config de la VM ${VMID} en el origen (ni viva ni aparcada)"
+  disks_of_file "$f"
+}
+disks_of_file() {   # <config local>: inventario y contraste con DISKS
+  local f="$1" inv want
   inv=$(disk_inventory "$f")
   if [[ -n "${DISKS:-}" ]]; then
     want=$(tr -s ' \t' '\n' <<< "$DISKS" | sed '/^$/d' | sort -n -u | tr '\n' ' ' | sed 's/ $//')
@@ -367,13 +404,115 @@ last_common() {
   for cand in $(sed -n "s#^${POOLDS}/vm-${VMID}-disk-${first}@\(rtmig-[A-Za-z0-9_.:-]*\)\$#\1#p" <<< "$list" | tac); do
     ok=1
     for dd in $DISKS; do
-      g1=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
-      g2=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
+      g1=$(src_zget_guid "$(src_ds "$dd")@${cand}") || exit 1
+      g2=$(dst_zget guid "$(dst_ds "$dd")@${cand}") || exit 1
       [[ "$g1" != ABSENT && "$g1" == "$g2" ]] || { ok=0; break; }
     done
     (( ok )) && { echo "$cand"; return 0; }
   done
   return 1
+}
+
+# ---- nombres de los zvols en cada lado ----------------------------------------------------------
+src_ds() { echo "${POOLDS}/vm-${VMID}-disk-$1"; }
+# En pull, hasta la promoción (push), el destino recibe en el contenedor $RECV_DIR/disk-N; después, y
+# siempre en push, en el sitio definitivo.
+dst_promoted() {
+  [[ "$(state_get PROMOTED)" == 1 ]] || return 1
+  case "$(state_get PHASE)" in parked|publishing|pushed|starting|started|rollingback) return 0 ;; esac
+  return 1
+}
+dst_ds() {
+  if [[ "$RTMIG_MODE" == pull ]] && ! dst_promoted; then echo "${RECV_DIR}/disk-$1"
+  else echo "${POOLDS}/vm-${VMID}-disk-$1"; fi
+}
+# Opciones de zfs recv en pull: sin montar, y anulando cualquier propiedad que mande el emisor.
+RECV_X="-u -x mountpoint -x canmount -x sharenfs -x sharesmb -x setuid -x exec -x devices -x snapdev -x volmode -x refreservation -x reservation -x quota -x refquota -x readonly"
+
+# Tamaño declarado de cada disco de una config ("N bytes" por línea; los unusedN, sin tamaño, no salen).
+disk_sizes_of_file() {
+  awk -v vmid="$VMID" '/^\[/{exit}
+    $1 ~ /^(scsi|sata|virtio|efidisk|tpmstate)[0-9]+:$/ && $2 ~ ("^local-zfs:vm-" vmid "-disk-[0-9]+") {
+      n=$2; sub("^local-zfs:vm-" vmid "-disk-", "", n); sub(/,.*/, "", n)
+      if (match($2, /,size=[0-9]+[KMGT]/)) { v=substr($2, RSTART+6, RLENGTH-6); u=substr(v, length(v)); v=substr(v, 1, length(v)-1)
+        m=(u=="K")?1024:(u=="M")?1048576:(u=="G")?1073741824:1099511627776; printf "%s %.0f\n", n, v*m } }' "$1"
+}
+
+# pull: contenedor con cuota y reserva = tamaño declarado de los discos (+10 % +1 GiB), acotado por la
+# asignación fiable; adopta zvols propios retenidos de un viaje anterior (vuelta al mismo nodo).
+ensure_recv_container() {
+  [[ "$RTMIG_MODE" == pull ]] || return 0
+  local f total=0 n b q
+  f=$(conf_file) || die "no hay config de la VM ${VMID} en el origen"
+  while read -r n b; do total=$(( total + b )); done < <(disk_sizes_of_file "$f")
+  (( total > 0 )) || die "la config no declara tamaños de disco: no sé qué cuota darle al contenedor"
+  (( total <= ALLOC_DISK_GB * 1073741824 + 67108864 )) || die "los discos declarados ($(( total >> 30 )) GiB) pasan de la asignación (${ALLOC_DISK_GB} GiB)"
+  q=$(( total + total / 10 + 1073741824 ))
+  on_q dst "zfs list -H -o name '${RECV_ROOT}' >/dev/null 2>&1 || zfs create -o canmount=off -o mountpoint=none '${RECV_ROOT}'" >/dev/null
+  on_q dst "zfs list -H -o name '${RECV_DIR}' >/dev/null 2>&1 || zfs create -o canmount=off -o mountpoint=none '${RECV_DIR}'" >/dev/null
+  on_q dst "zfs set quota=${q} '${RECV_DIR}' && zfs set reservation=${q} '${RECV_DIR}'" >/dev/null \
+    || die "no pude fijar cuota/reserva de ${q} B en ${RECV_DIR} (¿falta sitio en el pool del destino?)"
+  for n in $DISKS; do
+    local in_c tgt
+    in_c=$(zget dst type "${RECV_DIR}/disk-${n}") || exit 1
+    tgt=$(zget dst type "$(src_ds "$n")") || exit 1
+    if [[ "$in_c" == ABSENT && "$tgt" != ABSENT ]]; then
+      on_q dst "zfs rename '$(src_ds "$n")' '${RECV_DIR}/disk-${n}'" >/dev/null
+      log "zvol propio retenido $(src_ds "$n") adoptado en el contenedor (vuelta al mismo nodo)"
+    fi
+  done
+  check_recv_container 0
+}
+
+# Lo que hay en el contenedor tiene que ser exactamente: el contenedor y, como mucho, un VOLUMEN por
+# disco esperado (todos con strict=1), cada uno con un volsize que no pase del declarado (+1 MiB). Si
+# no, se destruye el contenedor entero y se aborta.
+check_recv_container() {   # <strict 0|1>
+  [[ "$RTMIG_MODE" == pull ]] || return 0
+  local strict="$1" out name type n want f v bad="" seen=" "
+  out=$(on_q dst "zfs list -H -o name,type -r '${RECV_DIR}'") || exit 1
+  f=$(conf_file) || die "no hay config de la VM ${VMID}"
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    if [[ "$name" == "$RECV_DIR" ]]; then [[ "$type" == filesystem ]] || bad="${bad} ${name}(${type})"; continue; fi
+    n="${name#"${RECV_DIR}/disk-"}"
+    if [[ "$name" != "${RECV_DIR}/disk-${n}" || ! " ${DISKS} " =~ " ${n} " || "$type" != volume ]]; then
+      bad="${bad} ${name}(${type})"; continue
+    fi
+    want=$(disk_sizes_of_file "$f" | awk -v n="$n" '$1==n {print $2}')
+    if [[ -n "$want" ]]; then
+      v=$(zget dst volsize "$name" -p) || exit 1
+      (( v <= want + 1048576 )) || bad="${bad} ${name}(volsize ${v} > ${want})"
+    fi
+    seen="${seen}${n} "
+  done <<< "$out"
+  if [[ "$strict" == 1 ]]; then
+    for n in $DISKS; do [[ "$seen" == *" ${n} "* ]] || bad="${bad} falta-disk-${n}"; done
+  fi
+  if [[ -n "$bad" ]]; then
+    on dst "zfs destroy -r '${RECV_DIR}'" >/dev/null 2>&1 || true
+    die "lo recibido del origen no es lo esperado (${bad# }): contenedor ${RECV_DIR} destruido; no sigo"
+  fi
+}
+
+# pull: promueve los zvols del contenedor a su sitio definitivo (reentrante) tras comprobarlo entero.
+promote_recv() {
+  [[ "$RTMIG_MODE" == pull ]] || return 0
+  dst_promoted && return 0
+  check_recv_container 1
+  local n c t
+  for n in $DISKS; do
+    c=$(zget dst type "${RECV_DIR}/disk-${n}") || exit 1
+    t=$(zget dst type "$(src_ds "$n")") || exit 1
+    if [[ "$c" == volume && "$t" == ABSENT ]]; then
+      on_q dst "zfs rename '${RECV_DIR}/disk-${n}' '$(src_ds "$n")'" >/dev/null
+    elif [[ ! ( "$c" == ABSENT && "$t" == volume ) ]]; then
+      die "no puedo promover disk-${n}: contenedor=${c}, definitivo=${t}"
+    fi
+  done
+  state_set "PROMOTED=1"
+  on dst "zfs destroy '${RECV_DIR}'" >/dev/null 2>&1 || warn "no pude quitar el contenedor vacío ${RECV_DIR}"
+  log "zvols recibidos verificados y promovidos a ${POOLDS}/vm-${VMID}-disk-*"
 }
 
 # Flujo ZFS de origen a destino, con el limitador en el nodo que corre el kit. Siempre lo abre el nodo

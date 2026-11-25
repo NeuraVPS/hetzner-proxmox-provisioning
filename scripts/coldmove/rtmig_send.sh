@@ -20,8 +20,8 @@
 #
 # Los nombres de snapshot deben empezar por «rtmig-» (p. ej. rtmig-$(date -u +%Y%m%dT%H%MZ)).
 #
-# Variables: las de rtmig_common.sh (RTMIG_MODE, VMID, DST/DST_NODE o SRC/SRC_NODE, WORK, DISKS,
-# SSH_PORT) y además:
+# Variables: las de rtmig_common.sh (RTMIG_MODE, VMID; push: DST/DST_NODE; pull: SRC/SRC_NODE/DST_NODE y
+# ALLOC_MEMORY_MB/ALLOC_CORES/ALLOC_DISK_GB; WORK, DISKS, SSH_PORT) y además:
 #   RATE  (por defecto 30m)   límite de pv (-L), por flujo. 30m ≈ 250 Mbit/s: cabe en un enlace
 #                             no-Hetzner de ~300 Mbit/s por flujo (Kademar, medido 08/11) sin ahogar al
 #                             nodo. Dentro de Hetzner se puede subir (60m–110m). "0" = sin límite
@@ -95,11 +95,12 @@ verify() {   # guid igual en origen y destino = mismo snapshot (lref/ref solo in
              # la contabilidad de huecos/bloques embebidos difiere unos KB sin diferir el contenido)
   local snap="$1" bad=0 s d si di
   for dd in $DISKS; do
-    local ds="${POOLDS}/vm-${VMID}-disk-${dd}@${snap}"
+    local ds dds
+    ds="$(src_ds "$dd")@${snap}"; dds="$(dst_ds "$dd")@${snap}"
     s=$(on src "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
-    d=$(on dst "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
+    d=$(on dst "zfs get -H -o value guid '$dds' 2>/dev/null" || true)
     si=$(on src "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" | tr -cd '[:alnum:]./' | cut -c1-40 || true)
-    di=$(on dst "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" | tr -cd '[:alnum:]./' | cut -c1-40 || true)
+    di=$(on dst "zfs get -H -o value referenced,logicalreferenced '$dds' 2>/dev/null | paste -sd/" | tr -cd '[:alnum:]./' | cut -c1-40 || true)
     [[ "$s" =~ ^[0-9]{1,20}$ ]] || s=""; [[ "$d" =~ ^[0-9]{1,20}$ ]] || d=""
     if [[ -n "$s" && "$s" == "$d" ]]; then log "VERIFY OK   $ds  guid=$s  ref/lref origen=$si destino=$di"
     else log "VERIFY FAIL $ds  guid origen=[${s:-ausente}] destino=[${d:-ausente}]"; bad=1; fi
@@ -107,46 +108,49 @@ verify() {   # guid igual en origen y destino = mismo snapshot (lref/ref solo in
   return $bad
 }
 
-resume_one() {   # resume_one <ds> <token>
+resume_one() {   # resume_one <ds del destino> <token>
   local ds="$1" tok="$2" rc
-  [[ "$tok" =~ ^[A-Za-z0-9+/=_.:-]+$ ]] || die "token de reanudación raro en ${ds}"
+  [[ "$tok" =~ ^[A-Za-z0-9-]+$ ]] || die "token de reanudación raro en ${ds}"
   log "reanudando ${ds} (token de recepción a medias en el destino)"
-  stream_src_to_dst "zfs send -t '${tok}'" "zfs recv -s '${ds}'"
+  stream_src_to_dst "zfs send -t '${tok}'" "zfs recv -s ${RECV_OPTS} '${ds}'"
   read -r -a rc <<< "$STREAM_RC"
   [[ "${rc[0]}" == 0 && "${rc[1]}" == 0 && "${rc[2]}" == 0 ]] || die "reanudación de ${ds} falló (send=${rc[0]} pv=${rc[1]} recv=${rc[2]}); vuelve a lanzar la misma orden"
 }
 
 # send_disk <disk> <snap> [prev]: deja @snap en el destino, sea saltando, reanudando o enviando.
 send_disk() {
-  local dd="$1" snap="$2" prev="${3:-}" ds gs gd tok gps gpd
-  ds="${POOLDS}/vm-${VMID}-disk-${dd}"
+  local dd="$1" snap="$2" prev="${3:-}" ds dds gs gd tok gps gpd
+  ds=$(src_ds "$dd"); dds=$(dst_ds "$dd")
   gs=$(src_zget_guid "${ds}@${snap}") || exit 1
   [[ "$gs" != ABSENT ]] || die "falta ${ds}@${snap} en origen"
-  gd=$(dst_zget guid "${ds}@${snap}") || exit 1
-  if [[ "$gd" == "$gs" ]]; then log "${ds}@${snap} ya está en el destino (guid ${gs}): lo salto"; return 0; fi
-  tok=$(dst_zget receive_resume_token "$ds") || exit 1
+  gd=$(dst_zget guid "${dds}@${snap}") || exit 1
+  if [[ "$gd" == "$gs" ]]; then log "${dds}@${snap} ya está en el destino (guid ${gs}): lo salto"; return 0; fi
+  tok=$(dst_zget receive_resume_token "$dds") || exit 1
   if [[ -n "$tok" && "$tok" != "-" && "$tok" != ABSENT ]]; then
-    resume_one "$ds" "$tok"
-    gd=$(dst_zget guid "${ds}@${snap}") || exit 1
-    if [[ "$gd" == "$gs" ]]; then log "${ds}@${snap} completado al reanudar"; return 0; fi
-    tok=$(dst_zget receive_resume_token "$ds") || exit 1   # reanudó otro envío anterior: sigue abajo
+    resume_one "$dds" "$tok"
+    check_recv_container 0
+    gd=$(dst_zget guid "${dds}@${snap}") || exit 1
+    if [[ "$gd" == "$gs" ]]; then log "${dds}@${snap} completado al reanudar"; return 0; fi
+    tok=$(dst_zget receive_resume_token "$dds") || exit 1   # reanudó otro envío anterior: sigue abajo
   fi
   if [[ -z "$prev" ]]; then
-    [[ "$tok" == ABSENT ]] || die "el destino ya tiene ${ds} sin @${snap}: no piso nada (¿otro traslado? revisa a mano)"
+    [[ "$tok" == ABSENT ]] || die "el destino ya tiene ${dds} sin @${snap}: no piso nada (¿otro traslado? revisa a mano)"
     send_one "$dd" "$snap"
   else
     gps=$(src_zget_guid "${ds}@${prev}") || exit 1
     [[ "$gps" != ABSENT ]] || die "falta ${ds}@${prev} en origen"
-    gpd=$(dst_zget guid "${ds}@${prev}") || exit 1
-    [[ "$gps" == "$gpd" ]] || die "${ds}@${prev}: guid origen=[${gps}] destino=[${gpd}]: no es base común"
+    gpd=$(dst_zget guid "${dds}@${prev}") || exit 1
+    [[ "$gps" == "$gpd" ]] || die "${dds}@${prev}: guid origen=[${gps}] destino=[${gpd}]: no es base común"
     send_one "$dd" "$snap" "$prev"
   fi
-  gd=$(dst_zget guid "${ds}@${snap}") || exit 1
-  [[ "$gd" == "$gs" ]] || die "${ds}@${snap}: tras el envío el destino tiene guid [${gd}], no [${gs}]"
+  check_recv_container 0   # pull: lo recibido tiene que ser exactamente un volumen (si no, fuera)
+  gd=$(dst_zget guid "${dds}@${snap}") || exit 1
+  [[ "$gd" == "$gs" ]] || die "${dds}@${snap}: tras el envío el destino tiene guid [${gd}], no [${gs}]"
 }
 
 send_one() {   # send_one <disk> <snap> [prev]
-  local snap="$2" prev="${3:-}" ds="${POOLDS}/vm-${VMID}-disk-${1}"
+  local snap="$2" prev="${3:-}" ds dds
+  ds=$(src_ds "$1"); dds=$(dst_ds "$1")
   local recvflags="-s"; local sendargs=(-c -e)
   [[ -n "${ZSTD:-}" ]] && sendargs=(-e)
   if [[ -n "$prev" ]]; then sendargs+=(-i "@${prev}"); recvflags="-s -F"; fi
@@ -155,7 +159,7 @@ send_one() {   # send_one <disk> <snap> [prev]
   log "send ${ds}@${snap} ${prev:+(incremental desde @$prev) }estimado=$(numfmt --to=iec "${est:-0}")B rate=${RATE} zstd=${ZSTD:-no}"
   local t0=$SECONDS rc sendcmd recvcmd
   sendcmd="nice -n 19 zfs send ${sendargs[*]} '${ds}@${snap}'"
-  recvcmd="zfs recv ${recvflags} '${ds}'"
+  recvcmd="zfs recv ${recvflags} ${RECV_OPTS} '${dds}'"
   if [[ -n "${ZSTD:-}" ]]; then
     sendcmd="set -o pipefail; ${sendcmd} | zstd -q -c -${ZSTD} -T${ZSTD_T:-12}"
     recvcmd="set -o pipefail; zstd -q -d -c | ${recvcmd}"
@@ -163,13 +167,14 @@ send_one() {   # send_one <disk> <snap> [prev]
   stream_src_to_dst "$sendcmd" "$recvcmd"
   read -r -a rc <<< "$STREAM_RC"
   [[ "${rc[0]}" == 0 && "${rc[1]}" == 0 && "${rc[2]}" == 0 ]] \
-    || die "envío de ${ds} falló (send=${rc[0]} pv=${rc[1]} recv=${rc[2]}); reanudar con: $0 resume"
+    || { check_recv_container 0; die "envío de ${ds} falló (send=${rc[0]} pv=${rc[1]} recv=${rc[2]}); reanudar con: $0 resume"; }
   log "hecho ${ds}@${snap} en $((SECONDS - t0)) s"
 }
 
 CMD="${1:-}"
 case "$CMD" in base|incr|last|pending|verify|resume) ;; *) awk 'NR>1 \&\& /^#/ {print; next} NR>1 {exit}' "$0"; exit 2 ;; esac
 [[ "${ZSTD:-}" =~ ^([0-9]{1,2})?$ && "${ZSTD_T:-12}" =~ ^[0-9]{1,3}$ ]] || die "ZSTD/ZSTD_T no válidos"
+RECV_OPTS=""; [[ "$RTMIG_MODE" == pull ]] && RECV_OPTS="$RECV_X"
 case "$CMD" in base|incr|resume) take_lock ;; esac
 check_fleet_key
 check_peer_identity
@@ -185,6 +190,7 @@ case "$CMD" in
   base)
     SNAP="${2:?SNAP}"; check_snap_name "$SNAP"
     dst_must_be_free
+    ensure_recv_container
     if [[ "${REUSE_SNAP:-0}" == 1 ]]; then   # @SNAP creada a mano antes (p. ej. pool lleno)
       for d in $DISKS; do
         g=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${d}@${SNAP}") || exit 1
@@ -204,6 +210,10 @@ case "$CMD" in
     # la misma orden tras un corte (aunque ya hayan llegado todos los discos) se usa la misma base,
     # no «el último común», que entonces sería el propio NEW.
     PREVF="$WORK/${VMID}.incr-${NEW}.prev"
+    # Destino libre y (en pull) contenedor listo ANTES de buscar la base común: en una vuelta o tras un
+    # rollback, los zvols propios retenidos se adoptan en el contenedor, y la base está ahí.
+    dst_must_be_free
+    ensure_recv_container
     if [[ -f "$PREVF" ]]; then
       REC=$(head -1 "$PREVF"); check_snap_name "$REC"
       [[ "$PREV" == auto || "$PREV" == "$REC" ]] || die "este incr ya se lanzó con PREV=@${REC}; no se puede repetir con @${PREV}"
@@ -216,7 +226,6 @@ case "$CMD" in
     check_snap_name "$PREV"
     [[ "$PREV" != "$NEW" ]] || die "PREV y NEW son el mismo snapshot"
     [[ -f "$PREVF" ]] || printf '%s\n' "$PREV" > "$PREVF"
-    dst_must_be_free
     snap_all "$NEW"
     for d in $(printf '%s\n' $DISKS | sort -n -r); do send_disk "$d" "$NEW" "$PREV"; done
     verify "$NEW"
@@ -225,10 +234,10 @@ case "$CMD" in
         # Cada lado se consulta con una asignación aparte: «no existe» se salta, cualquier error aborta
         # ANTES de borrar nada (nunca un destroy por una respuesta vacía).
         gl=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}") || exit 1
-        gr=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}") || exit 1
+        gr=$(dst_zget guid "$(dst_ds "$d")@${PREV}") || exit 1
         [[ -n "$gl" && -n "$gr" ]] || die "respuesta vacía al consultar @${PREV} de disk-${d}: no borro nada"
         [[ "$gl" == ABSENT ]] || on_q src "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" >/dev/null
-        [[ "$gr" == ABSENT ]] || on_q dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" >/dev/null
+        [[ "$gr" == ABSENT ]] || on_q dst "zfs destroy '$(dst_ds "$d")@${PREV}'" >/dev/null
       done
       log "@${PREV} destruido en origen y destino (queda @${NEW} como base común)"
     fi
@@ -253,10 +262,11 @@ case "$CMD" in
     log "pool origen: $(on src "zpool list -H -o cap,free rpool" | tr '\t' ' ' | tr -cd '[:alnum:] .%' | cut -c1-40)"
     ;;
   resume)
+    ensure_recv_container
     for d in $DISKS; do
-      ds="${POOLDS}/vm-${VMID}-disk-${d}"
+      ds=$(dst_ds "$d")
       tok=$(dst_zget receive_resume_token "$ds") || exit 1
-      if [[ -n "$tok" && "$tok" != "-" && "$tok" != ABSENT ]]; then resume_one "$ds" "$tok"; fi
+      if [[ -n "$tok" && "$tok" != "-" && "$tok" != ABSENT ]]; then resume_one "$ds" "$tok"; check_recv_container 0; fi
     done
     log "tokens reanudados. Para completar los discos que faltan, vuelve a lanzar la MISMA orden base/incr con el MISMO snapshot."
     ;;

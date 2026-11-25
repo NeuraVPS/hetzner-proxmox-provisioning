@@ -20,7 +20,7 @@ sueltas (`zfs`, `qm`, `cat`, `sha256sum`, `rm`, `mv`…), y ninguna de ellas abr
 |---|---|---|---|
 | Entre nodos de la flota (Hetzner) | `push` (por defecto) | ORIGEN | `DST`, `DST_NODE` |
 | Hacia un nodo de otro proveedor que autoriza la clave de flota (Kademar como DESTINO) | `push` | ORIGEN (Hetzner) | `DST`, `DST_NODE` |
-| Desde un nodo de otro proveedor **sin** clave de flota (Kademar como ORIGEN) | `pull` (`RTMIG_MODE=pull`) | DESTINO (Hetzner) | `SRC`, `SRC_NODE` |
+| Desde un nodo de otro proveedor **sin** clave de flota (Kademar como ORIGEN) | `pull` (`RTMIG_MODE=pull`) | DESTINO (Hetzner) | `SRC`, `SRC_NODE`, más `DST_NODE` (este nodo) y `ALLOC_*` |
 
 **Cómo se decide:** si `proxmox_nodes/<origen>.provider` existe y no es `hetzner` (Kademar:
 `provider: kademar`), el modo es `pull` y el kit se lanza en el destino. Los nodos de Hetzner no llevan
@@ -64,6 +64,25 @@ hostil, y nada suyo se ejecuta ni se evalúa.
   `vm-public-ipv6`, activos o con `|`). Una regla propia, un `IPSET`, un `ALIASES` o una
   `policy_in` hacen abortar.
 - **Historial del globo:** el de un origen no fiable no se importa.
+- **El flujo ZFS no se recibe nunca en el sitio definitivo.** Va a un contenedor propio,
+  `rpool/rtmig-recv/<VMID>` (`RECV_ROOT`):
+  - Cuota y reserva iguales al tamaño declarado de los discos, +10 % +1 GiB. El total no puede pasar
+    de `ALLOC_DISK_GB`.
+  - `zfs recv -u` (sin montar) y `-x` para anular las propiedades que mande el emisor: `mountpoint`,
+    `canmount`, `sharenfs`, `sharesmb`, `setuid`, `exec`, `devices`, `snapdev`, `volmode`,
+    `refreservation`, `reservation`, `quota`, `refquota` y `readonly`. Igual en la precopia, los
+    incrementales y la reanudación.
+  - Después de cada recepción se comprueba el contenido: el contenedor y, como mucho, un **volumen**
+    (`type=volume`) por disco esperado, sin hijos y sin pasar del tamaño declarado. Si algo no
+    cuadra, se destruye el contenedor entero y se aborta.
+  - En `push` se verifica todo (los discos completos) y solo entonces se promueven a
+    `rpool/data/vm-<VMID>-disk-N`, antes de publicar ninguna config.
+- **Recursos de la asignación fiable:** `memory`, `cores` y `sockets: 1` salen de `ALLOC_*`, y el
+  `balloon` nunca pasa de `memory`. El `balloon_mb` de `push` tampoco puede pasar de la memoria
+  asignada. Los discos declarados no pueden sumar más que `ALLOC_DISK_GB`.
+- **MAC:** se conserva, porque cambiarla rompe la red de Windows. Pero antes de apagar, y otra vez al
+  publicar, se comprueba que tiene el prefijo esperado (`EXPECTED_MAC_PREFIX`, por defecto
+  `BC:24:11`) y que ninguna otra VM del destino la usa.
 - **Agente SSH:** nunca se reenvía. El kit usa `-a -o ForwardAgent=no -o ClearAllForwardings=yes`
   y `migrate_vm.sh` igual. Los runners de `run_remotes` solo reenvían el agente a las IPs de la
   flota (`2a01:4f8::/32` y `2a01:4f9::/32`).
@@ -84,12 +103,16 @@ hostil, y nada suyo se ejecuta ni se evalúa.
 
 **Parámetros comunes, por entorno:**
 - `VMID`; `RTMIG_MODE` (`push` por defecto, o `pull`).
-- En `push`, `DST` y `DST_NODE`; en `pull`, `SRC` y `SRC_NODE`.
-  - La IP es la de `proxmox_nodes/<nodo>.ip`, en forma canónica y sin zona (`%eth0`). En una BASE:
-    `jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json`.
-  - El id del nodo se comprueba con `hostname` en él antes de hacer nada.
-  - En `pull`, el nodo destino es el propio; si se pone `DST_NODE`, tiene que coincidir con
-    `hostname`.
+- En `push`: `DST` y `DST_NODE`.
+- En `pull`, todas obligatorias:
+  - `SRC` y `SRC_NODE`, del origen.
+  - `DST_NODE`, que es este mismo nodo y tiene que coincidir con `hostname`.
+  - `ALLOC_MEMORY_MB`, `ALLOC_CORES` y `ALLOC_DISK_GB`: la asignación fiable de la VM
+    (`servers/<doc>` de Firestore). Se obtienen en una BASE con
+    `python3 scripts/coldmove/rtmig_alloc.py <VMID>`, que imprime la línea lista para `export`.
+- Las IPs son las de `proxmox_nodes/<nodo>.ip`, en forma canónica y sin zona (`%eth0`). En una BASE:
+  `jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json`.
+- El id del otro nodo se comprueba con `hostname` en él antes de hacer nada.
 - Opcionales: `WORK` (por defecto `/root/rtmig`), `SSH_PORT` y `DISKS`. Si se pone `DISKS`, tiene
   que coincidir exactamente con el inventario de la config.
 
@@ -97,11 +120,19 @@ hostil, y nada suyo se ejecuta ni se evalúa.
 Solo se admiten zvols `local-zfs:vm-<VMID>-disk-N`. Cualquier otro volumen hace abortar: otro
 almacenamiento, el disco de otra VM, `base-`, `vmstate` o una ruta cruda. Los CD-ROM no cuentan.
 
-**Fases, estado y cerrojo.** `park` abre `$WORK/<VMID>.state`, que liga el traslado a la VMID, al UUID
-(`smbios1`), al nodo origen, al nodo e IP destino, al inventario y, desde `push`, al snapshot final
-y al sha256 de la config publicada. También liga el pool (`POOLDS`) y el sha256 del `.fw`.
-- Fases: `parked → publishing → pushed → starting → started → done`, o
+**Fases, estado y cerrojo.** `shutdown` abre `$WORK/<VMID>.state` antes de apagar. El estado liga el
+traslado a:
+- la VMID, el UUID (`smbios1`), el modo, los dos nodos, la IP del otro nodo, el pool (`POOLDS`) y el
+  inventario;
+- el sha256 de la config y del `.fw` del origen, tal como se validaron;
+- desde `push`, el snapshot final, el sha256 de la config y del `.fw` publicados y, en `pull`, la
+  promoción de los zvols.
+
+Fases:
+- `stopping → preparing → parked → publishing → pushed → starting → started → done`, o
   `rollingback → rolledback`.
+- `stopping` y `preparing` son anteriores al aparcado: la config del origen sigue intacta. Desde ahí,
+  `rollback` solo comprueba que es la validada y arranca la VM.
 - Las fases intermedias (`publishing`, `starting`, `rollingback`) se registran **antes** de actuar:
   si se pierde la confirmación, se repite la misma orden y el kit reconcilia lo que encuentra. Por
   ejemplo, si la VM ya está corriendo en destino con la config publicada, `start` solo marca
@@ -133,7 +164,9 @@ es la red.
 
 ## Flujo
 - **`push`**, en el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
-- **`pull`**, en el nodo destino: `cd /root/rtmig && export RTMIG_MODE=pull VMID=… SRC=… SRC_NODE=…`.
+- **`pull`**, en el nodo destino: `cd /root/rtmig && export RTMIG_MODE=pull VMID=… SRC=… SRC_NODE=…
+  DST_NODE=$(hostname)` y la línea de `rtmig_alloc.py` (`ALLOC_MEMORY_MB=… ALLOC_CORES=…
+  ALLOC_DISK_GB=…`).
 
 Las órdenes son las mismas en los dos modos. En `pull`, «el origen» de cada paso se ejecuta por SSH
 desde el destino: el apagado ordenado, el aparcado de la config, el `zfs send` y la restauración del
@@ -149,17 +182,27 @@ rollback.
    `$WORK/<VMID>.incr-<nueva>.prev`, así que repetir la misma orden, aunque ya hayan llegado todos
    los discos, usa la misma base, verifica por guid y limpia de forma idempotente.
 3. **Corte, a la hora pactada:**
-   1. `./rtmig_cutover.sh shutdown 600`: primero las comprobaciones previas, **antes de apagar**:
-      inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
-      libre. Luego el apagado ordenado. Si Windows no se apaga, **no se fuerza**: decide una persona.
+   1. `./rtmig_cutover.sh shutdown 600`: primero las comprobaciones previas, **antes de apagar**.
+      - La config y el `.fw` del origen se copian verificados por sha256, y sobre esas copias se
+        comprueban:
+        - el inventario de discos;
+        - en `pull`, el perfil, y que la MAC tenga el prefijo esperado y no la use otra VM del
+          destino;
+        - la CPU y las licencias (ver abajo; el `ACK` va ya en esta orden);
+        - la precopia común con este destino, y que el destino esté libre.
+      - Luego se abre el estado en `stopping` y viene el apagado ordenado. Si Windows no se apaga,
+        **no se fuerza**: se repite `shutdown` o se hace `rollback`, con la decisión de una persona.
    2. `./rtmig_cutover.sh park`: exporta el historial del reconciliador de globo (si el origen lo
-      tiene y el modo es `push`) y aparca la config en `$WORK`. Así nadie puede arrancar la VM en
-      origen. Los zvols se quedan.
-      - La config y el `.fw` llegan primero a nombres provisionales (`*.staging`). Solo cuando han
-        llegado los dos se pasan a los definitivos y se abre el estado.
-      - Si algo cae antes, no queda nada «aparcado» y `park` se repite sin más.
-      - Si cae después, al quitar la config del origen, `park` se retoma, y `rollback` también
-        funciona desde ahí.
+      tiene y el modo es `push`) y aparca la config en `$WORK/<VMID>.parked/`. Así nadie puede
+      arrancar la VM en origen. Los zvols se quedan.
+      - **Comprobación previa:** la config y el `.fw` del origen tienen que ser los mismos que validó
+        `shutdown` (sha256).
+      - **Fase `preparing`:** la config y el `.fw` se copian, verificados, a `$WORK/<VMID>.staging/`.
+        Ahí se comprueban y, en `pull`, pasan el perfil. Después se escribe un `MANIFEST` y el
+        directorio entero se **promueve con un solo `rename` atómico** a `<VMID>.parked/`. Solo
+        entonces la fase pasa a `parked` y se quita la config del origen.
+      - **Si se corta en cualquier punto**, `park` se repite: si la promoción ya estaba hecha y su
+        manifiesto cuadra, sigue desde ahí. También vale `rollback`.
    3. `RATE=0 ./rtmig_send.sh incr auto rtmig-final-<fecha>`: incremental final, con `VERIFY OK`.
    4. `./rtmig_cutover.sh push rtmig-final-<fecha> [balloon_mb]`:
       - exige que el origen siga sin config (respuesta positiva);
@@ -202,7 +245,10 @@ lanzado en A).
   borra el origen. Kademar tiene los mismos snapshots, con el mismo guid.
 - **No se usa `base`:** se niega sin pisar nada («el destino ya tiene … sin @SNAP: no piso nada»).
 - **La vuelta empieza con** `RTMIG_MODE=pull SRC=<IP Kademar> SRC_NODE=0000266-KDM-9755
-  DST_NODE=<A> ./rtmig_send.sh incr auto rtmig-<nueva>`.
+  DST_NODE=<A> ALLOC_…=… ./rtmig_send.sh incr auto rtmig-<nueva>`.
+  - En `pull`, el primer envío **adopta** los zvols retenidos de A en el contenedor de recepción
+    (`zfs rename`). Allí se reciben los incrementales y, en `push`, se verifican y se promueven
+    otra vez a `rpool/data`.
   - `auto` encuentra el último `@rtmig-*` común (el final de la ida, con el mismo guid en los tres
     discos).
   - El incremental se recibe con `-F`, que devuelve el zvol de A a ese snapshot. La VM estuvo
@@ -230,8 +276,13 @@ La regla es la misma que en `migrate_vm.sh` y en el defrag. La vía fría direct
 - Todo queda en `$WORK/cpu-change.txt`, una vez publicada la config.
 
 ## Rollback
-Antes de `park`, la VM sigue en el origen: basta con no seguir. Si ya está aparcada (fases `parked`,
-`pushed` o `started`):
+En `stopping` o `preparing` la config del origen no se ha tocado. `rollback` comprueba que sigue
+siendo la validada en `shutdown` y arranca la VM si está parada; el destino no se toca.
+
+En `pull`, lo ya recibido se queda en el contenedor `rpool/rtmig-recv/<VMID>`, con su reserva, para
+un reintento. Si se abandona, se borra a mano (`zfs destroy -r rpool/rtmig-recv/<VMID>`).
+
+Si ya está aparcada (fases `parked`, `pushed` o `started`):
 1. Si la VM corre en el destino, apagarla **ordenadamente** allí (`qm shutdown`), con la decisión de
    una persona.
 2. `./rtmig_cutover.sh rollback`. Exige una respuesta positiva del destino: config ausente, o

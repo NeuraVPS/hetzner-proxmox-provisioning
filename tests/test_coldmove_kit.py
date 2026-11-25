@@ -118,16 +118,34 @@ def save(): json.dump(st, open(path, "w"))
 a = sys.argv[1:]
 with open(os.path.join(root, "zfs.log"), "a") as f: f.write(side + " " + " ".join(a) + "\n")
 def split(n): return n.split("@", 1) if "@" in n else (n, None)
-def new_ds(): return {"snaps": {}, "order": [], "written": 0, "token": "-"}
+def new_ds(t="volume", volsize=1 << 30): return {"snaps": {}, "order": [], "written": 0, "token": "-", "type": t, "volsize": volsize, "props": {}}
+def typ(ds): return st[ds].get("type", "volume")
+def missing(n): sys.stderr.write("cannot open '%s': dataset does not exist\n" % n); sys.exit(1)
 if a[0] == "list":
     if "-t" in a:
         ds = a[-1]
-        for s in st.get(ds, {}).get("order", []): print(ds + "@" + s)
+        if ds not in st: missing(ds)
+        for s_ in st[ds]["order"]: print(ds + "@" + s_)
     elif "-r" in a:
-        for ds in sorted(st): print(ds + "\t1G")
+        r = a[-1]
+        if "name,type" in a:
+            if r not in st: missing(r)
+            for ds in sorted(st):
+                if ds == r or ds.startswith(r + "/"): print("%s\t%s" % (ds, typ(ds)))
+        else:
+            for ds in sorted(st): print(ds + "\t1G")
     else:
         ds, sn = split(a[-1])
         sys.exit(0 if ds in st and (sn is None or sn in st[ds]["snaps"]) else 1)
+elif a[0] == "create":
+    name = a[-1]
+    if name in st: sys.stderr.write("exists\n"); sys.exit(1)
+    st[name] = new_ds("filesystem", 0); save()
+elif a[0] == "rename":
+    src_, dst_ = a[-2], a[-1]
+    if src_ not in st: missing(src_)
+    if dst_ in st: sys.stderr.write("exists\n"); sys.exit(1)
+    st[dst_] = st.pop(src_); save()
 elif a[0] == "snapshot":
     for n in a[1:]:
         ds, sn = split(n)
@@ -136,14 +154,15 @@ elif a[0] == "snapshot":
         st[ds]["written"] = 0
     save()
 elif a[0] == "set":
-    pass
+    k, v = a[1].split("=", 1); ds = a[2]
+    if ds not in st: missing(ds)
+    st[ds].setdefault("props", {})[k] = v; save()
 elif a[0] == "get":
     prop = a[a.index("value") + 1]; ds, sn = split(a[-1])
     fail = os.environ.get("FAKE_ZFS_FAIL_MATCH")
     if fail and side == os.environ.get("FAKE_ZFS_FAIL_SIDE", "dst") and fail in " ".join(a):
         sys.stderr.write("internal error: Input/output error\n"); sys.exit(1)
-    if ds not in st or (sn and sn not in st[ds]["snaps"]):
-        sys.stderr.write("cannot open '%s': dataset does not exist\n" % a[-1]); sys.exit(1)
+    if ds not in st or (sn and sn not in st[ds]["snaps"]): missing(a[-1])
     hostile = os.environ.get("FAKE_HOSTILE_" + prop.split("@")[0].upper())
     if hostile is not None and side == "src":     # a compromised origin answering garbage
         print(hostile); sys.exit()
@@ -154,37 +173,60 @@ elif a[0] == "get":
         print(st[ds].get("written", 0))
     elif prop == "receive_resume_token":
         print(st[ds].get("token", "-"))
+    elif prop == "type":
+        print(typ(ds))
+    elif prop == "volsize":
+        print(st[ds].get("volsize", 1 << 30))
+    elif prop in ("quota", "reservation"):
+        print(st[ds].get("props", {}).get(prop, 0))
     else:
         print("1G"); print("2G")
 elif a[0] == "send":
-    if "-t" in a:                       # resume from token: "1-" + hex("ds~snap~guid~prev")
-        sds, sn, guid, prev = bytes.fromhex(a[a.index("-t") + 1][2:]).decode().split("~")
-        sys.stdout.write("STREAM %s %s %s %s\n" % (sds, sn, guid, prev)); sys.exit()
+    if "-t" in a:                       # resume from token: "1-" + hex(json fields)
+        fields = json.loads(bytes.fromhex(a[a.index("-t") + 1][2:]).decode())
+        sys.stdout.write("STREAM " + json.dumps(fields) + "\n"); sys.exit()
     ds, sn = split(a[-1])
     prev = a[a.index("-i") + 1].lstrip("@") if "-i" in a else ""
     if "-nP" in a: print("size\t1000"); sys.exit()
     if sn not in st.get(ds, {}).get("snaps", {}): sys.exit(1)
-    sys.stdout.write("STREAM %s %s %s %s\n" % (ds, sn, st[ds]["snaps"][sn], prev or "-"))
+    fields = {"ds": ds, "sn": sn, "guid": st[ds]["snaps"][sn], "prev": prev or "-",
+              "volsize": st[ds].get("volsize", 1 << 30), "type": typ(ds), "extra": False}
+    hs = os.environ.get("FAKE_HOSTILE_STREAM") if side == "src" else None
+    if hs == "filesystem": fields["type"] = "filesystem"
+    if hs == "extra": fields["extra"] = True
+    if hs == "big": fields["volsize"] = 1 << 50
+    sys.stdout.write("STREAM " + json.dumps(fields) + "\n")
 elif a[0] == "recv":
-    ds = a[-1]; _, sds, sn, guid, prev = sys.stdin.read().split()
+    ds = a[-1]; f = json.loads(sys.stdin.read().split(" ", 1)[1])
     cut = os.path.join(root, "recv-cut")
     if os.path.exists(cut) and open(cut).read().strip() == ds:   # cut half way: leave a token
         os.remove(cut)
-        if ds not in st: st[ds] = new_ds()
-        st[ds]["token"] = "1-" + "~".join([sds, sn, guid, prev]).encode().hex(); save()
+        if ds not in st: st[ds] = new_ds(f["type"], f["volsize"])
+        st[ds]["token"] = "1-" + json.dumps(f).encode().hex(); save()
         sys.stderr.write("connection reset\n"); sys.exit(1)
     if st.get(ds, {}).get("token", "-") != "-":
         if "-s" not in a: sys.exit(1)
         st[ds]["token"] = "-"
-    elif prev == "-":
+    elif f["prev"] == "-":
         if ds in st: sys.stderr.write("exists\n"); sys.exit(1)
-        st[ds] = new_ds()
-    elif ds not in st or prev not in st[ds]["snaps"]:
+        st[ds] = new_ds(f["type"], f["volsize"])
+    elif ds not in st or f["prev"] not in st[ds]["snaps"]:
         sys.stderr.write("no base\n"); sys.exit(1)
-    st[ds]["snaps"][sn] = guid; st[ds]["order"].append(sn); st[ds]["written"] = 0
+    st[ds]["snaps"][f["sn"]] = f["guid"]; st[ds]["order"].append(f["sn"]); st[ds]["written"] = 0
+    if f.get("extra"):
+        st[ds.rsplit("/", 1)[0] + "/evil"] = new_ds("filesystem", 0)
     save()
 elif a[0] == "destroy":
-    ds, sn = split(a[-1]); del st[ds]["snaps"][sn]; st[ds]["order"].remove(sn); save()
+    if "-r" in a:
+        r = a[-1]
+        for ds in [d for d in st if d == r or d.startswith(r + "/")]: del st[ds]
+        save(); sys.exit()
+    ds, sn = split(a[-1])
+    if sn is None:
+        if ds not in st: missing(ds)
+        if any(d.startswith(ds + "/") for d in st): sys.stderr.write("has children\n"); sys.exit(1)
+        del st[ds]; save(); sys.exit()
+    del st[ds]["snaps"][sn]; st[ds]["order"].remove(sn); save()
 else:
     sys.exit(3)
 '''
@@ -276,8 +318,10 @@ class Kit:
         self.src_conf.write_text(conf if conf is not None else CONF.format(cpu=cpu))
         (self.t / "src/etc/pve/firewall" / f"{VMID}.fw").write_text("[OPTIONS]\nenable: 1\n")
         (self.t / f"src/state-{VMID}").write_text("running")
+        sizes = {0: 512 << 30, 1: 1 << 20, 2: 4 << 20}
         (self.t / "src/zfs.json").write_text(json.dumps(
-            {f"rpool/data/vm-{VMID}-disk-{n}": {"snaps": {}, "order": [], "written": 7, "token": "-"}
+            {f"rpool/data/vm-{VMID}-disk-{n}": {"snaps": {}, "order": [], "written": 7, "token": "-",
+                                                 "type": "volume", "volsize": sizes[n]}
              for n in (0, 1, 2)}))
         # what QEMU runs with on the source (PVE runs x86-64-v* as qemu64,+flags)
         if run_cpu is None:
@@ -305,7 +349,8 @@ class Kit:
         if self.mode == "push":
             self.env.update({"DST": "2001:db8:2::2", "DST_NODE": dst_host})
         else:
-            self.env.update({"SRC": "2001:db8:1::2", "SRC_NODE": src_host, "DST_NODE": dst_host})
+            self.env.update({"SRC": "2001:db8:1::2", "SRC_NODE": src_host, "DST_NODE": dst_host,
+                             "ALLOC_MEMORY_MB": "61440", "ALLOC_CORES": "8", "ALLOC_DISK_GB": "512"})
         for k in ("CHANGE_CPU", "ACK_HWID_CHANGE", "CPU_NOTICE", "RATE", "DISKS", "ZSTD",
                   "FAKE_REMOTE", "FAKE_JUMP_CHAIN", "FAKE_JUMP",
                   "DST" if self.mode == "pull" else "SRC", "SRC_NODE" if self.mode == "push" else "DST",
@@ -331,6 +376,10 @@ class Kit:
             if ip: e.update(SRC=ip, FAKE_SRC_IP=ip)
             if node: e["SRC_NODE"] = node
         return e
+
+    def dst_ds(self, n):
+        """where the destination receives disk n before the push (pull: the receive container)"""
+        return f"rpool/data/vm-{VMID}-disk-{n}" if self.mode == "push" else f"rpool/rtmig-recv/{VMID}/disk-{n}"
 
     @property
     def peer_host(self):
@@ -411,7 +460,7 @@ class HappyPath(ModeCase):
             imp = [l for l in k.read("ramguard.log").splitlines() if "import-state" in l]
             if k.mode == "push":
                 self.assertEqual(imp[0].split(), ["dst", "import-state", VMID, "0000266-KDM-9755",
-                                                  k.read(f"work/{VMID}.balloon-state").strip()])
+                                                  k.read(f"work/{VMID}.parked/balloon-state").strip()])
             else:
                 self.assertEqual(imp, [])
             k.ok("rtmig_cutover.sh", "start")
@@ -419,7 +468,7 @@ class HappyPath(ModeCase):
             self.assertEqual(k.state()["PHASE"], "started")
             k.ok("rtmig_cutover.sh", "close")
             self.assertEqual(k.state()["PHASE"], "done")
-            self.assertFalse((k.work / f"{VMID}.conf.src").exists())
+            self.assertFalse((k.work / f"{VMID}.parked/conf").exists())
             self.assertEqual(len(json.loads(k.read("src/zfs.json"))), 3)   # source zvols kept
 
     def test_no_reconciler_on_source_means_no_history(self):
@@ -428,7 +477,7 @@ class HappyPath(ModeCase):
             k.to_final()
             k.ok("rtmig_cutover.sh", "push", FINAL, "47104")
             self.assertNotIn("import-state", k.read("ramguard.log"))
-            self.assertFalse((k.work / f"{VMID}.balloon-state").exists())
+            self.assertFalse((k.work / f"{VMID}.parked/balloon-state").exists())
 
     @push_only
     def test_dest_without_reconciler_skips_import(self):
@@ -444,7 +493,7 @@ class ResumableSend(ModeCase):
     def test_base_cut_half_way_resumes_with_the_same_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
-            (k.t / "recv-cut").write_text(f"rpool/data/vm-{VMID}-disk-1")
+            (k.t / "recv-cut").write_text(k.dst_ds(1))
             r = k.run("rtmig_send.sh", "base", "rtmig-20990101T0000Z")
             self.assertEqual(r.returncode, 1, out(r))
             r = k.ok("rtmig_send.sh", "base", "rtmig-20990101T0000Z")
@@ -456,7 +505,7 @@ class ResumableSend(ModeCase):
     def test_resume_command_then_same_base_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp)
-            (k.t / "recv-cut").write_text(f"rpool/data/vm-{VMID}-disk-2")
+            (k.t / "recv-cut").write_text(k.dst_ds(2))
             self.assertEqual(k.run("rtmig_send.sh", "base", "rtmig-20990101T0000Z").returncode, 1)
             r = k.ok("rtmig_send.sh", "resume")
             self.assertIn("vuelve a lanzar la MISMA orden", r.stdout)
@@ -538,7 +587,7 @@ class Phases(ModeCase):
     def test_push_refuses_if_the_source_config_came_back(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final()
-            k.src_conf.write_text((k.work / f"{VMID}.conf.src").read_text())
+            k.src_conf.write_text((k.work / f"{VMID}.parked/conf").read_text())
             r = k.run("rtmig_cutover.sh", "push", FINAL)
             self.assertEqual(r.returncode, 1); self.assertIn("dos configs arrancables", out(r))
             self.assertFalse(k.dst_conf.exists())
@@ -548,7 +597,7 @@ class Phases(ModeCase):
             k = Kit(tmp); k.to_final()
             r = k.run("rtmig_cutover.sh", "push", FINAL, **k.peer_env(ip="2001:db8:9::3"))
             self.assertEqual(r.returncode, 1); self.assertIn("con el otro nodo en", out(r))
-            p = k.work / f"{VMID}.conf.src"
+            p = k.work / f"{VMID}.parked/conf"
             p.write_text(p.read_text().replace("uuid=1111", "uuid=9999"))
             r = k.run("rtmig_cutover.sh", "push", FINAL)
             self.assertEqual(r.returncode, 1); self.assertIn("no es la de este traslado", out(r))
@@ -626,12 +675,12 @@ class Safety(ModeCase):
 
     def test_park_refuses_a_stale_parked_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
-            k = Kit(tmp); k.work.mkdir()
-            (k.work / f"{VMID}.fw.src").write_text("[OPTIONS]\nenable: 0\n")   # left over from an old move
+            k = Kit(tmp); (k.work / f"{VMID}.parked").mkdir(parents=True)
+            (k.work / f"{VMID}.parked/fw").write_text("[OPTIONS]\nenable: 0\n")   # left over from an old move
             k.ok("rtmig_send.sh", "base", "rtmig-a")
             k.ok("rtmig_cutover.sh", "shutdown", "60")
             r = k.run("rtmig_cutover.sh", "park")
-            self.assertEqual(r.returncode, 1); self.assertIn("queda una copia anterior", out(r))
+            self.assertEqual(r.returncode, 1); self.assertIn("queda una copia aparcada anterior", out(r))
             self.assertTrue(k.src_conf.exists())
 
 
@@ -645,8 +694,8 @@ class Rollback(ModeCase):
             self.assertTrue(list(k.work.glob(f"{VMID}.conf.dst-*")))
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
             self.assertEqual(k.state()["PHASE"], "rolledback")
-            self.assertFalse((k.work / f"{VMID}.conf.src").exists())          # archived, never reused
-            self.assertTrue(list(k.work.glob(f"{VMID}.conf.src.rolledback-*")))
+            self.assertFalse((k.work / f"{VMID}.parked/conf").exists())          # archived, never reused
+            self.assertTrue(list(k.work.glob(f"{VMID}.parked.rolledback-*")))
 
     def test_rollback_after_start_needs_explicit_consent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -711,6 +760,9 @@ class Rollback(ModeCase):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
             k.ok("rtmig_cutover.sh", "rollback")
+            # the VM ran again on the origin: a fresh incremental before the next cut (in pull it also
+            # adopts the promoted zvols back into the receive container)
+            k.ok("rtmig_send.sh", "incr", "auto", "rtmig-again")
             k.ok("rtmig_cutover.sh", "shutdown", "60")
             k.ok("rtmig_cutover.sh", "park")
             self.assertEqual(k.state()["PHASE"], "parked")
@@ -893,7 +945,7 @@ class ThirdReview(ModeCase):
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "stopped")
             fw.unlink()                                                             # missing firewall
             r = k.ok("rtmig_cutover.sh", "rollback")
-            self.assertEqual(fw.read_text(), k.read(f"work/{VMID}.fw.src") or "[OPTIONS]\nenable: 1\n")
+            self.assertEqual(fw.read_text(), k.read(f"work/{VMID}.parked/fw") or "[OPTIONS]\nenable: 1\n")
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
             self.assertEqual(k.state()["PHASE"], "rolledback")
 
@@ -986,10 +1038,11 @@ class ThirdReview(ModeCase):
                 f.rename(str(f).split(".rolledback-")[0])
             st = k.read(f"work/{VMID}.state").replace("ARCHIVE_PENDING=", "ARCHIVE_PENDING=rolledback")
             (k.work / f"{VMID}.state").write_text(st)
-            self.assertTrue((k.work / f"{VMID}.conf.src").exists())
+            self.assertTrue((k.work / f"{VMID}.parked/conf").exists())
             k.ok("rtmig_cutover.sh", "status")
-            self.assertFalse((k.work / f"{VMID}.conf.src").exists())
+            self.assertFalse((k.work / f"{VMID}.parked/conf").exists())
             self.assertEqual(k.state()["ARCHIVE_PENDING"], "")
+            k.ok("rtmig_send.sh", "incr", "auto", "rtmig-again")
             k.ok("rtmig_cutover.sh", "shutdown", "60"); k.ok("rtmig_cutover.sh", "park")
 
 
@@ -1030,7 +1083,7 @@ class CpuGuard(ModeCase):
         k, r = self.push("host", CHANGE_CPU="1", CPU_NOTICE="correo 20/11")
         self.assertEqual(r.returncode, 0, out(r))
         self.assertIn("cpu: x86-64-v4", k.read(f"dst/etc/pve/qemu-server/{VMID}.conf"))
-        self.assertIn("cpu: host", k.read(f"work/{VMID}.conf.src"))
+        self.assertIn("cpu: host", k.read(f"work/{VMID}.parked/conf"))
         self.assertIn("host -> x86-64-v4", k.read("work/cpu-change.txt"))
 
     def test_both_switches_are_exclusive(self):
@@ -1085,7 +1138,7 @@ class PullMode(unittest.TestCase):
             self.assertTrue(all(l.startswith("dst> root@2001:db8:1::2 :: ") for l in ssh_lines), ssh_lines[:3])
             self.assertEqual(k.read("nested.log"), "")
             # the work dir (state, parked copy, history) lives on the destination that runs the kit
-            self.assertTrue(list(k.work.glob(f"{VMID}.conf.src.done-*")))
+            self.assertTrue(list(k.work.glob(f"{VMID}.parked.done-*")))
             # zfs streams: send on the origin, receive on the destination
             z = k.read("zfs.log").splitlines()
             self.assertTrue(any(l.startswith("src send ") for l in z)); self.assertTrue(any(l.startswith("dst recv ") for l in z))
@@ -1177,8 +1230,8 @@ class PullMode(unittest.TestCase):
             k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
             r = k.run("rtmig_cutover.sh", "park", FAKE_SSH_FAIL_MATCH='cat "${PVE_ETC:-/etc/pve}/firewall/')
             self.assertEqual(r.returncode, 1)
-            self.assertFalse((k.work / f"{VMID}.conf.src").exists())      # nothing «parked» half way
-            self.assertTrue(k.src_conf.exists()); self.assertEqual(k.state().get("PHASE"), None)
+            self.assertFalse((k.work / f"{VMID}.parked").exists())           # nothing «parked» half way
+            self.assertTrue(k.src_conf.exists()); self.assertEqual(k.state().get("PHASE"), "preparing")
             k.ok("rtmig_cutover.sh", "park")                              # simply repeat it
             self.assertEqual(k.state()["PHASE"], "parked")
 
@@ -1249,7 +1302,7 @@ class PullHostile(unittest.TestCase):
             self.assertNotIn("evil", pub); self.assertNotIn("[snap1]", pub); self.assertNotIn("meta:", pub)
             self.assertIn("smbios1: uuid=11111111-2222-3333-4444-555555555555", pub)
             # the original stays parked for a rollback to Kademar
-            self.assertIn("local:snippets/evil.sh", k.read(f"work/{VMID}.conf.src"))
+            self.assertIn("local:snippets/evil.sh", k.read(f"work/{VMID}.parked/conf"))
 
     def test_fw_is_rewritten_from_the_allow_list_or_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1270,7 +1323,7 @@ class PullHostile(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             k = self.kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
             self.assertEqual(k.read("ramguard.log"), "")
-            self.assertFalse((k.work / f"{VMID}.balloon-state").exists())
+            self.assertFalse((k.work / f"{VMID}.parked/balloon-state").exists())
 
     def test_hostile_snapshot_names_are_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1287,6 +1340,189 @@ class PullHostile(unittest.TestCase):
         self.assertIn("SSHO=(-a -x -o ForwardAgent=no -o ClearAllForwardings=yes", s)
         with tempfile.TemporaryDirectory() as tmp:
             k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+
+
+class SecondHostileReview(unittest.TestCase):
+    """2nd Codex review of #296."""
+
+    def kit(self, tmp, **kw):
+        return Kit(tmp, mode="pull", src_host="0000266-KDM-9755", dst_host="0000238-AX162-2-LTD",
+                   src_cpu=TURIN, dst_cpu=GENOA, **kw)
+
+    def dst_zfs(self, k):
+        return json.loads(k.read("dst/zfs.json") or "{}")
+
+    # 1. the .fw is fetched (sha-verified) and checked BEFORE stopping
+    def test_cut_fw_read_during_shutdown_never_stops_the_vm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            (k.t / f"src/etc/pve/firewall/{VMID}.fw").write_text("[OPTIONS]\npolicy_in: DROP\nenable: 1\n")
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60", FAKE_SSH_FAIL_MATCH='cat "${PVE_ETC:-/etc/pve}/firewall/')
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertNotIn("shutdown", k.read("qm.log"))
+
+    def test_policy_in_drop_is_a_valid_fw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            (k.t / f"src/etc/pve/firewall/{VMID}.fw").write_text("[OPTIONS]\npolicy_in: DROP\nenable: 1\n")
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            self.assertIn("policy_in: DROP", k.read(f"dst/etc/pve/firewall/{VMID}.fw"))
+
+    # 2. preparing: everything between the shutdown and «parked» can be repeated or rolled back
+    def promoted_but_not_committed(self, k):
+        """park finished, then pretend its last state write and the rm on the origin never happened"""
+        k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60"); k.ok("rtmig_cutover.sh", "park")
+        k.src_conf.write_text(k.read(f"work/{VMID}.parked/conf"))
+        (k.t / f"src/etc/pve/firewall/{VMID}.fw").write_text(k.read(f"work/{VMID}.parked/fw"))
+        st = k.read(f"work/{VMID}.state").replace("PHASE=parked", "PHASE=preparing")
+        (k.work / f"{VMID}.state").write_text(st)
+
+    def test_park_resumes_a_promotion_that_was_not_committed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); self.promoted_but_not_committed(k)
+            r = k.ok("rtmig_cutover.sh", "park")
+            self.assertIn("ya estaba promovida", r.stdout)
+            self.assertEqual(k.state()["PHASE"], "parked"); self.assertFalse(k.src_conf.exists())
+
+    def test_rollback_from_preparing_restarts_the_untouched_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); self.promoted_but_not_committed(k)
+            k.ok("rtmig_cutover.sh", "rollback")
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertEqual(k.state()["PHASE"], "rolledback")
+            self.assertTrue(list(k.work.glob(f"{VMID}.parked.rolledback-*")))
+
+    def test_rollback_from_stopping_when_windows_did_not_stop(self):
+        for fail in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+                if fail:
+                    self.assertEqual(k.run("rtmig_cutover.sh", "shutdown", "5", FAKE_SHUTDOWN_FAIL="1").returncode, 1)
+                else:
+                    k.ok("rtmig_cutover.sh", "shutdown", "5")
+                self.assertEqual(k.state()["PHASE"], "stopping")
+                k.ok("rtmig_cutover.sh", "rollback")
+                self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+                self.assertEqual(k.state()["PHASE"], "rolledback")
+
+    def test_park_refuses_an_origin_config_changed_since_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+            k.src_conf.write_text(k.src_conf.read_text() + "args: -evil\n")
+            r = k.run("rtmig_cutover.sh", "park")
+            self.assertEqual(r.returncode, 1); self.assertIn("cambió desde el shutdown", out(r))
+
+    # 3. receive container
+    def test_receive_goes_to_a_bounded_container_then_is_promoted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            z = self.dst_zfs(k)
+            self.assertEqual(sorted(n for n in z if n.startswith("rpool/rtmig-recv/")),
+                             [f"rpool/rtmig-recv/{VMID}"] + [f"rpool/rtmig-recv/{VMID}/disk-{n}" for n in (0, 1, 2)])
+            self.assertFalse(any(n.startswith("rpool/data/") for n in z))
+            q = int(z[f"rpool/rtmig-recv/{VMID}"]["props"]["quota"])
+            want = (512 << 30) + (5 << 20)
+            self.assertEqual(q, want + want // 10 + (1 << 30))
+            self.assertEqual(z[f"rpool/rtmig-recv/{VMID}"]["props"]["reservation"], str(q))
+            recv = [l for l in k.read("zfs.log").splitlines() if l.startswith("dst recv ")]
+            self.assertTrue(recv and all(" -u " in l and "-x mountpoint" in l and "-x canmount" in l for l in recv))
+            k.ok("rtmig_send.sh", "incr", "auto", "rtmig-b"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+            k.ok("rtmig_cutover.sh", "park"); k.ok("rtmig_send.sh", "incr", "auto", FINAL, RATE="0")
+            k.ok("rtmig_cutover.sh", "push", FINAL)
+            z = self.dst_zfs(k)
+            self.assertFalse(any(n.startswith("rpool/rtmig-recv/") for n in z))
+            self.assertEqual(sorted(n for n in z if n.startswith("rpool/data/")),
+                             [f"rpool/data/vm-{VMID}-disk-{n}" for n in (0, 1, 2)])
+
+    def test_hostile_streams_are_destroyed_not_promoted(self):
+        for hs, needle in (("filesystem", "(filesystem)"), ("extra", "evil"), ("big", "volsize")):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = self.kit(tmp)
+                r = k.run("rtmig_send.sh", "base", "rtmig-a", FAKE_HOSTILE_STREAM=hs)
+                self.assertEqual(r.returncode, 1, hs); self.assertIn("no es lo esperado", out(r)); self.assertIn(needle, out(r))
+                z = self.dst_zfs(k)
+                self.assertFalse(any(n.startswith(f"rpool/rtmig-recv/{VMID}") for n in z), hs)
+                self.assertFalse(any(n.startswith("rpool/data/") for n in z), hs)
+
+    def test_declared_disks_beyond_the_allocation_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            r = k.run("rtmig_send.sh", "base", "rtmig-a", ALLOC_DISK_GB="100")
+            self.assertEqual(r.returncode, 1); self.assertIn("pasan de la asignación", out(r))
+            self.assertEqual(self.dst_zfs(k), {})
+
+    # 4. resources from the trusted allocation; MAC checked before stopping
+    def test_resources_come_from_the_allocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = CONF.format(cpu="x86-64-v4").replace("memory: 61440", "memory: 999999").replace("cores: 8", "cores: 64") + "balloon: 900000\n"
+            k = self.kit(tmp, conf=conf)
+            k.to_final(); r = k.ok("rtmig_cutover.sh", "push", FINAL)
+            pub = k.dst_conf.read_text()
+            self.assertIn("memory: 61440", pub); self.assertIn("cores: 8", pub); self.assertIn("sockets: 1", pub)
+            self.assertIn("balloon: 61440", pub); self.assertNotIn("999999", pub)
+            r = k.run("rtmig_cutover.sh", "status")
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            r = k.run("rtmig_send.sh", "base", "rtmig-a", ALLOC_CORES="")
+            self.assertEqual(r.returncode, 2); self.assertIn("ALLOC_CORES", out(r))
+
+    def test_balloon_argument_cannot_exceed_the_allocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.to_final()
+            r = k.run("rtmig_cutover.sh", "push", FINAL, "70000")
+            self.assertEqual(r.returncode, 1); self.assertIn("> memoria asignada", out(r))
+
+    def test_mac_in_use_on_the_destination_refuses_before_stopping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            (k.t / "dst/etc/pve/qemu-server/555.conf").write_text("net0: virtio=bc:24:11:00:00:01,bridge=vmbr0\n")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("ya la usa otra VM", out(r)); self.assertIn("555.conf", out(r))
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+
+    def test_mac_prefix_is_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp, conf=CONF.format(cpu="x86-64-v4").replace("BC:24:11:00:00:01", "02:00:00:00:00:01"))
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("prefijo esperado", out(r))
+            k.ok("rtmig_cutover.sh", "shutdown", "60", EXPECTED_MAC_PREFIX="02:00:00")
+
+    def test_rtmig_alloc_reads_the_trusted_allocation(self):
+        fb = textwrap.dedent("""\
+            _apps = {}
+            def initialize_app(c): _apps["x"] = c
+            """)
+        fs = textwrap.dedent("""\
+            import json, os
+            class _D:
+                def __init__(self, i, d): self.id = i; self._d = d
+                def to_dict(self): return self._d
+            class _Q:
+                def __init__(self, v): self.v = v
+                def stream(self):
+                    return [_D(i, d) for i, d in json.loads(os.environ["FAKE_SERVERS"]).items() if d.get("proxmoxId") == self.v]
+            class _C:
+                def where(self, f, op, v): return _Q(v)
+            class _Cl:
+                def collection(self, n): assert n == "servers"; return _C()
+            def client(): return _Cl()
+            """)
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d, "firebase_admin"); pkg.mkdir()
+            (pkg / "__init__.py").write_text(fb); (pkg / "credentials.py").write_text("def Certificate(p): return p\n")
+            (pkg / "firestore.py").write_text(fs)
+            run = lambda servers, vmid: subprocess.run(["python3", str(KIT / "rtmig_alloc.py"), vmid], capture_output=True, text=True,
+                                                       env=dict(os.environ, PYTHONPATH=d, FAKE_SERVERS=json.dumps(servers)))
+            r = run({"a": {"proxmoxId": 1517, "memoryGb": 19, "cores": 5, "diskGb": 136}}, "1517")
+            self.assertEqual(r.returncode, 0, r.stderr); self.assertEqual(r.stdout.strip(), "ALLOC_MEMORY_MB=19456 ALLOC_CORES=5 ALLOC_DISK_GB=136")
+            self.assertEqual(run({}, "1517").returncode, 2)
+            self.assertEqual(run({"a": {"proxmoxId": 1, "memoryGb": 1, "cores": 1, "diskGb": 1},
+                                  "b": {"proxmoxId": 1, "memoryGb": 1, "cores": 1, "diskGb": 1}}, "1").returncode, 2)
+            self.assertEqual(run({"a": {"proxmoxId": 9, "memoryGb": 19, "cores": "x", "diskGb": 1}}, "9").returncode, 2)
+            self.assertEqual(run({}, "01").returncode, 2)
 
 
 class ShutdownNeedsPrecopy(ModeCase):
@@ -1333,7 +1569,7 @@ class ReturnToTheSameNode(unittest.TestCase):
             self.assertTrue(all(a_guids.values()))                         # A kept FINAL on its 3 zvols
             # back: the kit now runs on A (fake side "src") in pull mode, Kademar (fake "dst") is the origin
             back = dict(k.env, RTMIG_MODE="pull", SRC="2001:db8:2::2", SRC_NODE="0000266-KDM-9755",
-                        DST_NODE="0000238-AX162-2-LTD")
+                        DST_NODE="0000238-AX162-2-LTD", ALLOC_MEMORY_MB="61440", ALLOC_CORES="8", ALLOC_DISK_GB="512")
             back.pop("DST")
             (k.t / "dst/run").mkdir(); (k.t / "dst/run" / f"{VMID}.pid").write_text("777\n")
             (k.t / "dst/proc/777").mkdir(parents=True)
