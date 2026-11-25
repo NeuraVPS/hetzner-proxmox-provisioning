@@ -839,7 +839,12 @@ HOME_REGION="${HOME_REGION:-fsn}"
 
 transit() { printf '%s%x' "$TRANSIT_BASE" $(( $1 * 16 + $2 )); }
 
-NODE_V6="$(ip -6 addr show scope global | sed -n 's#.*inet6 \([0-9a-f:]*\)/128.*#\1#p' | head -1)"
+# NODE_V6 y TUN_MTU pueden venir de /etc/default/neuravps-tunnels (nodos fuera de
+# Hetzner, p. ej. Kademar 0000266: su /64 no es /128 y su camino IPv6 de salida
+# es de 1476, asi que el tunel va a 1432). Sin ellos, lo de siempre: la /128
+# global del nodo y MTU 1456.
+TUN_MTU="${TUN_MTU:-1456}"
+[ -n "${NODE_V6:-}" ] || NODE_V6="$(ip -6 addr show scope global | sed -n 's#.*inet6 \([0-9a-f:]*\)/128.*#\1#p' | head -1)"
 [ -n "$NODE_V6" ] || NODE_V6="$(ip -6 addr show dev "$(ip -6 route show default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)" scope global | sed -n 's#.*inet6 \([0-9a-f:]*\)/.*#\1#p' | head -1)"
 NODE_V4="10.65.$(( NODE_ID / 256 )).$(( NODE_ID % 256 ))"
 
@@ -849,10 +854,12 @@ CANON_FSN="$(transit 0 0)"
 CANON_HEL="$(transit 0 2)"
 
 mk() { # iface remoto direccion_local/127
-  local show cur
+  local show cur curl
   show="$(ip -6 tunnel show "$1" 2>/dev/null)"
   cur="$(printf '%s' "$show" | sed -n 's/.*remote \([0-9a-f:]*\) .*/\1/p')"
-  if [ "$cur" != "$2" ] || ! printf '%s' "$show" | grep -q 'encaplimit none'; then
+  curl="$(printf '%s' "$show" | sed -n 's/.*local \([0-9a-f:]*\) .*/\1/p')"
+  # El extremo local tambien cuenta: si cambia NODE_V6, el tunel se recrea.
+  if [ "$cur" != "$2" ] || [ "$curl" != "$NODE_V6" ] || ! printf '%s' "$show" | grep -q 'encaplimit none'; then
     ip link del "$1" 2>/dev/null
     # `encaplimit none` es OBLIGATORIO: por defecto ip6gre mete una cabecera
     # DSTOPT, el nexthdr pasa a 60 en vez de 47 y las reglas de firewall que
@@ -860,7 +867,7 @@ mk() { # iface remoto direccion_local/127
     # extremos, TX subiendo, RX clavado a 0.
     ip link add name "$1" type ip6gre local "$NODE_V6" remote "$2" encaplimit none || return 1
   fi
-  ip link set "$1" mtu 1456 up
+  ip link set "$1" mtu "$TUN_MTU" up
   ip -6 addr replace "$3" dev "$1"
   # rp_filter=0 en los tuneles. Con anclaje a VIP el camino es asimetrico A
   # PROPOSITO: el trafico entra por el tunel de la VIP que la base posee y sale
