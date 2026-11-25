@@ -109,6 +109,33 @@ def test_broken_files_are_rejected(sync, mutate, needle):
     assert any(needle in e for e in errors), errors
 
 
+@pytest.mark.parametrize("mutate, needle", [
+    # A DROP before the lifeline makes it dead even though it is present.
+    (lambda t: t.replace("[RULES]\n\n", "[RULES]\n\nIN DROP -log nolog\n"), "before the SSH lifeline"),
+    (lambda t: t.replace("[RULES]\n\n", "[RULES]\n\nGROUP vm-no-internet\n"), "before the SSH lifeline"),
+    # A narrowed lifeline is not a lifeline.
+    (lambda t: t.replace("IN SSH(ACCEPT) -source +dc/base -log nolog", "IN SSH(ACCEPT) -source +dc/base -dest 2001:db8::1 -log nolog"), "lose SSH"),
+    # PVE lowercases ipset names and resets on a repeat: a second [IPSET BASE] wipes the first.
+    (lambda t: t + "\n[IPSET BASE]\n\n2001:db8:dead::/64\n", "repeated"),
+    (lambda t: t.replace("[IPSET base]", "[ipset Base]") + "\n[IPSET base]\n2001:db8:b0::/64\n", "repeated"),
+    # nomatch entries never admit.
+    (lambda t: t.replace("2001:db8:b1::/64 # BASE 1", "!2001:db8:b1::/64 # BASE 1"), "2001:db8:b1::2"),
+    (lambda t: t.replace("2001:db8:ffff::/64", "::/0"), "IPSET vm-ident"),
+])
+def test_lifeline_must_be_effective(sync, mutate, needle):
+    errors = sync.validate_cluster_fw(mutate(GOOD), 2, BASES)
+    assert any(needle in e for e in errors), errors
+
+
+def test_missing_base_inventory_is_an_error(sync):
+    assert any("BASE_HOSTS" in e for e in sync.validate_cluster_fw(GOOD, 2, []))
+
+
+def test_lowercase_headers_like_pve_accepts(sync):
+    lower = GOOD.replace("[OPTIONS]", "[options]").replace("[RULES]", "[rules]")
+    assert sync.validate_cluster_fw(lower, 2, BASES) == []
+
+
 def test_large_shrink_against_previous_is_rejected(sync):
     prev = GOOD.replace("2001:db8:2::/64 # n2\n", "".join(f"2001:db8:{i:x}::/64 # x\n" for i in range(2, 20)))
     errors = sync.validate_cluster_fw(GOOD, 2, BASES, prev)
@@ -128,6 +155,7 @@ class FakeBox:
     def __init__(self, content):
         self.files = {"/home/firewall/cluster.fw": content}
         self.dirs = set()
+        self.owners = set()
         self.calls = []
 
     def ssh(self, args, timeout=60):
@@ -141,6 +169,7 @@ class FakeBox:
         elif cmd == "rm":
             target = rest[-1]
             self.dirs.discard(target)
+            self.owners = {o for o in self.owners if not o.startswith(target + "/")}
             self.files.pop(target, None)
         elif cmd == "sha256sum":
             import hashlib
@@ -149,6 +178,13 @@ class FakeBox:
             self.files[rest[1]] = self.files.pop(rest[0])
         elif cmd == "stat":
             return subprocess.CompletedProcess(args, 0, "0\n", "")
+        elif cmd == "ls":
+            if getattr(self, "ls_override", None) is not None:
+                return subprocess.CompletedProcess(args, 0, "\n".join(self.ls_override) + "\n", "")
+            names = [k.rsplit("/", 1)[1] for k in self.owners if k.startswith(rest[0] + "/")]
+            return subprocess.CompletedProcess(args, 0, "\n".join(names) + "\n", "")
+        elif cmd == "touch":
+            self.owners.add(rest[0])
         return ok
 
     def scp(self, src, dst):
@@ -169,9 +205,14 @@ def box(sync, monkeypatch):
     return fake
 
 
+def publish(sync, nodes):
+    with sync.storage_box_fw_lock():
+        return sync.publish_cluster_fw_locked(nodes)
+
+
 def test_update_uploads_to_temp_and_renames(sync, box):
     nodes = dict(NODES, n3="2001:db8:3::2")
-    text = sync.update_storage_box_cluster_fw(nodes)
+    text = publish(sync, nodes)
     assert box.files["/home/firewall/cluster.fw"] == text
     assert "2001:db8:3::/64 # n3" in text
     pushes = [c for c in box.calls if c[0] == "scp" and ":" in c[2]]
@@ -184,21 +225,24 @@ def test_update_uploads_to_temp_and_renames(sync, box):
 def test_invalid_canonical_is_left_untouched(sync, box):
     box.files["/home/firewall/cluster.fw"] = GOOD + TAIL
     with pytest.raises(ValueError):
-        sync.update_storage_box_cluster_fw(dict(NODES, n3="2001:db8:3::2"))
+        publish(sync, dict(NODES, n3="2001:db8:3::2"))
     assert box.files["/home/firewall/cluster.fw"] == GOOD + TAIL
     assert not any(c[0] == "mv" for c in box.calls)
     assert not box.dirs, "lock released on refusal"
 
 
 def test_unchanged_does_not_upload(sync, box):
-    sync.update_storage_box_cluster_fw(NODES)
+    publish(sync, NODES)
     assert not any(c[0] == "mv" for c in box.calls)
 
 
-def test_stale_remote_lock_is_broken(sync, box, monkeypatch):
+def test_stale_remote_lock_is_never_broken(sync, box):
     box.dirs.add(sync.FW_REMOTE_LOCK_DIR)  # stat() says mtime 0 -> very old
-    sync.update_storage_box_cluster_fw(dict(NODES, n3="2001:db8:3::2"))
-    assert any(c[:2] == ["rm", "-r"] for c in box.calls)
+    with pytest.raises(sync.StorageBoxLockStale):
+        publish(sync, dict(NODES, n3="2001:db8:3::2"))
+    assert sync.FW_REMOTE_LOCK_DIR in box.dirs, "someone else's lock left alone"
+    assert not any(c[:2] == ["rm", "-r"] for c in box.calls)
+    assert box.files["/home/firewall/cluster.fw"] == GOOD
 
 
 def test_fresh_remote_lock_waits_then_times_out(sync, box, monkeypatch):
@@ -209,8 +253,32 @@ def test_fresh_remote_lock_waits_then_times_out(sync, box, monkeypatch):
         subprocess.CompletedProcess(a, 0, f"{int(time.time())}\n", "") if a[0] == "stat" else orig(a)))
     monkeypatch.setattr(sync, "FW_REMOTE_LOCK_WAIT_S", 0)
     with pytest.raises(TimeoutError):
-        sync.update_storage_box_cluster_fw(dict(NODES, n3="2001:db8:3::2"))
+        publish(sync, dict(NODES, n3="2001:db8:3::2"))
     assert box.files["/home/firewall/cluster.fw"] == GOOD
+
+
+def test_release_does_not_remove_a_lock_that_is_not_ours(sync, box):
+    with sync.storage_box_fw_lock():
+        box.dirs.discard(sync.FW_REMOTE_LOCK_DIR)  # someone removed ours...
+        box.dirs.add(sync.FW_REMOTE_LOCK_DIR)       # ...and took a new one
+        box.ls_override = ["otherbase-1-2"]
+    assert sync.FW_REMOTE_LOCK_DIR in box.dirs
+
+
+def test_whole_pass_runs_under_the_lock_and_reads_inventory_inside(sync, box, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sync, "read_pve_nodes_state", lambda: seen.append(sync.FW_REMOTE_LOCK_DIR in box.dirs) or dict(NODES))
+    monkeypatch.setattr(sync, "distribute_cluster_fw", lambda nodes, text: seen.append(sync.FW_REMOTE_LOCK_DIR in box.dirs) or {n: ("unchanged", "") for n in nodes})
+    assert sync.run_cluster_fw_sync_once() is True
+    assert seen == [True, True]
+    assert not box.dirs
+
+
+def test_refusal_alerts_and_fails(sync, box, monkeypatch):
+    box.files["/home/firewall/cluster.fw"] = GOOD + TAIL
+    monkeypatch.setattr(sync, "read_pve_nodes_state", lambda: dict(NODES))
+    assert sync.run_cluster_fw_sync_once() is False
+    assert sync._alerts and "rechazada" in sync._alerts[0][0]
 
 
 # --- queue / coalescing -------------------------------------------------------
@@ -241,6 +309,47 @@ def test_request_arriving_mid_run_is_served(sync, monkeypatch):
     assert runs == [1, 1]
 
 
+def test_failed_pass_schedules_spaced_retry(sync, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: False)
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0: scheduled.append((extra, delay_s)) or "u")
+    sync.FW_SYNC_PENDING.write_text("1\n")
+    assert sync.sync_nodes_sync_firewall_worker() == 1
+    assert scheduled == [(["--retry=1"], sync.FW_RETRY_BASE_S)]
+    sync.FW_SYNC_PENDING.write_text("1\n")
+    sync.sync_nodes_sync_firewall_worker(attempt=2)
+    assert scheduled[-1] == (["--retry=3"], sync.FW_RETRY_BASE_S * 4)
+    sync.FW_SYNC_PENDING.write_text("1\n")
+    sync.sync_nodes_sync_firewall_worker(attempt=sync.FW_MAX_RETRIES)
+    assert len(scheduled) == 2 and "sigue fallando" in sync._alerts[-1][0]
+
+
+def test_alert_is_not_repeated(sync, monkeypatch, tmp_path):
+    import importlib
+    sent = []
+    spec = importlib.util.spec_from_file_location('sync_fw_alert', Path(__file__).with_name('sync-base-nat.py'))
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    real.FW_ALERT_STATE = tmp_path / "alerts.json"
+    env = tmp_path / "env"
+    env.write_text("SMTP_PASSWORD=x\n")
+    real.FW_ALERT_ENV_FILE = str(env)
+
+    class FakeSMTP:
+        def __init__(self, *a, **k): pass
+        def starttls(self): pass
+        def login(self, *a): pass
+        def sendmail(self, *a): sent.append(a)
+        def quit(self): pass
+
+    import smtplib
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    real._fw_alert("x", "same body")
+    real._fw_alert("x", "same body")
+    real._fw_alert("x", "other body")
+    assert len(sent) == 2
+
+
 def test_cli_request_returns_without_running(sync, monkeypatch):
     started = []
     monkeypatch.setattr(sync.subprocess, "run", lambda cmd, **kw: started.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
@@ -256,7 +365,9 @@ def test_cli_request_returns_without_running(sync, monkeypatch):
 def node_env(tmp_path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "pve-firewall").write_text("#!/bin/sh\necho restarted >> \"$NV_LOG\"\n")
+    (bindir / "pve-firewall").write_text(
+        "#!/bin/sh\nif [ \"$1\" = status ]; then echo 'Status: enabled/running'; exit 0; fi\n"
+        "[ -e \"$NV_FAIL_RESTART\" ] && exit 1\necho restarted >> \"$NV_LOG\"\n")
     (bindir / "perl").write_text("#!/bin/sh\nif grep -q '^EPT)' \"$2\"; then echo 'parser warning: line 9'; exit 3; fi\necho 'parsed rules=4'\n")
     for f in bindir.iterdir():
         f.chmod(0o755)
@@ -268,9 +379,12 @@ def node_env(tmp_path):
 def _run_node(sync, node_env, text, digest=None):
     import hashlib
     tmp, bindir, target = node_env
-    script = sync.node_fw_apply_script(digest or hashlib.sha256(text.encode()).hexdigest())
-    script = script.replace("/etc/pve/firewall/cluster.fw", str(target)).replace("/root/cluster.fw.prev", str(tmp / "prev"))
-    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", NV_LOG=str(tmp / "log"))
+    script = sync.node_fw_apply_script(digest or hashlib.sha256(text.encode()).hexdigest(), BASES)
+    script = (script.replace("/etc/pve/firewall/cluster.fw", str(target))
+              .replace("/root/cluster.fw.prev", str(tmp / "prev"))
+              .replace(sync.NODE_FW_APPLIED_MARK, str(tmp / "applied")))
+    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", NV_LOG=str(tmp / "log"),
+               NV_FAIL_RESTART=str(tmp / "fail-restart"))
     return subprocess.run(["bash", "-c", script], input=text, capture_output=True, text=True, env=env)
 
 
@@ -284,6 +398,30 @@ def test_node_installs_valid_file(sync, node_env):
     r = _run_node(sync, node_env, GOOD)
     assert "NVFW-UNCHANGED" in r.stdout
     assert (tmp / "log").read_text() == "restarted\n", "no restart when unchanged"
+
+
+def test_failed_restart_is_retried_next_pass(sync, node_env):
+    tmp, _, target = node_env
+    (tmp / "fail-restart").write_text("1")
+    r = _run_node(sync, node_env, GOOD)
+    assert r.returncode == 23 and target.read_text() == GOOD
+    (tmp / "fail-restart").unlink()
+    r = _run_node(sync, node_env, GOOD)
+    assert "NVFW-UPDATED" in r.stdout, "same bytes but not applied -> restart again"
+    assert (tmp / "log").read_text() == "restarted\n"
+    assert "NVFW-UNCHANGED" in _run_node(sync, node_env, GOOD).stdout
+
+
+def test_node_gets_base_addresses(sync):
+    script = sync.node_fw_apply_script("0" * 64, BASES)
+    assert all(b in script for b in BASES)
+
+
+def test_first_boot_carries_the_same_validator(sync):
+    fb = (Path(__file__).parents[2] / "first_boot.sh").read_text()
+    body = fb.split("<<'NVFWPL'\n", 1)[1].split("\nNVFWPL\n", 1)[0] + "\n"
+    assert body == sync.NODE_FW_VALIDATOR_PL.lstrip("\n")
+    assert "get /home/firewall/cluster.fw /etc/pve/firewall/cluster.fw" not in fb
 
 
 def test_node_keeps_old_file_when_parser_warns(sync, node_env):

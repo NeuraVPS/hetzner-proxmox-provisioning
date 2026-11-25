@@ -742,10 +742,75 @@ systemctl enable neuravps-vm-status-watch.timer
 # BootOrder, final reboot) and leaving the pending-first-boot marker armed —
 # 14 half-configured nodes on 2026-07-04 when the fleet key was never seeded
 # in rescue. Retry, then carry the failure to the exit code instead of dying.
+# The canonical cluster.fw is downloaded aside and only installed if PVE's own
+# parser loads it cleanly and the SSH lifeline from +dc/base is intact (same
+# validator the BASE runs on every node before replacing the file — keep this
+# heredoc identical to NODE_FW_VALIDATOR_PL in base/snippets/sync-base-nat.py;
+# test_cluster_fw_sync.py enforces it). Otherwise the baseline written above
+# stays, and the BASE sync delivers the canonical file later.
+install_validated_cluster_fw() {
+  local sb=/root/cluster.fw.storagebox out
+  [ -s "$sb" ] || { log "WARNING: canonical cluster.fw not downloaded; keeping the baseline"; return 0; }
+  cat > /root/nv-validate-cluster-fw.pl <<'NVFWPL'
+use strict; use warnings;
+use PVE::Firewall;
+use Net::IP qw(:PROC);
+my ($f, @bases) = @ARGV;
+die "usage: FILE [BASE_IP...]\n" unless $f;
+my @w; local $SIG{__WARN__} = sub { push @w, $_[0] };
+my $c = eval { PVE::Firewall::load_clusterfw_conf($f) };
+if ($@) { print "parse died: $@"; exit 2 }
+if (@w) { print "parser warning: $_" for @w; exit 3 }
+my @e;
+push @e, "options.enable != 1" unless ($c->{options}{enable} // 0) == 1;
+push @e, "policy_in missing" unless $c->{options}{policy_in};
+my @rules = @{$c->{rules} || []};
+push @e, "no [RULES]" unless @rules;
+for my $s ("base", "hosts-ipv6") { push @e, "ipset $s empty" unless @{$c->{ipset}{$s} || []} }
+for my $s (sort keys %{$c->{ipset} || {}}) {
+  for my $x (@{$c->{ipset}{$s}}) { push @e, "ipset $s entry $x->{cidr} has errors" if $x->{errors} }
+}
+my ($life, $block);
+for my $i (0 .. $#rules) {
+  my $r = $rules[$i];
+  next unless ($r->{enable} // 1) && ($r->{type} // '') =~ /^(in|group)$/;
+  if (!defined $life && $r->{type} eq 'in' && ($r->{macro} // '') eq 'SSH'
+      && ($r->{action} // '') eq 'ACCEPT' && ($r->{source} // '') eq '+dc/base'
+      && !grep { defined $r->{$_} && $r->{$_} ne '' } qw(dest dport sport proto iface icmp-type)) {
+    $life = $i;
+  }
+  if (!defined $block && ($r->{type} eq 'group' || ($r->{action} // '') =~ /^(DROP|REJECT)$/)) {
+    $block = $i;
+  }
+}
+push @e, "no unrestricted SSH ACCEPT from +dc/base" unless defined $life;
+push @e, "a DROP/REJECT/GROUP rule comes before the SSH lifeline" if defined $life && defined $block && $block < $life;
+my @nets = map { Net::IP->new($_->{cidr}) } grep { !$_->{nomatch} } @{$c->{ipset}{base} || []};
+for my $b (@bases) {
+  my $ip = Net::IP->new($b) or do { push @e, "bad base address $b"; next };
+  my $in = grep { $_ && $_->version == $ip->version
+                  && (($ip->overlaps($_) // 0) == $IP_A_IN_B_OVERLAP || ($ip->overlaps($_) // 0) == $IP_IDENTICAL) } @nets;
+  push @e, "ipset base does not cover $b" unless $in;
+}
+if (@e) { print "check: $_\n" for @e; exit 4 }
+printf "parsed rules=%d base=%d hosts=%d\n", scalar @rules,
+  scalar @{$c->{ipset}{base}}, scalar @{$c->{ipset}{'hosts-ipv6'}};
+NVFWPL
+  if out=$(perl /root/nv-validate-cluster-fw.pl "$sb" 2>&1); then
+    if cat "$sb" > /etc/pve/firewall/cluster.fw.tmp.$$ && mv /etc/pve/firewall/cluster.fw.tmp.$$ /etc/pve/firewall/cluster.fw; then
+      log "cluster.fw: canonical installed ($out)"
+    else
+      log "WARNING: could not install the canonical cluster.fw; keeping the baseline"
+    fi
+  else
+    log "WARNING: canonical cluster.fw rejected, keeping the baseline: $out"
+  fi
+  rm -f "$sb" /root/nv-validate-cluster-fw.pl
+}
 pull_from_storagebox() {
   sftp -i /root/.ssh/neuravps_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes -P 23 u560363@u560363.your-storagebox.de <<EOF
 get /home/id/firebase-credentials.json /etc/firebase-credentials.json
-get /home/firewall/cluster.fw /etc/pve/firewall/cluster.fw
+get /home/firewall/cluster.fw /root/cluster.fw.storagebox
 bye
 EOF
 }
@@ -761,6 +826,7 @@ else
   done
   if [ "$STORAGEBOX_PULL_OK" -eq 1 ] && [ -s /etc/firebase-credentials.json ]; then
     chmod 600 /etc/firebase-credentials.json
+    install_validated_cluster_fw
   else
     log "WARNING: storagebox pull failed after 3 attempts — node is missing firebase-credentials.json (sync-dnat.py Firestore updates) and the canonical cluster.fw (BASE push also delivers it)"
     FIRST_BOOT_FAILED=1
