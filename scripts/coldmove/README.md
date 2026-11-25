@@ -95,6 +95,10 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
       - si el origen no tiene `.fw`, el destino tampoco puede tenerlo;
       - con un cambio `[PENDING]` de cpu o balloon que haya que fijar, se niega. La CPU que decide
         la guarda es la que arrancará, es decir, la de `[PENDING]` si la hay;
+      - la decisión de CPU y el aviso quedan en el estado antes de publicar. El cierre del push es
+        uno solo para el camino normal y para la reanudación: verifica la config y el `.fw`, deja
+        la constancia en `cpu-change.txt` una sola vez e importa el historial del globo una sola
+        vez;
       - importa el historial del globo, si el destino tiene reconciliador.
       - Una VPS E que viene de un EX44 hacia una caja SQX (AX162, KDM) lleva `47104`.
         `migrate_vm.sh` lo vuelve a ajustar por `nodeType`.
@@ -121,6 +125,10 @@ La regla es la misma que en `migrate_vm.sh` y en el defrag. La vía fría direct
 - **Modelo genérico (`x86-64-v*`):** el Hardware ID de SQX no cambia; cualquier destino del mismo
   nivel vale. Un `x86-64-v4` hacia un destino sin AVX-512 no arrancaría, así que se rechaza salvo con
   `CHANGE_CPU=1`.
+- **Cambio de modelo pendiente.** `shutdown` lee con qué CPU corre de verdad la VM (la línea `-cpu`
+  de QEMU) y la compara con la del próximo arranque. Si son de clase distinta, por ejemplo `host` en
+  marcha con `[PENDING] cpu: x86-64-v4`, el Hardware ID cambia aunque el silicio no cambie, y se
+  pide la misma constancia. La CPU en marcha queda en el estado (`RUN_CPU`) para `push`.
 - **`cpu: host`/`max`, otro modelo con nombre o sin línea `cpu`, cuando el silicio cambia**
   (vendor|family|model): el Hardware ID cambia. `shutdown` y `push` se niegan si no llevan una de
   estas:
@@ -139,9 +147,15 @@ Antes de `park`, la VM sigue en el origen: basta con no seguir. Si ya está apar
    - **Si la VM llegó a arrancar en el destino, o sus discos tienen escrituras después del snapshot
      final,** volver al origen pierde ese trabajo. Hace falta `ACK_DISCARD_DEST_WRITES=<VMID>` y queda
      anotado en el estado.
-   - Aparca la config (y el `.fw`) del destino en su `$WORK` y confirma que ya no está.
-   - Restaura la config del origen, con la CPU original, y la arranca allí.
-   - Archiva la copia aparcada (`*.rolledback-<fecha>`): no se reutiliza nunca.
+   - Copia la config y el `.fw` del destino a su `$WORK` (`*.conf.dst-<fecha>` y `*.fw.dst-<fecha>`),
+     los retira y confirma que ya no están.
+   - Restaura en el origen el `.fw` y la config **por separado**, cada uno con un fichero temporal
+     y `mv -n`, y comprueba el sha256 de cada uno contra la copia aparcada (o la ausencia del
+     `.fw`, si no lo había). **Solo arranca con los dos verificados**; si se corta, la misma orden
+     lo retoma.
+   - Escribe la fase `rolledback` y después archiva la copia aparcada (`*.rolledback-<fecha>`): no
+     se reutiliza nunca. Si se corta entre las dos cosas, el siguiente paso del kit termina el
+     archivado.
    - Los discos de los dos lados se quedan.
 3. Si `migrate_vm.sh` ya se había ejecutado: `migrate_vm.sh <VMID> <número del nodo origen>`, que
    vuelve a reconciliar rutas y Firestore hacia el origen.

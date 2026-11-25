@@ -140,6 +140,14 @@ dst_zget() {   # <prop> <objeto> [-p]
   printf '%s\n' "$val"
 }
 
+# Lo mismo en el ORIGEN, para el guid de un snapshot: guid, ABSENT si ZFS dice que no existe, o muere.
+src_zget_guid() {
+  local out
+  if out=$(zfs get -H -o value guid "$1" 2>&1); then printf '%s\n' "$out"
+  elif grep -q 'dataset does not exist' <<< "$out"; then echo ABSENT
+  else die "zfs falló en origen al leer el guid de $1 (${out%%$'\n'*}): estado INDETERMINADO"; fi
+}
+
 # Publicación segura de un fichero en /etc/pve del destino: se escribe a <final>.rtmig-tmp, se
 # comprueba allí su sha256 y solo entonces se renombra (mv -n: nunca pisa) a la ruta final. pmxcfs
 # hace atómico el rename (es lo que usa el propio PVE). Imprime PUBLISHED, BADSHA, EXISTS, WRITEFAIL,

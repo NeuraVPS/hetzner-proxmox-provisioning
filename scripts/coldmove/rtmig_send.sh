@@ -102,13 +102,14 @@ verify() {   # guid igual en origen y destino = mismo snapshot (lref/ref solo in
 }
 
 last_common() {   # último @rtmig-* presente en TODOS los discos de ambos lados con el mismo guid
-  local cand g1 ok first
+  local cand g1 g2 ok first
   first="${DISKS%% *}"
   for cand in $(zfs list -H -t snapshot -o name -s createtxg "${POOLDS}/vm-${VMID}-disk-${first}" | sed -n 's/.*@\(rtmig-.*\)/\1/p' | tac); do
     ok=1
     for dd in $DISKS; do
-      g1=$(zfs get -H -o value guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}" 2>/dev/null || true)
-      [[ -n "$g1" && "$g1" == "$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}")" ]] || { ok=0; break; }
+      g1=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
+      g2=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
+      [[ "$g1" != ABSENT && "$g1" == "$g2" ]] || { ok=0; break; }
     done
     (( ok )) && { echo "$cand"; return 0; }
   done
@@ -130,25 +131,25 @@ send_disk() {
   local dd="$1" snap="$2" prev="${3:-}" ds gs gd tok gps gpd
   ds="${POOLDS}/vm-${VMID}-disk-${dd}"
   gs=$(zfs get -H -o value guid "${ds}@${snap}" 2>/dev/null) || die "falta ${ds}@${snap} en origen"
-  gd=$(dst_zget guid "${ds}@${snap}")
+  gd=$(dst_zget guid "${ds}@${snap}") || exit 1
   if [[ "$gd" == "$gs" ]]; then log "${ds}@${snap} ya está en el destino (guid ${gs}): lo salto"; return 0; fi
-  tok=$(dst_zget receive_resume_token "$ds")
+  tok=$(dst_zget receive_resume_token "$ds") || exit 1
   if [[ -n "$tok" && "$tok" != "-" && "$tok" != ABSENT ]]; then
     resume_one "$ds" "$tok"
-    gd=$(dst_zget guid "${ds}@${snap}")
+    gd=$(dst_zget guid "${ds}@${snap}") || exit 1
     if [[ "$gd" == "$gs" ]]; then log "${ds}@${snap} completado al reanudar"; return 0; fi
-    tok=$(dst_zget receive_resume_token "$ds")   # reanudó otro envío anterior: sigue abajo
+    tok=$(dst_zget receive_resume_token "$ds") || exit 1   # reanudó otro envío anterior: sigue abajo
   fi
   if [[ -z "$prev" ]]; then
     [[ "$tok" == ABSENT ]] || die "el destino ya tiene ${ds} sin @${snap}: no piso nada (¿otro traslado? revisa a mano)"
     send_one "$dd" "$snap"
   else
     gps=$(zfs get -H -o value guid "${ds}@${prev}" 2>/dev/null) || die "falta ${ds}@${prev} en origen"
-    gpd=$(dst_zget guid "${ds}@${prev}")
+    gpd=$(dst_zget guid "${ds}@${prev}") || exit 1
     [[ "$gps" == "$gpd" ]] || die "${ds}@${prev}: guid origen=[${gps}] destino=[${gpd}]: no es base común"
     send_one "$dd" "$snap" "$prev"
   fi
-  gd=$(dst_zget guid "${ds}@${snap}")
+  gd=$(dst_zget guid "${ds}@${snap}") || exit 1
   [[ "$gd" == "$gs" ]] || die "${ds}@${snap}: tras el envío el destino tiene guid [${gd}], no [${gs}]"
 }
 
@@ -214,7 +215,7 @@ case "$CMD" in
       [[ "$PREV" == auto || "$PREV" == "$REC" ]] || die "este incr ya se lanzó con PREV=@${REC}; no se puede repetir con @${PREV}"
       PREV="$REC"; log "incr ya empezado antes: PREV=@${PREV} (de ${PREVF})"
     elif [[ "$PREV" == "auto" ]]; then
-      PREV=$(last_common) || die "no hay snapshot rtmig-* común"
+      PREV=$(last_common) || die "no hay snapshot rtmig-* común (o falló una consulta: ver arriba)"
       [[ "$PREV" != "$NEW" ]] || die "@${NEW} ya está completo en los dos lados y no consta su base: pasa PREV explícito para verificar/limpiar"
       log "PREV=auto -> @${PREV}"
     fi
@@ -227,12 +228,13 @@ case "$CMD" in
     verify "$NEW"
     if [[ "${DROP_PREV:-0}" == "1" ]]; then   # idempotente: solo lo que siga existiendo
       for d in $DISKS; do
-        if zfs list -H "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}" >/dev/null 2>&1; then
-          zfs destroy "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}"
-        fi
-        if [[ "$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}")" != ABSENT ]]; then
-          dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" || die "no pude destruir @${PREV} de disk-${d} en destino"
-        fi
+        # Cada lado se consulta con una asignación aparte: «no existe» se salta, cualquier error aborta
+        # ANTES de borrar nada (nunca un destroy por una respuesta vacía).
+        gl=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}") || exit 1
+        gr=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}") || exit 1
+        [[ -n "$gl" && -n "$gr" ]] || die "respuesta vacía al consultar @${PREV} de disk-${d}: no borro nada"
+        [[ "$gl" == ABSENT ]] || zfs destroy "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}"
+        [[ "$gr" == ABSENT ]] || dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" || die "no pude destruir @${PREV} de disk-${d} en destino"
       done
       log "@${PREV} destruido en origen y destino (queda @${NEW} como base común)"
     fi
@@ -258,7 +260,7 @@ case "$CMD" in
   resume)
     for d in $DISKS; do
       ds="${POOLDS}/vm-${VMID}-disk-${d}"
-      tok=$(dst_zget receive_resume_token "$ds")
+      tok=$(dst_zget receive_resume_token "$ds") || exit 1
       if [[ -n "$tok" && "$tok" != "-" && "$tok" != ABSENT ]]; then resume_one "$ds" "$tok"; fi
     done
     log "tokens reanudados. Para completar los discos que faltan, vuelve a lanzar la MISMA orden base/incr con el MISMO snapshot."

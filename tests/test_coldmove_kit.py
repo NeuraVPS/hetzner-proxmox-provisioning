@@ -33,6 +33,11 @@ host = args[i]; cmd = " ".join(args[i + 1:])
 root = os.environ["FAKE_ROOT"]
 with open(os.path.join(root, "ssh.log"), "a") as f: f.write(host + " :: " + cmd + "\n")
 fail = os.environ.get("FAKE_SSH_FAIL_MATCH")
+dead = os.path.join(root, "ssh-dead")          # FAKE_SSH_DIE_AFTER: the link dies after that command
+if os.path.exists(dead):
+    sys.stderr.write("Connection timed out\n"); sys.exit(255)
+if os.environ.get("FAKE_SSH_DIE_AFTER") and os.environ["FAKE_SSH_DIE_AFTER"] in cmd:
+    open(dead, "w").close()
 if fail and fail in cmd:
     sys.stderr.write("Connection closed by remote host\n"); sys.exit(255)
 if host == os.environ.get("FAKE_JUMP", "-"):
@@ -46,6 +51,11 @@ elif host == "root@" + os.environ["FAKE_DST_IP"]:
                NV_RECONCILER=os.path.join(root, "dst/reconciler.sh"))
 else:
     sys.stderr.write("ssh: connect to host %s: No route\n" % host); sys.exit(255)
+lose = os.environ.get("FAKE_SSH_LOSE_MATCH")
+if lose and lose in cmd:                 # the command runs, but its answer never comes back
+    subprocess.run(["bash", "-c", cmd], env=env, capture_output=True,
+                   stdin=subprocess.DEVNULL if no_stdin else None)
+    sys.exit(255)
 trunc = os.environ.get("FAKE_SSH_TRUNCATE_MATCH")
 if trunc and trunc in cmd and not no_stdin:
     data = sys.stdin.buffer.read()
@@ -118,7 +128,7 @@ elif a[0] == "set":
 elif a[0] == "get":
     prop = a[a.index("value") + 1]; ds, sn = split(a[-1])
     fail = os.environ.get("FAKE_ZFS_FAIL_MATCH")
-    if fail and side == "dst" and fail in " ".join(a):
+    if fail and side == os.environ.get("FAKE_ZFS_FAIL_SIDE", "dst") and fail in " ".join(a):
         sys.stderr.write("internal error: Input/output error\n"); sys.exit(1)
     if ds not in st or (sn and sn not in st[ds]["snaps"]):
         sys.stderr.write("cannot open '%s': dataset does not exist\n" % a[-1]); sys.exit(1)
@@ -199,7 +209,7 @@ def out(r):
 
 class Kit:
     def __init__(self, tmp, cpu="x86-64-v4", src_cpu=GENOA, dst_cpu=TURIN,
-                 src_reconciler=True, dst_reconciler=True, conf=None):
+                 src_reconciler=True, dst_reconciler=True, conf=None, run_cpu=None):
         self.t = Path(tmp)
         b = self.t / "bin"; b.mkdir()
         for name, body in (("ssh", FAKE_SSH), ("hostname", FAKE_HOSTNAME), ("qm", FAKE_QM),
@@ -224,6 +234,13 @@ class Kit:
         (self.t / "src/zfs.json").write_text(json.dumps(
             {f"rpool/data/vm-{VMID}-disk-{n}": {"snaps": {}, "order": [], "written": 7, "token": "-"}
              for n in (0, 1, 2)}))
+        # what QEMU runs with on the source (PVE runs x86-64-v* as qemu64,+flags)
+        if run_cpu is None:
+            run_cpu = "qemu64,+avx512f" if cpu.startswith("x86-64-v") else cpu + ",+kvm_pv_eoi"
+        (self.t / "run").mkdir(); (self.t / "run" / f"{VMID}.pid").write_text("31337\n")
+        (self.t / "proc/31337").mkdir(parents=True)
+        (self.t / "proc/31337/cmdline").write_bytes(
+            b"\0".join([b"/usr/bin/kvm", b"-id", VMID.encode(), b"-cpu", run_cpu.encode(), b"-m", b"61440"]) + b"\0")
         self.work = self.t / "work"
         self.env = dict(os.environ)
         self.env.update({
@@ -235,9 +252,11 @@ class Kit:
             "CPUINFO": str(self.t / "src/cpuinfo"),
             "NV_RAM_GUARD": str(self.t / "src/ram-guard.py"),
             "NV_RECONCILER": str(self.t / "src/reconciler.sh"),
+            "QEMU_PIDDIR": str(self.t / "run"), "PROC_DIR": str(self.t / "proc"),
         })
         for k in ("CHANGE_CPU", "ACK_HWID_CHANGE", "CPU_NOTICE", "RATE", "DISKS", "ZSTD", "FAKE_SIDE",
-                  "ACK_DISCARD_DEST_WRITES", "FAKE_SSH_FAIL_MATCH", "FAKE_SSH_TRUNCATE_MATCH"):
+                  "ACK_DISCARD_DEST_WRITES", "FAKE_SSH_FAIL_MATCH", "FAKE_SSH_TRUNCATE_MATCH",
+                  "FAKE_SSH_LOSE_MATCH", "FAKE_SSH_DIE_AFTER", "FAKE_ZFS_FAIL_MATCH", "FAKE_ZFS_FAIL_SIDE"):
             self.env.pop(k, None)
 
     def run(self, script, *args, **env):
@@ -719,9 +738,11 @@ class SecondReview(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("cpu=host", out(r))
             self.assertNotIn("shutdown", k.read("qm.log"))
         with tempfile.TemporaryDirectory() as tmp:
-            conf = CONF.format(cpu="host") + "\n[PENDING]\ndelete: cpu\n"            # → kvm64
-            k = Kit(tmp, conf=conf, dst_cpu=GENOA); k.ok("rtmig_send.sh", "base", "rtmig-a")
-            self.assertEqual(k.run("rtmig_cutover.sh", "shutdown", "60").returncode, 0)
+            conf = CONF.format(cpu="host") + "\n[PENDING]\ndelete: cpu\n"            # → kvm64 on next boot
+            k = Kit(tmp, conf=conf, dst_cpu=GENOA, run_cpu="host"); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("corría con host y arrancará con kvm64", out(r))
+            k.ok("rtmig_cutover.sh", "shutdown", "60", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo")
 
     def test_pending_balloon_blocks_setting_one(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -760,6 +781,118 @@ class SecondReview(unittest.TestCase):
             for bad in ("2001:db8:2:0::2", "fe80::1%eth0", "2001:DB8:2::2", " 2001:db8:2::2"):
                 r = k.run("rtmig_send.sh", "base", "rtmig-a", DST=bad)
                 self.assertEqual(r.returncode, 2, bad); self.assertIn("canónica", out(r))
+
+
+class ThirdReview(unittest.TestCase):
+    """3rd review of PR #291."""
+
+    def test_rollback_starts_only_with_conf_and_fw_verified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            r = k.run("rtmig_cutover.sh", "rollback", FAKE_QM_START_FAIL="src")      # cut after restoring
+            self.assertEqual(r.returncode, 1); self.assertEqual(k.state()["PHASE"], "rollingback")
+            fw = k.t / f"src/etc/pve/firewall/{VMID}.fw"
+            fw.write_text("[OPTIONS]\nen")                                          # truncated firewall
+            r = k.run("rtmig_cutover.sh", "rollback")
+            self.assertEqual(r.returncode, 1); self.assertIn("no arranco sin su firewall", out(r))
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "stopped")
+            fw.unlink()                                                             # missing firewall
+            r = k.ok("rtmig_cutover.sh", "rollback")
+            self.assertEqual(fw.read_text(), k.read(f"work/{VMID}.fw.src") or "[OPTIONS]\nenable: 1\n")
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertEqual(k.state()["PHASE"], "rolledback")
+
+    def test_rollback_keeps_a_copy_of_the_dest_fw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            k.ok("rtmig_cutover.sh", "rollback")
+            self.assertTrue(list(k.work.glob(f"{VMID}.fw.dst-*")))
+            self.assertTrue(list(k.work.glob(f"{VMID}.conf.dst-*")))
+
+    def test_running_host_with_pending_v4_needs_the_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = CONF.format(cpu="host") + "\n[PENDING]\ncpu: x86-64-v4\n"
+            k = Kit(tmp, conf=conf, dst_cpu=GENOA, run_cpu="host"); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("corría con host y arrancará con x86-64-v4", out(r))
+            self.assertNotIn("shutdown", k.read("qm.log"))
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, conf=conf, dst_cpu=GENOA, run_cpu="host")
+            env = {"ACK_HWID_CHANGE": VMID, "CPU_NOTICE": "correo 21/11"}
+            k.to_final(**env)
+            self.assertEqual(k.state()["RUN_CPU"], "host")
+            r = k.run("rtmig_cutover.sh", "push", FINAL)                  # without ACK: push re-checks
+            self.assertEqual(r.returncode, 1); self.assertIn("cambio de modelo pendiente", out(r))
+            k.ok("rtmig_cutover.sh", "push", FINAL, **env)
+            self.assertIn("cambio de modelo pendiente: corría con host", k.read("work/cpu-change.txt"))
+
+    def test_unreadable_running_cpu_refuses_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); (k.t / "run" / f"{VMID}.pid").unlink()
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("no pude leer con qué CPU corre", out(r))
+
+    def test_lost_answer_after_rename_still_finishes_the_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, cpu="host", dst_cpu=TURIN)
+            env = {"ACK_HWID_CHANGE": VMID, "CPU_NOTICE": "correo 22/11"}
+            k.to_final(**env)
+            r = k.run("rtmig_cutover.sh", "push", FINAL, FAKE_SSH_LOSE_MATCH="qemu-server/4242.conf.rtmig-tmp", **env)
+            self.assertEqual(r.returncode, 0, out(r)); self.assertIn("se perdió", out(r))
+            self.assertEqual(k.state()["PHASE"], "pushed")
+            self.assertEqual(sum("import-state" in l for l in k.read("ramguard.log").splitlines()), 1)
+            self.assertEqual(k.read("work/cpu-change.txt").count("ACK_HWID_CHANGE"), 1)
+
+    def test_resumed_push_runs_the_same_finish_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, cpu="host", dst_cpu=TURIN)
+            env = {"ACK_HWID_CHANGE": VMID, "CPU_NOTICE": "correo 22/11"}
+            k.to_final(**env)
+            # the first push dies right after the rename, before its finish (answer AND probe lost)
+            r = k.run("rtmig_cutover.sh", "push", FINAL, FAKE_SSH_LOSE_MATCH="qemu-server/4242.conf.rtmig-tmp",
+                      FAKE_SSH_DIE_AFTER="qemu-server/4242.conf.rtmig-tmp", **env)
+            self.assertEqual(r.returncode, 1); self.assertTrue(k.dst_conf.exists())
+            (k.t / "ssh-dead").unlink()                                     # the link comes back
+            self.assertEqual(k.state()["PHASE"], "publishing")
+            r = k.ok("rtmig_cutover.sh", "push", FINAL)                    # retried WITHOUT the variables
+            self.assertIn("completo el cierre del push", r.stdout)
+            self.assertEqual(k.state()["PHASE"], "pushed")
+            self.assertEqual(sum("import-state" in l for l in k.read("ramguard.log").splitlines()), 1)
+            self.assertEqual(k.read("work/cpu-change.txt").count("ACK_HWID_CHANGE"), 1)
+            self.assertIn("correo 22/11", k.read("work/cpu-change.txt"))
+
+    def test_start_verifies_the_fw_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            (k.t / f"dst/etc/pve/firewall/{VMID}.fw").write_text("[OPTIONS]\nenable: 0\n")
+            r = k.run("rtmig_cutover.sh", "start")
+            self.assertEqual(r.returncode, 1); self.assertIn("el .fw del destino no es el publicado", out(r))
+            self.assertNotIn("dst start", k.read("qm.log"))
+
+    def test_drop_prev_aborts_on_zfs_errors_before_destroying(self):
+        for side in ("dst", "src"):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp)
+                k.ok("rtmig_send.sh", "base", "rtmig-a")
+                k.ok("rtmig_send.sh", "incr", "auto", "rtmig-b")
+                r = k.run("rtmig_send.sh", "incr", "auto", "rtmig-b", DROP_PREV="1",
+                          FAKE_ZFS_FAIL_MATCH="@rtmig-a", FAKE_ZFS_FAIL_SIDE=side)
+                self.assertEqual(r.returncode, 1, side); self.assertIn("INDETERMINADO", out(r))
+                self.assertNotIn("destroy", k.read("zfs.log"), side)
+
+    def test_archive_interrupted_after_the_terminal_phase_is_recovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            k.ok("rtmig_cutover.sh", "rollback")
+            for f in k.work.glob(f"{VMID}.*.rolledback-*"):              # pretend the archive never ran
+                f.rename(str(f).split(".rolledback-")[0])
+            st = k.read(f"work/{VMID}.state").replace("ARCHIVE_PENDING=", "ARCHIVE_PENDING=rolledback")
+            (k.work / f"{VMID}.state").write_text(st)
+            self.assertTrue((k.work / f"{VMID}.conf.src").exists())
+            k.ok("rtmig_cutover.sh", "status")
+            self.assertFalse((k.work / f"{VMID}.conf.src").exists())
+            self.assertEqual(k.state()["ARCHIVE_PENDING"], "")
+            k.ok("rtmig_cutover.sh", "shutdown", "60"); k.ok("rtmig_cutover.sh", "park")
 
 
 class CpuGuard(unittest.TestCase):
