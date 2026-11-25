@@ -76,3 +76,9 @@ case "${SYNC_PVE_NODES_ON_BOOT,,}" in
   fi
   ;;
 esac
+
+# A cluster.fw sync queued or interrupted (worker killed, reboot) before this
+# boot: serve it now (the CLI only queues; a detached worker does the work).
+if [ -e /var/lib/base-nat/fw-sync.pending ] || [ -e /var/lib/base-nat/fw-sync.inprogress ]; then
+  python3 /usr/local/sbin/sync-base-nat.py sync nodes sync-firewall || true
+fi

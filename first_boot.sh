@@ -628,6 +628,10 @@ policy_forward: DROP
 2a01:4f8:2b03:18a9::/64 # BASE 0 GERMANY (b0) IPv6
 2a01:4f9:3070:3984::/64 # BASE 1 IPv6
 2a01:4f9:c01f:e:ffff::/112 # transito de los tuneles base<->nodo
+2a01:4f8:fff2:95::/64 # VIP FSN (failover) - tuneles anclados a VIP
+2a01:4f9:fff1:5f::/64 # VIP HEL (failover) - tuneles anclados a VIP
+2a01:4f8:2b01:124::/64 # BASE 0 NUEVA (FSN) IPv6
+2a01:4f9:2a:2d56::/64 # BASE 1 NUEVA (HEL) IPv6
 
 [IPSET hosts-ipv6]
 
@@ -742,10 +746,81 @@ systemctl enable neuravps-vm-status-watch.timer
 # BootOrder, final reboot) and leaving the pending-first-boot marker armed —
 # 14 half-configured nodes on 2026-07-04 when the fleet key was never seeded
 # in rescue. Retry, then carry the failure to the exit code instead of dying.
+# The canonical cluster.fw is downloaded aside and only installed if PVE's own
+# parser loads it cleanly and the SSH lifeline from +dc/base is intact (same
+# validator the BASE runs on every node before replacing the file — keep this
+# heredoc identical to NODE_FW_VALIDATOR_PL in base/snippets/sync-base-nat.py;
+# test_cluster_fw_sync.py enforces it). Otherwise the baseline written above
+# stays, and the BASE sync delivers the canonical file later.
+# Current BASE IPv6 addresses (BASE_HOSTS in base/base_setup.sh; the test
+# keeps them in sync, and the baseline above must cover them).
+NV_BASE_IPV6S="2a01:4f8:2b01:124::2 2a01:4f9:2a:2d56::2"
+install_validated_cluster_fw() {
+  local sb=/root/cluster.fw.storagebox out
+  [ -s "$sb" ] || { log "WARNING: canonical cluster.fw not downloaded; keeping the baseline"; return 0; }
+  cat > /root/nv-validate-cluster-fw.pl <<'NVFWPL'
+use strict; use warnings;
+use PVE::Firewall;
+use Net::IP qw(:PROC);
+my ($f, @bases) = @ARGV;
+die "usage: FILE [BASE_IP...]\n" unless $f;
+my @w; local $SIG{__WARN__} = sub { push @w, $_[0] };
+my $c = eval { PVE::Firewall::load_clusterfw_conf($f) };
+if ($@) { print "parse died: $@"; exit 2 }
+if (@w) { print "parser warning: $_" for @w; exit 3 }
+my @e;
+push @e, "options.enable != 1" unless ($c->{options}{enable} // 0) == 1;
+push @e, "policy_in missing" unless $c->{options}{policy_in};
+my @rules = @{$c->{rules} || []};
+push @e, "no [RULES]" unless @rules;
+for my $s ("base", "hosts-ipv6") { push @e, "ipset $s empty" unless @{$c->{ipset}{$s} || []} }
+for my $s (sort keys %{$c->{ipset} || {}}) {
+  for my $x (@{$c->{ipset}{$s}}) { push @e, "ipset $s entry $x->{cidr} has errors" if $x->{errors} }
+}
+my ($life, $block);
+for my $i (0 .. $#rules) {
+  my $r = $rules[$i];
+  next unless ($r->{enable} // 1) && ($r->{type} // '') =~ /^(in|group)$/;
+  if (!defined $life && $r->{type} eq 'in' && ($r->{macro} // '') eq 'SSH'
+      && ($r->{action} // '') eq 'ACCEPT' && ($r->{source} // '') eq '+dc/base'
+      && !grep { defined $r->{$_} && $r->{$_} ne '' } qw(dest dport sport proto iface icmp-type)) {
+    $life = $i;
+  }
+  if (!defined $block && ($r->{type} eq 'group' || ($r->{action} // '') =~ /^(DROP|REJECT)$/)) {
+    $block = $i;
+  }
+}
+push @e, "no unrestricted SSH ACCEPT from +dc/base" unless defined $life;
+push @e, "a DROP/REJECT/GROUP rule comes before the SSH lifeline" if defined $life && defined $block && $block < $life;
+push @e, "ipset base must not contain exclusions ($_->{cidr})" for grep { $_->{nomatch} } @{$c->{ipset}{base} || []};
+push @e, "no BASE addresses given to check ipset base against" unless @bases;
+my @nets = map { Net::IP->new($_->{cidr}) } grep { !$_->{nomatch} } @{$c->{ipset}{base} || []};
+for my $b (@bases) {
+  my $ip = Net::IP->new($b) or do { push @e, "bad base address $b"; next };
+  my $in = grep { $_ && $_->version == $ip->version
+                  && (($ip->overlaps($_) // 0) == $IP_A_IN_B_OVERLAP || ($ip->overlaps($_) // 0) == $IP_IDENTICAL) } @nets;
+  push @e, "ipset base does not cover $b" unless $in;
+}
+if (@e) { print "check: $_\n" for @e; exit 4 }
+printf "parsed rules=%d base=%d hosts=%d\n", scalar @rules,
+  scalar @{$c->{ipset}{base}}, scalar @{$c->{ipset}{'hosts-ipv6'}};
+NVFWPL
+  # shellcheck disable=SC2086  # one argument per BASE address
+  if out=$(perl /root/nv-validate-cluster-fw.pl "$sb" $NV_BASE_IPV6S 2>&1) && [ "${out#parsed rules=}" != "$out" ]; then
+    if cat "$sb" > /etc/pve/firewall/cluster.fw.tmp.$$ && mv /etc/pve/firewall/cluster.fw.tmp.$$ /etc/pve/firewall/cluster.fw; then
+      log "cluster.fw: canonical installed ($out)"
+    else
+      log "WARNING: could not install the canonical cluster.fw; keeping the baseline"
+    fi
+  else
+    log "WARNING: canonical cluster.fw rejected, keeping the baseline: $out"
+  fi
+  rm -f "$sb" /root/nv-validate-cluster-fw.pl
+}
 pull_from_storagebox() {
   sftp -i /root/.ssh/neuravps_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -oBatchMode=yes -P 23 u560363@u560363.your-storagebox.de <<EOF
 get /home/id/firebase-credentials.json /etc/firebase-credentials.json
-get /home/firewall/cluster.fw /etc/pve/firewall/cluster.fw
+get /home/firewall/cluster.fw /root/cluster.fw.storagebox
 bye
 EOF
 }
@@ -761,6 +836,7 @@ else
   done
   if [ "$STORAGEBOX_PULL_OK" -eq 1 ] && [ -s /etc/firebase-credentials.json ]; then
     chmod 600 /etc/firebase-credentials.json
+    install_validated_cluster_fw
   else
     log "WARNING: storagebox pull failed after 3 attempts — node is missing firebase-credentials.json (sync-dnat.py Firestore updates) and the canonical cluster.fw (BASE push also delivers it)"
     FIRST_BOOT_FAILED=1
