@@ -145,6 +145,14 @@ threading.Event().wait()
         procs.append(subprocess.Popen(["nsenter", "-t", ga, "-n", "python3", "-c", srv, EXCL]))
         procs.append(subprocess.Popen(["nsenter", "-t", gb, "-n", "python3", "-c", srv, LEGACY, EXCL]))
         procs.append(subprocess.Popen(["nsenter", "-t", inet, "-n", "python3", "-c", srv, STRANGER]))
+        udp_srv = r'''import socket,sys
+s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind((sys.argv[1],5353))
+open(sys.argv[2],"w").close()
+while True:
+ d,a=s.recvfrom(100);open(sys.argv[2],"a").write(a[0]+"\\n");s.sendto(b"pong",a)
+'''
+        udp_log = tmp / "udp.log"
+        procs.append(subprocess.Popen(["nsenter", "-t", inet, "-n", "python3", "-c", udp_srv, STRANGER, str(udp_log)]))
         procs.append(subprocess.Popen(["python3", "-c", srv, WAN_NODE]))
         time.sleep(.4)
 
@@ -162,6 +170,16 @@ except Exception as e:print("ERR",type(e).__name__)
             if tcp(inet, STRANGER, LEGACY) and tcp(inet, STRANGER, EXCL) and tcp(tun, TRANSIT, LEGACY):
                 break
             time.sleep(.25)
+
+        def udp(src):
+            return n(gb, "python3", "-c", r'''import socket,sys
+s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind((sys.argv[1],0));s.connect((sys.argv[2],5353));s.settimeout(1.5)
+s.send(b"x")
+try:
+ print("RESP" if s.recv(10)==b"pong" else "OTRO")
+except (ConnectionRefusedError, PermissionError):print("RECHAZO")
+except Exception as e:print("ERR",type(e).__name__)
+''', src, STRANGER, check=False).stdout.strip()
 
         def tcp_err(pid, src, dst):
             return n(pid, "python3", "-c", cli, src, dst, check=False).stdout.strip()
@@ -228,6 +246,9 @@ except Exception as e:print("MUERTA",type(e).__name__)
         print("== MODE=drop SALIDA_MODE=count:", r.stdout.strip(), r.stderr.strip());  matrix(True, False)
         m = mirar(); print("  ", m)
         check("salida en count: cuenta conexiones nuevas", "MODOSAL=count" in m and "SALIDA=0" not in m)
+        res = udp(LEGACY)
+        check(f"salida en count: UDP desde la heredada SE ENTREGA ({res})",
+              res == "RESP" and LEGACY in udp_log.read_text())
         r = run()
         print("== MODE=drop SALIDA_MODE=drop:", r.stdout.strip(), r.stderr.strip());  matrix(True)
         t0 = time.time(); e = tcp_err(gb, LEGACY, STRANGER); dt = time.time() - t0
@@ -235,15 +256,11 @@ except Exception as e:print("MUERTA",type(e).__name__)
         hold_out.stdin.write("\n"); hold_out.stdin.flush()
         out = hold_out.stdout.readline().strip()
         check(f"conexion saliente abierta antes de armar no sobrevive ({out})", out.startswith("MUERTA"))
-        icmp = n(gb, "python3", "-c", r'''import socket,sys
-s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind((sys.argv[1],0));s.connect((sys.argv[2],53));s.settimeout(1.5)
-s.send(b"x")
-try:
- s.recv(10);print("RESP")
-except (ConnectionRefusedError, PermissionError):print("RECHAZO")
-except Exception as e:print("ERR",type(e).__name__)
-''', LEGACY, STRANGER, check=False).stdout.strip()
-        check(f"UDP desde la heredada rechazado con ICMPv6 ({icmp})", icmp == "RECHAZO")
+        udp_log.write_text("")
+        res = udp(LEGACY)
+        otro = int(sh("nft", "-j", "list", "chain", "inet", "nvxnode64", "salida64").stdout.split('"nv-salida-otro"')[0].rsplit('"packets": ', 1)[1].split(",")[0])
+        check(f"UDP desde la heredada: rechazado ({res}), sin entrega y nv-salida-otro={otro}",
+              res == "RECHAZO" and LEGACY not in udp_log.read_text() and otro > 0)
         hold.stdin.write("\n"); hold.stdin.flush()
         out = hold.stdout.readline().strip()
         check(f"conexion entrante abierta en count no sobrevive a drop ({out})", out.startswith("MUERTA"))

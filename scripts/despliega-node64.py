@@ -12,11 +12,11 @@ codigo 1 si algun nodo queda MAL.
                       [--sin64 0000266-KDM-9755] [--hilos N] [--base b1|b0]
                       [--solo-mirar | --quitar]
 
-`--modo-salida` (defecto count) es el sentido de SALIDA (invitado -> fuera con
-origen en el /64 del nodo); se escribe SIEMPRE explicito en el drop-in.
+`--modo` (entrada) y `--modo-salida` (invitado -> fuera con origen en el /64 del
+nodo) son OBLIGATORIOS al instalar y al mirar; los dos van al drop-in.
 `--solo-mirar` verifica que cada nodo siga protegido en el `--modo` indicado.
-`--modo count` (defecto) solo cuenta y registra: canario. Con FINAL/SALIDA
-revisados, se repasa con `--modo drop`. Repetir el mismo modo no reinicia los
+`count` solo cuenta y registra (canario); `drop` arma. Marcha atras de un solo
+sentido: repetir con ese sentido en `count`. Repetir el mismo modo no reinicia los
 contadores (la pasada solo reconstruye si algo cambia).
 `--quitar` = marcha atras: para y deshabilita timer y servicio y borra las tablas
 (deja los ficheros, inertes). En un nodo a mano:
@@ -52,15 +52,21 @@ _MIRAR_SH = ("if [ -x /usr/local/sbin/nvx-node64.py ]; then "
              "SERVICIO=$(systemctl is-enabled nvx-node64.service 2>/dev/null || echo not-found); fi\n")
 
 _INSTALA_SH = """\
-echo {PY} | base64 -d > /usr/local/sbin/nvx-node64.py.new && chmod 755 /usr/local/sbin/nvx-node64.py.new \
-  && mv /usr/local/sbin/nvx-node64.py.new /usr/local/sbin/nvx-node64.py || echo INSTALAR=fallo
-echo {SERVICE} | base64 -d > /etc/systemd/system/nvx-node64.service
-echo {TIMER} | base64 -d > /etc/systemd/system/nvx-node64.timer
+set -o pipefail
+# 1) Primero el drop-in con los DOS modos y daemon-reload: si el timer vence en
+#    medio, el ejecutable nuevo ya ve SALIDA_MODE (el viejo lo ignora).
 mkdir -p /etc/neuravps /etc/systemd/system/nvx-node64.service.d
+printf '[Service]\\nEnvironment=MODE={modo}\\nEnvironment=SALIDA_MODE={smodo}\\n' > /etc/systemd/system/nvx-node64.service.d/mode.conf.new \
+  && mv /etc/systemd/system/nvx-node64.service.d/mode.conf.new /etc/systemd/system/nvx-node64.service.d/mode.conf || echo DROPIN=fallo
 printf '%s\\n' {excluir} > /etc/neuravps/node64-guard-allow-vmids
 case "$(hostname)" in {sin64pat}) : > /etc/neuravps/node64-guard-sin64 ;; *) rm -f /etc/neuravps/node64-guard-sin64 ;; esac
-printf '[Service]\\nEnvironment=MODE={modo}\\nEnvironment=SALIDA_MODE={smodo}\\n' > /etc/systemd/system/nvx-node64.service.d/mode.conf
-systemctl daemon-reload
+echo {SERVICE} | base64 -d > /etc/systemd/system/nvx-node64.service
+echo {TIMER} | base64 -d > /etc/systemd/system/nvx-node64.timer
+systemctl daemon-reload || echo RELOAD=fallo
+systemctl show -p Environment --value nvx-node64.service | grep -q "SALIDA_MODE={smodo}" || echo DROPIN=no_cargado
+# 2) Despues, el ejecutable (sustitucion atomica).
+echo {PY} | base64 -d > /usr/local/sbin/nvx-node64.py.new && chmod 755 /usr/local/sbin/nvx-node64.py.new \
+  && mv /usr/local/sbin/nvx-node64.py.new /usr/local/sbin/nvx-node64.py || echo INSTALAR=fallo
 systemctl enable nvx-node64.service nvx-node64.timer >/dev/null 2>&1 || echo ENABLE=fallo
 systemctl start nvx-node64.timer >/dev/null 2>&1 || echo TIMERSTART=fallo
 # A traves de la unidad: serializado con el timer (y el script lleva cerrojo).
@@ -90,7 +96,7 @@ def _node_script(accion, modo, excluir, sin64=(), smodo="count"):
 def veredicto(accion, modo, sin64, n, d, smodo="count"):
     if "ERROR" in d or d.get("NVXFIN") != "1":
         return False
-    if any(k in d for k in ("INSTALAR", "ENABLE", "TIMERSTART", "APLICAR")):
+    if any(k in d for k in ("INSTALAR", "ENABLE", "TIMERSTART", "APLICAR", "DROPIN", "RELOAD")):
         return False
     if accion == "quitar":
         return (d.get("TABLA") == "no" and d.get("BR", "no") == "no"
@@ -119,8 +125,10 @@ def protegido(modo, sin64, n, d, smodo="count"):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--nodos")
-    p.add_argument("--modo", choices=["count", "drop"], default="count")
-    p.add_argument("--modo-salida", choices=["count", "drop"], default="count")
+    # Sin valores por defecto a proposito: cada orden dice los DOS sentidos, para
+    # que cambiar las excluidas o auditar no desarme (ni arme) un sentido sin querer.
+    p.add_argument("--modo", choices=["count", "drop"])
+    p.add_argument("--modo-salida", choices=["count", "drop"])
     p.add_argument("--excluir", default=EXCLUIR_DEFECTO)
     p.add_argument("--sin64", default=SIN64_DEFECTO)
     p.add_argument("--hilos", type=int, default=8)
@@ -132,6 +140,8 @@ def main():
     excluir = [x.strip() for x in a.excluir.split(",") if x.strip().isdigit()]
     sin64 = set(x.strip() for x in a.sin64.split(",") if x.strip())
     accion = "mirar" if a.solo_mirar else "quitar" if a.quitar else "instalar"
+    if accion != "quitar" and (not a.modo or not a.modo_salida):
+        raise SystemExit("indica --modo y --modo-salida (count|drop) explicitamente")
     orden = f"echo {_node_script(accion, a.modo, excluir, sin64, a.modo_salida)} | base64 -d | bash"
 
     r = subprocess.run(["ssh", "-n", a.base, "cat /var/lib/base-nat/pve_nodes.json"],

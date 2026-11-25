@@ -1406,8 +1406,9 @@ cat > /mnt/usr/local/sbin/nvx-node64.py <<'NVXEOF'
 # respuestas a lo que la entrada ya permite (nv-salida-resp/-rel); lo demas se
 # rechaza: TCP con RST (nv-salida) y el resto con ICMPv6 policy-fail
 # (nv-salida-otro), para que el invitado no espere un timeout y use su IDENT o
-# IPv4, que si van por las bases. Con SALIDA_MODE=count solo se cuentan las
-# conexiones nuevas (log limitado "nvx-node64 out:"). El trafico del propio
+# IPv4, que si van por las bases. Con SALIDA_MODE=count solo se cuentan los
+# paquetes en estado new (incluye retransmisiones; no son conexiones distintas)
+# con log limitado "nvx-node64 out:". El trafico del propio
 # host (::2, ::1) no es forward y no pasa por aqui.
 #
 # nv-spoof: descarta lo que un invitado envia por vmbr0 con ORIGEN en las
@@ -1588,7 +1589,8 @@ def ruleset(mode, p64, infra, infra_tun, excl, smode=None):
     else:
         sal_tcp = ('meta l4proto tcp ct state new counter '
                    'limit rate 6/minute log prefix "nvx-node64 out: " level info')
-        sal_otro = "meta l4proto != tcp ct state new counter"
+        sal_otro = ('meta l4proto != tcp ct state new counter '
+                    'limit rate 6/minute log prefix "nvx-node64 out: " level info')
     el = lambda xs: f"elements = {{ {', '.join(xs)} }}" if xs else ""
     pref = [str(n) for n in p64]
     ex_addr, ex_own = [], []

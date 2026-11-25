@@ -61,18 +61,19 @@ los contadores se conservan.
 ## Operación
 
 ```bash
-scripts/despliega-node64.py --solo-mirar --modo drop            # ¿sigue protegida la flota?
-scripts/despliega-node64.py --nodos <a,b> --modo count          # canario: solo cuenta
+scripts/despliega-node64.py --solo-mirar --modo drop --modo-salida drop     # ¿sigue protegida la flota?
+scripts/despliega-node64.py --nodos <a,b> --modo count --modo-salida count  # canario: solo cuenta
 scripts/despliega-node64.py --nodos <a,b> --modo drop --modo-salida count   # entrada armada, salida midiendo
 scripts/despliega-node64.py --nodos <a,b> --modo drop --modo-salida drop    # las dos armadas
-scripts/despliega-node64.py --modo drop --excluir 520,1306,...  # otra lista de excluidas
+scripts/despliega-node64.py --modo drop --modo-salida drop --excluir 520,1306,...  # otra lista de excluidas
 # en el nodo:
 python3 /usr/local/sbin/nvx-node64.py --mirar
 journalctl -k | grep nvx-node64          # en modo count, quién llega
 ```
 
 `FINAL` = intentos de fuera descartados (o que se descartarían); `SALIDA` = salida del
-invitado con origen node64 (conexiones nuevas en count, paquetes rechazados en drop);
+invitado con origen node64 (paquetes en estado new en count, rechazados en drop; no son
+conexiones distintas);
 `SALRESP` = respuestas permitidas; `EXCL` = tráfico a una VM excluida;
 `AJENA` = a la dirección de una excluida por otro puerto; `SPOOF` = invitado con origen
 IDENT reservado; `N64OK=si` = el conjunto vivo coincide con el /64 de `vmbr0`.
@@ -85,7 +86,8 @@ Nodos nuevos: `install.sh` los deja en `drop` a propósito (no tienen VMs hereda
   servicio y borra la tabla; los ficheros quedan inertes).
 - Un nodo: `systemctl disable --now nvx-node64.timer nvx-node64.service; python3 /usr/local/sbin/nvx-node64.py --quitar`
   (o `--nodos <nodo> --quitar` desde el sandbox).
-- Volver a solo contar sin quitar: `--modo count`.
+- Desarmar solo la salida: `--nodos <...> --modo drop --modo-salida count`; solo la entrada:
+  `--modo count --modo-salida drop`. El script exige siempre los dos modos.
 
 ## Pruebas
 
