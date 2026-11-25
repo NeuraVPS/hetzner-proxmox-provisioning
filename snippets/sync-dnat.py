@@ -16,10 +16,8 @@ Where it writes:
     The file holds only the secret, generated on the node
     (scripts/node_token_admin.py in the web repo). NEURAVPS_NODE_API_URL and
     NEURAVPS_NODE_TOKEN_FILE override URL and path for local testing.
-    In this mode an unreachable function never loses the desired state:
-    node-boot records every VM as unresolved before its first call, `watch`
-    never publishes `stopped` for those and hands them to `node-boot-retry`
-    (a transient unit) until they are resolved or the node boots again.
+    As on the fleet, VMs are only started by the node-boot pass: one whose
+    desired state cannot be read then stays off.
 
 Commands:
   Hook (Proxmox):
@@ -39,11 +37,6 @@ Commands:
   Node boot:
     sync-dnat.py node-boot                 — Set proxmox_nodes/<host>.lastNodeBootAt
                                               and sync all VM statuses.
-    sync-dnat.py node-boot-retry           — Token mode only, spawned by `watch`:
-                                              finish what node-boot could not read.
-                                              Before working on VMs by hand, remove
-                                              /var/lib/neuravps/node_boot_pending.json
-                                              so none is started behind your back.
   Firestore IPv6 update (one VM):
     sync-dnat.py set-server-ipv6 <VMID> <IPV6>
                                             — Set servers/{id}.ipv6 for the
@@ -159,17 +152,14 @@ NODE_API_RETRY_CODES = (429, 500, 502, 503, 504)
 # together. Whatever does not fit is left to the watchdog.
 HOOK_BUDGET_S = 12
 HOOK_CALL_TIMEOUT_S = 8
-# node-boot: time it may LOSE to a failing function. The unit has
-# TimeoutStartSec=300 on nodes without the SQX drop-in, and the VM starts need
-# most of that.
+# node-boot must fit in TimeoutStartSec=300: shorter calls, and once reads have
+# lost this long to a failing function, stop asking.
 BOOT_CALL_TIMEOUT_S = 10
-NODE_BOOT_API_BUDGET_S = 90
-NODE_BOOT_ACTION_BUDGET_S = 30
-NODE_BOOT_RETRY_WINDOW_S = 180  # no new retry round after this
-ACTION_MAX_RETRIES = 24         # watchdog ticks (~2.5 h) for the maintenance flags
-BOOT_PENDING_FILE = Path("/var/lib/neuravps/node_boot_pending.json")
-BOOT_PENDING_LOCK = "/run/neuravps-boot-pending.lock"
-_UNRESOLVED = object()
+READ_FAILURE_BUDGET_S = 90
+_read_time_lost = 0.0
+# A finalize_boot decided at node-boot whose write did not get through.
+BOOT_FINALIZE_FILE = Path("/var/lib/neuravps/boot_finalize.json")
+FINALIZE_MAX_RETRIES = 24  # watchdog ticks, ~2.5 h
 
 
 class NodeApiError(Exception):
@@ -178,10 +168,6 @@ class NodeApiError(Exception):
     def __init__(self, message, code=None):
         super().__init__(message)
         self.code = code
-
-    @property
-    def rejected(self):
-        return self.code in (401, 403)
 
     @property
     def transient(self):
@@ -258,10 +244,27 @@ def _node_api(op, attempts=3, timeout=None, **fields):
         time.sleep(0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5))
 
 
-def _api_desired_status(vmid, timeout):
-    """Status on the server doc, None if there is no doc. Raises if unknown."""
-    docs = _node_api("get_server", attempts=1, timeout=timeout, vmid=vmid)["servers"]
-    return docs[0].get("status") if docs else None
+def _api_get_status(vmid):
+    """get_firestore_status through the node API. None if there is no doc or it
+    could not be read."""
+    global _read_time_lost
+    if _read_time_lost >= READ_FAILURE_BUDGET_S:
+        logger.error(f"VM {vmid}: status NOT read, the node API has been failing too long; "
+                     "if it should be running it will NOT be auto-started")
+        return None
+    began = time.monotonic()
+    try:
+        docs = _node_api("get_server", timeout=BOOT_CALL_TIMEOUT_S, vmid=vmid)["servers"]
+        if not docs:
+            return None
+        if len(docs) > 1:
+            logger.warning(f"Multiple Firestore documents for VM {vmid}; using first")
+        return docs[0].get("status")
+    except Exception as e:
+        _read_time_lost += time.monotonic() - began
+        logger.error(f"VM {vmid}: status NOT read ({e}); "
+                     "if it should be running it will NOT be auto-started")
+        return None
 
 
 def _api_update_status(vmid, status):
@@ -300,284 +303,71 @@ def _api_write_status(vmid, status):
                 logger.info(f"Updated Firestore server {doc['id']} (VM {vmid}): status={status}")
             _remember_status(vmid, status)
             return True
-        except NodeApiError as e:
-            if not (e.transient or e.code == 409):
-                logger.warning(f"Status of VM {vmid} refused, not retrying: {e}")
-                return False
-            if attempt == attempts or time.monotonic() - began >= HOOK_BUDGET_S - 1:
+        except Exception as e:
+            code_ok = not isinstance(e, NodeApiError) or e.transient or e.code == 409
+            backoff = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            # A refused credential or request will not get better: leave at once.
+            if (not code_ok or attempt == attempts
+                    or time.monotonic() - began + backoff >= HOOK_BUDGET_S - 1):
                 logger.warning(f"Failed to update status for VM {vmid} after {attempt} attempts: {e}")
                 return False
-            backoff = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
             logger.info(f"update_status VM {vmid} attempt {attempt}/{attempts} failed ({e}); retrying in {backoff:.1f}s")
             time.sleep(backoff)
-        except Exception as e:
-            logger.warning(f"Failed to update status for VM {vmid}: {e}")
-            return False
-    return False
 
 
-# --- what node-boot has not resolved yet (token mode only) -------------------
-def _boot_id():
+def _api_post_boot_action():
+    """handle_pending_post_boot_action for token mode. Only ever called by the
+    node-boot pass: it is the one place that may start the VM."""
+    BOOT_FINALIZE_FILE.unlink(missing_ok=True)  # anything older is decided again below
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
-        return ""
-
-
-_boot_unsaved = None  # fallback if the file cannot be written: still start the VMs
-
-
-def _load_boot_state():
-    """This boot's unresolved work, or None. A previous boot's file is ignored."""
-    if _boot_unsaved is not None:
-        return json.loads(json.dumps(_boot_unsaved))
-    try:
-        state = json.loads(BOOT_PENDING_FILE.read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(state, dict) or state.get("boot_id") != _boot_id():
-        return None
-    return state
-
-
-def _write_boot_state(state):
-    global _boot_unsaved
-    try:
-        if not state.get("vms") and state.get("action") is None:
-            BOOT_PENDING_FILE.unlink(missing_ok=True)
-            _boot_unsaved = None
+        node = _node_api("get_node", timeout=BOOT_CALL_TIMEOUT_S)
+        if not node.get("exists") or (node.get("pendingPostBootAction") is None
+                                      and not node.get("maintenance")):
             return
-        BOOT_PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = BOOT_PENDING_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state))
-        tmp.replace(BOOT_PENDING_FILE)
-        _boot_unsaved = None
-    except OSError as e:
-        _boot_unsaved = state
-        logger.warning(f"Could not persist {BOOT_PENDING_FILE}: {e}")
-
-
-@contextlib.contextmanager
-def _boot_state():
-    """Locked read-modify-write (node-boot and the hooks run concurrently)."""
-    try:
-        lock = open(BOOT_PENDING_LOCK, "a+")  # pylint: disable=consider-using-with
-        fcntl.flock(lock, fcntl.LOCK_EX)
-    except OSError as e:
-        logger.warning(f"could not take {BOOT_PENDING_LOCK} ({e})")
-        lock = None
-    try:
-        state = _load_boot_state()
-        yield state
-        if state is not None:
-            _write_boot_state(state)
-    finally:
-        if lock is not None:
-            lock.close()
-
-
-def _boot_pending_init():
-    """Before the first call: if node-boot dies or the function is down, every
-    VM is still known to be unresolved."""
-    vms = sorted(int(p.stem) for p in VM_CONFIG_DIR.glob("*.conf") if p.stem.isdigit())
-    state = {"boot_id": _boot_id(), "vms": vms, "loop": False,
-             "action": {"tries": 0, "finalize": None}}
-    _write_boot_state(state)
-    return state
-
-
-def _boot_pending_vms():
-    state = _load_boot_state()
-    return set(state.get("vms") or []) if state else set()
-
-
-def _settle_boot_vm(vmid):
-    """Its desired state was read and acted on, or a hook has since changed it."""
-    with _boot_state() as state:
-        if state and vmid in (state.get("vms") or []):
-            state["vms"].remove(vmid)
-
-
-class _ApiBudget:
-    """Time that failing calls and the pauses between them may consume."""
-
-    def __init__(self, seconds):
-        self.left = float(seconds)
-
-    def spent(self):
-        return self.left < 1
-
-    def call(self, fn):
-        timeout = min(BOOT_CALL_TIMEOUT_S, max(1.0, self.left))
-        began = time.monotonic()
-        try:
-            with _hard_deadline(timeout + 2):
-                return fn(timeout)
-        except _DeadlineExceeded:
-            self.left -= time.monotonic() - began
-            raise NodeApiError("deadline exceeded") from None
-        except NodeApiError:
-            self.left -= time.monotonic() - began
-            raise
-
-    def pause(self, seconds):
-        seconds = min(seconds, max(0.0, self.left))
-        time.sleep(seconds)
-        self.left -= seconds
-
-    def retry(self, fn, attempts=3):
-        for attempt in range(1, attempts + 1):
-            try:
-                return self.call(fn)
-            except NodeApiError as e:
-                if not e.transient or attempt == attempts or self.spent():
-                    raise
-                self.pause(2 * attempt)
-
-
-_boot_budget = None
-
-
-def _api_boot_reconcile(loop=None):
-    """node_boot_reconcile for token mode. A VM whose desired state cannot be
-    read stays unresolved and is retried: here within the budget, afterwards by
-    the watchdog's node-boot-retry."""
-    budget = _boot_budget or _ApiBudget(NODE_BOOT_API_BUDGET_S)
-    if _load_boot_state() is None:
-        _boot_pending_init()
-    if loop is None:
-        loop = _boot_history_crashloop()
-    present = get_all_vms()
-    with _boot_state() as state:
-        if state:
-            # VMs the config listing missed join; VMs that are gone leave.
-            if not state.get("listed"):
-                state["vms"] = sorted(set(state["vms"]) | set(present))
-            if present:  # an empty list may just be pmxcfs not being up yet
-                state["vms"] = [v for v in state["vms"] if v in present]
-            state["loop"] = loop
-            state["listed"] = True
-
-    window_end = time.monotonic() + NODE_BOOT_RETRY_WINDOW_S
-    delay = 2.0
-    rejected = False
-    while True:
-        pending = _boot_pending_vms()
-        if not pending:
+        # Only a cycle opened before this boot is the one this boot ends.
+        started, uptime = node.get("maintenanceStartedAt"), _node_uptime_sec()
+        if not started or uptime is None or started >= time.time() - uptime:
+            logger.warning(f"node-boot: the maintenance flags on {NODE_NAME} are not from before "
+                           "this boot; leaving them alone")
             return
-        failures = 0
-
-        def read(vmid):
-            nonlocal failures, rejected
-            # Settled meanwhile by a hook, or no point in calling any more.
-            if vmid not in _boot_pending_vms() or rejected or failures >= 3 or budget.spent():
-                return _UNRESOLVED
-            try:
-                status = budget.call(lambda t: _api_desired_status(vmid, t))
-            except NodeApiError as e:
-                failures += 1
-                rejected = e.rejected
-                logger.warning(f"VM {vmid}: desired state unknown ({e}); left unresolved")
-                return _UNRESOLVED
-            failures = 0
-            return status
-
-        _node_boot_reconcile_locked(read, _settle_boot_vm, only=pending, loop=loop)
-        left = _boot_pending_vms()
-        if not left:
-            return
-        if rejected or budget.spent() or time.monotonic() + delay > window_end:
-            break
-        budget.pause(delay)
-        delay = min(delay * 2, 20.0)
-
-    why = "the node token was REJECTED" if rejected else "the node API is not answering"
-    logger.error(f"node-boot: {why}; desired state of VMs {sorted(left)} unresolved. "
-                 "They are NOT published as stopped; the watchdog will retry")
-
-
-def _api_post_boot_action(initial):
-    """handle_pending_post_boot_action for token mode. `initial` is node-boot
-    itself; later calls come from node-boot-retry."""
-    state = _load_boot_state()
-    if state is None and initial:
-        state = _boot_pending_init()
-    action = (state or {}).get("action")
-    if action is None:
+    except NodeApiError as e:
+        logger.error(f"node-boot: could not read the maintenance flags of {NODE_NAME} ({e}); "
+                     "no VM auto-start, and maintenance/pendingPostBootAction may still be set")
         return
+    decided = {"cycle": node["cycle"], "vmStarted": _auto_start_after_user_reboot(node)}
+    _api_finalize(dict(decided, tries=0))
 
-    def done():
-        with _boot_state() as current:
-            if current:
-                current["action"] = None
 
-    budget = _ApiBudget(NODE_BOOT_ACTION_BUDGET_S)
+def _api_finalize(pending):
+    """Write the result decided at node-boot. On failure keep it for the
+    watchdog; `cycle` makes sure a newer maintenance is never closed."""
     try:
-        decided = action.get("finalize")  # set: the VM part is done, only the write is missing
-        if not decided:
-            node = budget.retry(lambda t: _node_api("get_node", attempts=1, timeout=t))
-            if not node.get("exists") or (node.get("pendingPostBootAction") is None
-                                          and not node.get("maintenance")):
-                done()
-                return
-            started = node.get("maintenanceStartedAt")
-            uptime = _node_uptime_sec()
-            if not initial and started and uptime is not None and started > time.time() - uptime:
-                logger.warning("node-boot: the open maintenance cycle started after this boot; leaving it")
-                done()
-                return
-            vm_started = _auto_start_after_user_reboot(node)
-            decided = {"cycle": node["cycle"], "vmStarted": vm_started}
-            with _boot_state() as current:
-                if current and current.get("action") is not None:
-                    current["action"]["finalize"] = decided
-        budget.retry(lambda t: _node_api("finalize_boot", attempts=1, timeout=t, **decided))
-        logger.info(f"node-boot: finalized maintenance on {NODE_NAME} (vm_started={decided['vmStarted']})")
-        done()
+        _node_api("finalize_boot", attempts=2, timeout=BOOT_CALL_TIMEOUT_S,
+                  cycle=pending["cycle"], vmStarted=pending["vmStarted"])
+        logger.info(f"node-boot: finalized maintenance on {NODE_NAME} (vm_started={pending['vmStarted']})")
     except NodeApiError as e:
         if e.code == 409:
             logger.warning("node-boot: a newer maintenance cycle is open; leaving it")
-            done()
-        else:
-            logger.error(f"node-boot: could not finalize maintenance on {NODE_NAME} ({e}); "
-                         "maintenance/pendingPostBootAction may still be set. The watchdog will retry")
-
-
-def node_boot_retry():
-    """Finish, from the watchdog, what node-boot could not read or write."""
-    global _boot_budget
-    _boot_budget = _ApiBudget(NODE_BOOT_API_BUDGET_S)
-    with open(BOOT_RECONCILE_LOCK, "a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # the watch stands down meanwhile
-        state = _load_boot_state()
-        if state is None:
+        elif pending["tries"] < FINALIZE_MAX_RETRIES:
+            logger.warning(f"node-boot: could not finalize maintenance ({e}); the watchdog will retry")
+            try:
+                BOOT_FINALIZE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                BOOT_FINALIZE_FILE.write_text(json.dumps(dict(pending, tries=pending["tries"] + 1)))
+            except OSError as write_error:
+                logger.error(f"Could not persist {BOOT_FINALIZE_FILE}: {write_error}")
             return
-        if state.get("vms"):
-            _api_boot_reconcile(loop=bool(state.get("loop")))
-        with _boot_state() as current:
-            action = (current or {}).get("action")
-            if action is None:
-                return
-            action["tries"] = action.get("tries", 0) + 1
-            if action["tries"] > ACTION_MAX_RETRIES:
-                logger.error(f"node-boot: giving up on the maintenance flags of {NODE_NAME} after "
-                             f"{ACTION_MAX_RETRIES} retries; clear them by hand")
-                current["action"] = None
-                return
-        _api_post_boot_action(initial=False)
+        else:
+            logger.error(f"node-boot: giving up finalizing maintenance on {NODE_NAME} ({e}); "
+                         "clear maintenance/pendingPostBootAction by hand")
+    BOOT_FINALIZE_FILE.unlink(missing_ok=True)
 
 
-def _spawn_boot_retry_if_pending():
-    """The watch unit has TimeoutStartSec=120, too short to start VMs in."""
-    state = _load_boot_state()
-    if not state or (not state.get("vms") and state.get("action") is None):
-        return
+def _api_retry_finalize():
     try:
-        run(["systemd-run", "--collect", "--no-block", "--unit=nvps-boot-retry",
-             "--property=Type=oneshot", "--property=TimeoutStartSec=1800",
-             "/usr/bin/python3", os.path.abspath(__file__), "node-boot-retry"])
-    except (OSError, subprocess.CalledProcessError) as e:
-        logger.info(f"watch: node-boot-retry not launched (already running?): {e}")
+        pending = json.loads(BOOT_FINALIZE_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    _api_finalize(pending)
 
 
 # ---------------------------------------------------------------
@@ -686,16 +476,7 @@ def _query_local_server_doc(db, vmid):
 
 def get_firestore_status(vmid):
     if use_node_api():
-        try:
-            docs = _node_api("get_server", vmid=vmid)["servers"]
-            if not docs:
-                return None
-            if len(docs) > 1:
-                logger.warning(f"Multiple Firestore documents for VM {vmid}; using first")
-            return docs[0].get("status")
-        except Exception as e:
-            logger.warning(f"Failed to get status for VM {vmid} from Firestore: {e}")
-            return None
+        return _api_get_status(vmid)
     if not ensure_firebase_initialized():
         return None
     try:
@@ -809,8 +590,7 @@ def update_status_in_firestore(vmid, status):
 def update_proxmox_node_last_boot_at():
     if use_node_api():
         try:
-            budget = _boot_budget or _ApiBudget(NODE_BOOT_API_BUDGET_S)
-            budget.retry(lambda t: _node_api("node_booted", attempts=1, timeout=t), attempts=2)
+            _node_api("node_booted", attempts=2, timeout=BOOT_CALL_TIMEOUT_S)
             logger.info(f"Updated proxmox_nodes/{NODE_NAME} lastNodeBootAt")
         except Exception as e:
             logger.warning(f"Failed to update lastNodeBootAt for proxmox_nodes/{NODE_NAME}: {e}")
@@ -892,7 +672,7 @@ def handle_pending_post_boot_action():
     """
     if use_node_api():
         try:
-            _api_post_boot_action(initial=True)
+            _api_post_boot_action()
         except Exception as e:
             logger.warning(f"handle_pending_post_boot_action failed on {NODE_NAME}: {e}")
         return
@@ -934,11 +714,7 @@ def sync_all_statuses():
     """Reconcile every local VM's running/stopped state with Firestore."""
     all_vm_status = get_all_vms()
     logger.info(f"All VMs: {sorted(all_vm_status.keys())}")
-    unresolved = _boot_pending_vms() if use_node_api() else set()
     for vmid, actual_status in all_vm_status.items():
-        if actual_status == "stopped" and vmid in unresolved:
-            logger.info(f"VM {vmid}: desired state not resolved since boot — not publishing stopped")
-            continue
         firestore_status = get_firestore_status(vmid)
         if firestore_status != actual_status:
             logger.info(f"VM {vmid} status changed from {firestore_status} to {actual_status}, updating Firestore")
@@ -965,6 +741,8 @@ def watch_statuses():
     """
     if _watch_should_stand_down():
         return 0
+    if use_node_api():
+        _api_retry_finalize()
     actual = get_all_vms()
     cache = _load_status_cache()
     drifted = {vmid: st for vmid, st in actual.items() if cache.get(vmid) != st}
@@ -976,13 +754,6 @@ def watch_statuses():
         for vmid in stale:
             cache.pop(vmid, None)
         _save_status_cache(cache)
-
-    if use_node_api():
-        _spawn_boot_retry_if_pending()
-        # A guest stopped only because node-boot could not read what it should
-        # be: publishing that would erase the desired state.
-        unresolved = _boot_pending_vms()
-        drifted = {v: st for v, st in drifted.items() if not (st == "stopped" and v in unresolved)}
 
     if not drifted:
         return 0
@@ -1114,10 +885,7 @@ def node_boot_reconcile():
         lock_fh = None
 
     try:
-        if use_node_api():
-            _api_boot_reconcile()
-        else:
-            _node_boot_reconcile_locked()
+        _node_boot_reconcile_locked()
     finally:
         if lock_fh is not None:
             # flock is released by the close (and by process death, which is why
@@ -1215,10 +983,7 @@ def _wait_for_boot_memory(vmid, cfg, last_start, sleep=time.sleep,
         sleep(5)
 
 
-def _node_boot_reconcile_locked(read_desired=None, on_resolved=None, only=None, loop=None):
-    """The arguments are for token mode (_api_boot_reconcile): a reader that may
-    answer _UNRESOLVED, a callback once a VM is dealt with, the VMs left to do
-    and the reboot-loop verdict already taken for this boot."""
+def _node_boot_reconcile_locked():
     stagger = _boot_stagger_config()
     last_start = None
     reconcile_start = time.monotonic()
@@ -1227,24 +992,17 @@ def _node_boot_reconcile_locked(read_desired=None, on_resolved=None, only=None, 
         logger.info(f"boot stagger ON: {stagger}")
     all_vm_status = get_all_vms()
     logger.info(f"All VMs: {sorted(all_vm_status.keys())}")
-    if loop is None:
-        loop = _boot_history_crashloop()
+    loop = _boot_history_crashloop()
     if loop:
         logger.warning(
             "REBOOT LOOP detected (many reboots in a short window) — NOT auto-starting "
             "VMs this boot. Desired state left intact for the operator to resolve."
         )
     for vmid, actual_status in all_vm_status.items():
-        if only is not None and vmid not in only:
-            continue
-        desired = (read_desired or get_firestore_status)(vmid)
-        if desired is _UNRESOLVED:
-            continue
+        desired = get_firestore_status(vmid)
         if desired == "running" and actual_status != "running":
             if loop:
                 logger.warning(f"VM {vmid}: desired=running but node in reboot loop — skipping auto-start (Firestore left 'running')")
-                if on_resolved:
-                    on_resolved(vmid)
                 continue
             logger.info(f"VM {vmid}: desired=running, stopped after node reboot — auto-starting")
             if stagger is not None:
@@ -1267,8 +1025,6 @@ def _node_boot_reconcile_locked(read_desired=None, on_resolved=None, only=None, 
             logger.info(f"VM {vmid}: running on host but Firestore={desired}; syncing up to running")
             update_status_in_firestore(vmid, "running")
         # else: already matches, or desired stopped/None & VM stopped -> no-op (never clobber)
-        if on_resolved:
-            on_resolved(vmid)
 
 
 BOOT_RAM_GUARD_S = 180
@@ -1355,10 +1111,6 @@ def main():
     # user-requested post-boot action (VPS E dedicated nodes only).
     if len(sys.argv) >= 2 and sys.argv[1] == "node-boot":
         logger.info("node-boot: updating lastNodeBootAt and reconciling VMs to desired state")
-        if use_node_api():
-            global _boot_budget
-            _boot_budget = _ApiBudget(NODE_BOOT_API_BUDGET_S)
-            _boot_pending_init()
         update_proxmox_node_last_boot_at()
         try:
             node_boot_reconcile()
@@ -1370,11 +1122,6 @@ def main():
             logger.warning(f"node-boot: reconcile failed, continuing to finalize: {e}")
         handle_pending_post_boot_action()
         logger.info("Sync complete.")
-        return
-
-    if len(sys.argv) >= 2 and sys.argv[1] == "node-boot-retry":
-        if use_node_api():
-            node_boot_retry()
         return
 
     # Hook mode: <vmid> <phase>
@@ -1389,16 +1136,12 @@ def main():
         if phase == "post-start":
             logger.info(f"Hook: VM {triggered_vmid} post-start")
             boot_ram_guard(triggered_vmid)
-            if use_node_api():
-                _settle_boot_vm(triggered_vmid)
             update_status_in_firestore(triggered_vmid, "running")
             logger.info("Sync complete.")
             return
 
         if phase == "post-stop":
             logger.info(f"Hook: VM {triggered_vmid} post-stop")
-            if use_node_api():
-                _settle_boot_vm(triggered_vmid)
             update_status_in_firestore(triggered_vmid, "stopped")
             logger.info("Sync complete.")
             return

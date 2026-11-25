@@ -22,7 +22,6 @@ class Api:
         self.calls = []
         self.headers = []
         self.replies = {}  # op -> list of (code, body); the last one repeats
-        self.by_vmid = {}  # vmid -> list of (code, body), takes precedence
         self.delay = 0.0
 
     def ops(self):
@@ -38,7 +37,7 @@ def api():
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.calls.append(body)
             state.headers.append(self.headers["Authorization"])
-            queue = state.by_vmid.get(body.get("vmid")) or state.replies.get(body["op"], [(200, {})])
+            queue = state.replies.get(body["op"], [(200, {})])
             if state.delay:
                 time.sleep(state.delay)
             code, reply = queue.pop(0) if len(queue) > 1 else queue[0]
@@ -79,7 +78,7 @@ def sync(tmp_path, monkeypatch, api):
     (tmp_path / '227.conf').write_text('memory: 4096\n')
     m.run = lambda cmd: 'status: stopped'
     m._remember_status = MagicMock(wraps=m._remember_status)
-    # A clock that only advances when the script sleeps or a test moves it.
+    # No real waiting and no jitter: the clock only advances when the script sleeps.
     m.clock = [1000.0]
     m.slept = []
     def sleep(seconds):
@@ -87,12 +86,11 @@ def sync(tmp_path, monkeypatch, api):
         m.clock[0] += seconds
     m.time = SimpleNamespace(sleep=sleep, monotonic=lambda: m.clock[0], time=time.time,
                              time_ns=time.time_ns)
-    m.BOOT_PENDING_FILE = tmp_path / 'boot_pending.json'
-    m.BOOT_PENDING_LOCK = str(tmp_path / 'pending.lock')
+    m.random = SimpleNamespace(uniform=lambda a, b: 0.0)
+    m._STATUS_CACHE = tmp_path / 'cache.json'
+    m.BOOT_FINALIZE_FILE = tmp_path / 'boot_finalize.json'
     m.BOOT_RECONCILE_LOCK = str(tmp_path / 'reconcile.lock')
     m.BOOT_STAGGER_FILE = str(tmp_path / 'absent')
-    m._STATUS_CACHE = tmp_path / 'cache.json'
-    m._boot_id = lambda: 'boot-1'
     m._boot_history_crashloop = lambda: False
     m._node_uptime_sec = lambda: 3600.0
     m.ensure_firebase_initialized = MagicMock(side_effect=AssertionError("no SDK in API mode"))
@@ -203,7 +201,8 @@ def test_hook_stops_when_its_budget_is_spent(sync, api):
     api.replies["get_server"] = [(503, {})]
     sync.HOOK_BUDGET_S = 3
     assert sync.update_status_in_firestore(227, "stopped") is False
-    assert 2 <= len(api.calls) < 4 and sum(sync.slept) < 3
+    # 0.5 s + 1 s of backoff; the next one (2 s) would not fit.
+    assert len(api.calls) == 3 and sync.slept == [0.5, 1.0]
 
 
 def test_hook_has_a_hard_wall_clock_bound(sync, api):
@@ -223,14 +222,8 @@ def test_failed_write_leaves_the_vm_drifted_for_the_watch(sync, api):
 
 
 # --- node-boot ---------------------------------------------------------------
-def node_reply(**kw):
-    base = {"exists": True, "pendingPostBootAction": "start-vm", "maintenance": True,
-            "maintenanceStartedAt": 1.0, "cycle": "c" * 32, "max_vm": 1}
-    return (200, dict(base, **kw))
-
-
 def host(sync, tmp_path, states):
-    """VMs of the node: {vmid: running|stopped}; qm start flips them."""
+    """VMs of the node: {vmid: running|stopped}; returns the qm start calls."""
     started = []
     for vmid in states:
         (tmp_path / f'{vmid}.conf').write_text('memory: 4096\n')
@@ -240,118 +233,46 @@ def host(sync, tmp_path, states):
             states[int(cmd[2])] = "running"
             started.append(int(cmd[2]))
             return ""
-        if cmd[0] == "systemd-run":
-            started.append("spawn")
-            return ""
         return f"status: {states[int(cmd[2])]}"
     sync.run = run
     sync.get_all_vms = lambda: dict(states)
     return started
 
 
-def boot(sync):
-    sync._boot_budget = sync._ApiBudget(sync.NODE_BOOT_API_BUDGET_S)
-    sync._boot_pending_init()
+def test_boot_starts_what_should_be_running(sync, api, tmp_path):
+    started = host(sync, tmp_path, {227: "stopped"})
+    api.replies["get_server"] = [docs("running")]
     sync.node_boot_reconcile()
-
-
-def test_boot_starts_what_should_be_running_and_forgets_it(sync, api, tmp_path):
-    started = host(sync, tmp_path, {227: "stopped"})
-    api.replies["get_server"] = [docs("running")]
-    boot(sync)
     assert started == [227]
-    assert sync._boot_pending_vms() == set()
 
 
-def test_no_doc_is_resolved_not_a_failure(sync, api, tmp_path):
-    started = host(sync, tmp_path, {227: "stopped"})
-    api.replies["get_server"] = [(200, {"servers": []})]
-    boot(sync)
-    assert started == [] and api.ops() == ["get_server"] and sync._boot_pending_vms() == set()
-
-
-def test_failed_read_is_retried_within_the_same_node_boot(sync, api, tmp_path):
-    started = host(sync, tmp_path, {227: "stopped", 228: "stopped"})
-    api.by_vmid[227] = [(503, {}), docs("running")]
-    api.by_vmid[228] = [docs("running")]
-    boot(sync)
-    assert sorted(started) == [227, 228]
-    assert sync._boot_pending_vms() == set()
-
-
-def test_function_down_for_whole_boot(sync, api, tmp_path):
-    states = {vmid: "stopped" for vmid in range(227, 255)}
-    started = host(sync, tmp_path, states)
+def test_function_down_at_boot_starts_nothing_and_stays_bounded(sync, api, tmp_path, caplog):
+    started = host(sync, tmp_path, {vmid: "stopped" for vmid in range(227, 255)})
     api.replies["get_server"] = [(503, {})]
-    boot(sync)
-    assert started == [] and sync._boot_pending_vms() == set(states)
-    assert len(api.calls) < 40 and sum(sync.slept) <= sync.NODE_BOOT_RETRY_WINDOW_S
+    real_sleep = sync.time.sleep
+    # Each failed read costs 31.5 s of fake time, as with a black-holed endpoint.
+    sync.time.sleep = lambda s: (real_sleep(s), sync.clock.__setitem__(0, sync.clock[0] + 10))
+    sync.node_boot_reconcile()
+    assert started == []
+    assert len(api.calls) <= 15
+    assert "will NOT be auto-started" in caplog.text
 
-    # The watch must not publish them as stopped, and hands them over.
-    sync._save_status_cache({vmid: "running" for vmid in states})
-    sync._node_uptime_sec = lambda: 3600.0
-    api.calls.clear()
+
+def test_watch_never_starts_a_vm_and_publishes_what_it_sees(sync, api, tmp_path):
+    started = host(sync, tmp_path, {227: "stopped"})
+    sync._save_status_cache({227: "running"})
+    api.replies["get_server"] = [docs("running")]
     sync.watch_statuses()
-    assert started == ["spawn"] and api.calls == []
-    sync.sync_all_statuses()
-    assert api.calls == []
-    sync._watch_should_stand_down.held.close()  # the watch process exits
-
-    # The function is back: the retry starts them.
-    started.clear()
-    api.replies["get_server"] = [docs("running")]
-    api.replies["get_node"] = [node_reply(pendingPostBootAction=None, maintenance=False)]
-    sync.node_boot_retry()
-    assert sorted(started) == sorted(states)
-    assert sync._load_boot_state() is None
-
-
-def test_rejected_token_stops_after_one_read(sync, api, tmp_path):
-    host(sync, tmp_path, {227: "stopped", 228: "stopped"})
-    api.replies["get_server"] = [(401, {})]
-    boot(sync)
-    assert len(api.calls) == 1 and sync._boot_pending_vms() == {227, 228}
-
-
-def test_hook_settles_a_vm_and_watch_publishes_it_again(sync, api, tmp_path, monkeypatch):
-    host(sync, tmp_path, {227: "stopped"})
-    sync._boot_pending_init()
-    monkeypatch.setattr(sync.sys, "argv", ["sync-dnat.py", "227", "post-stop"])
-    sync.is_running_under_backup = lambda: False
-    api.replies["get_server"] = [docs()]
-    sync.main()
-    assert sync._boot_pending_vms() == set()
-
-
-def test_previous_boot_file_is_ignored(sync, api, tmp_path):
-    host(sync, tmp_path, {227: "stopped"})
-    sync._boot_pending_init()
-    sync._boot_id = lambda: "boot-2"
-    assert sync._boot_pending_vms() == set()
-
-
-def test_reboot_loop_is_remembered_by_the_retry(sync, api, tmp_path):
-    started = host(sync, tmp_path, {227: "stopped"})
-    sync._boot_history_crashloop = lambda: True
-    api.replies["get_server"] = [(503, {})]
-    boot(sync)
-    api.replies["get_server"] = [docs("running")]
-    api.replies["get_node"] = [node_reply(pendingPostBootAction=None, maintenance=False)]
-    sync._boot_history_crashloop = MagicMock(side_effect=AssertionError("counted twice"))
-    sync.node_boot_retry()
-    assert started == [] and sync._load_boot_state() is None
-
-
-def test_unwritable_state_file_still_starts_vms(sync, api, tmp_path):
-    started = host(sync, tmp_path, {227: "stopped"})
-    (tmp_path / "file").write_text("")
-    sync.BOOT_PENDING_FILE = tmp_path / "file" / "pending.json"
-    api.replies["get_server"] = [docs("running")]
-    boot(sync)
-    assert started == [227]
+    assert started == [] and api.ops() == ["get_server", "set_status"]
 
 
 # --- maintenance cycle -------------------------------------------------------
+def node_reply(**kw):
+    base = {"exists": True, "pendingPostBootAction": "start-vm", "maintenance": True,
+            "maintenanceStartedAt": time.time() - 7200, "cycle": "c" * 32, "max_vm": 1}
+    return (200, dict(base, **kw))
+
+
 def test_post_boot_action_finalizes_the_cycle_it_saw(sync, api, tmp_path):
     started = host(sync, tmp_path, {227: "stopped"})
     api.replies["get_node"] = [node_reply()]
@@ -359,30 +280,43 @@ def test_post_boot_action_finalizes_the_cycle_it_saw(sync, api, tmp_path):
     sync.handle_pending_post_boot_action()
     assert api.ops() == ["node_booted", "get_node", "finalize_boot"]
     assert api.calls[-1] == {"op": "finalize_boot", "cycle": "c" * 32, "vmStarted": True}
-    assert started == [227]
-    assert sync._load_boot_state()["action"] is None
+    assert started == [227] and not sync.BOOT_FINALIZE_FILE.exists()
 
 
-def test_nothing_pending_is_not_finalized(sync, api, tmp_path):
-    host(sync, tmp_path, {227: "running"})
-    api.replies["get_node"] = [node_reply(pendingPostBootAction=None, maintenance=False, cycle=None)]
-    sync.handle_pending_post_boot_action()
-    assert api.ops() == ["get_node"]
-
-
-def test_failed_finalize_is_retried_without_starting_again(sync, api, tmp_path):
+@pytest.mark.parametrize("reply", [
+    {"pendingPostBootAction": None, "maintenance": False, "cycle": None},  # nothing pending
+    {"maintenanceStartedAt": time.time() - 60},  # opened after the boot (an hour ago)
+    {"maintenanceStartedAt": None},
+])
+def test_cycle_that_this_boot_does_not_end_is_not_touched(sync, api, tmp_path, reply):
     started = host(sync, tmp_path, {227: "stopped"})
+    api.replies["get_node"] = [node_reply(**reply)]
+    sync.handle_pending_post_boot_action()
+    assert api.ops() == ["get_node"] and started == []
+
+
+def test_unread_flags_are_never_decided_later(sync, api, tmp_path):
+    started = host(sync, tmp_path, {227: "stopped"})
+    api.replies["get_node"] = [(503, {})]
+    sync.handle_pending_post_boot_action()
+    api.calls.clear()
+    sync.watch_statuses()
+    assert "get_node" not in api.ops() and started == []
+
+
+def test_failed_finalize_is_only_rewritten_later(sync, api, tmp_path):
+    states = {227: "stopped"}
+    started = host(sync, tmp_path, states)
     api.replies["get_node"] = [node_reply()]
     api.replies["finalize_boot"] = [(503, {})]
     sync.handle_pending_post_boot_action()
-    assert api.ops().count("finalize_boot") == 3
-    assert sync._load_boot_state()["action"]["finalize"]["vmStarted"] is True
-    sync._write_boot_state(dict(sync._load_boot_state(), vms=[]))
+    assert sync.BOOT_FINALIZE_FILE.exists()
+    states[227] = "stopped"  # the user shut it down afterwards
     api.calls.clear()
     api.replies["finalize_boot"] = [(200, {"finalized": True})]
-    sync.node_boot_retry()
-    assert api.ops() == ["finalize_boot"] and started == [227]
-    assert sync._load_boot_state() is None
+    sync._api_retry_finalize()
+    assert api.calls == [{"op": "finalize_boot", "cycle": "c" * 32, "vmStarted": True}]
+    assert started == [227] and not sync.BOOT_FINALIZE_FILE.exists()
 
 
 def test_newer_cycle_is_left_alone(sync, api, tmp_path):
@@ -390,28 +324,15 @@ def test_newer_cycle_is_left_alone(sync, api, tmp_path):
     api.replies["get_node"] = [node_reply()]
     api.replies["finalize_boot"] = [(409, {})]
     sync.handle_pending_post_boot_action()
-    assert api.ops() == ["get_node", "finalize_boot"]
-    assert sync._load_boot_state()["action"] is None
+    assert api.ops() == ["get_node", "finalize_boot"] and not sync.BOOT_FINALIZE_FILE.exists()
 
 
-def test_retry_ignores_a_cycle_opened_after_the_boot(sync, api, tmp_path):
-    started = host(sync, tmp_path, {227: "stopped"})
-    api.replies["get_node"] = [(503, {})]
-    sync.handle_pending_post_boot_action()
-    sync._write_boot_state(dict(sync._load_boot_state(), vms=[]))
-    api.replies["get_node"] = [node_reply(maintenanceStartedAt=time.time() - 60)]
-    api.calls.clear()
-    sync.node_boot_retry()
-    assert api.ops() == ["get_node"] and started == []
-
-
-def test_maintenance_retries_are_bounded(sync, api, tmp_path, caplog):
+def test_finalize_retries_are_bounded(sync, api, tmp_path):
     host(sync, tmp_path, {227: "running"})
-    api.replies["get_node"] = [(401, {})]
+    api.replies["get_node"] = [node_reply()]
+    api.replies["finalize_boot"] = [(401, {})]
     sync.handle_pending_post_boot_action()
-    sync._write_boot_state(dict(sync._load_boot_state(), vms=[]))
-    api.calls.clear()
-    for _ in range(sync.ACTION_MAX_RETRIES + 5):
-        sync.node_boot_retry()
-    assert len(api.calls) == sync.ACTION_MAX_RETRIES
-    assert sync._load_boot_state() is None
+    for _ in range(sync.FINALIZE_MAX_RETRIES + 5):
+        sync._api_retry_finalize()
+    assert api.ops().count("finalize_boot") == sync.FINALIZE_MAX_RETRIES + 1
+    assert not sync.BOOT_FINALIZE_FILE.exists()
