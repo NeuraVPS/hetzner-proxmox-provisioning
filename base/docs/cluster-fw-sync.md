@@ -12,8 +12,10 @@ PVE de toda la flota. Las bases solo reescriben `[IPSET hosts-ipv6]` (desde
   `systemd-run --unit=nv-cluster-fw-sync-*` (vuelve en <1 s).
 - Los workers se serializan con `flock` en `/var/lib/base-nat/.fw-sync.lock`; el que
   entra consume la marca y hace una pasada; el que entra sin marca no hace nada
-  (las ráfagas se agrupan). Si la pasada falla, programa reintentos a los 10, 20 y
-  40 min (`--retry=N`) y, agotados, avisa por correo.
+  (las ráfagas se agrupan). La marca pasa a `fw-sync.inprogress` y solo se borra tras
+  una pasada buena: si la pasada falla o el worker muere (SIGTERM), se programan
+  reintentos a los 10, 20 y 40 min (`--retry=N`) y, agotados, se avisa; tras un
+  SIGKILL o un reinicio la recoge el siguiente worker o `base-nat-boot.sh`.
 - **Toda la pasada** (leer `pve_nodes.json`, publicar y repartir) va dentro del lock
   `mkdir /home/firewall/.cluster.fw.lock` del Storage Box: dos bases nunca se cruzan
   y un nodo no recibe una versión anterior después de una nueva. **El lock nunca se
@@ -22,8 +24,8 @@ PVE de toda la flota. Las bases solo reescriben `[IPSET hosts-ipv6]` (desde
 - Publicar: descarga → reescribe hosts-ipv6 → **valida** (cabeceras como las lee PVE,
   sin repetir —PVE reinicia la sección repetida—, gramática por sección,
   `[OPTIONS] enable: 1`, `IN SSH(ACCEPT) -source +dc/base` sin restricciones y antes
-  de cualquier DROP/REJECT/GROUP, `[IPSET base]` cubre las IPv6 de `BASE_HOSTS` con
-  entradas positivas, nº de hosts, sin encoger >20 %) → sube a
+  de cualquier DROP/REJECT/GROUP, `[IPSET base]` cubre las IPv6 de `BASE_HOSTS` y no
+  tiene exclusiones `!`, nº de hosts, sin encoger >20 %) → sube a
   `cluster.fw.tmp-<base>-<pid>` → sha256 → `mv` sobre `cluster.fw`.
 - Reparto: la base **empuja el contenido por SSH** a cada nodo (8 en paralelo). El
   nodo comprueba el sha256 y lo carga con `PVE::Firewall::load_clusterfw_conf`
@@ -35,8 +37,9 @@ PVE de toda la flota. Las bases solo reescriben `[IPSET hosts-ipv6]` (desde
   a reiniciar aunque los bytes coincidan. Los nodos no necesitan la clave del Storage
   Box para esto (Kademar incluido).
 - `first_boot.sh` descarga el canónico aparte y lo pasa por el mismo validador (copia
-  idéntica, comprobada por test) antes de instalarlo; si no pasa, se queda la base
-  escrita en el propio script y el sync de la base lo entrega después.
+  idéntica, comprobada por test, con las IPv6 de las bases en `NV_BASE_IPV6S`) antes
+  de instalarlo; si no pasa, se queda la plantilla escrita en el propio script (que
+  ya incluye las /64 de b0/b1 actuales y las VIPs) y el sync de la base lo entrega después.
 - Correo a soporte@ (`/etc/neuravps/hw-error-scan.env`) en rechazos, fallos del
   Storage Box y reintentos agotados; el mismo aviso no se repite en 6 h. Los nodos
   inalcanzables solo quedan en `/var/log/sync-base-nat.log`.

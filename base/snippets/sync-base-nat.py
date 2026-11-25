@@ -1625,7 +1625,7 @@ def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
     lines = text.splitlines(keepends=True)
     start = None
     for i, line in enumerate(lines):
-        if line.strip() == IPSET_HOSTS_IPV6_HEADER:
+        if _fw_normalize_header(line.strip()) == IPSET_HOSTS_IPV6_HEADER:
             start = i
             break
     if start is None:
@@ -1634,7 +1634,7 @@ def replace_hosts_ipv6_section(text: str, nodes: dict[str, str]) -> str:
     end = len(lines)
     for j in range(start + 1, len(lines)):
         stripped = lines[j].strip()
-        if stripped.startswith("[") and stripped != IPSET_HOSTS_IPV6_HEADER:
+        if stripped.startswith("["):
             end = j
             break
 
@@ -2168,6 +2168,10 @@ def sync_nodes_del(node_id: str):
 # state. See base/docs/cluster-fw-sync.md.
 
 FW_SYNC_PENDING = STATE_DIR / "fw-sync.pending"
+# A request being served. Kept until a pass succeeds, so a worker killed
+# mid-pass (SIGKILL, reboot) leaves it for the next worker or for
+# base-nat-boot.sh to pick up.
+FW_SYNC_INPROGRESS = STATE_DIR / "fw-sync.inprogress"
 FW_SYNC_LOCK = STATE_DIR / ".fw-sync.lock"
 FW_ALERT_STATE = STATE_DIR / "fw-sync-alerts.json"
 FW_REMOTE_LOCK_DIR = os.environ.get(
@@ -2321,7 +2325,10 @@ def validate_cluster_fw(
     for entry in base_entries:
         value = entry.split("#", 1)[0].strip()
         if value.startswith("!"):
-            continue  # nomatch entries exclude, they never admit
+            # An exclusion inside an allowed /64 would carve a BASE out of
+            # the effective set while the /64 still "covers" it on paper.
+            errors.append(f"[IPSET base] must not contain exclusions: {entry!r}")
+            continue
         try:
             nets.append(ipaddress.ip_network(value, strict=False))
         except ValueError:
@@ -2437,7 +2444,12 @@ def storage_box_fw_lock():
     while True:
         r = _fw_storage_ssh(["mkdir", FW_REMOTE_LOCK_DIR])
         if r.returncode == 0:
-            _fw_storage_ssh(["touch", f"{FW_REMOTE_LOCK_DIR}/{owner}"])
+            t = _fw_storage_ssh(["touch", f"{FW_REMOTE_LOCK_DIR}/{owner}"])
+            if t.returncode != 0 or owner not in _fw_storage_ssh(["ls", FW_REMOTE_LOCK_DIR]).stdout.split():
+                # Without the owner file the release below would refuse to
+                # remove the lock: undo now, while we know it is ours.
+                _fw_storage_ssh(["rm", "-r", FW_REMOTE_LOCK_DIR])
+                raise RuntimeError(f"Storage Box lock: could not register owner: {(t.stderr or t.stdout).strip()}")
             break
         if "exists" not in (r.stderr + r.stdout).lower():
             raise RuntimeError(f"Storage Box lock: mkdir failed: {(r.stderr or r.stdout).strip()}")
@@ -2563,6 +2575,8 @@ for my $i (0 .. $#rules) {
 }
 push @e, "no unrestricted SSH ACCEPT from +dc/base" unless defined $life;
 push @e, "a DROP/REJECT/GROUP rule comes before the SSH lifeline" if defined $life && defined $block && $block < $life;
+push @e, "ipset base must not contain exclusions ($_->{cidr})" for grep { $_->{nomatch} } @{$c->{ipset}{base} || []};
+push @e, "no BASE addresses given to check ipset base against" unless @bases;
 my @nets = map { Net::IP->new($_->{cidr}) } grep { !$_->{nomatch} } @{$c->{ipset}{base} || []};
 for my $b (@bases) {
   my $ip = Net::IP->new($b) or do { push @e, "bad base address $b"; next };
@@ -2592,11 +2606,14 @@ def node_fw_apply_script(digest: str, base_ipv6s: list[str]) -> str:
     mark = NODE_FW_APPLIED_MARK
     return (
         "set -u; umask 077; f=/etc/pve/firewall/cluster.fw; "
-        "t=$(mktemp /tmp/nv-cluster-fw.XXXXXX); v=$(mktemp /tmp/nv-fwval.XXXXXX); "
+        "t=$(mktemp /tmp/nv-cluster-fw.XXXXXX) && v=$(mktemp /tmp/nv-fwval.XXXXXX) "
+        "|| { echo 'NVFW-FAIL mktemp'; exit 26; }; "
         "trap 'rm -f \"$t\" \"$v\"' EXIT; "
-        f"echo {validator} | base64 -d > \"$v\"; cat > \"$t\"; "
+        f"echo {validator} | base64 -d > \"$v\" && [ -s \"$v\" ] || {{ echo 'NVFW-FAIL validator'; exit 26; }}; "
+        "cat > \"$t\" || { echo 'NVFW-FAIL read'; exit 26; }; "
         f"[ \"$(sha256sum < \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'NVFW-REJECT checksum mismatch'; exit 20; }}; "
         f"out=$(perl \"$v\" \"$t\" {bases} 2>&1) || {{ echo \"NVFW-REJECT $out\"; exit 21; }}; "
+        "case \"$out\" in 'parsed rules='*) ;; *) echo \"NVFW-REJECT validator said: $out\"; exit 21;; esac; "
         f"if cmp -s \"$t\" \"$f\" && [ \"$(cat {mark} 2>/dev/null)\" = {digest} ]; then echo NVFW-UNCHANGED; exit 0; fi; "
         "if ! cmp -s \"$t\" \"$f\"; then "
         "  if [ -e \"$f\" ]; then cp -p \"$f\" /root/cluster.fw.prev || { echo 'NVFW-FAIL backup'; exit 24; }; fi; "
@@ -2743,26 +2760,43 @@ def sync_nodes_sync_firewall_worker(attempt: int = 0) -> int:
                 time.sleep(5)
         ok = True
         ran = False
-        # Consume the marker BEFORE reading state: a request arriving mid-run
-        # leaves a new marker and its own worker, so nothing is lost.
-        while FW_SYNC_PENDING.exists():
-            FW_SYNC_PENDING.unlink(missing_ok=True)
-            ran = True
-            ok = run_cluster_fw_sync_once() and ok
+        try:
+            # Promote the marker BEFORE reading state: a request arriving
+            # mid-pass leaves a new marker (and its own worker), so nothing is
+            # lost; the in-progress marker only goes away after a good pass.
+            while FW_SYNC_PENDING.exists() or FW_SYNC_INPROGRESS.exists():
+                if FW_SYNC_PENDING.exists():
+                    os.replace(FW_SYNC_PENDING, FW_SYNC_INPROGRESS)
+                ran = True
+                if run_cluster_fw_sync_once():
+                    FW_SYNC_INPROGRESS.unlink(missing_ok=True)
+                else:
+                    ok = False
+                    break
+        except BaseException:
+            # SIGTERM (RuntimeMaxSec, systemctl stop) or a crash: the request
+            # stays in-progress; make sure someone comes back for it.
+            _fw_schedule_retry(attempt)
+            raise
         if not ran:
             logger.info("sync-firewall: request already served by an earlier run")
             return 0
     if not ok:
-        if attempt < FW_MAX_RETRIES:
-            delay = FW_RETRY_BASE_S * (2 ** attempt)
-            unit = _fw_start_worker([f"--retry={attempt + 1}"], delay_s=delay)
-            logger.warning("sync-firewall: pass failed; retry %d/%d in %d s (%s)",
-                           attempt + 1, FW_MAX_RETRIES, delay, unit or "NOT scheduled")
-        else:
-            _fw_alert("la sincronización sigue fallando",
-                      f"{FW_MAX_RETRIES} reintentos agotados; ver /var/log/sync-base-nat.log. "
-                      "Los nodos inalcanzables se quedan con su cluster.fw anterior hasta la próxima pasada.")
+        _fw_schedule_retry(attempt)
     return 0 if ok else 1
+
+
+def _fw_schedule_retry(attempt: int) -> None:
+    if attempt < FW_MAX_RETRIES:
+        delay = FW_RETRY_BASE_S * (2 ** attempt)
+        unit = _fw_start_worker([f"--retry={attempt + 1}"], delay_s=delay)
+        logger.warning("sync-firewall: pass not completed; retry %d/%d in %d s (%s)",
+                       attempt + 1, FW_MAX_RETRIES, delay, unit or "NOT scheduled")
+    else:
+        _fw_alert("la sincronización sigue fallando",
+                  f"{FW_MAX_RETRIES} reintentos agotados; ver /var/log/sync-base-nat.log. "
+                  "La petición queda pendiente (fw-sync.inprogress) para la próxima llamada o el "
+                  "próximo arranque de la base. Los nodos inalcanzables conservan su cluster.fw anterior.")
 
 
 def sync_nodes_sync_firewall(wait: bool = False, attempt: int = 0):

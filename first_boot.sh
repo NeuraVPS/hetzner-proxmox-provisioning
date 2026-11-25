@@ -628,6 +628,10 @@ policy_forward: DROP
 2a01:4f8:2b03:18a9::/64 # BASE 0 GERMANY (b0) IPv6
 2a01:4f9:3070:3984::/64 # BASE 1 IPv6
 2a01:4f9:c01f:e:ffff::/112 # transito de los tuneles base<->nodo
+2a01:4f8:fff2:95::/64 # VIP FSN (failover) - tuneles anclados a VIP
+2a01:4f9:fff1:5f::/64 # VIP HEL (failover) - tuneles anclados a VIP
+2a01:4f8:2b01:124::/64 # BASE 0 NUEVA (FSN) IPv6
+2a01:4f9:2a:2d56::/64 # BASE 1 NUEVA (HEL) IPv6
 
 [IPSET hosts-ipv6]
 
@@ -748,6 +752,9 @@ systemctl enable neuravps-vm-status-watch.timer
 # heredoc identical to NODE_FW_VALIDATOR_PL in base/snippets/sync-base-nat.py;
 # test_cluster_fw_sync.py enforces it). Otherwise the baseline written above
 # stays, and the BASE sync delivers the canonical file later.
+# Current BASE IPv6 addresses (BASE_HOSTS in base/base_setup.sh; the test
+# keeps them in sync, and the baseline above must cover them).
+NV_BASE_IPV6S="2a01:4f8:2b01:124::2 2a01:4f9:2a:2d56::2"
 install_validated_cluster_fw() {
   local sb=/root/cluster.fw.storagebox out
   [ -s "$sb" ] || { log "WARNING: canonical cluster.fw not downloaded; keeping the baseline"; return 0; }
@@ -785,6 +792,8 @@ for my $i (0 .. $#rules) {
 }
 push @e, "no unrestricted SSH ACCEPT from +dc/base" unless defined $life;
 push @e, "a DROP/REJECT/GROUP rule comes before the SSH lifeline" if defined $life && defined $block && $block < $life;
+push @e, "ipset base must not contain exclusions ($_->{cidr})" for grep { $_->{nomatch} } @{$c->{ipset}{base} || []};
+push @e, "no BASE addresses given to check ipset base against" unless @bases;
 my @nets = map { Net::IP->new($_->{cidr}) } grep { !$_->{nomatch} } @{$c->{ipset}{base} || []};
 for my $b (@bases) {
   my $ip = Net::IP->new($b) or do { push @e, "bad base address $b"; next };
@@ -796,7 +805,8 @@ if (@e) { print "check: $_\n" for @e; exit 4 }
 printf "parsed rules=%d base=%d hosts=%d\n", scalar @rules,
   scalar @{$c->{ipset}{base}}, scalar @{$c->{ipset}{'hosts-ipv6'}};
 NVFWPL
-  if out=$(perl /root/nv-validate-cluster-fw.pl "$sb" 2>&1); then
+  # shellcheck disable=SC2086  # one argument per BASE address
+  if out=$(perl /root/nv-validate-cluster-fw.pl "$sb" $NV_BASE_IPV6S 2>&1) && [ "${out#parsed rules=}" != "$out" ]; then
     if cat "$sb" > /etc/pve/firewall/cluster.fw.tmp.$$ && mv /etc/pve/firewall/cluster.fw.tmp.$$ /etc/pve/firewall/cluster.fw; then
       log "cluster.fw: canonical installed ($out)"
     else

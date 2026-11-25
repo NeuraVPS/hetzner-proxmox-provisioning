@@ -76,6 +76,7 @@ def sync(tmp_path, monkeypatch):
     module.PVE_NODES_STATE_FILE = tmp_path / 'pve_nodes.json'
     module.FW_SYNC_PENDING = tmp_path / 'fw-sync.pending'
     module.FW_SYNC_LOCK = tmp_path / '.fw-sync.lock'
+    module.FW_SYNC_INPROGRESS = tmp_path / 'fw-sync.inprogress'
     module._fw_alert = lambda subject, body: module._alerts.append((subject, body))
     module._alerts = []
     return module
@@ -444,3 +445,87 @@ def test_node_validator_matches_real_pve_parser_contract(sync):
     # strings the base keys on in sync with the script.
     assert "load_clusterfw_conf" in sync.NODE_FW_VALIDATOR_PL
     assert "+dc/base" in sync.NODE_FW_VALIDATOR_PL
+
+
+# --- second review round ------------------------------------------------------
+
+def test_exclusion_inside_allowed_base_net_is_rejected(sync):
+    t = GOOD.replace("2001:db8:b1::/64 # BASE 1\n", "2001:db8:b1::/64 # BASE 1\n!2001:db8:b0::2/128\n")
+    assert any("exclusions" in e for e in sync.validate_cluster_fw(t, 2, BASES))
+
+
+def test_lowercase_hosts_header_is_rewritten(sync):
+    t = GOOD.replace("[IPSET hosts-ipv6]", "[ipset hosts-ipv6]")
+    new = sync.replace_hosts_ipv6_section(t, dict(NODES, n3="2001:db8:3::2"))
+    assert "2001:db8:3::/64 # n3" in new
+    assert sync.validate_cluster_fw(new, 3, BASES) == []
+
+
+def _fb():
+    return (Path(__file__).parents[2] / "first_boot.sh").read_text()
+
+
+def test_first_boot_baseline_covers_current_bases(sync):
+    import re
+    setup = (Path(__file__).parents[1] / "base_setup.sh").read_text()
+    bases = [e.split("=", 1)[1] for e in re.search(r"^BASE_HOSTS=(\S+)", setup, re.M).group(1).split(",")]
+    fb = _fb()
+    assert re.search(r'^NV_BASE_IPV6S="([^"]+)"', fb, re.M).group(1).split() == bases
+    baseline = fb.split("cat >/etc/pve/firewall/cluster.fw <<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0] + "\n"
+    assert sync.validate_cluster_fw(baseline, None, bases) == []
+    assert '"$sb" $NV_BASE_IPV6S' in fb
+
+
+def test_interrupted_pass_is_kept_and_picked_up(sync, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0: scheduled.append((extra, delay_s)) or "u")
+
+    def killed():
+        raise SystemExit(143)  # what the SIGTERM handler raises
+
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", killed)
+    sync.FW_SYNC_PENDING.write_text("1\n")
+    with pytest.raises(SystemExit):
+        sync.sync_nodes_sync_firewall_worker()
+    assert sync.FW_SYNC_INPROGRESS.exists() and not sync.FW_SYNC_PENDING.exists()
+    assert scheduled and scheduled[0][0] == ["--retry=1"]
+    # The next worker (no new request at all) serves the in-progress one.
+    runs = []
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: runs.append(1) or True)
+    assert sync.sync_nodes_sync_firewall_worker() == 0
+    assert runs == [1] and not sync.FW_SYNC_INPROGRESS.exists()
+
+
+def test_failed_pass_keeps_request_in_progress(sync, monkeypatch):
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0: "u")
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: False)
+    sync.FW_SYNC_PENDING.write_text("1\n")
+    assert sync.sync_nodes_sync_firewall_worker() == 1
+    assert sync.FW_SYNC_INPROGRESS.exists()
+
+
+def test_boot_script_picks_up_queued_sync():
+    boot = (Path(__file__).with_name("base-nat-boot.sh")).read_text()
+    assert "fw-sync.inprogress" in boot and "sync nodes sync-firewall" in boot
+
+
+def test_owner_registration_failure_releases_lock(sync, box, monkeypatch):
+    orig = box.ssh
+    monkeypatch.setattr(sync, "_fw_storage_ssh", lambda a, timeout=60: (
+        subprocess.CompletedProcess(a, 1, "", "touch: failed") if a[0] == "touch" else orig(a)))
+    with pytest.raises(RuntimeError):
+        with sync.storage_box_fw_lock():
+            pytest.fail("must not enter the critical section")
+    assert sync.FW_REMOTE_LOCK_DIR not in box.dirs
+
+
+def test_node_rejects_when_validator_prints_nothing(sync, node_env):
+    tmp, bindir, target = node_env
+    (bindir / "perl").write_text("#!/bin/sh\nexit 0\n")
+    r = _run_node(sync, node_env, GOOD)
+    assert r.returncode == 21 and target.read_text() == "old\n"
+
+
+def test_node_validator_requires_bases(sync):
+    assert "no BASE addresses given" in sync.NODE_FW_VALIDATOR_PL
+    assert "must not contain exclusions" in sync.NODE_FW_VALIDATOR_PL
