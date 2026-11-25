@@ -38,12 +38,12 @@ FILES="rtmig_common.sh rtmig_send.sh rtmig_cutover.sh"
 LOCAL=$(md5sum $FILES)
 rc=0
 for N in $TARGETS; do
-  ssh "$JUMP" "ssh -o ConnectTimeout=15 root@$N 'mkdir -p $WORK'"
-  for f in $FILES; do ssh "$JUMP" "ssh -o ConnectTimeout=15 root@$N 'cat > $WORK/$f'" < "$f"; done
-  ssh "$JUMP" "ssh root@$N 'chmod 755 $WORK/rtmig_send.sh $WORK/rtmig_cutover.sh'"
-  REMOTE=$(ssh "$JUMP" "ssh root@$N 'cd $WORK && md5sum $FILES'")
+  ssh -a "$JUMP" "ssh -a -o ForwardAgent=no -o ConnectTimeout=15 root@$N 'mkdir -p $WORK'"
+  for f in $FILES; do ssh -a "$JUMP" "ssh -a -o ForwardAgent=no -o ConnectTimeout=15 root@$N 'cat > $WORK/$f'" < "$f"; done
+  ssh -a "$JUMP" "ssh -a -o ForwardAgent=no root@$N 'chmod 755 $WORK/rtmig_send.sh $WORK/rtmig_cutover.sh'"
+  REMOTE=$(ssh -a "$JUMP" "ssh -a -o ForwardAgent=no root@$N 'cd $WORK && md5sum $FILES'")
   if [[ "$REMOTE" == "$LOCAL" ]]; then
-    echo "OK  $N ($(ssh "$JUMP" "ssh root@$N hostname")): md5 iguales"
+    echo "OK  $N ($(ssh -a "$JUMP" "ssh -a -o ForwardAgent=no root@$N hostname")): md5 iguales"
   else
     echo "MAL $N: md5 distintos" >&2; diff <(echo "$LOCAL") <(echo "$REMOTE") >&2 || true; rc=1
   fi

@@ -12,13 +12,19 @@
 #                       (zfs, qm, cat, sha256sum, rm, mv…) y ninguna de ellas hace ssh.
 # En los dos modos el estado, la copia aparcada y el cerrojo viven en $WORK del nodo que corre el kit.
 #
+# En modo pull el ORIGEN es NO FIABLE (puede estar comprometido): todo lo que devuelve (contadores, guid,
+# configs, .fw, nombres, firmas de CPU) se valida aquí como entrada hostil, y nada suyo se ejecuta ni se
+# evalúa. Su config y su .fw no se publican tal cual en el destino: pasan por un perfil con lista
+# blanca (rtmig_cutover.sh, sanitize_conf / sanitize_fw). No se le reenvía nunca el agente SSH.
+#
 # Variables comunes (todas por entorno; nada de valores de un traslado concreto en el código):
 #   VMID      (obligatoria) VMID de la VM; es la misma en origen y destino.
 #   push:  DST       IP del nodo DESTINO, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
 #          DST_NODE  id del nodo destino (= hostname = nodo PVE); se comprueba con `hostname` allí.
 #   pull:  SRC       IP del nodo ORIGEN, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
 #          SRC_NODE  id del nodo origen; se comprueba con `hostname` allí.
-#          (DST_NODE es este nodo; si se pone, tiene que ser igual a `hostname`.)
+#          DST_NODE  OBLIGATORIO también: este nodo; tiene que ser igual a `hostname` (el corte queda
+#                    ligado al par origen/destino explícito).
 #   WORK      (por defecto /root/rtmig) carpeta de trabajo del nodo que corre el kit.
 #   DISKS     (opcional) sufijos N de rpool/data/vm-$VMID-disk-N. Si se pone, tiene que coincidir
 #             EXACTAMENTE con el inventario de la config; si no, se usa el inventario.
@@ -73,7 +79,8 @@ case "$RTMIG_MODE" in
     SRC_NODE="${SRC_NODE:?SRC_NODE (id del nodo origen; se comprueba con hostname)}"
     canon_ip "$SRC" || { echo "SRC tiene que ser una IP literal canónica y sin zona (proxmox_nodes.ip), no '$SRC'" >&2; exit 2; }
     valid_node "$SRC_NODE" || { echo "SRC_NODE no válido: $SRC_NODE" >&2; exit 2; }
-    [[ -z "${DST_NODE:-}" || "$DST_NODE" == "$LOCAL_NODE" ]] \
+    [[ -n "${DST_NODE:-}" ]] || { echo "en modo pull hace falta DST_NODE explícito (este nodo, ${LOCAL_NODE})" >&2; exit 2; }
+    [[ "$DST_NODE" == "$LOCAL_NODE" ]] \
       || { echo "en modo pull el kit corre en el DESTINO: DST_NODE=${DST_NODE} pero este nodo es ${LOCAL_NODE}" >&2; exit 2; }
     DST_NODE="$LOCAL_NODE"; PEER="$SRC"; PEER_NODE="$SRC_NODE"; PEER_ROLE=src ;;
   *) echo "RTMIG_MODE solo admite push o pull (vale '${RTMIG_MODE}')" >&2; exit 2 ;;
@@ -87,7 +94,9 @@ R_CONF="\${PVE_ETC:-/etc/pve}/qemu-server/${VMID}.conf"
 R_FW="\${PVE_ETC:-/etc/pve}/firewall/${VMID}.fw"
 STATE="$WORK/${VMID}.state"
 
-SSHO=(-p "${SSH_PORT:-22}" -c aes128-gcm@openssh.com -o BatchMode=yes -o ConnectTimeout=15
+# -a / ForwardAgent=no / sin reenvíos: el otro nodo (en pull, uno externo) nunca recibe el agente.
+SSHO=(-a -x -o ForwardAgent=no -o ClearAllForwardings=yes
+      -p "${SSH_PORT:-22}" -c aes128-gcm@openssh.com -o BatchMode=yes -o ConnectTimeout=15
       -o ServerAliveInterval=30 -o ServerAliveCountMax=6
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -172,6 +181,16 @@ probe() {
   [[ "$pve" == ok ]] || die "estado INDETERMINADO en ${name}: /etc/pve no está disponible (pmxcfs). No se ha tocado nada"
   [[ ( "$P_CONF" == present || "$P_CONF" == absent ) && ( "$P_FW" == present || "$P_FW" == absent ) ]] \
     || die "estado INDETERMINADO en ${name}: respuesta rara (${out//$'\n'/ })"
+  # Formato estricto de cada campo (el otro lado puede no ser fiable).
+  [[ "$P_STATUS" =~ ^(running|stopped|paused|prelaunch|suspended|none)$ ]] \
+    || die "estado INDETERMINADO en ${name}: estado de la VM con formato raro"
+  if [[ "$P_CONF" == present ]]; then
+    [[ "$P_SHA" =~ ^[0-9a-f]{64}$ && ( -z "$P_UUID" || "$P_UUID" =~ ^[0-9A-Fa-f-]{36}$ ) ]] \
+      || die "estado INDETERMINADO en ${name}: sha o UUID de la config con formato raro"
+  fi
+  if [[ "$P_FW" == present ]]; then
+    [[ "$P_FWSHA" =~ ^[0-9a-f]{64}$ ]] || die "estado INDETERMINADO en ${name}: sha del .fw con formato raro"
+  fi
   if [[ "$P_CONF" == present && "$P_STATUS" == none ]]; then
     die "estado INDETERMINADO en ${name}: hay config de la VM ${VMID} pero qm status no responde"
   fi
@@ -192,6 +211,19 @@ zget() {   # <src|dst> <prop> <objeto> [-p]
   fi
   val=$(sed -n 's/^VAL=//p' <<< "$out" | head -1)
   [[ -n "$val" ]] || die "respuesta vacía de zfs en ${name} para $2 de $3: estado INDETERMINADO"
+  # Entrada posiblemente hostil: guid y contadores, entero decimal estricto y acotado (cabe en la
+  # aritmética de 64 bits del shell); el token, solo su alfabeto; el resto, sin caracteres de control.
+  if [[ "$val" != ABSENT ]]; then
+    case "$2" in
+      guid) [[ "$val" =~ ^[0-9]{1,20}$ ]] || die "guid con formato raro en ${name} para $3: estado INDETERMINADO" ;;
+      written@*|used|referenced|logicalreferenced)
+        if [[ "${4:-}" == -p && ! "$val" =~ ^[0-9]{1,18}$ ]]; then
+          die "contador $2 con formato raro en ${name} para $3: estado INDETERMINADO"
+        fi ;;
+      receive_resume_token) [[ "$val" == - || "$val" =~ ^[A-Za-z0-9-]{1,4096}$ ]] || die "token de reanudación raro en ${name} para $3" ;;
+      *) val=$(printf '%s' "$val" | tr -cd '[:print:]' | cut -c1-200) ;;
+    esac
+  fi
   printf '%s\n' "$val"
 }
 dst_zget() { zget dst "$@"; }
@@ -245,6 +277,19 @@ state_set() {   # state_set KEY=VAL ... (fusiona y escribe de forma atómica)
 }
 conf_uuid() { awk '/^\[/{exit} /^smbios1:/{if (match($0,/uuid=[0-9A-Fa-f-]+/)) print substr($0,RSTART+5,RLENGTH-5); exit}' "$1"; }
 
+# Estado de la versión anterior del kit (solo push, sin MODE ni PEER, con DST): se migra a mano de
+# lo comprobable. Solo si ahora se corre en push, en el mismo nodo origen y hacia la MISMA IP y nodo
+# destino que guardó; si no, se rechaza (no se adivina).
+migrate_old_state() {
+  [[ -z "$(state_get MODE)" ]] || return 0
+  local old_dst; old_dst=$(state_get DST)
+  [[ -n "$old_dst" && "$RTMIG_MODE" == push && "$old_dst" == "$DST" && "$(state_get DST_NODE)" == "$DST_NODE" \
+     && "$(state_get SRC_NODE)" == "$SRC_NODE" ]] \
+    || die "estado de una versión anterior del kit (sin MODE) que no corresponde a este traslado en push hacia ${DST_NODE:-?} (${DST:-?}): termínalo con la versión con la que se empezó"
+  state_set "MODE=push" "PEER=${old_dst}"
+  log "estado de la versión anterior del kit migrado (MODE=push, PEER=${old_dst})"
+}
+
 # Comprueba que el estado guardado es de ESTE traslado. Args: fases admitidas.
 require_state() {
   local ph; ph=$(state_get PHASE)
@@ -252,6 +297,7 @@ require_state() {
   local ok=0 p; for p in "$@"; do [[ "$ph" == "$p" ]] && ok=1; done
   (( ok )) || die "fase actual '${ph}', y este paso necesita: $*"
   [[ "$(state_get VMID)" == "$VMID" ]] || die "el estado es de la VM $(state_get VMID), no de ${VMID}"
+  migrate_old_state
   [[ "$(state_get MODE)" == "$RTMIG_MODE" ]] || die "el estado es de un traslado en modo $(state_get MODE), no ${RTMIG_MODE}"
   [[ "$(state_get SRC_NODE)" == "$SRC_NODE" ]] || die "el estado es de un traslado desde $(state_get SRC_NODE), no desde ${SRC_NODE}"
   [[ "$(state_get POOLDS)" == "$POOLDS" ]] || die "el estado es del pool $(state_get POOLDS), no de ${POOLDS}"
@@ -310,6 +356,24 @@ cpu_sig_from() {
            /^cpu family/ && !sf {gsub(/[ \t]/,"",$2); f=$2; sf=1}
            /^model[ \t]*:/ && !sm {gsub(/[ \t]/,"",$2); m=$2; sm=1}
            END {printf "%s|%s|%s", v, f, m}'
+}
+
+# Último @rtmig-* presente en TODOS los discos de los dos lados con el mismo guid. Los nombres que
+# devuelve el origen se filtran por el patrón de check_snap_name (los que no cuadran se ignoran).
+last_common() {
+  local cand g1 g2 ok first list
+  first="${DISKS%% *}"
+  list=$(on_q src "zfs list -H -t snapshot -o name -s createtxg '${POOLDS}/vm-${VMID}-disk-${first}'") || exit 1
+  for cand in $(sed -n "s#^${POOLDS}/vm-${VMID}-disk-${first}@\(rtmig-[A-Za-z0-9_.:-]*\)\$#\1#p" <<< "$list" | tac); do
+    ok=1
+    for dd in $DISKS; do
+      g1=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
+      g2=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
+      [[ "$g1" != ABSENT && "$g1" == "$g2" ]] || { ok=0; break; }
+    done
+    (( ok )) && { echo "$cand"; return 0; }
+  done
+  return 1
 }
 
 # Flujo ZFS de origen a destino, con el limitador en el nodo que corre el kit. Siempre lo abre el nodo

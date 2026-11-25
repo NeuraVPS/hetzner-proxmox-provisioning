@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ForwardAgent solo hacia nodos de la flota de Hetzner (2a01:4f8::/32 y 2a01:4f9::/32). Un nodo de
+# otro proveedor (proxmox_nodes.provider ≠ hetzner, p. ej. Kademar, sin clave de flota y no fiable)
+# no recibe nunca el agente: -a -o ForwardAgent=no (25/11/2026, revisión del PR #296).
+nv_agent_opt() {
+  case "$1" in
+    2a01:4f8:*|2a01:4f9:*) echo "-o ForwardAgent=yes" ;;
+    *) echo "-a -o ForwardAgent=no" ;;
+  esac
+}
 # Tarea por nodo del sweep OpenSSH (la invoca install-openssh-fleet.sh vía
 # xargs). Abre UNA sesión SSH al nodo y dentro paraleliza VM_PARALLEL
 # guest-execs. Prefija cada línea con el nombre del nodo.
@@ -10,7 +19,7 @@ GUEST_TIMEOUT="${GUEST_TIMEOUT:-240}"
 PSB64=$(cat "$DIR/payload.b64")
 
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o ConnectTimeout=10 -o ForwardAgent=yes "root@$ip" \
+    -o ConnectTimeout=10 $(nv_agent_opt "$ip") "root@$ip" \
     "bash -s -- '$PSB64' '$VM_PARALLEL' '$GUEST_TIMEOUT'" <<'REMOTE' | sed "s/^/$name /"
 PSB64="$1"; VMPAR="$2"; GTMO="$3"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT

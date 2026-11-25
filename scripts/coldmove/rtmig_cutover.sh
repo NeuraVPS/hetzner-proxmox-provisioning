@@ -91,6 +91,136 @@ conf_set_key() {   # <fichero> <key> <value>
   mv "$tmp" "$f"
 }
 
+# ---- perfil local de VM (modo pull: la config y el .fw del origen son entrada HOSTIL) ------------------
+# Se construye en ESTE nodo una config nueva solo con claves permitidas y valores con formato
+# estricto; el hookscript es siempre el nuestro. Cualquier clave fuera de la lista (args, hostpci, usb,
+# serial, parallel, audio, rng, virtiofs, cicustom, lock, startup, hookscript ajeno…), un [PENDING] o un
+# valor con formato raro hacen abortar. Las secciones de snapshot y `parent` se descartan (sus
+# snapshots no viajan). Imprime en stderr qué se descartó.
+NV_HOOKSCRIPT="${NV_HOOKSCRIPT:-shared:snippets/sync-dnat.py}"
+sanitize_conf() {   # <entrada> <salida> <uuid esperado>
+  VMID="$VMID" HOOK="$NV_HOOKSCRIPT" UUID_WANT="$3" python3 - "$1" "$2" <<'PYSAN'
+import os, re, sys
+vmid, hook, uuid_want = os.environ["VMID"], os.environ["HOOK"], os.environ["UUID_WANT"]
+src, dst = sys.argv[1], sys.argv[2]
+DISK = r"local-zfs:vm-%s-disk-\d{1,3}" % re.escape(vmid)
+DOPT = r"(,(cache|discard|iothread|size|ssd|efitype|pre-enrolled-keys|ms-cert|version|aio|backup|replicate|format)=[A-Za-z0-9.+_-]{1,32})*"
+RULES = {
+    "name": r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}",
+    "memory": r"\d{1,7}", "balloon": r"\d{1,7}", "cores": r"\d{1,3}", "sockets": r"\d{1,2}", "vcpus": r"\d{1,3}",
+    "cpu": r"(x86-64-v[234](-AES)?|host|max|kvm64|qemu64|EPYC[A-Za-z0-9-]{0,24})",
+    "ostype": r"(win11|win10|win8|win7|w2k8|wvista|wxp|w2k|l26|l24|other|solaris)",
+    "machine": r"(pc|q35|pc-q35-[0-9.]+(\+pve\d+)?|pc-i440fx-[0-9.]+(\+pve\d+)?)",
+    "bios": r"(ovmf|seabios)", "boot": r"order=[a-z0-9;]{1,64}", "scsihw": r"[a-z0-9-]{1,32}",
+    "agent": r"[01](,(fstrim_cloned_disks|freeze-fs-on-backup|type)=[a-z0-9-]{1,16})*",
+    "smbios1": r"uuid=[0-9A-Fa-f-]{36}(,base64=1)?(,(family|manufacturer|product|serial|sku|version)=[A-Za-z0-9+/=]{0,128})*",
+    "vmgenid": r"[0-9A-Fa-f-]{36}",
+    "numa": r"[01]", "tablet": r"[01]", "onboot": r"[01]", "localtime": r"[01]", "kvm": r"[01]",
+    "vga": r"(std|virtio|qxl|none|serial0)(,memory=\d{1,4})?",
+    "net0": r"virtio=[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5},bridge=vmbr0(,(firewall|queues|mtu|link_down)=\d{1,5}|,rate=[0-9.]{1,8})*",
+    "efidisk0": DISK + DOPT, "tpmstate0": DISK + DOPT,
+}
+DISK_KEY = re.compile(r"(scsi\d{1,2}|virtio\d{1,2}|sata\d|unused\d{1,2})$")
+DROP = {"digest", "meta", "parent", "hookscript"}   # hookscript: se fija aquí, no se copia
+CDROM = re.compile(r"(ide|sata)\d")
+out, bad, dropped, top, seen = [], [], [], True, set()
+for raw in open(src, encoding="utf-8", errors="strict").read().splitlines():
+    line = raw.rstrip("\r")
+    if line.startswith("["):
+        if line.strip() == "[PENDING]":
+            bad.append("[PENDING]")
+        top = False
+        dropped.append(line.strip()); continue
+    if not top:
+        continue
+    if not line.strip():
+        continue
+    if line.startswith("#"):
+        if re.fullmatch(r"#neuravps-stream-template-key%3A [A-Za-z0-9._-]{1,80}", line):
+            out.append(line)
+        else:
+            dropped.append("#descripción")
+        continue
+    m = re.fullmatch(r"([a-z0-9_-]{1,32}):\s?(.*)", line)
+    if not m:
+        bad.append(repr(line[:40])); continue
+    k, v = m.group(1), m.group(2).strip()
+    if k in seen:
+        bad.append(k + " (repetida)"); continue
+    seen.add(k)
+    if k in DROP:
+        dropped.append(k); continue
+    if k in RULES:
+        ok = re.fullmatch(RULES[k], v)
+    elif DISK_KEY.fullmatch(k):
+        ok = re.fullmatch(DISK + (DOPT if not k.startswith("unused") else ""), v)
+    elif CDROM.fullmatch(k):
+        ok = re.fullmatch(r"none,media=cdrom", v)
+    else:
+        bad.append(k); continue
+    if not ok:
+        bad.append(k + "=" + v[:40]); continue
+    out.append("%s: %s" % (k, v))
+if bad:
+    sys.stderr.write("NO-PERMITIDO " + "; ".join(bad) + "\n"); sys.exit(3)
+sm = [l for l in out if l.startswith("smbios1: ")]
+if not sm or ("uuid=" + uuid_want) not in sm[0]:
+    sys.stderr.write("NO-PERMITIDO smbios1 sin el UUID del traslado\n"); sys.exit(3)
+for need in ("memory", "cores", "net0", "name"):
+    if not any(l.startswith(need + ": ") for l in out):
+        sys.stderr.write("NO-PERMITIDO falta %s\n" % need); sys.exit(3)
+out.append("hookscript: " + hook)
+open(dst, "w").write("\n".join(out) + "\n")
+if dropped:
+    sys.stderr.write("DESCARTADO " + ", ".join(dropped) + "\n")
+PYSAN
+}
+
+# El .fw por VM de un origen no fiable: solo [OPTIONS] con enable, y [RULES] con los grupos de la
+# flota (activos o desactivados con «|»). Nada más (ni reglas propias, ni IPSET, ni ALIASES, ni
+# políticas). Se reescribe en limpio.
+sanitize_fw() {   # <entrada> <salida>
+  python3 - "$1" "$2" <<'PYFW'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+sec, opts, rules, bad = None, [], [], []
+for raw in open(src, encoding="utf-8", errors="strict").read().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line in ("[OPTIONS]", "[RULES]"):
+        sec = line; continue
+    if line.startswith("["):
+        bad.append(line[:40]); sec = "x"; continue
+    if sec == "[OPTIONS]" and re.fullmatch(r"enable:\s?[01]", line):
+        opts.append("enable: " + line[-1]); continue
+    if sec == "[RULES]":
+        m = re.fullmatch(r"(\|?)GROUP (vm-default|vm-no-internet|vm-public-ipv6)(\s+#.*)?", line)
+        if m:
+            rules.append("%sGROUP %s" % (m.group(1), m.group(2))); continue
+    bad.append(line[:40])
+if bad:
+    sys.stderr.write("NO-PERMITIDO " + "; ".join(bad) + "\n"); sys.exit(3)
+txt = "[OPTIONS]\n\n" + "\n".join(opts[:1]) + ("\n" if opts else "") + "\n[RULES]\n\n" + "\n".join(rules) + ("\n" if rules else "")
+open(dst, "w").write(txt)
+PYFW
+}
+
+# Aplica el perfil (solo en pull) a <conf> [<fw>] → $WORK/<VMID>.conf.prof [.fw.prof]; muere si no pasa.
+profile_check() {   # <conf> <uuid> [fw]
+  local err
+  if ! err=$(sanitize_conf "$1" "$WORK/${VMID}.conf.prof" "$2" 2>&1 >/dev/null); then
+    die "la config del origen no cumple el perfil permitido para traerla a ${DST_NODE}: ${err#NO-PERMITIDO } (no se toca nada; resolverlo en el origen)"
+  fi
+  [[ -n "$err" ]] && log "perfil: ${err}"
+  if [[ -n "${3:-}" ]]; then
+    if ! err=$(sanitize_fw "$3" "$WORK/${VMID}.fw.prof" 2>&1 >/dev/null); then
+      die "el .fw del origen no cumple el perfil permitido: ${err#NO-PERMITIDO } (no se toca nada)"
+    fi
+  fi
+  return 0
+}
+
 # rc 0 si la config del destino (última probe dst) es la de ESTE traslado: presente y con su UUID.
 dst_conf_is_ours() { [[ "$P_CONF" == present && -n "$P_UUID" && "$P_UUID" == "$(state_get UUID)" ]]; }
 
@@ -176,7 +306,7 @@ no_active_transfer() {
 
 archive_parked() {   # <sufijo>: la copia aparcada no se reutiliza nunca
   local ts f; ts=$(date -u +%Y%m%dT%H%M%SZ)
-  for f in conf.src fw.src balloon-state conf.push; do
+  for f in conf.src fw.src balloon-state conf.push conf.prof fw.prof; do
     [[ -e "$WORK/${VMID}.${f}" ]] && mv "$WORK/${VMID}.${f}" "$WORK/${VMID}.${f}.${1}-${ts}"
   done
   return 0
@@ -250,7 +380,21 @@ case "$CMD" in
     RUN_CPU=$(running_cpu)
     [[ -n "$RUN_CPU" ]] || die "no pude leer con qué CPU corre la VM en el origen (pid de QEMU y /proc/<pid>/cmdline): no se puede saber si cambia el Hardware ID; no apago"
     LIVE_CONF=$(conf_file live) || die "no pude leer la config de la VM en el origen"
+    # pull: la config y el .fw del origen (no fiable) tienen que pasar el perfil, y antes que nada más.
+    if [[ "$RTMIG_MODE" == pull ]]; then
+      SRC_FW_NOW=""
+      if [[ "$(on_q src "[ -e \"${R_FW}\" ] && echo yes || echo no")" == yes ]]; then
+        on src "cat \"${R_FW}\"" > "$WORK/${VMID}.fw.live" 2>/dev/null || die "no pude leer el .fw del origen"
+        SRC_FW_NOW="$WORK/${VMID}.fw.live"
+      fi
+      profile_check "$LIVE_CONF" "$(conf_uuid "$LIVE_CONF")" "$SRC_FW_NOW"
+      rm -f "$WORK/${VMID}.fw.live" "$WORK/${VMID}.conf.prof" "$WORK/${VMID}.fw.prof"
+    fi
     cpu_decision "$LIVE_CONF" "$RUN_CPU"
+    # Precopia común verificada con ESTE destino antes de apagar: sin ella el corte duraría la copia
+    # entera (y un nodo que no es el de la precopia no puede apagar la VM).
+    BASE=$(last_common) || die "no hay ningún @rtmig-* común (mismo guid en todos los discos) entre ${SRC_NODE} y ${DST_NODE}: haz antes la precopia (rtmig_send.sh base). No apago"
+    log "precopia común con ${DST_NODE}: @${BASE}"
     probe dst
     [[ "$P_CONF" == absent ]] || die "el destino ${DST_NODE} ya tiene config de la VM ${VMID}: no apago"
     [[ "$P_FW" == absent ]] || die "el destino ${DST_NODE} tiene un .fw de la VM ${VMID}: no es de este traslado; revísalo antes de apagar"
@@ -304,8 +448,11 @@ case "$CMD" in
     [[ "$P_CONF" == absent ]] || die "el destino ${DST_NODE} ya tiene config de la VM ${VMID}"
     [[ "$P_FW" == absent ]] || die "el destino ${DST_NODE} tiene un .fw de la VM ${VMID} sin config: no es de este traslado; revísalo"
     # Historial del reconciliador de globo: export-state necesita la config viva, así que va ANTES de
-    # aparcar. Solo si este nodo tiene reconciliador (en un EX44 no hay historial que llevar).
-    if [[ "$(reconciler src)" == yes ]]; then
+    # aparcar. Solo si el origen tiene reconciliador (en un EX44 no hay historial que llevar), y nunca
+    # en modo pull: lo que diga un origen no fiable no se mete en el estado del reconciliador del destino.
+    if [[ "$RTMIG_MODE" == pull ]]; then
+      log "modo pull: el historial del globo del origen no se importa (origen no fiable)"
+    elif [[ "$(reconciler src)" == yes ]]; then
       if B=$(on_q src "python3 \"\${NV_RAM_GUARD:-/usr/local/sbin/neuravps-ram-guard.py}\" export-state ${VMID} '${SRC_NODE}'" 2>/dev/null) && [[ "$B" =~ ^[A-Za-z0-9+/=]+$ ]]; then
         printf '%s\n' "$B" > "$WORK/${VMID}.balloon-state"
         log "historial del globo exportado a $WORK/${VMID}.balloon-state"
@@ -315,9 +462,18 @@ case "$CMD" in
     else
       log "el origen no tiene reconciliador de globo: no hay historial que exportar"
     fi
-    # Copia de la config (y del .fw) del origen a $WORK de ESTE nodo, comprobada por sha256.
-    fetch src "$R_CONF" "$WORK/${VMID}.conf.src" "$SRC_CONF_SHA"
-    [[ "$SRC_FW" == present ]] && fetch src "$R_FW" "$WORK/${VMID}.fw.src" "$SRC_FWSHA"
+    # Copia de la config (y del .fw) del origen a $WORK de ESTE nodo, comprobada por sha256, primero a
+    # nombres provisionales (*.staging): solo cuando han llegado las dos se pasan a los definitivos y se
+    # abre el estado. Si algo cae antes, no queda ninguna copia «aparcada» y park se puede repetir.
+    rm -f "$WORK/${VMID}.conf.staging" "$WORK/${VMID}.fw.staging"
+    fetch src "$R_CONF" "$WORK/${VMID}.conf.staging" "$SRC_CONF_SHA"
+    [[ "$SRC_FW" == present ]] && fetch src "$R_FW" "$WORK/${VMID}.fw.staging" "$SRC_FWSHA"
+    [[ "$(conf_uuid "$WORK/${VMID}.conf.staging")" == "$UUID" ]] || die "la config leída del origen cambió durante el park (UUID): no sigo"
+    if [[ "$RTMIG_MODE" == pull ]]; then
+      profile_check "$WORK/${VMID}.conf.staging" "$UUID" "$( [[ -f $WORK/${VMID}.fw.staging ]] && echo "$WORK/${VMID}.fw.staging" )"
+    fi
+    [[ -f "$WORK/${VMID}.fw.staging" ]] && mv "$WORK/${VMID}.fw.staging" "$WORK/${VMID}.fw.src"
+    mv "$WORK/${VMID}.conf.staging" "$WORK/${VMID}.conf.src"
     rm -f "$WORK/${VMID}.conf.live"
     # El estado se abre ANTES de quitar la config: si algo cae aquí, push verá la config en origen y parará.
     rm -f "$STATE"
@@ -371,11 +527,23 @@ case "$CMD" in
       log "disco OK: $ds@$SNAP guid=$gs, 0 B posteriores en ambos lados"
     done
     # Config final, preparada en local: CPU y balloon ya aplicados. Se publica de una sola vez.
-    cp -a "$WORK/${VMID}.conf.src" "$WORK/${VMID}.conf.push"
+    if [[ "$RTMIG_MODE" == pull ]]; then
+      # Origen no fiable: lo que se publica en el destino es el PERFIL (lista blanca), no su config.
+      profile_check "$WORK/${VMID}.conf.src" "$(state_get UUID)" "$( [[ -f $WORK/${VMID}.fw.src ]] && echo "$WORK/${VMID}.fw.src" )"
+      mv "$WORK/${VMID}.conf.prof" "$WORK/${VMID}.conf.push"
+    else
+      cp -a "$WORK/${VMID}.conf.src" "$WORK/${VMID}.conf.push"
+    fi
     [[ -n "$B" ]] && conf_set_key "$WORK/${VMID}.conf.push" balloon "$B"
     [[ -n "$CPU_NEW" ]] && conf_set_key "$WORK/${VMID}.conf.push" cpu "$CPU_NEW"
     PUSH_SHA=$(sha256sum < "$WORK/${VMID}.conf.push" | cut -d' ' -f1)
-    if [[ -f "$WORK/${VMID}.fw.src" ]]; then FW_SHA=$(sha256sum < "$WORK/${VMID}.fw.src" | cut -d' ' -f1); else FW_SHA=none; fi
+    FW_PUB=""
+    if [[ -f "$WORK/${VMID}.fw.src" ]]; then
+      FW_PUB="$WORK/${VMID}.fw.src"; [[ "$RTMIG_MODE" == pull ]] && FW_PUB="$WORK/${VMID}.fw.prof"
+      FW_SHA=$(sha256sum < "$FW_PUB" | cut -d' ' -f1)
+    else
+      FW_SHA=none
+    fi
     # Intención registrada ANTES de escribir nada en el destino: lo que haya allí con estos hashes es nuestro.
     # La decisión de CPU (y el aviso que la justifica) va en la intención: el cierre del push la deja
     # en cpu-change.txt una sola vez, aunque se repita push sin las variables.
@@ -388,7 +556,7 @@ case "$CMD" in
     elif [[ "$DST_FW_BEFORE" == present && "$DST_FWSHA_BEFORE" == "$FW_SHA" ]]; then
       log ".fw ya publicado por el push anterior (sha ${FW_SHA:0:12}…)"
     else   # el .fw solo no hace arrancable la VM: va primero
-      r=$(dst_publish "$WORK/${VMID}.fw.src" "$R_FW")
+      r=$(dst_publish "$FW_PUB" "$R_FW")
       probe dst   # manda lo que hay en el destino, no la respuesta (pudo perderse tras el rename)
       [[ "$P_FW" == present && "$P_FWSHA" == "$FW_SHA" ]] \
         || die "el .fw no llegó bien al destino (${r}); la config NO se ha publicado. Repite push o haz rollback"

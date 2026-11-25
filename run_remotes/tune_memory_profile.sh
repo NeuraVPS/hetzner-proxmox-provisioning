@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ForwardAgent solo hacia nodos de la flota de Hetzner (2a01:4f8::/32 y 2a01:4f9::/32). Un nodo de
+# otro proveedor (proxmox_nodes.provider ≠ hetzner, p. ej. Kademar, sin clave de flota y no fiable)
+# no recibe nunca el agente: -a -o ForwardAgent=no (25/11/2026, revisión del PR #296).
+nv_agent_opt() {
+  case "$1" in
+    2a01:4f8:*|2a01:4f9:*) echo "-o ForwardAgent=yes" ;;
+    *) echo "-a -o ForwardAgent=no" ;;
+  esac
+}
 
 ############################################################
 # Phase-1 fleet memory retune (NeuraVPS/NeuraVPS docs/NEURAVPS_FLEET_TUNING_PLAN.md)
@@ -296,7 +305,7 @@ PARALLEL="${PARALLEL:-1}"
 
 _run_one_node() {
     local hostname="$1" ip="$2" out rc
-    out=$(ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ForwardAgent=yes "root@$ip" \
+    out=$(ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 $(nv_agent_opt "$ip") "root@$ip" \
         "APPLY='${APPLY}' DESWAP='${DESWAP}' FORCE_PROFILE='${FORCE_PROFILE}'; $FUNC_CONTENT; remote_task" 2>&1)
     rc=$?
     printf -- '------------------------------------------------\n%s (%s)\n%s\n' "$hostname" "$ip" "$out"

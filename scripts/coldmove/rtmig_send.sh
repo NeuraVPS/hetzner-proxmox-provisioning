@@ -98,29 +98,13 @@ verify() {   # guid igual en origen y destino = mismo snapshot (lref/ref solo in
     local ds="${POOLDS}/vm-${VMID}-disk-${dd}@${snap}"
     s=$(on src "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
     d=$(on dst "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
-    si=$(on src "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" || true)
-    di=$(on dst "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" || true)
+    si=$(on src "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" | tr -cd '[:alnum:]./' | cut -c1-40 || true)
+    di=$(on dst "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" | tr -cd '[:alnum:]./' | cut -c1-40 || true)
+    [[ "$s" =~ ^[0-9]{1,20}$ ]] || s=""; [[ "$d" =~ ^[0-9]{1,20}$ ]] || d=""
     if [[ -n "$s" && "$s" == "$d" ]]; then log "VERIFY OK   $ds  guid=$s  ref/lref origen=$si destino=$di"
     else log "VERIFY FAIL $ds  guid origen=[${s:-ausente}] destino=[${d:-ausente}]"; bad=1; fi
   done
   return $bad
-}
-
-last_common() {   # último @rtmig-* presente en TODOS los discos de ambos lados con el mismo guid
-  local cand g1 g2 ok first
-  first="${DISKS%% *}"
-  local list
-  list=$(on_q src "zfs list -H -t snapshot -o name -s createtxg '${POOLDS}/vm-${VMID}-disk-${first}'") || exit 1
-  for cand in $(sed -n 's/.*@\(rtmig-.*\)/\1/p' <<< "$list" | tac); do
-    ok=1
-    for dd in $DISKS; do
-      g1=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
-      g2=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
-      [[ "$g1" != ABSENT && "$g1" == "$g2" ]] || { ok=0; break; }
-    done
-    (( ok )) && { echo "$cand"; return 0; }
-  done
-  return 1
 }
 
 resume_one() {   # resume_one <ds> <token>
@@ -167,6 +151,7 @@ send_one() {   # send_one <disk> <snap> [prev]
   [[ -n "${ZSTD:-}" ]] && sendargs=(-e)
   if [[ -n "$prev" ]]; then sendargs+=(-i "@${prev}"); recvflags="-s -F"; fi
   local est; est=$(on src "zfs send -nP ${sendargs[*]} '${ds}@${snap}' 2>/dev/null" | awk '/^size/{print $2}' || true)
+  [[ "$est" =~ ^[0-9]{1,18}$ ]] || est=0   # estimación del origen: solo informativa, nunca se evalúa
   log "send ${ds}@${snap} ${prev:+(incremental desde @$prev) }estimado=$(numfmt --to=iec "${est:-0}")B rate=${RATE} zstd=${ZSTD:-no}"
   local t0=$SECONDS rc sendcmd recvcmd
   sendcmd="nice -n 19 zfs send ${sendargs[*]} '${ds}@${snap}'"
@@ -261,10 +246,11 @@ case "$CMD" in
     BPS=$(rate_bps)
     for d in $DISKS; do
       w=$(zget src "written@${P}" "${POOLDS}/vm-${VMID}-disk-${d}" -p) || exit 1
+      [[ "$w" =~ ^[0-9]{1,18}$ ]] || die "contador escrito de disk-${d} con formato raro: no lo evalúo"
       if (( BPS > 0 )); then eta="~$(( w / BPS ))s a RATE=${RATE}"; else eta="RATE=0 (sin límite)"; fi
       log "  disk-${d}: $(numfmt --to=iec "$w")B escritos desde @${P}  (${eta})"
     done
-    log "pool origen: $(on src "zpool list -H -o cap,free rpool" | tr '\t' ' ')"
+    log "pool origen: $(on src "zpool list -H -o cap,free rpool" | tr '\t' ' ' | tr -cd '[:alnum:] .%' | cut -c1-40)"
     ;;
   resume)
     for d in $DISKS; do

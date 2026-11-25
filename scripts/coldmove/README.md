@@ -36,6 +36,44 @@ el campo.
 - **En los dos modos**, el estado, la copia aparcada y el cerrojo viven en `$WORK` del nodo que
   corre el kit. En `pull`, eso es el destino: Kademar no guarda nada del traslado.
 
+### En `pull`, el origen NO es fiable
+Kademar puede estar comprometido. Todo lo que devuelve se valida en el nodo de Hetzner como entrada
+hostil, y nada suyo se ejecuta ni se evalúa.
+- **Contadores y guid:** solo se aceptan enteros decimales estrictos y acotados. Un valor raro es
+  estado INDETERMINADO, y `pending` nunca lo mete en la aritmética del shell. Los nombres de
+  snapshot que no cumplen el patrón `rtmig-…` se ignoran.
+- **Sondas:** el estado de la VM, los sha256 y el UUID se validan por formato. La firma de CPU solo
+  se acepta como `vendor|family|model`.
+- **Config: perfil local con lista blanca** (`sanitize_conf`). Lo que se publica en el destino es una
+  config nueva construida aquí:
+  - Solo con claves permitidas y valores de formato estricto:
+    - `name`, `memory`, `balloon`, `cores`, `sockets`, `vcpus`, `cpu` (modelos conocidos), `ostype`,
+      `machine`, `bios`, `boot`, `scsihw`, `agent`, `smbios1` (con el UUID del traslado), `vmgenid`;
+    - `numa`, `tablet`, `onboot`, `localtime`, `kvm`, `vga`;
+    - `net0` (solo `virtio=<MAC>,bridge=vmbr0` y opciones numéricas);
+    - discos `efidisk0`, `tpmstate0`, `scsiN`/`virtioN`/`sataN`/`unusedN`, solo `local-zfs:vm-<VMID>-disk-N`;
+    - CD-ROM `none`.
+  - El **hookscript es siempre el nuestro**: `shared:snippets/sync-dnat.py`.
+  - Hacen abortar **antes de apagar**: `args`, `hostpci`, `usb`, `serial`, `parallel`, `audio`,
+    `rng`, `virtiofs`, `lock`, `startup`, un `[PENDING]`, una clave repetida o un valor raro.
+  - Se descartan las secciones de snapshot, `parent`, `meta`, `digest` y la descripción, salvo la
+    marca de plantilla `#neuravps-stream-template-key`.
+  - La config original se queda aparcada para un rollback a Kademar.
+- **`.fw`: se reescribe en limpio desde la lista blanca** (`sanitize_fw`). Solo se admiten
+  `[OPTIONS] enable: 0|1` y `[RULES]` con los grupos de la flota (`vm-default`, `vm-no-internet` y
+  `vm-public-ipv6`, activos o con `|`). Una regla propia, un `IPSET`, un `ALIASES` o una
+  `policy_in` hacen abortar.
+- **Historial del globo:** el de un origen no fiable no se importa.
+- **Agente SSH:** nunca se reenvía. El kit usa `-a -o ForwardAgent=no -o ClearAllForwardings=yes`
+  y `migrate_vm.sh` igual. Los runners de `run_remotes` solo reenvían el agente a las IPs de la
+  flota (`2a01:4f8::/32` y `2a01:4f9::/32`).
+
+### Corte ligado al par origen/destino
+- En `pull`, `DST_NODE` es obligatorio y tiene que ser este nodo.
+- **`shutdown` no apaga sin una precopia común verificada con ese destino:** algún `@rtmig-*` con el
+  mismo guid en todos los discos de los dos lados. Así, otro nodo sin la precopia no puede apagar la
+  VM, y el corte nunca dura una copia entera.
+
 ## Piezas
 | Fichero | Dónde corre | Qué hace |
 |---|---|---|
@@ -115,8 +153,13 @@ rollback.
       inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
       libre. Luego el apagado ordenado. Si Windows no se apaga, **no se fuerza**: decide una persona.
    2. `./rtmig_cutover.sh park`: exporta el historial del reconciliador de globo (si el origen lo
-      tiene) y aparca la config en `$WORK`. Así nadie puede arrancar la VM en origen. Los zvols se
-      quedan.
+      tiene y el modo es `push`) y aparca la config en `$WORK`. Así nadie puede arrancar la VM en
+      origen. Los zvols se quedan.
+      - La config y el `.fw` llegan primero a nombres provisionales (`*.staging`). Solo cuando han
+        llegado los dos se pasan a los definitivos y se abre el estado.
+      - Si algo cae antes, no queda nada «aparcado» y `park` se repite sin más.
+      - Si cae después, al quitar la config del origen, `park` se retoma, y `rollback` también
+        funciona desde ahí.
    3. `RATE=0 ./rtmig_send.sh incr auto rtmig-final-<fecha>`: incremental final, con `VERIFY OK`.
    4. `./rtmig_cutover.sh push rtmig-final-<fecha> [balloon_mb]`:
       - exige que el origen siga sin config (respuesta positiva);
@@ -151,6 +194,22 @@ rollback.
 
 El origen se queda con los zvols y los snapshots `@rtmig-*`. Se borran **a mano** pasados los días de
 keep acordados (por ejemplo, con `KEEP='hasta AAAA-MM-DD'` en `rtmig_send.sh`), después de verificar.
+
+## Vuelta al mismo nodo
+Ejemplo: una VM que fue de un nodo de Hetzner **A** a Kademar (en `push`) y vuelve a **A** (en `pull`,
+lanzado en A).
+- **A conserva sus zvols `vm-<VMID>-disk-N` y los `@rtmig-*` del viaje de ida**, porque el kit nunca
+  borra el origen. Kademar tiene los mismos snapshots, con el mismo guid.
+- **No se usa `base`:** se niega sin pisar nada («el destino ya tiene … sin @SNAP: no piso nada»).
+- **La vuelta empieza con** `RTMIG_MODE=pull SRC=<IP Kademar> SRC_NODE=0000266-KDM-9755
+  DST_NODE=<A> ./rtmig_send.sh incr auto rtmig-<nueva>`.
+  - `auto` encuentra el último `@rtmig-*` común (el final de la ida, con el mismo guid en los tres
+    discos).
+  - El incremental se recibe con `-F`, que devuelve el zvol de A a ese snapshot. La VM estuvo
+    aparcada en A, así que no hay escrituras que perder.
+- **Después, el corte de siempre:** `shutdown`, `park`, `incr` final, `push` y `start`.
+- El estado anterior de A está en `done` o `rolledback`, así que no estorba.
+- No borrar los zvols de A antes de que pase el keep acordado: son la base de la vuelta.
 
 ## CPU y licencias (`shutdown` y `push`)
 La regla es la misma que en `migrate_vm.sh` y en el defrag. La vía fría directa de `migrate_vm.sh`

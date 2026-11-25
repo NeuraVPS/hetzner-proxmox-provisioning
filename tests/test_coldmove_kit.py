@@ -144,6 +144,9 @@ elif a[0] == "get":
         sys.stderr.write("internal error: Input/output error\n"); sys.exit(1)
     if ds not in st or (sn and sn not in st[ds]["snaps"]):
         sys.stderr.write("cannot open '%s': dataset does not exist\n" % a[-1]); sys.exit(1)
+    hostile = os.environ.get("FAKE_HOSTILE_" + prop.split("@")[0].upper())
+    if hostile is not None and side == "src":     # a compromised origin answering garbage
+        print(hostile); sys.exit()
     if prop == "guid":
         if not sn: sys.exit(1)
         print(st[ds]["snaps"][sn])
@@ -239,6 +242,9 @@ def push_only(fn):
         return fn(self, *a, **kw)
     wrapper.__name__ = fn.__name__
     return wrapper
+# (also used for tests whose config carries [PENDING]/snapshot sections: in pull mode the origin's
+#  config goes through the local profile, which refuses [PENDING] and drops snapshot sections; the
+#  pull behaviour is covered in PullHostile.)
 
 
 class Kit:
@@ -299,10 +305,10 @@ class Kit:
         if self.mode == "push":
             self.env.update({"DST": "2001:db8:2::2", "DST_NODE": dst_host})
         else:
-            self.env.update({"SRC": "2001:db8:1::2", "SRC_NODE": src_host})
+            self.env.update({"SRC": "2001:db8:1::2", "SRC_NODE": src_host, "DST_NODE": dst_host})
         for k in ("CHANGE_CPU", "ACK_HWID_CHANGE", "CPU_NOTICE", "RATE", "DISKS", "ZSTD",
                   "FAKE_REMOTE", "FAKE_JUMP_CHAIN", "FAKE_JUMP",
-                  "DST" if self.mode == "pull" else "SRC", "DST_NODE" if self.mode == "pull" else "SRC_NODE",
+                  "DST" if self.mode == "pull" else "SRC", "SRC_NODE" if self.mode == "push" else "DST",
                   "ACK_DISCARD_DEST_WRITES", "FAKE_SSH_FAIL_MATCH", "FAKE_SSH_TRUNCATE_MATCH",
                   "FAKE_SSH_LOSE_MATCH", "FAKE_SSH_DIE_AFTER", "FAKE_ZFS_FAIL_MATCH", "FAKE_ZFS_FAIL_SIDE"):
             self.env.pop(k, None)
@@ -379,14 +385,18 @@ class HappyPath(ModeCase):
             r = k.ok("rtmig_cutover.sh", "shutdown", "60")
             self.assertIn("previas OK", r.stdout)
             r = k.ok("rtmig_cutover.sh", "park")
-            self.assertIn("historial del globo exportado", r.stdout)
+            if k.mode == "push":
+                self.assertIn("historial del globo exportado", r.stdout)
+            else:                                                     # untrusted origin: never imported
+                self.assertIn("no se importa (origen no fiable)", r.stdout)
             self.assertFalse(k.src_conf.exists())
             st = k.state()
             self.assertEqual((st["PHASE"], st["UUID"], st["SRC_NODE"], st["DST_NODE"], st["DISKS"]),
                              ("parked", "11111111-2222-3333-4444-555555555555", "0000999-AX162-TEST",
                               "0000266-KDM-9755", "0 1 2"))
-            log = k.read("ramguard.log").splitlines()
-            self.assertEqual(log[0].split()[:4], ["src", "export-state", VMID, "0000999-AX162-TEST"])
+            if k.mode == "push":
+                log = k.read("ramguard.log").splitlines()
+                self.assertEqual(log[0].split()[:4], ["src", "export-state", VMID, "0000999-AX162-TEST"])
             k.ok("rtmig_send.sh", "incr", "auto", FINAL, RATE="0")
             r = k.ok("rtmig_cutover.sh", "push", FINAL, "47104")
             self.assertEqual(r.stdout.count("disco OK"), 3)
@@ -399,8 +409,11 @@ class HappyPath(ModeCase):
             self.assertTrue(k.read(f"dst/etc/pve/firewall/{VMID}.fw"))
             self.assertNotIn("dst set", k.read("qm.log"))            # published in one go, no qm set
             imp = [l for l in k.read("ramguard.log").splitlines() if "import-state" in l]
-            self.assertEqual(imp[0].split(), ["dst", "import-state", VMID, "0000266-KDM-9755",
-                                              k.read(f"work/{VMID}.balloon-state").strip()])
+            if k.mode == "push":
+                self.assertEqual(imp[0].split(), ["dst", "import-state", VMID, "0000266-KDM-9755",
+                                                  k.read(f"work/{VMID}.balloon-state").strip()])
+            else:
+                self.assertEqual(imp, [])
             k.ok("rtmig_cutover.sh", "start")
             self.assertEqual(k.read(f"dst/state-{VMID}").strip(), "running")
             self.assertEqual(k.state()["PHASE"], "started")
@@ -417,6 +430,7 @@ class HappyPath(ModeCase):
             self.assertNotIn("import-state", k.read("ramguard.log"))
             self.assertFalse((k.work / f"{VMID}.balloon-state").exists())
 
+    @push_only
     def test_dest_without_reconciler_skips_import(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, dst_reconciler=False)
@@ -597,7 +611,7 @@ class Safety(ModeCase):
 
     def test_shutdown_never_forces(self):
         with tempfile.TemporaryDirectory() as tmp:
-            k = Kit(tmp)
+            k = Kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
             r = k.run("rtmig_cutover.sh", "shutdown", "5", FAKE_SHUTDOWN_FAIL="1")
             self.assertEqual(r.returncode, 1); self.assertIn("NO forzar", out(r))
             self.assertNotIn("stop", [l.split()[1] for l in k.read("qm.log").splitlines()])
@@ -771,7 +785,9 @@ class SecondReview(ModeCase):
     def test_fw_hash_recorded_and_verified(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
-            fw = k.read(f"src/etc/pve/firewall/{VMID}.fw") or k.read(f"work/{VMID}.fw.src")
+            # the hash of what was PUBLISHED (in pull, the .fw rewritten from the allow-list)
+            fw = k.read(f"dst/etc/pve/firewall/{VMID}.fw")
+            self.assertTrue(fw)
             self.assertEqual(k.state()["FW_SHA"], hashlib.sha256(fw.encode()).hexdigest())
 
     def test_start_reconciles_when_the_confirmation_was_lost(self):
@@ -806,6 +822,7 @@ class SecondReview(ModeCase):
             self.assertEqual(k.state()["PHASE"], "rolledback")
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
 
+    @push_only
     def test_pending_cpu_decides_before_shutdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             conf = CONF.format(cpu="x86-64-v4") + "\n[PENDING]\ncpu: host\n"
@@ -820,6 +837,7 @@ class SecondReview(ModeCase):
             self.assertEqual(r.returncode, 1); self.assertIn("corría con host y arrancará con kvm64", out(r))
             k.ok("rtmig_cutover.sh", "shutdown", "60", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo")
 
+    @push_only
     def test_pending_balloon_blocks_setting_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[PENDING]\nballoon: 2048\n")
@@ -827,6 +845,7 @@ class SecondReview(ModeCase):
             r = k.run("rtmig_cutover.sh", "push", FINAL, "47104")
             self.assertEqual(r.returncode, 1); self.assertIn("PENDIENTE de balloon", out(r))
 
+    @push_only
     def test_conf_set_key_ignores_snapshot_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, conf=CONF.format(cpu="x86-64-v4") + "\n[snap1]\nballoon: 47104\ncpu: host\n")
@@ -885,6 +904,7 @@ class ThirdReview(ModeCase):
             self.assertTrue(list(k.work.glob(f"{VMID}.fw.dst-*")))
             self.assertTrue(list(k.work.glob(f"{VMID}.conf.dst-*")))
 
+    @push_only
     def test_running_host_with_pending_v4_needs_the_ack(self):
         with tempfile.TemporaryDirectory() as tmp:
             conf = CONF.format(cpu="host") + "\n[PENDING]\ncpu: x86-64-v4\n"
@@ -1080,14 +1100,6 @@ class PullMode(unittest.TestCase):
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
             self.assertTrue(all(l.startswith("dst> root@2001:db8:1::2 :: ") for l in k.read("ssh.log").splitlines()))
 
-    def test_balloon_history_is_exported_on_the_origin_by_the_destination(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            k = self.kademar_origin(tmp)
-            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
-            log = k.read("ramguard.log").splitlines()
-            self.assertEqual(log[0].split()[:4], ["src", "export-state", VMID, "0000266-KDM-9755"])
-            self.assertEqual(log[1].split()[:4], ["dst", "import-state", VMID, "0000238-AX162-2-LTD"])
-
     def test_push_from_a_node_without_the_fleet_key_points_to_pull(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, mode="push", src_host="0000266-KDM-9755", dst_host="0000238-AX162-2-LTD")
@@ -1101,6 +1113,9 @@ class PullMode(unittest.TestCase):
             k = self.kademar_origin(tmp)
             r = k.run("rtmig_send.sh", "base", "rtmig-a", DST_NODE="0000999-OTRO")
             self.assertEqual(r.returncode, 2); self.assertIn("el kit corre en el DESTINO", out(r))
+            env = dict(k.env); env.pop("DST_NODE")
+            r = subprocess.run(["bash", str(KIT / "rtmig_send.sh"), "base", "rtmig-a"], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 2); self.assertIn("hace falta DST_NODE explícito", out(r))
             r = k.run("rtmig_send.sh", "base", "rtmig-a", NV_FLEET_KEY=str(k.t / "dst/no-key"))
             self.assertEqual(r.returncode, 1); self.assertIn("tiene que correr en un nodo de Hetzner", out(r))
 
@@ -1156,6 +1171,17 @@ class PullMode(unittest.TestCase):
             self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
             self.assertEqual(k.state()["PHASE"], "rolledback")
 
+    def test_park_cut_while_reading_the_fw_is_repeatable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kademar_origin(tmp)
+            k.ok("rtmig_send.sh", "base", "rtmig-a"); k.ok("rtmig_cutover.sh", "shutdown", "60")
+            r = k.run("rtmig_cutover.sh", "park", FAKE_SSH_FAIL_MATCH='cat "${PVE_ETC:-/etc/pve}/firewall/')
+            self.assertEqual(r.returncode, 1)
+            self.assertFalse((k.work / f"{VMID}.conf.src").exists())      # nothing «parked» half way
+            self.assertTrue(k.src_conf.exists()); self.assertEqual(k.state().get("PHASE"), None)
+            k.ok("rtmig_cutover.sh", "park")                              # simply repeat it
+            self.assertEqual(k.state()["PHASE"], "parked")
+
     def test_nested_ssh_is_detected_by_the_fakes(self):
         # guard for the guard: a command run over ssh that tries to ssh again is caught
         with tempfile.TemporaryDirectory() as tmp:
@@ -1167,7 +1193,168 @@ class PullMode(unittest.TestCase):
             self.assertIn("src -> root@2001:db8:2::2", k.read("nested.log"))
 
 
-for _cls in (HappyPath, ResumableSend, Inventory, Phases, Safety, Rollback, SecondReview, ThirdReview, CpuGuard):
+class PullHostile(unittest.TestCase):
+    """Coordinator's rule for #296: in pull mode the origin (Kademar) is NOT TRUSTED. Everything it
+    returns is validated on the Hetzner node as hostile input; nothing of it is executed or evaluated;
+    its config and .fw reach the destination only through a local allow-list profile."""
+
+    def kit(self, tmp, **kw):
+        return Kit(tmp, mode="pull", src_host="0000266-KDM-9755", dst_host="0000238-AX162-2-LTD",
+                   src_cpu=TURIN, dst_cpu=GENOA, **kw)
+
+    def test_pending_counter_is_never_evaluated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            for bad in ("a[$(touch /tmp/pwned-rtmig)]", "1e3", "-5", "99999999999999999999"):
+                r = k.run("rtmig_send.sh", "pending", FAKE_HOSTILE_WRITTEN=bad)
+                self.assertEqual(r.returncode, 1, bad); self.assertIn("formato raro", out(r))
+            self.assertFalse(os.path.exists("/tmp/pwned-rtmig"))
+
+    def test_hostile_guid_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            r = k.run("rtmig_send.sh", "base", "rtmig-a", FAKE_HOSTILE_GUID="$(id)")
+            self.assertEqual(r.returncode, 1); self.assertIn("guid con formato raro", out(r))
+
+    def profile_fail(self, extra, needle):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp, conf=CONF.format(cpu="x86-64-v4") + extra)
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1, extra); self.assertIn("no cumple el perfil", out(r)); self.assertIn(needle, out(r))
+            self.assertNotIn("shutdown", k.read("qm.log"))                # checked BEFORE stopping it
+
+    def test_profile_refuses_dangerous_keys(self):
+        self.profile_fail("args: -device foo\n", "args")
+        self.profile_fail("hostpci0: 0000:01:00.0\n", "hostpci0")
+        self.profile_fail("usb0: host=1234:5678\n", "usb0")
+        self.profile_fail("serial0: socket\n", "serial0")
+        self.profile_fail("\n[PENDING]\ncpu: host\n", "[PENDING]")
+
+    def test_profile_refuses_bad_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = CONF.format(cpu="x86-64-v4").replace("bridge=vmbr0", "bridge=vmbr9")
+            k = self.kit(tmp, conf=conf); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("net0=", out(r))
+
+    def test_published_config_is_the_profile_with_our_hookscript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = (CONF.format(cpu="x86-64-v4").replace("hookscript: shared:snippets/sync-dnat.py", "hookscript: local:snippets/evil.sh")
+                    + "meta: creation-qemu=11.0.3\ndescription: hola\n\n[snap1]\nballoon: 1\nargs: -evil\n")
+            k = self.kit(tmp, conf=conf.replace("description: hola\n", ""))
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            pub = k.dst_conf.read_text()
+            self.assertIn("hookscript: shared:snippets/sync-dnat.py", pub)
+            self.assertNotIn("evil", pub); self.assertNotIn("[snap1]", pub); self.assertNotIn("meta:", pub)
+            self.assertIn("smbios1: uuid=11111111-2222-3333-4444-555555555555", pub)
+            # the original stays parked for a rollback to Kademar
+            self.assertIn("local:snippets/evil.sh", k.read(f"work/{VMID}.conf.src"))
+
+    def test_fw_is_rewritten_from_the_allow_list_or_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            (k.t / f"src/etc/pve/firewall/{VMID}.fw").write_text(
+                "[OPTIONS]\n\nenable: 1\n\n[RULES]\n\n|GROUP vm-no-internet\nGROUP vm-default # x\n")
+            k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            self.assertEqual(k.read(f"dst/etc/pve/firewall/{VMID}.fw"),
+                             "[OPTIONS]\n\nenable: 1\n\n[RULES]\n\n|GROUP vm-no-internet\nGROUP vm-default\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp)
+            (k.t / f"src/etc/pve/firewall/{VMID}.fw").write_text("[OPTIONS]\nenable: 1\npolicy_in: ACCEPT\n[RULES]\nIN ACCEPT -p tcp\n")
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("el .fw del origen no cumple el perfil", out(r))
+
+    def test_balloon_history_from_an_untrusted_origin_is_not_imported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.to_final(); k.ok("rtmig_cutover.sh", "push", FINAL)
+            self.assertEqual(k.read("ramguard.log"), "")
+            self.assertFalse((k.work / f"{VMID}.balloon-state").exists())
+
+    def test_hostile_snapshot_names_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            p = k.t / "src/zfs.json"; st = json.loads(p.read_text())
+            d0 = st[f"rpool/data/vm-{VMID}-disk-0"]
+            d0["snaps"]["rtmig-x;id"] = "1"; d0["order"].append("rtmig-x;id")
+            p.write_text(json.dumps(st))
+            r = k.ok("rtmig_send.sh", "last")
+            self.assertEqual(r.stdout.strip().splitlines()[-1], "rtmig-a")
+
+    def test_agent_is_never_forwarded_to_the_peer(self):
+        s = (KIT / "rtmig_common.sh").read_text()
+        self.assertIn("SSHO=(-a -x -o ForwardAgent=no -o ClearAllForwardings=yes", s)
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp); k.ok("rtmig_send.sh", "base", "rtmig-a")
+
+
+class ShutdownNeedsPrecopy(ModeCase):
+    def test_no_common_base_no_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp)
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("haz antes la precopia", out(r))
+            self.assertNotIn("shutdown", k.read("qm.log"))
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+
+
+class OldStateMigration(unittest.TestCase):
+    def test_push_state_of_the_previous_version_is_migrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, mode="push"); k.to_final()
+            st = "\n".join(l for l in k.read(f"work/{VMID}.state").splitlines()
+                           if not l.startswith(("MODE=", "PEER="))) + "\nDST=2001:db8:2::2\n"
+            (k.work / f"{VMID}.state").write_text(st)
+            r = k.ok("rtmig_cutover.sh", "push", FINAL)
+            self.assertIn("estado de la versión anterior del kit migrado", r.stdout)
+            self.assertEqual((k.state()["MODE"], k.state()["PEER"]), ("push", "2001:db8:2::2"))
+
+    def test_old_state_for_another_destination_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, mode="push"); k.to_final()
+            st = "\n".join(l for l in k.read(f"work/{VMID}.state").splitlines()
+                           if not l.startswith(("MODE=", "PEER="))) + "\nDST=2001:db8:7::7\n"
+            (k.work / f"{VMID}.state").write_text(st)
+            r = k.run("rtmig_cutover.sh", "push", FINAL)
+            self.assertEqual(r.returncode, 1); self.assertIn("versión anterior del kit", out(r))
+
+
+class ReturnToTheSameNode(unittest.TestCase):
+    """(b) Hetzner A → Kademar (push) and back Kademar → A (pull): A kept its zvols and @rtmig-*
+    snapshots, so the way back is `incr auto` (same guids); `base` refuses without overwriting."""
+
+    def test_round_trip_uses_incr_auto_on_the_retained_zvols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, mode="push", src_host="0000238-AX162-2-LTD", dst_host="0000266-KDM-9755",
+                    src_cpu=GENOA, dst_cpu=TURIN)
+            k.to_started(); k.ok("rtmig_cutover.sh", "close")             # the VM now lives on Kademar
+            a_guids = {n: v["snaps"].get(FINAL) for n, v in json.loads(k.read("src/zfs.json")).items()}
+            self.assertTrue(all(a_guids.values()))                         # A kept FINAL on its 3 zvols
+            # back: the kit now runs on A (fake side "src") in pull mode, Kademar (fake "dst") is the origin
+            back = dict(k.env, RTMIG_MODE="pull", SRC="2001:db8:2::2", SRC_NODE="0000266-KDM-9755",
+                        DST_NODE="0000238-AX162-2-LTD")
+            back.pop("DST")
+            (k.t / "dst/run").mkdir(); (k.t / "dst/run" / f"{VMID}.pid").write_text("777\n")
+            (k.t / "dst/proc/777").mkdir(parents=True)
+            (k.t / "dst/proc/777/cmdline").write_bytes(b"/usr/bin/kvm\0-cpu\0qemu64,+avx512f\0")
+            run = lambda *a: subprocess.run(["bash", str(KIT / a[0]), *a[1:]], capture_output=True, text=True, env=back)
+            r = run("rtmig_send.sh", "base", "rtmig-back-a")
+            self.assertEqual(r.returncode, 1); self.assertIn("no piso nada", out(r))
+            r = run("rtmig_send.sh", "incr", "auto", "rtmig-back-1")
+            self.assertEqual(r.returncode, 0, out(r)); self.assertIn(f"PREV=auto -> @{FINAL}", r.stdout)
+            self.assertEqual(r.stdout.count("VERIFY OK"), 3)
+            for step in (("rtmig_cutover.sh", "shutdown", "60"), ("rtmig_cutover.sh", "park"),
+                         ("rtmig_send.sh", "incr", "auto", "rtmig-back-final"),
+                         ("rtmig_cutover.sh", "push", "rtmig-back-final"), ("rtmig_cutover.sh", "start")):
+                r = run(*step); self.assertEqual(r.returncode, 0, (step, out(r)))
+            self.assertTrue(k.src_conf.exists()); self.assertFalse(k.dst_conf.exists())
+            self.assertEqual(k.read(f"src/state-{VMID}").strip(), "running")
+            self.assertEqual(k.read("nested.log"), "")
+
+
+for _cls in (HappyPath, ResumableSend, Inventory, Phases, Safety, Rollback, SecondReview, ThirdReview, CpuGuard,
+             ShutdownNeedsPrecopy):
     globals()["Pull" + _cls.__name__] = type("Pull" + _cls.__name__, (_cls,), {"MODE": "pull"})
 del _cls
 
@@ -1216,6 +1403,20 @@ class Static(unittest.TestCase):
             self.assertIsNone(re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", s), f)
             self.assertNotRegex(s, r"(?i)VMID=\$\{VMID:-\d|DST=\$\{DST:-")
             self.assertNotIn("BEGIN OPENSSH", s)
+
+    def test_runners_forward_the_agent_only_to_hetzner_fleet_ips(self):
+        files = subprocess.run(["git", "grep", "-l", "nv_agent_opt", "--", "run_remotes"], cwd=ROOT,
+                               capture_output=True, text=True).stdout.split()
+        self.assertGreaterEqual(len(files), 10)
+        leftovers = subprocess.run(["git", "grep", "-n", 'ForwardAgent=yes "root@', "--", ":!tests"], cwd=ROOT,
+                                   capture_output=True, text=True).stdout
+        self.assertEqual(leftovers, "")
+        f = ROOT / "run_remotes/generic.sh"
+        fn = re.search(r"(?ms)^nv_agent_opt\(\) \{\n.*?^\}\n", f.read_text()).group()
+        for ip, want in (("2a01:4f9:3a:276b::2", "-o ForwardAgent=yes"), ("2a01:4f8:2b03:18a9::2", "-o ForwardAgent=yes"),
+                         ("2a0c:4ac1:3:8::2", "-a -o ForwardAgent=no"), ("193.46.81.6", "-a -o ForwardAgent=no")):
+            r = subprocess.run(["bash", "-c", fn + f'nv_agent_opt "{ip}"'], capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), want, ip)
 
     def test_rate_default_fits_a_non_hetzner_link(self):
         self.assertIn('RATE="${RATE:-30m}"', (KIT / "rtmig_send.sh").read_text())

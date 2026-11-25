@@ -649,6 +649,17 @@ class ProviderGuard(unittest.TestCase):
             r = self.guard(sp, self.HETZ, dp, self.HETZ)
             self.assertEqual(r.returncode, 0, (sp, dp, r.stderr)); self.assertIn("PASSED", r.stdout)
 
+    def test_missing_provider_with_a_foreign_ip_is_external(self):
+        # PR #296 review: a valid doc without the field must not authorise any IP as Hetzner
+        for sp in ("unset", "hetzner"):
+            r = self.guard(sp, self.KDM, "unset", self.HETZ)
+            self.assertEqual(r.returncode, 1, sp); self.assertIn("no-hetzner", r.stderr)
+            r = self.guard("unset", self.HETZ, sp, "2a0c:4ac1:3:8::9")
+            self.assertEqual(r.returncode, 1, sp)
+
+    def test_ssh_to_nodes_never_forwards_the_agent(self):
+        self.assertIn("-a -o ForwardAgent=no", SCRIPT[SCRIPT.index("SSH_BASE_OPTS=("):SCRIPT.index("src_ssh() {")])
+
     def test_origin_of_another_provider_refused_with_pull_hint(self):
         for sp, sip in (("kademar", self.KDM), ("", self.KDM), ("NO-DOC", self.KDM), ("kademar", self.HETZ)):
             r = self.guard(sp, sip, "unset", self.HETZ)

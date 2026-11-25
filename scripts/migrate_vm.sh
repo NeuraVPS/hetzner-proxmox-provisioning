@@ -481,6 +481,7 @@ if (( SRC_EQ_DST == 0 )); then
   SSH_CTL_DIR=$(mktemp -d -t mvm.XXXXXX)
 fi
 SSH_BASE_OPTS=(
+  -a -o ForwardAgent=no   # nunca el agente de la BASE a un nodo (25/11/2026: los hay de otro proveedor)
   -o LogLevel=ERROR
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
@@ -948,9 +949,10 @@ PYNT
 # La vía es scripts/coldmove (README.md): hacia Kademar en modo push desde el
 # origen; desde Kademar en modo pull desde el destino. Tras el kit, este script
 # sí se usa para reconciliar (rama «already on dest», que no lanza remote_migrate).
-# provider sin campo («unset») = hetzner (docs anteriores). Si Firestore no
-# contesta o falta el doc, se decide por la IP: solo los /32 de Hetzner de la
-# flota (2a01:4f8::/32, 2a01:4f9::/32) cuentan como Hetzner.
+# Hetzner = provider sin campo («unset», docs anteriores) o «hetzner», Y además la
+# IP en los /32 de la flota (2a01:4f8::/32, 2a01:4f9::/32). Si no cuadran (o si
+# Firestore no contesta y la IP no es de esos /32) cuenta como externo; un
+# provider distinto de hetzner es externo siempre. Todo antes del token.
 _is_hetzner_fleet_ip() {
   python3 -c '
 import ipaddress, sys
@@ -963,8 +965,10 @@ sys.exit(0 if any(a in ipaddress.ip_network(n) for n in ("2a01:4f8::/32", "2a01:
 # <provider de Firestore|""|NO-DOC|unset> <ip> → hetzner | <proveedor> | no-hetzner
 _node_provider() {
   case "${1:-}" in
-    unset|hetzner) echo hetzner ;;
-    ""|NO-DOC) if _is_hetzner_fleet_ip "$2"; then echo hetzner; else echo no-hetzner; fi ;;
+    unset|hetzner|""|NO-DOC)
+      # Sin campo (o diciendo hetzner, o sin Firestore): solo es Hetzner si la IP está en los /32 de la
+      # flota. Una discrepancia (p. ej. doc sin provider con IP de otro proveedor) cuenta como externo.
+      if _is_hetzner_fleet_ip "$2"; then echo hetzner; else echo "no-hetzner(${1:-sin-dato})"; fi ;;
     *) echo "$1" ;;
   esac
 }

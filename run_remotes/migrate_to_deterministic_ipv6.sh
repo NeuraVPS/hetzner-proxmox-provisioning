@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ForwardAgent solo hacia nodos de la flota de Hetzner (2a01:4f8::/32 y 2a01:4f9::/32). Un nodo de
+# otro proveedor (proxmox_nodes.provider ≠ hetzner, p. ej. Kademar, sin clave de flota y no fiable)
+# no recibe nunca el agente: -a -o ForwardAgent=no (25/11/2026, revisión del PR #296).
+nv_agent_opt() {
+  case "$1" in
+    2a01:4f8:*|2a01:4f9:*) echo "-o ForwardAgent=yes" ;;
+    *) echo "-a -o ForwardAgent=no" ;;
+  esac
+}
 
 ############################################################
 # Migrate existing Proxmox nodes to "manual static IPv6 in-guest" model.
@@ -582,7 +591,7 @@ while read -r hostname ip; do
     # the local array doesn't get re-expanded). Empty if unset.
     only_vmids_str="${ONLY_VMIDS[*]:-}"
 
-    ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ForwardAgent=yes "root@$ip" \
+    ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(nv_agent_opt "$ip") "root@$ip" \
         "ONLY_VMIDS='${only_vmids_str}'; $FUNC_CONTENT; remote_task" \
         2>&1 \
         | tee >(grep -F 'RUNREMOTES_FAIL' \
