@@ -74,8 +74,16 @@ class ParseTests(unittest.TestCase):
         self.assertIn('counter drop comment "nv-final"', drop)
         self.assertIn('ct direction reply ct state established', drop)
         self.assertNotIn('log prefix', drop)
+        self.assertIn('reject with tcp reset comment "nv-salida"', drop)
+        self.assertIn('reject with icmpv6 type policy-fail comment "nv-salida-otro"', drop)
+        self.assertIn('modo=drop salida=drop', drop)
         count = mod.ruleset('count', p, [], [], {})
         self.assertNotIn('counter drop comment "nv-final"', count)
+        self.assertNotIn('reject', count)
+        mixed = mod.ruleset('drop', p, [], [], {}, 'count')
+        self.assertIn('counter drop comment "nv-final"', mixed)
+        self.assertNotIn('reject', mixed)
+        self.assertIn('modo=drop salida=count', mixed)
         self.assertNotIn('hook input', drop + count)
 
 

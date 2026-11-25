@@ -36,10 +36,15 @@ su /64 conservando el sufijo: un invitado con IDENT `::2` saldría como la base 
 por `nv-infra` en cualquier nodo. Ninguna VM usa esas direcciones (vmid ≥ 100). En
 MODE=count, `nv-spoof` y `nv-excl-ajena` solo cuentan.
 
-Además `nv-salida` cuenta (sin cortar) las conexiones nuevas que salen de `vmbr0` hacia
-fuera con origen en el /64 del nodo. **No se corta la salida**: un invitado con
-dirección node64 sigue pudiendo salir por la uplink del nodo (fuera de pools y de
-«Internet apagado»); es otro hueco, sin tratar aquí.
+**Salida** (cadena `salida64`, desde el 25/11): lo que un invitado envía desde `vmbr0`
+hacia fuera con origen en el /64 del nodo saldría por la uplink del nodo, sin pasar por
+las bases (pools, «Internet apagado»): la regla de política 100 solo lleva a la base el
+origen IDENT (comprobado en real: conexión de la VM1517 con origen node64 completada
+directa). Con `SALIDA_MODE=drop` solo pasan las respuestas a lo que la entrada permite
+(`nv-salida-resp`, `nv-salida-rel`); TCP se rechaza con RST (`nv-salida`) y el resto con
+ICMPv6 policy-fail (`nv-salida-otro`), para que el invitado use su IDENT o IPv4. Con
+`SALIDA_MODE=count` solo cuenta conexiones nuevas (log `nvx-node64 out:`). El tráfico del
+propio host (`::2`, `::1`) es output, no forward: no se ve afectado.
 
 Ante un error leyendo el estado (`ip`, `vmbr0`, `cluster.fw`, lista de excluidas) la pasada
 **no toca** lo puesto y sale con error (`ULTIMA=exit-code` en `--mirar`). Un `vmbr0` sin /64
@@ -47,7 +52,8 @@ solo se acepta con el marcador `/etc/neuravps/node64-guard-sin64` (el despliegue
 los nodos de `--sin64`, hoy solo 0000266-KDM-9755); ahí la tabla se pone con `node64`
 vacío y solo actúa `nv-spoof` (el nodo también lleva IDENT a las bases).
 
-`MODE` va por drop-in (`/etc/systemd/system/nvx-node64.service.d/mode.conf`). El timer
+`MODE` y `SALIDA_MODE` van por drop-in (el despliegue escribe los dos; sin `SALIDA_MODE`
+vale lo mismo que `MODE`) (`/etc/systemd/system/nvx-node64.service.d/mode.conf`). El timer
 reaplica cada 5 min, pero solo reconstruye la tabla (en una transacción atómica) si el
 conjunto calculado cambia o si la tabla falta (p. ej. tras un `flush ruleset`), así que
 los contadores se conservan.
@@ -55,17 +61,20 @@ los contadores se conservan.
 ## Operación
 
 ```bash
-scripts/despliega-node64.py --solo-mirar --modo drop            # ¿sigue protegida la flota?
-scripts/despliega-node64.py --nodos <a,b> --modo count          # canario: solo cuenta
-scripts/despliega-node64.py --nodos <a,b> --modo drop           # armar
-scripts/despliega-node64.py --modo drop --excluir 520,1306,...  # otra lista de excluidas
+scripts/despliega-node64.py --solo-mirar --modo drop --modo-salida drop     # ¿sigue protegida la flota?
+scripts/despliega-node64.py --nodos <a,b> --modo count --modo-salida count  # canario: solo cuenta
+scripts/despliega-node64.py --nodos <a,b> --modo drop --modo-salida count   # entrada armada, salida midiendo
+scripts/despliega-node64.py --nodos <a,b> --modo drop --modo-salida drop    # las dos armadas
+scripts/despliega-node64.py --modo drop --modo-salida drop --excluir 520,1306,...  # otra lista de excluidas
 # en el nodo:
 python3 /usr/local/sbin/nvx-node64.py --mirar
 journalctl -k | grep nvx-node64          # en modo count, quién llega
 ```
 
-`FINAL` = intentos de fuera descartados (o que se descartarían); `SALIDA` = conexiones
-nuevas que abre un invitado con origen node64; `EXCL` = tráfico a una VM excluida;
+`FINAL` = intentos de fuera descartados (o que se descartarían); `SALIDA` = salida del
+invitado con origen node64 (paquetes en estado new en count, rechazados en drop; no son
+conexiones distintas);
+`SALRESP` = respuestas permitidas; `EXCL` = tráfico a una VM excluida;
 `AJENA` = a la dirección de una excluida por otro puerto; `SPOOF` = invitado con origen
 IDENT reservado; `N64OK=si` = el conjunto vivo coincide con el /64 de `vmbr0`.
 
@@ -77,7 +86,8 @@ Nodos nuevos: `install.sh` los deja en `drop` a propósito (no tienen VMs hereda
   servicio y borra la tabla; los ficheros quedan inertes).
 - Un nodo: `systemctl disable --now nvx-node64.timer nvx-node64.service; python3 /usr/local/sbin/nvx-node64.py --quitar`
   (o `--nodos <nodo> --quitar` desde el sandbox).
-- Volver a solo contar sin quitar: `--modo count`.
+- Desarmar solo la salida: `--nodos <...> --modo drop --modo-salida count`; solo la entrada:
+  `--modo count --modo-salida drop`. El script exige siempre los dos modos.
 
 ## Pruebas
 

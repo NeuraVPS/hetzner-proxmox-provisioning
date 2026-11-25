@@ -73,8 +73,12 @@ def main():
         if not ok:
             fails.append(name)
 
-    def run(*args, mode="drop"):
-        return sh("python3", SCRIPT, *args, env=dict(env, MODE=mode), check=False)
+    def run(*args, mode="drop", smode=None):
+        e = dict(env, MODE=mode)
+        e.pop("SALIDA_MODE", None)
+        if smode:
+            e["SALIDA_MODE"] = smode
+        return sh("python3", SCRIPT, *args, env=e, check=False)
 
     def mirar():
         return run("--mirar").stdout.strip()
@@ -141,6 +145,14 @@ threading.Event().wait()
         procs.append(subprocess.Popen(["nsenter", "-t", ga, "-n", "python3", "-c", srv, EXCL]))
         procs.append(subprocess.Popen(["nsenter", "-t", gb, "-n", "python3", "-c", srv, LEGACY, EXCL]))
         procs.append(subprocess.Popen(["nsenter", "-t", inet, "-n", "python3", "-c", srv, STRANGER]))
+        udp_srv = r'''import socket,sys
+s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind((sys.argv[1],5353))
+open(sys.argv[2],"w").close()
+while True:
+ d,a=s.recvfrom(100);open(sys.argv[2],"a").write(a[0]+"\\n");s.sendto(b"pong",a)
+'''
+        udp_log = tmp / "udp.log"
+        procs.append(subprocess.Popen(["nsenter", "-t", inet, "-n", "python3", "-c", udp_srv, STRANGER, str(udp_log)]))
         procs.append(subprocess.Popen(["python3", "-c", srv, WAN_NODE]))
         time.sleep(.4)
 
@@ -159,7 +171,21 @@ except Exception as e:print("ERR",type(e).__name__)
                 break
             time.sleep(.25)
 
-        def matrix(closed):
+        def udp(src):
+            return n(gb, "python3", "-c", r'''import socket,sys
+s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind((sys.argv[1],0));s.connect((sys.argv[2],5353));s.settimeout(1.5)
+s.send(b"x")
+try:
+ print("RESP" if s.recv(10)==b"pong" else "OTRO")
+except (ConnectionRefusedError, PermissionError):print("RECHAZO")
+except Exception as e:print("ERR",type(e).__name__)
+''', src, STRANGER, check=False).stdout.strip()
+
+        def tcp_err(pid, src, dst):
+            return n(pid, "python3", "-c", cli, src, dst, check=False).stdout.strip()
+
+        def matrix(closed, out_closed=None):
+            out_closed = closed if out_closed is None else out_closed
             check("desconocido -> heredada", tcp(inet, STRANGER, LEGACY) != closed)
             check("invitado de otro nodo -> heredada", tcp(inet, OTHER_GUEST, LEGACY) != closed)
             check("cliente via SNAT de la base (base64::5ed) -> heredada", tcp(inet, BASE_SNAT, LEGACY) != closed)
@@ -169,7 +195,10 @@ except Exception as e:print("ERR",type(e).__name__)
             check("host de otro nodo (::2) -> heredada", tcp(inet, OTHER_HOST, LEGACY))
             check("transito por tun-* -> heredada", tcp(tun, TRANSIT, LEGACY))
             check("desconocido -> excluida residente (vmid 520)", tcp(inet, STRANGER, EXCL))
-            check("invitado sale desde la heredada (respuesta)", tcp(gb, LEGACY, STRANGER))
+            check("invitado sale desde la heredada", tcp(gb, LEGACY, STRANGER) != out_closed)
+            check("host sale con su ::2 (output, no forward)", tcp(str(os.getpid()), WAN_NODE, STRANGER))
+            check("host sale con la ::1 de vmbr0 (output)", tcp(str(os.getpid()), f"{N64}::1", STRANGER))
+            check("base (::2) -> heredada y la respuesta vuelve", tcp(inet, BASE_HOST, LEGACY))
             check("desconocido -> host del nodo (input)", tcp(inet, STRANGER, WAN_NODE))
             check("invitado sale con su IDENT normal", tcp(gb, ID_OK, STRANGER))
             check("invitado sale con IDENT reservada ::2 (suplantaria a la base)",
@@ -203,8 +232,35 @@ except Exception as e:print("MUERTA",type(e).__name__)
             time.sleep(.5)
             return ok
         check("count: vecina con la direccion de la excluida SI recibe (solo cuenta)", vecina_con_excluida(False))
+        # Conexion SALIENTE desde la heredada abierta antes de armar la salida.
+        hold_out = subprocess.Popen(["nsenter", "-t", gb, "-n", "python3", "-c", r'''import socket,sys
+s=socket.socket(socket.AF_INET6);s.settimeout(2);s.bind((sys.argv[1],0));s.connect((sys.argv[2],3389));s.recv(10)
+print("abierta",flush=True);sys.stdin.readline()
+try:
+ s.sendall(b"x");print("VIVA" if s.recv(10)==b"x" else "MUERTA")
+except Exception as e:print("MUERTA",type(e).__name__)
+''', LEGACY, STRANGER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        procs.append(hold_out)
+        hold_out.stdout.readline()
+        r = run(mode="drop", smode="count")
+        print("== MODE=drop SALIDA_MODE=count:", r.stdout.strip(), r.stderr.strip());  matrix(True, False)
+        m = mirar(); print("  ", m)
+        check("salida en count: cuenta conexiones nuevas", "MODOSAL=count" in m and "SALIDA=0" not in m)
+        res = udp(LEGACY)
+        check(f"salida en count: UDP desde la heredada SE ENTREGA ({res})",
+              res == "RESP" and LEGACY in udp_log.read_text())
         r = run()
-        print("== MODE=drop:", r.stdout.strip(), r.stderr.strip());  matrix(True)
+        print("== MODE=drop SALIDA_MODE=drop:", r.stdout.strip(), r.stderr.strip());  matrix(True)
+        t0 = time.time(); e = tcp_err(gb, LEGACY, STRANGER); dt = time.time() - t0
+        check(f"salida rechazada al instante con RST ({e}, {dt:.2f}s)", "ConnectionRefused" in e and dt < 1.2)
+        hold_out.stdin.write("\n"); hold_out.stdin.flush()
+        out = hold_out.stdout.readline().strip()
+        check(f"conexion saliente abierta antes de armar no sobrevive ({out})", out.startswith("MUERTA"))
+        udp_log.write_text("")
+        res = udp(LEGACY)
+        otro = int(sh("nft", "-j", "list", "chain", "inet", "nvxnode64", "salida64").stdout.split('"nv-salida-otro"')[0].rsplit('"packets": ', 1)[1].split(",")[0])
+        check(f"UDP desde la heredada: rechazado ({res}), sin entrega y nv-salida-otro={otro}",
+              res == "RECHAZO" and LEGACY not in udp_log.read_text() and otro > 0)
         hold.stdin.write("\n"); hold.stdin.flush()
         out = hold.stdout.readline().strip()
         check(f"conexion entrante abierta en count no sobrevive a drop ({out})", out.startswith("MUERTA"))
