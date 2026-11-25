@@ -841,6 +841,62 @@ _apt_dist_upgrade() {
   fi
 }
 
+# ----- Clase de memoria del nodo: por nodeType, no por el nombre (25/11/2026) ---
+# Decide dos cosas que antes se sacaban del NOMBRE (*AX162* / *EX44*): el globo
+# de una VPS E al cambiar de clase y si se copia el historial del reconciliador
+# de globo. Con el nodo Kademar (0000266-KDM-9755, nodeType SQX, solo vps-e) el
+# nombre no dice nada: caía en «other», no se adaptaba el globo y una E de
+# EX44 (memory 61440, globo = memory) llegaba con globo = 60 GB a una caja
+# compartida. La fuente de verdad del tipo de nodo es proxmox_nodes.nodeType,
+# puesto a mano (regla de Iván del 04/11; el defrag ya lo usa así):
+#   SQX   → «shared»:    caja SQX multi-VM con reconciliador; suelo de globo de
+#                        la E = VPSE_BALLOON_MIN_MB (AX162, AX102-SQX, Kademar).
+#   VPS-E → «dedicated»: EX44 de una sola E; globo = memory (no se desinfla).
+#   otro (MT5…) → «other»: no se toca nada.
+# Si Firestore no contesta, respaldo por nombre (*AX162*/*-KDM-* → shared,
+# *EX44* → dedicated) y se avisa: nunca peor que antes.
+NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0
+# Rellena NODE_TYPE_SRC / NODE_TYPE_DST una sola vez.
+_node_types_load() {
+  (( _NODE_TYPES_LOADED == 1 )) && return 0
+  _NODE_TYPES_LOADED=1
+  local out
+  out=$(timeout 60 python3 - "$SRC_NODE" "$DST_NODE" <<'PYNT' 2>/dev/null
+import os, sys
+import firebase_admin
+from firebase_admin import credentials, firestore
+creds = os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json")
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(credentials.Certificate(creds))
+db = firestore.client()
+for node in sys.argv[1:3]:
+    snap = db.collection("proxmox_nodes").document(node).get()
+    t = ((snap.to_dict() or {}).get("nodeType") if snap.exists else None) or "-"
+    print("NT %s %s" % (node, str(t).strip().replace(" ", "_") or "-"))
+PYNT
+) || true
+  NODE_TYPE_SRC=$(awk -v n="$SRC_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
+  NODE_TYPE_DST=$(awk -v n="$DST_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
+  [[ -n "$NODE_TYPE_SRC" && -n "$NODE_TYPE_DST" ]] \
+    || _warn "No pude leer proxmox_nodes.nodeType de ${SRC_NODE}/${DST_NODE} en Firestore; la clase de memoria sale del nombre (respaldo)."
+}
+# <node_id> <nodeType|""> → shared | dedicated | other
+_mem_class() {
+  local node="$1" nt
+  nt=$(printf '%s' "${2:-}" | tr '[:lower:]' '[:upper:]')
+  case "$nt" in
+    SQX)   echo shared; return ;;
+    VPS-E) echo dedicated; return ;;
+    ""|-)  ;;                       # sin dato: respaldo por nombre
+    *)     echo other; return ;;
+  esac
+  case "$node" in
+    *AX162*|*-KDM-*) echo shared ;;
+    *EX44*)          echo dedicated ;;
+    *)               echo other ;;
+  esac
+}
+
 # ----- Embedded Firestore helper (writes servers/{proxmoxId == VMID}) ----------
 # Requires firebase_admin + /etc/firebase-credentials.json on BASE.
 _firestore_update_servers() {
@@ -1927,7 +1983,10 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
 
   # 5) pvesh remote_migrate (deletes source after success; --online iff src running)
   BALLOON_HISTORY=""
-  if [[ "$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162* ]]; then
+  # Historial del reconciliador de globo: solo entre dos cajas «shared» (antes,
+  # solo entre dos *AX162*; ver _mem_class).
+  _node_types_load
+  if [[ "$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC")" == shared && "$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")" == shared ]]; then
     BALLOON_HISTORY=$(_balloon_state_retry src_ssh "python3 /usr/local/sbin/neuravps-ram-guard.py export-state '${VMID}' '${SRC_NODE}'") || BALLOON_HISTORY=""
     [[ "$BALLOON_HISTORY" =~ ^[A-Za-z0-9+/=]+$ ]] || BALLOON_HISTORY=""
     [[ -n "$BALLOON_HISTORY" ]] || _warn "Balloon history unavailable; destination will re-learn conservatively."
@@ -2096,9 +2155,11 @@ fi
 # VPS-E balloon adaptation across the EX44<->AX162 boundary (operator,
 # 2026-07-03). Dedicated EX44s run the vps-e with balloon == memory (the whole
 # box is theirs; no deflation). Shared AX162s pack vps-e with ballooning down
-# to the plan's ram_min so KSM/zswap can breathe. Cross-family moves
-# are offline-only (Intel<->AMD blocks live), so the qm set lands cleanly on a
-# stopped VM. Same-family moves no-op. VM is a vps-e iff its name is "E-*".
+# to the plan's ram_min so KSM/zswap can breathe. Cross-class moves are cold
+# (Intel<->AMD and Zen4<->Zen5 block live); with the rtmig cold kit this script
+# runs after the VM was started on dest, and `qm set --balloon` with the balloon
+# device already on changes the config at once (the reconciler does the rest).
+# Same-class moves no-op. VM is a vps-e iff its name is "E-*".
 #
 # 46 GB, NO 18. Este bloque nacio el 03-07-2026 con ram_min=18 GB, y el
 # 25-07-2026 el operador subio ram_min a 46 precisamente porque 18 estaba mal:
@@ -2115,14 +2176,18 @@ fi
 # es justo cuando el cliente menos puede permitirselo.
 VPSE_BALLOON_MIN_MB="${VPSE_BALLOON_MIN_MB:-47104}"
 _vm_name=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+# Clase por nodeType desde el 25/11/2026 (ver _mem_class): antes, por nombre
+# (*EX44* / *AX162*), y un destino como 0000266-KDM-9755 no se adaptaba. La
+# RAM (memory) NO se toca: las E de EX44 conservan sus 60 GB (Iván, 11/11).
 if [[ "$_vm_name" == E-* ]]; then
-  _fam() { case "$1" in *EX44*) echo EX44 ;; *AX162*) echo AX162 ;; *) echo other ;; esac; }
-  _src_fam=$(_fam "$SRC_NODE"); _dst_fam=$(_fam "$DST_NODE")
+  _node_types_load
+  _src_fam=$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC"); _dst_fam=$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")
+  _info "vps-e: clase de memoria ${SRC_NODE}=${_src_fam} (nodeType ${NODE_TYPE_SRC:-?}) → ${DST_NODE}=${_dst_fam} (nodeType ${NODE_TYPE_DST:-?})."
   if [[ "$_src_fam" != "$_dst_fam" && "$_dst_fam" != "other" ]]; then
     _mem_mb=$(dst_ssh "qm config '${VMID}'" 2>/dev/null | sed -n 's/^memory:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
-    if [[ "$_dst_fam" == "AX162" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"; else _target_balloon="${_mem_mb:-61440}"; fi
+    if [[ "$_dst_fam" == "shared" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"; else _target_balloon="${_mem_mb:-61440}"; fi
     if dst_ssh "qm set '${VMID}' --balloon '${_target_balloon}'" >/dev/null 2>&1; then
-      _ok "vps-e balloon adapted for ${_dst_fam} dest: balloon=${_target_balloon} MiB (memory=${_mem_mb:-?})."
+      _ok "vps-e balloon adapted for ${_dst_fam} dest: balloon=${_target_balloon} MiB (memory=${_mem_mb:-?}, sin cambiar)."
     else
       _warn "Could not set balloon=${_target_balloon} on dest — set it manually: qm set ${VMID} --balloon ${_target_balloon}"
     fi

@@ -506,6 +506,100 @@ class GuestRebootedEvent(unittest.TestCase):
         self.assertIn("WARN: Could not file migration_guest_rebooted", r.stderr)
 
 
+FAKE_FIRESTORE_NODES = textwrap.dedent("""\
+    import json, os
+    class _Snap:
+        def __init__(self, d): self.exists = d is not None; self._d = d
+        def to_dict(self): return self._d
+    class _Doc:
+        def __init__(self, i): self.i = i
+        def get(self):
+            if os.environ.get("FAKE_FS_FAIL"):
+                raise RuntimeError("boom")
+            return _Snap(json.loads(os.environ["FAKE_NODES"]).get(self.i))
+    class _Col:
+        def __init__(self, name): assert name == "proxmox_nodes", name
+        def document(self, i): return _Doc(i)
+    class _Client:
+        def collection(self, name): return _Col(name)
+    def client(): return _Client()
+    """)
+
+
+class NodeMemClass(unittest.TestCase):
+    """25/11/2026: the VPS-E balloon and the balloon-history copy follow
+    proxmox_nodes.nodeType, not the node NAME (0000266-KDM-9755 fell into
+    "other": an EX44 E would land with balloon = 60 GB)."""
+
+    def cls(self, node, nt=""):
+        return run_bash(_fn("_mem_class") + f'_mem_class "{node}" "{nt}"\n').stdout.strip()
+
+    def test_node_type_decides(self):
+        self.assertEqual(self.cls("0000266-KDM-9755", "SQX"), "shared")
+        self.assertEqual(self.cls("0000234-AX162-2-LTD", "SQX"), "shared")
+        self.assertEqual(self.cls("0000260-AX102-3-LTD", "SQX"), "shared")
+        self.assertEqual(self.cls("0000181-EX44", "VPS-E"), "dedicated")
+        self.assertEqual(self.cls("0000240-AX102-3-LTD", "MT5"), "other")
+        self.assertEqual(self.cls("0000234-AX162-2-LTD", "MT5"), "other")   # nodeType wins over name
+        self.assertEqual(self.cls("0000266-KDM-9755", "sqx"), "shared")
+
+    def test_name_fallback_without_node_type(self):
+        for nt in ("", "-"):
+            self.assertEqual(self.cls("0000266-KDM-9755", nt), "shared")
+            self.assertEqual(self.cls("0000235-AX162-2-LTD", nt), "shared")
+            self.assertEqual(self.cls("0000091-EX44", nt), "dedicated")
+            self.assertEqual(self.cls("0000240-AX102-3-LTD", nt), "other")
+
+    def load(self, nodes, fail=False):
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d, "firebase_admin")
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text(FAKE_FIREBASE)
+            (pkg / "credentials.py").write_text(FAKE_CREDENTIALS)
+            (pkg / "firestore.py").write_text(FAKE_FIRESTORE_NODES)
+            env = {"PYTHONPATH": d, "FAKE_NODES": json.dumps(nodes)}
+            if fail:
+                env["FAKE_FS_FAIL"] = "1"
+            body = ('SRC_NODE=0000181-EX44 DST_NODE=0000266-KDM-9755\n'
+                    'NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0\n'
+                    + _fn("_node_types_load") + _fn("_mem_class")
+                    + '_node_types_load; _node_types_load\n'
+                    'echo "SRC=$NODE_TYPE_SRC DST=$NODE_TYPE_DST"\n'
+                    'echo "CLS=$(_mem_class "$SRC_NODE" "$NODE_TYPE_SRC")>$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")"\n')
+            return run_bash(body, env)
+
+    def test_reads_node_type_from_firestore(self):
+        r = self.load({"0000181-EX44": {"nodeType": "VPS-E"},
+                       "0000266-KDM-9755": {"nodeType": "SQX", "allowedServerTypes": ["vps-e"]}})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SRC=VPS-E DST=SQX", r.stdout)
+        self.assertIn("CLS=dedicated>shared", r.stdout)
+        self.assertNotIn("WARN", r.stderr)
+
+    def test_missing_doc_or_field_falls_back_to_the_name(self):
+        r = self.load({"0000181-EX44": {}})
+        self.assertIn("SRC=- DST=-", r.stdout)
+        self.assertIn("CLS=dedicated>shared", r.stdout)
+
+    def test_firestore_down_warns_once_and_falls_back(self):
+        r = self.load({}, fail=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CLS=dedicated>shared", r.stdout)
+        self.assertEqual(r.stderr.count("WARN: No pude leer proxmox_nodes.nodeType"), 1)
+
+    def test_wiring_no_name_patterns_left(self):
+        self.assertNotIn('"$SRC_NODE" == *AX162* && "$DST_NODE" == *AX162*', SCRIPT)
+        self.assertNotIn("_fam() {", SCRIPT)
+        hist = SCRIPT.index("neuravps-ram-guard.py export-state")
+        self.assertIn('_mem_class "$SRC_NODE" "$NODE_TYPE_SRC")" == shared && "$(_mem_class "$DST_NODE" "$NODE_TYPE_DST")" == shared',
+                      SCRIPT[hist - 400:hist])
+        e = SCRIPT.index('if [[ "$_vm_name" == E-* ]]; then')
+        block = SCRIPT[e:SCRIPT.index("\nfi\n", e)]
+        self.assertIn("_node_types_load", block)
+        self.assertIn('if [[ "$_dst_fam" == "shared" ]]; then _target_balloon="$VPSE_BALLOON_MIN_MB"', block)
+        self.assertNotIn("--memory", block)          # RAM untouched (Iván 11/11)
+
+
 class Parses(unittest.TestCase):
     def test_script_parses(self):
         r = subprocess.run(["bash", "-n", str(ROOT / "scripts/migrate_vm.sh")],
