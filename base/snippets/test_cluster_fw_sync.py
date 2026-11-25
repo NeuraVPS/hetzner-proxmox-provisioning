@@ -268,7 +268,7 @@ def test_release_does_not_remove_a_lock_that_is_not_ours(sync, box):
 
 def test_whole_pass_runs_under_the_lock_and_reads_inventory_inside(sync, box, monkeypatch):
     seen = []
-    monkeypatch.setattr(sync, "read_pve_nodes_state", lambda: seen.append(sync.FW_REMOTE_LOCK_DIR in box.dirs) or dict(NODES))
+    monkeypatch.setattr(sync, "authoritative_fw_inventory", lambda: seen.append(sync.FW_REMOTE_LOCK_DIR in box.dirs) or dict(NODES))
     monkeypatch.setattr(sync, "distribute_cluster_fw", lambda nodes, text: seen.append(sync.FW_REMOTE_LOCK_DIR in box.dirs) or {n: ("unchanged", "") for n in nodes})
     assert sync.run_cluster_fw_sync_once() is True
     assert seen == [True, True]
@@ -277,7 +277,7 @@ def test_whole_pass_runs_under_the_lock_and_reads_inventory_inside(sync, box, mo
 
 def test_refusal_alerts_and_fails(sync, box, monkeypatch):
     box.files["/home/firewall/cluster.fw"] = GOOD + TAIL
-    monkeypatch.setattr(sync, "read_pve_nodes_state", lambda: dict(NODES))
+    monkeypatch.setattr(sync, "authoritative_fw_inventory", lambda: dict(NODES))
     assert sync.run_cluster_fw_sync_once() is False
     assert sync._alerts and "rechazada" in sync._alerts[0][0]
 
@@ -313,7 +313,7 @@ def test_request_arriving_mid_run_is_served(sync, monkeypatch):
 def test_failed_pass_schedules_spaced_retry(sync, monkeypatch):
     scheduled = []
     monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: False)
-    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0: scheduled.append((extra, delay_s)) or "u")
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0, unit="": scheduled.append((extra, delay_s)) or "u")
     sync.FW_SYNC_PENDING.write_text("1\n")
     assert sync.sync_nodes_sync_firewall_worker() == 1
     assert scheduled == [(["--retry=1"], sync.FW_RETRY_BASE_S)]
@@ -478,7 +478,7 @@ def test_first_boot_baseline_covers_current_bases(sync):
 
 def test_interrupted_pass_is_kept_and_picked_up(sync, monkeypatch):
     scheduled = []
-    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0: scheduled.append((extra, delay_s)) or "u")
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0, unit="": scheduled.append((extra, delay_s)) or "u")
 
     def killed():
         raise SystemExit(143)  # what the SIGTERM handler raises
@@ -489,15 +489,15 @@ def test_interrupted_pass_is_kept_and_picked_up(sync, monkeypatch):
         sync.sync_nodes_sync_firewall_worker()
     assert sync.FW_SYNC_INPROGRESS.exists() and not sync.FW_SYNC_PENDING.exists()
     assert scheduled and scheduled[0][0] == ["--retry=1"]
-    # The next worker (no new request at all) serves the in-progress one.
+    # The scheduled retry serves the in-progress one.
     runs = []
     monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: runs.append(1) or True)
-    assert sync.sync_nodes_sync_firewall_worker() == 0
+    assert sync.sync_nodes_sync_firewall_worker(attempt=1) == 0
     assert runs == [1] and not sync.FW_SYNC_INPROGRESS.exists()
 
 
 def test_failed_pass_keeps_request_in_progress(sync, monkeypatch):
-    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0: "u")
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0, unit="": "u")
     monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: False)
     sync.FW_SYNC_PENDING.write_text("1\n")
     assert sync.sync_nodes_sync_firewall_worker() == 1
@@ -529,3 +529,70 @@ def test_node_rejects_when_validator_prints_nothing(sync, node_env):
 def test_node_validator_requires_bases(sync):
     assert "no BASE addresses given" in sync.NODE_FW_VALIDATOR_PL
     assert "must not contain exclusions" in sync.NODE_FW_VALIDATOR_PL
+
+
+# --- third review round -------------------------------------------------------
+
+@pytest.mark.parametrize("hosts", [
+    "b0=2001:db8:b0::2",                       # b1 missing
+    "b0=2001:db8:b0::2,b1=not-an-ip",          # b1 malformed
+    "b0=2001:db8:b0::2,b1=2001:db8:b0::2",     # same address twice
+    "",
+])
+def test_partial_base_inventory_is_refused(sync, monkeypatch, hosts):
+    monkeypatch.setenv("BASE_HOSTS", hosts)
+    with pytest.raises(ValueError):
+        sync._base_ipv6s_for_validation()
+
+
+def test_full_base_inventory(sync, monkeypatch):
+    monkeypatch.setenv("BASE_HOSTS", "b0=2001:db8:b0::2,b1=2001:db8:b1::2")
+    assert sync._base_ipv6s_for_validation() == BASES
+
+
+def test_inventory_comes_from_firestore_not_local_copy(sync, monkeypatch):
+    monkeypatch.setattr(sync, "ensure_firebase", lambda: True)
+    monkeypatch.setattr(sync, "firestore_list_proxmox_nodes", lambda: dict(NODES, n3="2001:db8:3::2"))
+    monkeypatch.setattr(sync, "read_pve_nodes_state", lambda: dict(NODES))  # missed n3
+    assert set(sync.authoritative_fw_inventory()) == {"n1", "n2", "n3"}
+
+
+def test_short_firestore_read_is_refused(sync, monkeypatch):
+    monkeypatch.setattr(sync, "ensure_firebase", lambda: True)
+    monkeypatch.setattr(sync, "firestore_list_proxmox_nodes", lambda: {"n1": "2001:db8:1::2"})
+    monkeypatch.setattr(sync, "read_pve_nodes_state", lambda: {f"n{i}": f"2001:db8:{i}::2" for i in range(10)})
+    with pytest.raises(RuntimeError):
+        sync.authoritative_fw_inventory()
+
+
+def test_waiting_workers_do_not_rerun_a_failed_pass(sync, monkeypatch):
+    runs, scheduled = [], []
+    monkeypatch.setattr(sync, "_fw_start_worker", lambda extra, delay_s=0, unit="": scheduled.append(unit) or unit)
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: runs.append(1) or False)
+    sync.FW_SYNC_PENDING.write_text("1\n")
+    sync.sync_nodes_sync_firewall_worker()      # first of the burst: fails
+    sync.sync_nodes_sync_firewall_worker()      # others of the burst: nothing to do
+    sync.sync_nodes_sync_firewall_worker()
+    assert runs == [1]
+    assert scheduled == ["nv-cluster-fw-retry-1"]
+
+
+def test_retry_does_nothing_when_already_completed(sync, monkeypatch):
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: pytest.fail("nothing to retry"))
+    assert sync.sync_nodes_sync_firewall_worker(attempt=1) == 0
+    assert not sync.FW_SYNC_PENDING.exists()
+
+
+def test_retry_serves_in_progress_request(sync, monkeypatch):
+    runs = []
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: runs.append(1) or True)
+    sync.FW_SYNC_INPROGRESS.write_text("1\n")
+    assert sync.sync_nodes_sync_firewall_worker(attempt=1) == 0
+    assert runs == [1] and not sync.FW_SYNC_INPROGRESS.exists()
+
+
+def test_retry_cli_does_not_create_a_new_request(sync, monkeypatch):
+    monkeypatch.setattr(sync, "run_cluster_fw_sync_once", lambda: pytest.fail("nothing to retry"))
+    with pytest.raises(SystemExit):
+        sync.sync_nodes_sync_firewall(attempt=2)
+    assert not sync.FW_SYNC_PENDING.exists()

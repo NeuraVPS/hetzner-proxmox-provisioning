@@ -2480,15 +2480,65 @@ def storage_box_fw_lock():
             logger.error("sync-firewall: Storage Box lock no longer ours (%s); left alone", held)
 
 
+FW_REQUIRED_BASE_ALIASES = [
+    a.strip() for a in os.environ.get("FIREWALL_REQUIRED_BASES", "b0,b1").split(",") if a.strip()
+]
+
+
 def _base_ipv6s_for_validation() -> list[str]:
-    out = []
-    for ip in parse_base_hosts().values():
+    """IPv6 of every BASE that must keep SSH to the nodes.
+
+    Every alias in FIREWALL_REQUIRED_BASES (default b0,b1) must be present in
+    BASE_HOSTS with a valid IPv6; a partial list would silently weaken the
+    lifeline check to "covers whichever BASE is still listed".
+    """
+    hosts = parse_base_hosts()
+    out: list[str] = []
+    missing: list[str] = []
+    for alias in FW_REQUIRED_BASE_ALIASES:
+        ip = hosts.get(alias, "")
         try:
-            if ipaddress.ip_address(ip).version == 6:
-                out.append(ip)
+            if ipaddress.ip_address(ip).version != 6:
+                raise ValueError
         except ValueError:
-            pass
+            missing.append(f"{alias}={ip!r}")
+            continue
+        out.append(str(ipaddress.ip_address(ip)))
+    if missing or not out:
+        raise ValueError(
+            f"BASE_HOSTS lacks a valid IPv6 for required BASE(s) {missing or FW_REQUIRED_BASE_ALIASES}; "
+            "cannot prove the new cluster.fw keeps SSH from every BASE"
+        )
+    if len(set(out)) != len(out):
+        raise ValueError(f"BASE_HOSTS maps two required BASEs to the same address: {out}")
     return out
+
+
+def authoritative_fw_inventory() -> dict[str, str]:
+    """Node list to publish: Firestore, not this BASE's incremental copy.
+
+    pve_nodes.json is kept by per-event add/del; a BASE that was down for
+    one event misses it, and publishing its copy would drop (or resurrect) a
+    node in the fleet-wide hosts-ipv6. A short Firestore read is refused the
+    same way `sync nodes` refuses it.
+    """
+    if not ensure_firebase():
+        raise RuntimeError("Firebase unavailable: cannot read the authoritative node inventory")
+    nodes = firestore_list_proxmox_nodes()
+    local = read_pve_nodes_state()
+    if not nodes:
+        raise RuntimeError("Firestore returned no proxmox_nodes; refusing to publish")
+    if local and len(nodes) < len(local) * SHRINK_GUARD_PCT / 100.0:
+        raise RuntimeError(
+            f"Firestore returned {len(nodes)} node(s) vs {len(local)} in pve_nodes.json "
+            f"(below {SHRINK_GUARD_PCT:.0f}%); partial read, refusing to publish"
+        )
+    only_fs = sorted(set(nodes) - set(local))
+    only_local = sorted(set(local) - set(nodes))
+    if only_fs or only_local:
+        logger.warning("sync-firewall: pve_nodes.json differs from Firestore (missing here %s, extra here %s); "
+                       "publishing Firestore's list", only_fs, only_local)
+    return nodes
 
 
 def publish_cluster_fw_locked(nodes: dict[str, str]) -> str:
@@ -2673,10 +2723,7 @@ def run_cluster_fw_sync_once() -> bool:
         with storage_box_fw_lock():
             # Read the inventory INSIDE the lock: the pass that publishes last
             # is also the one that saw the newest node list.
-            nodes = read_pve_nodes_state()
-            if not nodes:
-                logger.error("sync-firewall: pve_nodes.json empty or missing; abort")
-                return False
+            nodes = authoritative_fw_inventory()
             text = publish_cluster_fw_locked(nodes)
             results = distribute_cluster_fw(nodes, text)
     except ValueError as e:
@@ -2708,12 +2755,16 @@ def run_cluster_fw_sync_once() -> bool:
     return not by_state.get("rejected") and not by_state.get("failed")
 
 
-def _fw_start_worker(extra: list[str], delay_s: int = 0) -> str:
-    """Start a detached worker through systemd (optionally delayed)."""
+def _fw_start_worker(extra: list[str], delay_s: int = 0, unit: str = "") -> str:
+    """Start a detached worker through systemd (optionally delayed).
+
+    A fixed `unit` name makes the call idempotent: if that retry is already
+    scheduled, systemd refuses the duplicate and the existing one stands.
+    """
     import time
 
     script = str(Path(sys.argv[0]).resolve())
-    unit = f"nv-cluster-fw-sync-{int(time.time())}-{os.getpid()}-{len(extra)}{delay_s}"
+    unit = unit or f"nv-cluster-fw-sync-{int(time.time())}-{os.getpid()}"
     cmd = ["systemd-run", "--quiet", "--collect", f"--unit={unit}"]
     if delay_s:
         cmd += [f"--on-active={delay_s}", f"--timer-property=AccuracySec=30"]
@@ -2729,6 +2780,9 @@ def _fw_start_worker(extra: list[str], delay_s: int = 0) -> str:
     except (OSError, subprocess.TimeoutExpired) as e:
         err = str(e)
     if delay_s:
+        if "already" in err.lower() or "exists" in err.lower():
+            logger.info("sync-firewall: retry %s already scheduled", unit)
+            return unit
         logger.error("sync-firewall: could not schedule retry: %s", err)
         return ""
     logger.warning("sync-firewall: systemd-run failed (%s); detaching with setsid", err)
@@ -2739,7 +2793,13 @@ def _fw_start_worker(extra: list[str], delay_s: int = 0) -> str:
 
 
 def sync_nodes_sync_firewall_worker(attempt: int = 0) -> int:
-    """Drain the queue: serialize on the local lock, run while a request is pending."""
+    """Drain the queue: serialize on the local lock, run while a request is pending.
+
+    attempt=0: a fresh request (or boot); serves `pending` only, so workers
+    left waiting by a burst exit at once instead of re-running a pass that
+    just failed. attempt>0: a scheduled retry; serves the in-progress request
+    if it is still there, and does nothing if someone already completed it.
+    """
     import signal
     import time
 
@@ -2760,16 +2820,18 @@ def sync_nodes_sync_firewall_worker(attempt: int = 0) -> int:
                 time.sleep(5)
         ok = True
         ran = False
+        todo = FW_SYNC_PENDING.exists() or (attempt > 0 and FW_SYNC_INPROGRESS.exists())
         try:
             # Promote the marker BEFORE reading state: a request arriving
             # mid-pass leaves a new marker (and its own worker), so nothing is
             # lost; the in-progress marker only goes away after a good pass.
-            while FW_SYNC_PENDING.exists() or FW_SYNC_INPROGRESS.exists():
+            while todo:
                 if FW_SYNC_PENDING.exists():
                     os.replace(FW_SYNC_PENDING, FW_SYNC_INPROGRESS)
                 ran = True
                 if run_cluster_fw_sync_once():
                     FW_SYNC_INPROGRESS.unlink(missing_ok=True)
+                    todo = FW_SYNC_PENDING.exists()
                 else:
                     ok = False
                     break
@@ -2789,7 +2851,8 @@ def sync_nodes_sync_firewall_worker(attempt: int = 0) -> int:
 def _fw_schedule_retry(attempt: int) -> None:
     if attempt < FW_MAX_RETRIES:
         delay = FW_RETRY_BASE_S * (2 ** attempt)
-        unit = _fw_start_worker([f"--retry={attempt + 1}"], delay_s=delay)
+        unit = _fw_start_worker([f"--retry={attempt + 1}"], delay_s=delay,
+                                unit=f"nv-cluster-fw-retry-{attempt + 1}")
         logger.warning("sync-firewall: pass not completed; retry %d/%d in %d s (%s)",
                        attempt + 1, FW_MAX_RETRIES, delay, unit or "NOT scheduled")
     else:
@@ -2804,9 +2867,13 @@ def sync_nodes_sync_firewall(wait: bool = False, attempt: int = 0):
     import time
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    FW_SYNC_PENDING.write_text(f"{time.time():.0f}\n")
-    if wait or attempt:
+    if attempt:
+        # A scheduled retry is not a new request: it only finishes the one
+        # still in progress (if any).
         sys.exit(sync_nodes_sync_firewall_worker(attempt))
+    FW_SYNC_PENDING.write_text(f"{time.time():.0f}\n")
+    if wait:
+        sys.exit(sync_nodes_sync_firewall_worker())
     unit = _fw_start_worker(["--worker"])
     logger.info("sync-firewall: queued (worker %s)", unit)
     print(f"sync-firewall: queued (worker {unit}); progress in {LOG_FILE}")

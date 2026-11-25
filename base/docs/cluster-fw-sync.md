@@ -13,10 +13,14 @@ PVE de toda la flota. Las bases solo reescriben `[IPSET hosts-ipv6]` (desde
 - Los workers se serializan con `flock` en `/var/lib/base-nat/.fw-sync.lock`; el que
   entra consume la marca y hace una pasada; el que entra sin marca no hace nada
   (las ráfagas se agrupan). La marca pasa a `fw-sync.inprogress` y solo se borra tras
-  una pasada buena: si la pasada falla o el worker muere (SIGTERM), se programan
-  reintentos a los 10, 20 y 40 min (`--retry=N`) y, agotados, se avisa; tras un
+  una pasada buena: si la pasada falla o el worker muere (SIGTERM), se programa
+  un reintento por nivel (`nv-cluster-fw-retry-N`, a los 10, 20 y 40 min) que solo
+  termina la petición en curso; los workers que esperaban en la misma ráfaga no
+  repiten la pasada fallida y, agotados, se avisa; tras un
   SIGKILL o un reinicio la recoge el siguiente worker o `base-nat-boot.sh`.
-- **Toda la pasada** (leer `pve_nodes.json`, publicar y repartir) va dentro del lock
+- **Toda la pasada** (leer el inventario **de Firestore** —no la copia incremental
+  `pve_nodes.json` de la base, que pudo perder un evento—, con la misma guarda de
+  lectura parcial del 80 %; publicar y repartir) va dentro del lock
   `mkdir /home/firewall/.cluster.fw.lock` del Storage Box: dos bases nunca se cruzan
   y un nodo no recibe una versión anterior después de una nueva. **El lock nunca se
   rompe solo**: si tiene más de 65 min se avisa y hay que borrarlo a mano tras
@@ -24,8 +28,8 @@ PVE de toda la flota. Las bases solo reescriben `[IPSET hosts-ipv6]` (desde
 - Publicar: descarga → reescribe hosts-ipv6 → **valida** (cabeceras como las lee PVE,
   sin repetir —PVE reinicia la sección repetida—, gramática por sección,
   `[OPTIONS] enable: 1`, `IN SSH(ACCEPT) -source +dc/base` sin restricciones y antes
-  de cualquier DROP/REJECT/GROUP, `[IPSET base]` cubre las IPv6 de `BASE_HOSTS` y no
-  tiene exclusiones `!`, nº de hosts, sin encoger >20 %) → sube a
+  de cualquier DROP/REJECT/GROUP, `[IPSET base]` cubre las IPv6 de b0 y b1 (`FIREWALL_REQUIRED_BASES`, ambas
+  obligatorias en `BASE_HOSTS`) y no tiene exclusiones `!`, nº de hosts, sin encoger >20 %) → sube a
   `cluster.fw.tmp-<base>-<pid>` → sha256 → `mv` sobre `cluster.fw`.
 - Reparto: la base **empuja el contenido por SSH** a cada nodo (8 en paralelo). El
   nodo comprueba el sha256 y lo carga con `PVE::Firewall::load_clusterfw_conf`
