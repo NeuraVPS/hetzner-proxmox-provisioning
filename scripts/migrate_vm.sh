@@ -166,8 +166,8 @@
 # reconcilia NAT, hookscript, Firestore, sonda RDP y reloj (w32tm). No se
 # duplica aquí: el kit aparca la config del origen (nadie puede arrancarla) y
 # conserva sus zvols para el rollback, cosa que el flujo de `remote_migrate
-# --delete` de este script no hace. Copia de referencia del kit:
-# work/gabriel-traslado-20261118/ (fuera de git).
+# --delete` de este script no hace. El kit está en scripts/coldmove/ (README.md
+# con el flujo y el rollback) desde el 25/11/2026.
 
 set -euo pipefail
 
