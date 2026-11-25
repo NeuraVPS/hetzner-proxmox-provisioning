@@ -212,6 +212,14 @@ print(f"{ec}||||{od}||||{ed}")
   # ----- Main flow -----
   echo "== Running remote task on ${NODE_NAME} =="
 
+  # Not for a node in token mode (sync-dnat.py without the service account):
+  # this script assigns <vmbr0 prefix>::<vmid>, an address the node API refuses,
+  # and it would only find out after reconfiguring the guest. Touch nothing.
+  if [[ ! -f /etc/firebase-credentials.json && -f /etc/neuravps-node-token ]]; then
+    echo "RUNREMOTES_FAIL	${NODE_NAME}	-	token-mode node: this migrator is not supported here; nothing changed"
+    return 1
+  fi
+
   # 0) Fetch latest sync-dnat.py from GitHub
   mkdir -p /var/lib/svz/snippets
   if ! curl -fsSL "$SYNC_DNAT_URL" -o "${SYNC_DNAT}.new"; then
