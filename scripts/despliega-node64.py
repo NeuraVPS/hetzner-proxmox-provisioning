@@ -7,10 +7,13 @@ por drop-in, aplica a traves de la unidad (serializada con el timer) y COMPRUEBA
 el resultado leyendo el estado del nodo (`nvx-node64.py --mirar`). Sale con
 codigo 1 si algun nodo queda MAL.
 
-  despliega-node64.py [--nodos a,b,c] [--modo count|drop] [--excluir 520,1306,...]
+  despliega-node64.py [--nodos a,b,c] [--modo count|drop] [--modo-salida count|drop]
+                      [--excluir 520,1306,...]
                       [--sin64 0000266-KDM-9755] [--hilos N] [--base b1|b0]
                       [--solo-mirar | --quitar]
 
+`--modo-salida` (defecto count) es el sentido de SALIDA (invitado -> fuera con
+origen en el /64 del nodo); se escribe SIEMPRE explicito en el drop-in.
 `--solo-mirar` verifica que cada nodo siga protegido en el `--modo` indicado.
 `--modo count` (defecto) solo cuenta y registra: canario. Con FINAL/SALIDA
 revisados, se repasa con `--modo drop`. Repetir el mismo modo no reinicia los
@@ -56,7 +59,7 @@ echo {TIMER} | base64 -d > /etc/systemd/system/nvx-node64.timer
 mkdir -p /etc/neuravps /etc/systemd/system/nvx-node64.service.d
 printf '%s\\n' {excluir} > /etc/neuravps/node64-guard-allow-vmids
 case "$(hostname)" in {sin64pat}) : > /etc/neuravps/node64-guard-sin64 ;; *) rm -f /etc/neuravps/node64-guard-sin64 ;; esac
-printf '[Service]\\nEnvironment=MODE={modo}\\n' > /etc/systemd/system/nvx-node64.service.d/mode.conf
+printf '[Service]\\nEnvironment=MODE={modo}\\nEnvironment=SALIDA_MODE={smodo}\\n' > /etc/systemd/system/nvx-node64.service.d/mode.conf
 systemctl daemon-reload
 systemctl enable nvx-node64.service nvx-node64.timer >/dev/null 2>&1 || echo ENABLE=fallo
 systemctl start nvx-node64.timer >/dev/null 2>&1 || echo TIMERSTART=fallo
@@ -72,9 +75,9 @@ nft list table bridge nvxnode64b >/dev/null 2>&1 && nft delete table bridge nvxn
 """
 
 
-def _node_script(accion, modo, excluir, sin64=()):
+def _node_script(accion, modo, excluir, sin64=(), smodo="count"):
     if accion == "instalar":
-        body = _INSTALA_SH.format(PY=PY, SERVICE=SERVICE, TIMER=TIMER, modo=modo,
+        body = _INSTALA_SH.format(PY=PY, SERVICE=SERVICE, TIMER=TIMER, modo=modo, smodo=smodo,
                                   excluir=" ".join(excluir),
                                   sin64pat="|".join(sorted(sin64)) or "__ninguno__")
     elif accion == "quitar":
@@ -84,7 +87,7 @@ def _node_script(accion, modo, excluir, sin64=()):
     return base64.b64encode((body + _MIRAR_SH).encode()).decode()
 
 
-def veredicto(accion, modo, sin64, n, d):
+def veredicto(accion, modo, sin64, n, d, smodo="count"):
     if "ERROR" in d or d.get("NVXFIN") != "1":
         return False
     if any(k in d for k in ("INSTALAR", "ENABLE", "TIMERSTART", "APLICAR")):
@@ -96,12 +99,12 @@ def veredicto(accion, modo, sin64, n, d):
     if accion == "instalar":
         unidades = (d.get("TIMER") == "enabled" and d.get("TIMERACT") == "active"
                     and d.get("SERVICIO") == "enabled" and d.get("ULTIMA") == "success")
-        return unidades and protegido(modo, sin64, n, d)
+        return unidades and protegido(modo, sin64, n, d, smodo)
     # mirar: acredita que el nodo sigue protegido en el modo pedido
-    return protegido(modo, sin64, n, d)
+    return protegido(modo, sin64, n, d, smodo)
 
 
-def protegido(modo, sin64, n, d):
+def protegido(modo, sin64, n, d, smodo="count"):
     """Tabla completa, en el modo pedido, con el /64 vivo cargado (vacio solo en --sin64)."""
     p64 = d.get("NODE64")
     if n in sin64:
@@ -109,13 +112,15 @@ def protegido(modo, sin64, n, d):
             return False
     elif p64 in ("error", "-", None):
         return False
-    return d.get("TABLA") == "si" and d.get("MODO") == modo and d.get("N64OK") == "si"
+    return (d.get("TABLA") == "si" and d.get("MODO") == modo and d.get("MODOSAL") == smodo
+            and d.get("N64OK") == "si")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--nodos")
     p.add_argument("--modo", choices=["count", "drop"], default="count")
+    p.add_argument("--modo-salida", choices=["count", "drop"], default="count")
     p.add_argument("--excluir", default=EXCLUIR_DEFECTO)
     p.add_argument("--sin64", default=SIN64_DEFECTO)
     p.add_argument("--hilos", type=int, default=8)
@@ -127,7 +132,7 @@ def main():
     excluir = [x.strip() for x in a.excluir.split(",") if x.strip().isdigit()]
     sin64 = set(x.strip() for x in a.sin64.split(",") if x.strip())
     accion = "mirar" if a.solo_mirar else "quitar" if a.quitar else "instalar"
-    orden = f"echo {_node_script(accion, a.modo, excluir, sin64)} | base64 -d | bash"
+    orden = f"echo {_node_script(accion, a.modo, excluir, sin64, a.modo_salida)} | base64 -d | bash"
 
     r = subprocess.run(["ssh", "-n", a.base, "cat /var/lib/base-nat/pve_nodes.json"],
                        capture_output=True, text=True, timeout=120)
@@ -162,12 +167,12 @@ def main():
         return n, d
 
     print(f"  {len(nodos)} nodo(s), {a.hilos} hilos via {a.base}, {accion}"
-          f"{' modo ' + a.modo + ' excluir ' + ','.join(excluir) if accion == 'instalar' else ''}\n")
+          f"{' modo ' + a.modo + ' salida ' + a.modo_salida + ' excluir ' + ','.join(excluir) if accion == 'instalar' else ''}\n")
     c = Counter()
     malos, casados = [], []
     with ThreadPoolExecutor(max_workers=a.hilos) as ex:
         for n, d in ex.map(uno, sorted(nodos.items())):
-            bien = veredicto(accion, a.modo, sin64, n, d)
+            bien = veredicto(accion, a.modo, sin64, n, d, a.modo_salida)
             c["ok" if bien else "MAL"] += 1
             if not bien:
                 malos.append((n, d))
@@ -177,8 +182,8 @@ def main():
     for n, d in malos:
         print(f"    ⚠ {n:<26} {d}")
     if casados:
-        print("\n  Trafico por la via node64 (FINAL=de fuera sin permiso, SALIDA=conexiones nuevas"
-              " del invitado con origen node64, EXCL=a una VM excluida, AJENA=a su direccion en otro puerto):")
+        print("\n  Trafico por la via node64 (FINAL=de fuera sin permiso, SALIDA=del invitado con origen"
+              " node64: conexiones nuevas en count, paquetes rechazados en drop, EXCL=a una VM excluida, AJENA=a su direccion en otro puerto):")
         for n, d in casados:
             print(f"    {n:<26} FINAL={d.get('FINAL')} SALIDA={d.get('SALIDA')} EXCL={d.get('EXCL')}"
                   f" AJENA={d.get('AJENA')} SPOOF={d.get('SPOOF')} INFRA={d.get('INFRA')} EST={d.get('EST')}")

@@ -1359,8 +1359,8 @@ NVXEOF
 # Guarda del /64 propio del nodo: un invitado con una IPv6 de ese /64 (modelo
 # anterior a IDENT, o puesta a mano) quedaria accesible desde Internet sin pasar
 # por las bases. Copia de base/snippets/nvx-node64.py (+ .service/.timer).
-# Arranca en MODE=drop (defecto del script, sin drop-in) A PROPOSITO: un nodo
-# nuevo no tiene VMs heredadas y la flota ya esta en drop (25/11/2026).
+# Arranca en MODE=drop y SALIDA_MODE=drop (defecto del script, sin drop-in) A
+# PROPOSITO: un nodo nuevo no tiene VMs heredadas y la flota ya esta en drop.
 cat > /mnt/usr/local/sbin/nvx-node64.py <<'NVXEOF'
 #!/usr/bin/env python3
 # E) Guarda del /64 propio del NODO: corta la entrada directa desde Internet a
@@ -1397,8 +1397,18 @@ cat > /mnt/usr/local/sbin/nvx-node64.py <<'NVXEOF'
 #     reply + established) o ICMPv6 relacionado (PMTU, errores). Una conexion
 #     ENTRANTE ya abierta antes de armar no se conserva.
 # Lo demas: nv-final, descarta (MODE=drop) o solo cuenta + log limitado
-# (MODE=count). Ademas nv-salida cuenta (sin cortar nunca) las conexiones NUEVAS
-# que un invitado abre hacia fuera con origen en el /64 del nodo.
+# (MODE=count).
+#
+# SALIDA (desde el 25/11/2026): lo que un invitado envia desde vmbr0 hacia fuera
+# con ORIGEN en el /64 del nodo sale por la uplink del nodo, saltandose las
+# bases (pools de salida, «Internet apagado»): la regla de politica 100 solo
+# lleva a la base el origen IDENT. Con SALIDA_MODE=drop solo pasan las
+# respuestas a lo que la entrada ya permite (nv-salida-resp/-rel); lo demas se
+# rechaza: TCP con RST (nv-salida) y el resto con ICMPv6 policy-fail
+# (nv-salida-otro), para que el invitado no espere un timeout y use su IDENT o
+# IPv4, que si van por las bases. Con SALIDA_MODE=count solo se cuentan las
+# conexiones nuevas (log limitado "nvx-node64 out:"). El trafico del propio
+# host (::2, ::1) no es forward y no pasa por aqui.
 #
 # nv-spoof: descarta lo que un invitado envia por vmbr0 con ORIGEN en las
 # direcciones reservadas de la IDENT (::1, ::2 y el transito /112). La base hace
@@ -1414,7 +1424,8 @@ cat > /mnt/usr/local/sbin/nvx-node64.py <<'NVXEOF'
 # existe y no tiene /64 propio (Kademar, con el marcador SIN64), pone la tabla
 # con node64 vacio: solo actua nv-spoof.
 #
-#   nvx-node64.py            aplica (MODE del entorno; defecto drop)
+#   nvx-node64.py            aplica (MODE y SALIDA_MODE del entorno; defecto drop;
+#                            SALIDA_MODE sin definir = MODE)
 #   nvx-node64.py --mirar    estado en una linea KEY=VALOR
 #   nvx-node64.py --quitar   borra las tablas (marcha atras inmediata)
 #
@@ -1565,13 +1576,19 @@ def excl_vms(hay_tabla=False):
     return out
 
 
-def ruleset(mode, p64, infra, infra_tun, excl):
+def ruleset(mode, p64, infra, infra_tun, excl, smode=None):
+    smode = smode or mode
     final = "counter drop" if mode == "drop" else \
         'counter limit rate 6/minute log prefix "nvx-node64 in: " level info'
     ajena = "counter drop" if mode == "drop" else "counter"
     spoof = ajena
-    salida_log = "" if mode == "drop" else \
-        ' limit rate 6/minute log prefix "nvx-node64 out: " level info'
+    if smode == "drop":
+        sal_tcp = "meta l4proto tcp counter reject with tcp reset"
+        sal_otro = "counter reject with icmpv6 type policy-fail"
+    else:
+        sal_tcp = ('meta l4proto tcp ct state new counter '
+                   'limit rate 6/minute log prefix "nvx-node64 out: " level info')
+        sal_otro = "meta l4proto != tcp ct state new counter"
     el = lambda xs: f"elements = {{ {', '.join(xs)} }}" if xs else ""
     pref = [str(n) for n in p64]
     ex_addr, ex_own = [], []
@@ -1585,7 +1602,7 @@ delete table inet {TABLE}
 table bridge {BTABLE}
 delete table bridge {BTABLE}
 table inet {TABLE} {{
-    comment "nvx-node64 modo={mode}"
+    comment "nvx-node64 modo={mode} salida={smode}"
     set node64 {{ type ipv6_addr; flags interval; {el(pref)} }}
     set infra6 {{ type ipv6_addr; {el([str(n.network_address) for n in infra])} }}
     set infra6tun {{ type ipv6_addr; flags interval; auto-merge; {el([str(n) for n in infra_tun])} }}
@@ -1595,7 +1612,13 @@ table inet {TABLE} {{
         type filter hook forward priority filter; policy accept;
         iifname "vmbr0" ip6 saddr @ident_resv {spoof} comment "nv-spoof"
         oifname "vmbr0" ip6 daddr @node64 jump entrada
-        iifname "vmbr0" oifname != "vmbr0" ip6 saddr @node64 ct state new counter{salida_log} comment "nv-salida"
+        iifname "vmbr0" oifname != "vmbr0" ip6 saddr @node64 jump salida64
+    }}
+    chain salida64 {{
+        ct direction reply counter accept comment "nv-salida-resp"
+        ct state related counter accept comment "nv-salida-rel"
+        {sal_tcp} comment "nv-salida"
+        {sal_otro} comment "nv-salida-otro"
     }}
     chain entrada {{
         ip6 daddr @excl6 counter accept comment "nv-excl"
@@ -1607,7 +1630,7 @@ table inet {TABLE} {{
     }}
 }}
 table bridge {BTABLE} {{
-    comment "nvx-node64 modo={mode}"
+    comment "nvx-node64 modo={mode} salida={smode}"
     set excl6 {{ type ipv6_addr; {el(ex_addr)} }}
     set excl_own {{ type ipv6_addr . ifname; {el(ex_own)} }}
     chain salida {{
@@ -1618,7 +1641,7 @@ table bridge {BTABLE} {{
 """
 
 
-ESPERADAS = {"nv-spoof", "nv-salida", "nv-excl", "nv-infra", "nv-infra-tun", "nv-est", "nv-rel", "nv-final"}
+ESPERADAS = {"nv-spoof", "nv-salida", "nv-salida-resp", "nv-salida-rel", "nv-salida-otro", "nv-excl", "nv-infra", "nv-infra-tun", "nv-est", "nv-rel", "nv-final"}
 
 
 def estado():
@@ -1626,7 +1649,7 @@ def estado():
     r = sh("nft", "-j", "list", "table", "inet", TABLE)
     if r.returncode != 0:
         return None
-    c, mode, jump = {}, "?", False
+    c, mode, jumps = {}, "?", set()
     for o in json.loads(r.stdout).get("nftables", []):
         t = o.get("table")
         if t and "comment" in t:
@@ -1635,8 +1658,8 @@ def estado():
         if not rule:
             continue
         for e in rule.get("expr", []):
-            if "jump" in e and e["jump"].get("target") == "entrada":
-                jump = True
+            if "jump" in e:
+                jumps.add(e["jump"].get("target"))
             if "counter" in e and "comment" in rule:
                 c[rule["comment"]] = e["counter"]["packets"]
     rb = sh("nft", "-j", "list", "table", "bridge", BTABLE)
@@ -1647,7 +1670,7 @@ def estado():
                 for e in rule.get("expr", []):
                     if "counter" in e:
                         c[rule["comment"]] = e["counter"]["packets"]
-    ok = jump and ESPERADAS <= set(c) and "nv-excl-ajena" in c
+    ok = {"entrada", "salida64"} <= jumps and ESPERADAS <= set(c) and "nv-excl-ajena" in c
     return mode, c, ok, set64()
 
 
@@ -1688,12 +1711,14 @@ def mirar():
         print(f"TABLA=no BR={br} NODE64={p64} {tail}")
         return
     mode, c, ok, s64 = st
+    mode, _, smode = mode.partition(" salida=")
     n64ok = "si" if vivos is not None and s64 == {str(n) for n in vivos} else "no"
-    print(f"TABLA={'si' if ok else 'incompleta'} MODO={mode} NODE64={p64} N64OK={n64ok} SPOOF={c.get('nv-spoof', 0)} "
+    print(f"TABLA={'si' if ok else 'incompleta'} MODO={mode} MODOSAL={smode or '?'} NODE64={p64} N64OK={n64ok} SPOOF={c.get('nv-spoof', 0)} "
           f"EXCL={c.get('nv-excl', 0)} AJENA={c.get('nv-excl-ajena', 0)} "
           f"INFRA={c.get('nv-infra', 0) + c.get('nv-infra-tun', 0)} "
           f"EST={c.get('nv-est', 0) + c.get('nv-rel', 0)} FINAL={c.get('nv-final', 0)} "
-          f"SALIDA={c.get('nv-salida', 0)} {tail}")
+          f"SALIDA={c.get('nv-salida', 0) + c.get('nv-salida-otro', 0)} "
+          f"SALRESP={c.get('nv-salida-resp', 0) + c.get('nv-salida-rel', 0)} {tail}")
 
 
 def quitar():
@@ -1706,7 +1731,8 @@ def quitar():
     print("nvx-node64: tablas quitadas")
 
 
-def aplicar(mode):
+def aplicar(mode, smode):
+    tag = f"{mode} salida={smode}"
     st = estado()
     p64 = node64_prefixes()          # Fallo => no se toca nada
     if not p64 and not os.path.exists(SIN64):
@@ -1720,24 +1746,24 @@ def aplicar(mode):
             raise                    # conserva la tabla puesta
         sets = {"base": [ipaddress.ip_network(x) for x in BASE_FALLBACK]}
     infra, infra_tun = infra_nets(sets)
-    text = ruleset(mode, p64, infra, infra_tun, excl_vms(st is not None))
+    text = ruleset(mode, p64, infra, infra_tun, excl_vms(st is not None), smode)
     try:
         prev = open(STATE).read()
     except OSError:
         prev = None
-    if st is not None and st[2] and st[0] == mode and prev == text \
+    if st is not None and st[2] and st[0] == tag and prev == text \
             and st[3] == {str(n) for n in p64}:
         return 0
     r = sh("nft", "-f", "-", inp=text)
     if r.returncode != 0:
         raise Fallo(f"nft: {r.stderr.strip()[:300]}")
     st = estado()
-    if st is None or not st[2] or st[0] != mode or st[3] != {str(n) for n in p64}:
+    if st is None or not st[2] or st[0] != tag or st[3] != {str(n) for n in p64}:
         raise Fallo("la tabla no quedo como se esperaba")
     with open(STATE + ".tmp", "w") as f:
         f.write(text)
     os.replace(STATE + ".tmp", STATE)
-    print(f"nvx-node64: guarda puesta (modo {mode}) en {', '.join(map(str, p64)) or 'ningun /64 (solo nv-spoof)'}")
+    print(f"nvx-node64: guarda puesta (modo {mode}, salida {smode}) en {', '.join(map(str, p64)) or 'ningun /64 (solo nv-spoof)'}")
     return 0
 
 
@@ -1746,8 +1772,9 @@ def main():
         mirar()
         return 0
     mode = os.environ.get("MODE", "drop")
-    if "--quitar" not in sys.argv and mode not in ("count", "drop"):
-        print("nvx-node64: MODE debe ser count o drop", file=sys.stderr)
+    smode = os.environ.get("SALIDA_MODE") or mode
+    if "--quitar" not in sys.argv and (mode not in ("count", "drop") or smode not in ("count", "drop")):
+        print("nvx-node64: MODE y SALIDA_MODE deben ser count o drop", file=sys.stderr)
         return 2
     with open(LOCK, "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
@@ -1755,7 +1782,7 @@ def main():
             quitar()
             return 0
         try:
-            return aplicar(mode)
+            return aplicar(mode, smode)
         except Fallo as e:
             print(f"nvx-node64: ERROR, no se cambia nada: {e}", file=sys.stderr)
             return 1
