@@ -38,7 +38,9 @@ Commands:
   sync-base-nat.py sync nodes <nodeId>
   sync-base-nat.py sync nodes add <nodeId> <ipv6>
   sync-base-nat.py sync nodes del <nodeId>
-  sync-base-nat.py sync nodes sync-firewall
+  sync-base-nat.py sync nodes sync-firewall [--wait]
+      Queue a cluster.fw sync (Storage Box + every node) and return at once;
+      a detached worker does the work. --wait runs it in the foreground.
 """
 from __future__ import annotations
 
@@ -2133,93 +2135,489 @@ def sync_nodes_del(node_id: str):
     logger.info("sync nodes del %s", node_id)
 
 
-def sync_nodes_sync_firewall():
+# --- cluster.fw: one writer at a time, validated, atomically replaced -----------------
+#
+# Every proxmox_nodes write fires `sync nodes sync-firewall` on a BASE. Until
+# 25/11/2026 each call did pull -> rewrite [IPSET hosts-ipv6] -> scp straight
+# onto the canonical file, with no lock, from whichever BASE the trigger
+# picked. On 06/09 seven node docs created in the same second produced
+# overlapping writes, and the canonical file kept 228 bytes of an older,
+# longer copy after its real end. PVE's parser happened to shrug it off; a
+# worse cross could have truncated [RULES] or [IPSET base] and shipped that to
+# every node, which with `policy_in: DROP` cuts the BASEs off from SSH.
+#
+# Now:
+#   * the CLI call only queues (a marker file) and starts a detached worker,
+#     so the Cloud Function returns in seconds instead of racing its 600 s cut;
+#   * workers serialize on a local flock and coalesce: one that gets the lock
+#     with no marker left has nothing to do;
+#   * the Storage Box read-modify-write runs under a mkdir lock on the Storage
+#     Box itself, so two BASEs never interleave;
+#   * the new text is validated (sections, grammar, lifeline rules, sizes)
+#     before upload, uploaded under a temporary name and renamed into place;
+#   * each node receives the validated bytes over SSH, checks the checksum,
+#     parses them with PVE's own parser (no warnings allowed) and only then
+#     replaces /etc/pve/firewall/cluster.fw; otherwise it keeps the old file.
+#
+# Rollback of the canonical file = upload the saved copy; nothing else holds
+# state.
+
+FW_SYNC_PENDING = STATE_DIR / "fw-sync.pending"
+FW_SYNC_LOCK = STATE_DIR / ".fw-sync.lock"
+FW_REMOTE_LOCK_DIR = os.environ.get(
+    "FIREWALL_REMOTE_LOCK_DIR",
+    str(Path(FIREWALL_REMOTE_PATH).parent / ".cluster.fw.lock"),
+).strip()
+# A Storage Box critical section takes seconds; anything far older is a dead
+# holder (the worker was killed between mkdir and rm).
+FW_REMOTE_LOCK_STALE_S = int(os.environ.get("FIREWALL_REMOTE_LOCK_STALE_S", "900"))
+FW_REMOTE_LOCK_WAIT_S = int(os.environ.get("FIREWALL_REMOTE_LOCK_WAIT_S", "600"))
+FW_LOCAL_LOCK_WAIT_S = int(os.environ.get("FIREWALL_LOCAL_LOCK_WAIT_S", "3000"))
+FW_NODE_PARALLEL = int(os.environ.get("FIREWALL_NODE_PARALLEL", "8"))
+FW_NODE_TIMEOUT_S = int(os.environ.get("FIREWALL_NODE_TIMEOUT_S", "120"))
+FW_MAX_BYTES = 1024 * 1024
+FW_ALERT_ENV_FILE = os.environ.get("FIREWALL_ALERT_ENV_FILE", "/etc/neuravps/hw-error-scan.env")
+
+FW_REQUIRED_SECTIONS = ("[OPTIONS]", "[IPSET base]", IPSET_HOSTS_IPV6_HEADER, "[RULES]")
+_FW_SECTION_RE = re.compile(
+    r"^\[(OPTIONS|RULES|ALIASES|IPSET [A-Za-z][A-Za-z0-9_-]*|group [A-Za-z][A-Za-z0-9_-]*)\]"
+    r"(\s*#.*)?$"
+)
+_FW_OPTION_RE = re.compile(r"^[a-z_]+:\s*\S.*$")
+_FW_RULE_RE = re.compile(
+    r"^\|?\s*(?:(?:IN|OUT)\s+[A-Za-z][A-Za-z0-9_-]*(?:\((?:ACCEPT|DROP|REJECT)\))?"
+    r"|GROUP\s+[A-Za-z][A-Za-z0-9_-]*)(?:\s.*)?$"
+)
+_FW_ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\s+\S+(\s*#.*)?$")
+_FW_LIFELINE_RE = re.compile(r"^IN\s+SSH\(ACCEPT\)\s+-source\s+\+dc/base(\s|$)")
+
+
+def _fw_ipset_entry_ok(entry: str) -> bool:
+    value = entry.split("#", 1)[0].strip()
+    if value.startswith("!"):
+        value = value[1:].strip()
+    if not value or " " in value:
+        return False
+    if re.match(r"^(dc/|guest/)?[A-Za-z][A-Za-z0-9_-]*$", value):
+        return True  # alias reference
+    try:
+        ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def parse_cluster_fw_sections(text: str) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Return (headers in order, {header: content lines}, errors)."""
+    headers: list[str] = []
+    body: dict[str, list[str]] = {}
+    errors: list[str] = []
+    current = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            m = _FW_SECTION_RE.match(line)
+            if not m:
+                errors.append(f"line {number}: bad section header {line[:60]!r}")
+                current = None
+                continue
+            header = f"[{m.group(1)}]"
+            if header in body:
+                errors.append(f"line {number}: section {header} repeated")
+            headers.append(header)
+            body.setdefault(header, [])
+            current = header
+            continue
+        if current is None:
+            errors.append(f"line {number}: content outside any section {line[:60]!r}")
+            continue
+        body[current].append(line)
+        if current == "[OPTIONS]":
+            ok = bool(_FW_OPTION_RE.match(line))
+        elif current == "[ALIASES]":
+            ok = bool(_FW_ALIAS_RE.match(line))
+        elif current.startswith("[IPSET "):
+            ok = _fw_ipset_entry_ok(line)
+        else:  # [RULES] and [group ...]
+            ok = bool(_FW_RULE_RE.match(line))
+        if not ok:
+            errors.append(f"line {number}: unexpected line in {current}: {line[:60]!r}")
+    return headers, body, errors
+
+
+def validate_cluster_fw(
+    text: str,
+    expected_hosts: int | None = None,
+    base_ipv6s: list[str] | None = None,
+    previous_text: str | None = None,
+) -> list[str]:
+    """Structural checks for a cluster.fw before it leaves this BASE.
+
+    Empty list = acceptable. The node repeats the parse with PVE's own parser;
+    this is the cheaper first gate that keeps a bad file off the Storage Box.
     """
-    Pull cluster.fw from Storage Box, rewrite [IPSET hosts-ipv6] from
-    pve_nodes.json, push back, then on each node scp pull + pve-firewall restart.
+    errors: list[str] = []
+    if not text.strip():
+        return ["empty file"]
+    if len(text.encode()) > FW_MAX_BYTES:
+        errors.append(f"too large ({len(text.encode())} bytes)")
+    if not text.endswith("\n"):
+        errors.append("does not end with a newline (truncated?)")
+    headers, body, parse_errors = parse_cluster_fw_sections(text)
+    errors.extend(parse_errors)
+    for header in FW_REQUIRED_SECTIONS:
+        if header not in body:
+            errors.append(f"missing section {header}")
+    options = {}
+    for line in body.get("[OPTIONS]", []):
+        k, _, v = line.partition(":")
+        options[k.strip()] = v.strip()
+    if options.get("enable") != "1":
+        errors.append("[OPTIONS] enable is not 1")
+    if not options.get("policy_in"):
+        errors.append("[OPTIONS] policy_in missing")
+    if not any(_FW_LIFELINE_RE.match(l) for l in body.get("[RULES]", [])):
+        errors.append("[RULES] lacks 'IN SSH(ACCEPT) -source +dc/base' (BASEs would lose SSH)")
+    base_entries = body.get("[IPSET base]", [])
+    if not base_entries:
+        errors.append("[IPSET base] is empty")
+    elif base_ipv6s:
+        nets = []
+        for entry in base_entries:
+            value = entry.split("#", 1)[0].strip()
+            try:
+                nets.append(ipaddress.ip_network(value, strict=False))
+            except ValueError:
+                pass
+        for ip_s in base_ipv6s:
+            ip = ipaddress.ip_address(ip_s)
+            if not any(ip.version == n.version and ip in n for n in nets):
+                errors.append(f"[IPSET base] does not cover BASE address {ip_s}")
+    hosts = body.get(IPSET_HOSTS_IPV6_HEADER, [])
+    if expected_hosts is not None and len(hosts) != expected_hosts:
+        errors.append(f"[IPSET hosts-ipv6] has {len(hosts)} entries, expected {expected_hosts}")
+    if previous_text is not None:
+        prev_headers, prev_body, _ = parse_cluster_fw_sections(previous_text)
+        for header in prev_headers:
+            if header not in body:
+                errors.append(f"section {header} present before, missing now")
+        prev_hosts = len(prev_body.get(IPSET_HOSTS_IPV6_HEADER, []))
+        if prev_hosts and len(hosts) < prev_hosts * SHRINK_GUARD_PCT / 100.0:
+            errors.append(
+                f"[IPSET hosts-ipv6] would shrink from {prev_hosts} to {len(hosts)} entries"
+            )
+    return errors
+
+
+def _fw_alert(subject: str, body: str) -> None:
+    """Best-effort email to soporte@ (same SMTP credential as hw-error-scan)."""
+    logger.error("sync-firewall ALERT: %s\n%s", subject, body)
+    try:
+        password = None
+        with open(FW_ALERT_ENV_FILE) as fh:
+            for line in fh:
+                if line.strip().startswith("SMTP_PASSWORD="):
+                    password = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
+        if not password:
+            logger.warning("sync-firewall: no SMTP_PASSWORD in %s; alert not emailed", FW_ALERT_ENV_FILE)
+            return
+        import smtplib
+        from email.mime.text import MIMEText
+
+        host = os.uname().nodename
+        msg = MIMEText(f"{body}\n\n-- sync-base-nat.py en {host}\n", "plain", "utf-8")
+        msg["Subject"] = f"[NeuraVPS] cluster.fw: {subject} ({host})"
+        msg["From"] = "Soporte NeuraVPS <soporte@neuravps.com>"
+        msg["To"] = "soporte@neuravps.com"
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+        try:
+            server.starttls()
+            server.login("soporte@neuravps.com", password)
+            server.sendmail("soporte@neuravps.com", ["soporte@neuravps.com"], msg.as_string())
+        finally:
+            server.quit()
+    except Exception as e:  # never let the alert path break the sync
+        logger.warning("sync-firewall: alert email failed: %s", e)
+
+
+def _fw_storage_ssh(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    """Run one command of the Storage Box restricted shell (no pipes/redirects)."""
+    cmd = ["ssh", "-p", FIREWALL_SCP_PORT, "-o", "StrictHostKeyChecking=no",
+           "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes",
+           "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=20",
+           f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}", " ".join(args)]
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+
+
+def _fw_scp(src: str, dst: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["scp", "-q"] + _firewall_scp_base_args() + ["-o", "LogLevel=ERROR", "-o", "ConnectTimeout=20", src, dst],
+        capture_output=True, text=True, check=False, timeout=120,
+    )
+
+
+@contextlib.contextmanager
+def storage_box_fw_lock():
+    """mkdir-based mutual exclusion on the Storage Box, across BASEs."""
+    import time
+
+    deadline = time.monotonic() + FW_REMOTE_LOCK_WAIT_S
+    owner = f"{os.uname().nodename}-{os.getpid()}-{int(time.time())}"
+    while True:
+        r = _fw_storage_ssh(["mkdir", FW_REMOTE_LOCK_DIR])
+        if r.returncode == 0:
+            _fw_storage_ssh(["touch", f"{FW_REMOTE_LOCK_DIR}/{owner}"])
+            break
+        if "exists" not in (r.stderr + r.stdout).lower():
+            raise RuntimeError(f"Storage Box lock: mkdir failed: {(r.stderr or r.stdout).strip()}")
+        st = _fw_storage_ssh(["stat", "-c", "%Y", FW_REMOTE_LOCK_DIR])
+        try:
+            age = time.time() - int(st.stdout.strip())
+        except ValueError:
+            age = 0  # vanished between mkdir and stat: just retry
+        if age > FW_REMOTE_LOCK_STALE_S:
+            held = _fw_storage_ssh(["ls", FW_REMOTE_LOCK_DIR]).stdout.split()
+            logger.warning("sync-firewall: breaking stale Storage Box lock (%.0f s old, owner %s)", age, held)
+            _fw_storage_ssh(["rm", "-r", FW_REMOTE_LOCK_DIR])
+            continue
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Storage Box lock held for {age:.0f} s by another BASE")
+        time.sleep(10)
+    try:
+        yield
+    finally:
+        r = _fw_storage_ssh(["rm", "-r", FW_REMOTE_LOCK_DIR])
+        if r.returncode != 0:
+            logger.warning("sync-firewall: could not release Storage Box lock: %s", (r.stderr or r.stdout).strip())
+
+
+def _base_ipv6s_for_validation() -> list[str]:
+    out = []
+    for ip in parse_base_hosts().values():
+        try:
+            if ipaddress.ip_address(ip).version == 6:
+                out.append(ip)
+        except ValueError:
+            pass
+    return out
+
+
+def update_storage_box_cluster_fw(nodes: dict[str, str]) -> str:
+    """Locked pull -> rewrite hosts-ipv6 -> validate -> temp upload -> rename.
+
+    Returns the text now canonical. Raises on any refusal; the canonical file
+    is never touched unless the new text passed validation and uploaded intact.
     """
+    import hashlib
+
+    remote = f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{FIREWALL_REMOTE_PATH}"
+    with tempfile.TemporaryDirectory(prefix="cluster-fw-") as tmpdir:
+        tmp = Path(tmpdir) / "cluster.fw"
+        with storage_box_fw_lock():
+            pull = _fw_scp(remote, str(tmp))
+            if pull.returncode != 0:
+                raise RuntimeError(f"scp pull failed: {(pull.stderr or pull.stdout).strip()}")
+            text = tmp.read_text()
+            new_text = replace_hosts_ipv6_section(text, nodes)
+            expected = len({str(ipaddress.IPv6Interface(f"{ip.strip()}/64").network) for ip in nodes.values()})
+            errors = validate_cluster_fw(new_text, expected, _base_ipv6s_for_validation(), text)
+            if errors:
+                raise ValueError("new cluster.fw rejected, Storage Box left as is:\n  " + "\n  ".join(errors))
+            if new_text == text:
+                logger.info("sync-firewall: Storage Box cluster.fw already current (%d nodes)", len(nodes))
+                return new_text
+            tmp.write_text(new_text)
+            digest = hashlib.sha256(new_text.encode()).hexdigest()
+            remote_tmp = f"{FIREWALL_REMOTE_PATH}.tmp-{os.uname().nodename}-{os.getpid()}"
+            push = _fw_scp(str(tmp), f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{remote_tmp}")
+            if push.returncode != 0:
+                _fw_storage_ssh(["rm", "-f", remote_tmp])
+                raise RuntimeError(f"scp push failed: {(push.stderr or push.stdout).strip()}")
+            check = _fw_storage_ssh(["sha256sum", remote_tmp])
+            if digest not in check.stdout:
+                _fw_storage_ssh(["rm", "-f", remote_tmp])
+                raise RuntimeError(f"uploaded temp copy has the wrong checksum: {check.stdout.strip()[:120]}")
+            _fw_storage_ssh(["chmod", "640", remote_tmp])
+            mv = _fw_storage_ssh(["mv", remote_tmp, FIREWALL_REMOTE_PATH])
+            if mv.returncode != 0:
+                _fw_storage_ssh(["rm", "-f", remote_tmp])
+                raise RuntimeError(f"rename into place failed: {(mv.stderr or mv.stdout).strip()}")
+            logger.info("sync-firewall: Storage Box cluster.fw updated (%d nodes, sha256 %s)", len(nodes), digest[:12])
+            return new_text
+
+
+# Runs on the node with the validated bytes on stdin. PVE's parser must load
+# them with no warning and keep the lifelines before /etc/pve is touched.
+NODE_FW_VALIDATOR_PL = r'''
+use strict; use warnings;
+use PVE::Firewall;
+my $f = shift or die "usage\n";
+my @w; local $SIG{__WARN__} = sub { push @w, $_[0] };
+my $c = eval { PVE::Firewall::load_clusterfw_conf($f) };
+if ($@) { print "parse died: $@"; exit 2 }
+if (@w) { print "parser warning: $_" for @w; exit 3 }
+my @e;
+push @e, "options.enable != 1" unless ($c->{options}{enable} // 0) == 1;
+push @e, "policy_in missing" unless $c->{options}{policy_in};
+push @e, "no [RULES]" unless @{$c->{rules} || []};
+for my $s ("base", "hosts-ipv6") { push @e, "ipset $s empty" unless @{$c->{ipset}{$s} || []} }
+my $ssh = grep { ($_->{macro}//'') eq 'SSH' && ($_->{source}//'') eq '+dc/base'
+                 && ($_->{action}//'') eq 'ACCEPT' && ($_->{enable}//1) } @{$c->{rules}};
+push @e, "no SSH ACCEPT from +dc/base" unless $ssh;
+if (@e) { print "check: $_\n" for @e; exit 4 }
+printf "parsed rules=%d base=%d hosts=%d\n", scalar @{$c->{rules}},
+  scalar @{$c->{ipset}{base}}, scalar @{$c->{ipset}{'hosts-ipv6'}};
+'''
+
+
+def node_fw_apply_script(digest: str) -> str:
+    """Shell run on a node: verify, parse, then replace cluster.fw atomically."""
+    import base64
+
+    validator = base64.b64encode(NODE_FW_VALIDATOR_PL.encode()).decode()
+    return (
+        "set -u; umask 077; f=/etc/pve/firewall/cluster.fw; "
+        "t=$(mktemp /tmp/nv-cluster-fw.XXXXXX); v=$(mktemp /tmp/nv-fwval.XXXXXX); "
+        "trap 'rm -f \"$t\" \"$v\"' EXIT; "
+        f"echo {validator} | base64 -d > \"$v\"; cat > \"$t\"; "
+        f"[ \"$(sha256sum < \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'NVFW-REJECT checksum mismatch'; exit 20; }}; "
+        "out=$(perl \"$v\" \"$t\" 2>&1) || { echo \"NVFW-REJECT $out\"; exit 21; }; "
+        "if cmp -s \"$t\" \"$f\"; then echo NVFW-UNCHANGED; exit 0; fi; "
+        "cp -p \"$f\" /root/cluster.fw.prev 2>/dev/null; "
+        "cat \"$t\" > \"$f.tmp.$$\" && mv \"$f.tmp.$$\" \"$f\" || { echo 'NVFW-FAIL write'; exit 22; }; "
+        "pve-firewall restart >/dev/null 2>&1 || { echo 'NVFW-FAIL pve-firewall restart'; exit 23; }; "
+        "echo \"NVFW-UPDATED $out\""
+    )
+
+
+def push_cluster_fw_to_node(node_id: str, ipv6: str, text: str, script: str) -> tuple[str, str]:
+    """('updated'|'unchanged'|'rejected'|'failed', detail)."""
+    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+           "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15",
+           f"root@{ipv6}", script]
+    try:
+        r = subprocess.run(cmd, input=text, capture_output=True, text=True,
+                           check=False, timeout=FW_NODE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return "failed", f"timeout after {FW_NODE_TIMEOUT_S} s"
+    out = (r.stdout or "").strip()
+    if r.returncode == 0 and "NVFW-UNCHANGED" in out:
+        return "unchanged", ""
+    if r.returncode == 0 and "NVFW-UPDATED" in out:
+        return "updated", out
+    if "NVFW-REJECT" in out:
+        return "rejected", out
+    return "failed", (out or (r.stderr or "").strip())[:300]
+
+
+def run_cluster_fw_sync_once() -> bool:
+    """One full pass. True when the Storage Box and every reachable node are OK."""
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+
     nodes = read_pve_nodes_state()
     if not nodes:
         logger.error("sync-firewall: pve_nodes.json empty or missing; abort")
-        sys.exit(1)
-    remote = f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{FIREWALL_REMOTE_PATH}"
-    scp_args = _firewall_scp_base_args()
-    fd, tmp_path = tempfile.mkstemp(prefix="cluster.fw.", suffix=".tmp")
-    os.close(fd)
-    tmp = Path(tmp_path)
-
+        return False
     try:
-        pull = subprocess.run(
-            ["scp"] + scp_args + [remote, str(tmp)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if pull.returncode != 0:
-            logger.error(
-                "sync-firewall: scp pull failed: %s",
-                (pull.stderr or pull.stdout or "").strip(),
-            )
-            sys.exit(1)
+        text = update_storage_box_cluster_fw(nodes)
+    except ValueError as e:
+        _fw_alert("sincronización rechazada", str(e))
+        return False
+    except Exception as e:
+        # Lock stuck, Storage Box unreachable, upload failed: the canonical
+        # file is untouched, but nobody reads this log, so say it.
+        _fw_alert("no se pudo actualizar el Storage Box", f"{type(e).__name__}: {e}")
+        return False
 
-        text = tmp.read_text()
-        try:
-            new_text = replace_hosts_ipv6_section(text, nodes)
-        except ValueError as e:
-            logger.error("sync-firewall: %s", e)
-            sys.exit(1)
-        tmp.write_text(new_text)
-
-        push = subprocess.run(
-            ["scp"] + scp_args + [str(tmp), remote],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if push.returncode != 0:
-            logger.error(
-                "sync-firewall: scp push failed: %s",
-                (push.stderr or push.stdout or "").strip(),
-            )
-            sys.exit(1)
-        logger.info("sync-firewall: Storage Box cluster.fw updated (%d nodes)", len(nodes))
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    remote_scp_inner = (
-        f"scp -P {FIREWALL_SCP_PORT} -o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null -o BatchMode=yes "
-        f"{FIREWALL_STORAGE_USER}@{FIREWALL_STORAGE_HOST}:{FIREWALL_REMOTE_PATH} "
-        "/etc/pve/firewall/cluster.fw && pve-firewall restart"
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    script = node_fw_apply_script(digest)
+    results: dict[str, tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, FW_NODE_PARALLEL)) as pool:
+        futures = {nid: pool.submit(push_cluster_fw_to_node, nid, ip, text, script)
+                   for nid, ip in sorted(nodes.items())}
+        for nid, fut in futures.items():
+            try:
+                results[nid] = fut.result()
+            except Exception as e:
+                results[nid] = ("failed", str(e))
+    by_state: dict[str, list[str]] = {}
+    for nid, (state, detail) in sorted(results.items()):
+        by_state.setdefault(state, []).append(nid)
+        if state in ("rejected", "failed"):
+            logger.warning("sync-firewall: node %s %s: %s", nid, state, detail)
+    logger.info(
+        "sync-firewall: done (%d nodes: %d updated, %d unchanged, %d rejected, %d failed; sha256 %s)",
+        len(nodes), len(by_state.get("updated", [])), len(by_state.get("unchanged", [])),
+        len(by_state.get("rejected", [])), len(by_state.get("failed", [])), digest[:12],
     )
-    failed: list[str] = []
-    for node_id, ipv6 in sorted(nodes.items()):
-        target = f"root@{ipv6}"
-        ssh_cmd = [
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "BatchMode=yes",
-            target,
-            remote_scp_inner,
-        ]
-        push_node = subprocess.run(ssh_cmd, capture_output=True, text=True, check=False)
-        if push_node.returncode != 0:
-            err = (push_node.stderr or push_node.stdout or "").strip()
-            logger.warning("sync-firewall: node %s (%s): %s", node_id, target, err)
-            failed.append(node_id)
-        else:
-            logger.info("sync-firewall: node %s ok", node_id)
-    if failed:
-        logger.error("sync-firewall: failed on %d node(s): %s", len(failed), failed)
-        sys.exit(1)
-    logger.info("sync-firewall: done (%d nodes)", len(nodes))
+    if by_state.get("rejected"):
+        _fw_alert(
+            f"{len(by_state['rejected'])} nodo(s) rechazaron el fichero",
+            "Los nodos conservan su cluster.fw anterior.\n\n" + "\n".join(
+                f"{nid}: {results[nid][1]}" for nid in by_state["rejected"]),
+        )
+    return not by_state.get("rejected") and not by_state.get("failed")
+
+
+def sync_nodes_sync_firewall_worker() -> int:
+    """Drain the queue: serialize on the local lock, run while a request is pending."""
+    import time
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with FW_SYNC_LOCK.open("a") as lock:
+        deadline = time.monotonic() + FW_LOCAL_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    logger.error("sync-firewall: local lock busy for %d s; giving up", FW_LOCAL_LOCK_WAIT_S)
+                    return 1
+                time.sleep(5)
+        ok = True
+        ran = False
+        # Consume the marker BEFORE reading state: a request arriving mid-run
+        # leaves a new marker and its own worker, so nothing is lost.
+        while FW_SYNC_PENDING.exists():
+            FW_SYNC_PENDING.unlink(missing_ok=True)
+            ran = True
+            ok = run_cluster_fw_sync_once() and ok
+        if not ran:
+            logger.info("sync-firewall: request already served by an earlier run")
+        return 0 if ok else 1
+
+
+def sync_nodes_sync_firewall(wait: bool = False):
+    """Queue a sync and start a detached worker (or run inline with --wait)."""
+    import time
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    FW_SYNC_PENDING.write_text(f"{time.time():.0f}\n")
+    if wait:
+        sys.exit(sync_nodes_sync_firewall_worker())
+    unit = f"nv-cluster-fw-sync-{int(time.time())}-{os.getpid()}"
+    script = str(Path(sys.argv[0]).resolve())
+    cmd = ["systemd-run", "--quiet", "--collect", "--no-block", f"--unit={unit}",
+           "--property=RuntimeMaxSec=3600", sys.executable, script,
+           "sync", "nodes", "sync-firewall", "--worker"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+        started = r.returncode == 0
+        err = (r.stderr or r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        started, err = False, str(e)
+    if not started:
+        logger.warning("sync-firewall: systemd-run failed (%s); detaching with setsid", err)
+        subprocess.Popen([sys.executable, script, "sync", "nodes", "sync-firewall", "--worker"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        unit = "setsid"
+    logger.info("sync-firewall: queued (worker %s)", unit)
+    print(f"sync-firewall: queued (worker {unit}); progress in {LOG_FILE}")
 
 
 def main_sync_nodes():
@@ -2250,13 +2648,16 @@ def main_sync_nodes():
         sync_nodes_del(args[1])
         return
     if args[0] == "sync-firewall":
-        if len(args) != 1:
+        extra = args[1:]
+        if extra not in ([], ["--wait"], ["--worker"]):
             print(
-                "Usage: sync-base-nat.py sync nodes sync-firewall",
+                "Usage: sync-base-nat.py sync nodes sync-firewall [--wait|--worker]",
                 file=sys.stderr,
             )
             sys.exit(2)
-        sync_nodes_sync_firewall()
+        if extra == ["--worker"]:
+            sys.exit(sync_nodes_sync_firewall_worker())
+        sync_nodes_sync_firewall(wait=extra == ["--wait"])
         return
     if len(args) != 1:
         print(
@@ -2264,7 +2665,7 @@ def main_sync_nodes():
             "       sync-base-nat.py sync nodes <nodeId>\n"
             "       sync-base-nat.py sync nodes add <nodeId> <ipv6>\n"
             "       sync-base-nat.py sync nodes del <nodeId>\n"
-            "       sync-base-nat.py sync nodes sync-firewall",
+            "       sync-base-nat.py sync nodes sync-firewall [--wait]",
             file=sys.stderr,
         )
         sys.exit(2)
