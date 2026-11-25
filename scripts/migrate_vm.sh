@@ -168,6 +168,10 @@
 # conserva sus zvols para el rollback, cosa que el flujo de `remote_migrate
 # --delete` de este script no hace. El kit está en scripts/coldmove/ (README.md
 # con el flujo y el rollback) desde el 25/11/2026.
+# Con un nodo de otro proveedor (proxmox_nodes.provider ≠ hetzner, p. ej. Kademar,
+# sin clave de flota) remote_migrate se rechaza en los dos sentidos (ver
+# _provider_guard): hacia él, kit en modo push; desde él, kit en modo pull,
+# lanzado en el destino de Hetzner.
 
 set -euo pipefail
 
@@ -888,7 +892,7 @@ _apt_dist_upgrade() {
 #   otro (MT5…) → «other»: no se toca nada.
 # Si Firestore no contesta, respaldo por nombre (*AX162*/*-KDM-* → shared,
 # *EX44* → dedicated) y se avisa: nunca peor que antes.
-NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0
+NODE_TYPE_SRC=""; NODE_TYPE_DST=""; NODE_PROVIDER_SRC=""; NODE_PROVIDER_DST=""; _NODE_TYPES_LOADED=0
 # Rellena NODE_TYPE_SRC / NODE_TYPE_DST una sola vez.
 _node_types_load() {
   (( _NODE_TYPES_LOADED == 1 )) && return 0
@@ -905,14 +909,19 @@ db = firestore.client()
 for node in sys.argv[1:3]:
     snap = db.collection("proxmox_nodes").document(node).get()
     if not snap.exists:
-        t = "NO-DOC"
+        t, p = "NO-DOC", "NO-DOC"
     else:
-        t = str((snap.to_dict() or {}).get("nodeType") or "").strip().replace(" ", "_") or "NO-FIELD"
-    print("NT %s %s" % (node, t))
+        d = snap.to_dict() or {}
+        t = str(d.get("nodeType") or "").strip().replace(" ", "_") or "NO-FIELD"
+        # provider: los docs de la flota de Hetzner no lo llevan (anteriores al 25/11/2026) = hetzner
+        p = str(d.get("provider") or "").strip().lower().replace(" ", "_") or "unset"
+    print("NT %s %s %s" % (node, t, p))
 PYNT
 ) || true
   NODE_TYPE_SRC=$(awk -v n="$SRC_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
   NODE_TYPE_DST=$(awk -v n="$DST_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
+  NODE_PROVIDER_SRC=$(awk -v n="$SRC_NODE" '$1=="NT" && $2==n {print $4; exit}' <<<"$out")
+  NODE_PROVIDER_DST=$(awk -v n="$DST_NODE" '$1=="NT" && $2==n {print $4; exit}' <<<"$out")
   if [[ -z "$NODE_TYPE_SRC" || -z "$NODE_TYPE_DST" ]]; then
     _warn "No pude leer proxmox_nodes.nodeType de ${SRC_NODE}/${DST_NODE} en Firestore; la clase de memoria sale del nombre (respaldo)."
     return 0
@@ -926,6 +935,52 @@ PYNT
     esac
   done
 }
+# ----- remote_migrate solo entre nodos de Hetzner (25/11/2026, opción «B+») ---------
+# Un nodo de otro proveedor (proxmox_nodes.provider ≠ hetzner; hoy 0000266-KDM-9755,
+# Kademar) no tiene la clave de flota y no debe recibir credenciales nuestras.
+#   - Como ORIGEN: remote_migrate se lanza EN el origen con un token root@pam del
+#     destino en la línea de órdenes (pveum token add en el destino → pvesh en el
+#     origen). Kademar recibiría un token root de un nodo de la flota. Se rechaza.
+#   - Como DESTINO: el token sería del propio Kademar (no expone la flota), pero
+#     el traslado tiene que ir por el kit igualmente: en caliente lo rechaza la
+#     guarda de silicio (Turin ≠ Genoa/Raphael) y en frío remote_migrate copiaría
+#     el disco entero con la VM parada, sin precopia. Se rechaza también.
+# La vía es scripts/coldmove (README.md): hacia Kademar en modo push desde el
+# origen; desde Kademar en modo pull desde el destino. Tras el kit, este script
+# sí se usa para reconciliar (rama «already on dest», que no lanza remote_migrate).
+# provider sin campo («unset») = hetzner (docs anteriores). Si Firestore no
+# contesta o falta el doc, se decide por la IP: solo los /32 de Hetzner de la
+# flota (2a01:4f8::/32, 2a01:4f9::/32) cuentan como Hetzner.
+_is_hetzner_fleet_ip() {
+  python3 -c '
+import ipaddress, sys
+try:
+    a = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if any(a in ipaddress.ip_network(n) for n in ("2a01:4f8::/32", "2a01:4f9::/32")) else 1)' "$1" 2>/dev/null
+}
+# <provider de Firestore|""|NO-DOC|unset> <ip> → hetzner | <proveedor> | no-hetzner
+_node_provider() {
+  case "${1:-}" in
+    unset|hetzner) echo hetzner ;;
+    ""|NO-DOC) if _is_hetzner_fleet_ip "$2"; then echo hetzner; else echo no-hetzner; fi ;;
+    *) echo "$1" ;;
+  esac
+}
+# <src_node> <src_provider> <src_ip> <dst_node> <dst_provider> <dst_ip>
+_provider_guard() {
+  local sp dp
+  sp=$(_node_provider "$2" "$3"); dp=$(_node_provider "$5" "$6")
+  if [[ "$sp" != hetzner ]]; then
+    _die "El origen ${1} es de otro proveedor (${sp}): remote_migrate se lanzaría EN ese nodo con un token root del destino ${4}, y un nodo sin la clave de flota no recibe credenciales nuestras. Traslado en FRÍO con el kit en modo pull, lanzado desde el destino: RTMIG_MODE=pull SRC=${3} SRC_NODE=${1} … (scripts/coldmove/README.md), y después este script para rutas y Firestore. Abortado antes de tocar la VM."
+  fi
+  if [[ "$dp" != hetzner ]]; then
+    _die "El destino ${4} es de otro proveedor (${dp}): el traslado va por el kit coldmove (en frío y con precopia; en caliente lo impide además la guarda de silicio), en modo push desde el origen: RTMIG_MODE=push DST=${6} DST_NODE=${4} … (scripts/coldmove/README.md), y después este script para rutas y Firestore. Abortado antes de tocar la VM."
+  fi
+  return 0
+}
+
 # <node_id> <nodeType|""> → shared | dedicated | other
 _mem_class() {
   local node="$1" nt
@@ -1735,6 +1790,11 @@ fi
 # ----- Migration phase (skipped if VM already on dest from a prior run) --------
 if (( _vm_on_src == 1 )); then
   _info "VM is on source — performing migration."
+
+  # remote_migrate solo entre dos nodos de Hetzner (ver _provider_guard): antes
+  # de leer nada más del origen y de crear ningún token.
+  _node_types_load
+  _provider_guard "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"
 
   # 0) Detect source run state to decide online vs offline migration. Stopped
   # VMs are migrated offline (no --online); we'll start them on dest after

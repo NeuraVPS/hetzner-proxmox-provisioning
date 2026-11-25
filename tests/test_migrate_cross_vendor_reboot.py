@@ -632,6 +632,63 @@ class ColdHwidGuard(unittest.TestCase):
         self.assertLess(call, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
 
 
+class ProviderGuard(unittest.TestCase):
+    """25/11/2026 (Iván «B+»): remote_migrate only between Hetzner nodes. An origin of another
+    provider would receive a root token of the destination; a destination of another provider goes
+    through the coldmove kit (cold, precopy)."""
+    HETZ = "2a01:4f9:3a:276b::2"
+    KDM = "2a0c:4ac1:3:8::2"
+
+    def guard(self, sp, sip, dp, dip):
+        body = (_fn("_is_hetzner_fleet_ip") + _fn("_node_provider") + _fn("_provider_guard")
+                + f'_provider_guard 0000266-KDM-9755 "{sp}" "{sip}" 0000238-AX162-2-LTD "{dp}" "{dip}"\necho PASSED\n')
+        return run_bash(body)
+
+    def test_hetzner_to_hetzner_passes(self):
+        for sp, dp in (("unset", "unset"), ("hetzner", "unset"), ("", ""), ("NO-DOC", "unset")):
+            r = self.guard(sp, self.HETZ, dp, self.HETZ)
+            self.assertEqual(r.returncode, 0, (sp, dp, r.stderr)); self.assertIn("PASSED", r.stdout)
+
+    def test_origin_of_another_provider_refused_with_pull_hint(self):
+        for sp, sip in (("kademar", self.KDM), ("", self.KDM), ("NO-DOC", self.KDM), ("kademar", self.HETZ)):
+            r = self.guard(sp, sip, "unset", self.HETZ)
+            self.assertEqual(r.returncode, 1, (sp, sip))
+            self.assertIn("token root", r.stderr); self.assertIn("RTMIG_MODE=pull", r.stderr)
+            self.assertIn("scripts/coldmove/README.md", r.stderr)
+
+    def test_destination_of_another_provider_refused_with_push_hint(self):
+        r = self.guard("unset", self.HETZ, "kademar", self.KDM)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("RTMIG_MODE=push", r.stderr); self.assertIn("precopia", r.stderr)
+        r = self.guard("unset", self.HETZ, "", self.KDM)              # Firestore down: by IP
+        self.assertEqual(r.returncode, 1)
+
+    def test_wired_before_any_token_or_copy(self):
+        a = SCRIPT.index('_info "VM is on source — performing migration."')
+        g = SCRIPT.index('_provider_guard "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6"')
+        self.assertLess(a, g)
+        for later in ("pveum user token add root@pam", "'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'",
+                      '_apt_dist_upgrade src_ssh "source ${SRC_NODE}"', "_live_cross_vendor_guard \"$SRC_CPU_SIG\""):
+            self.assertLess(g, SCRIPT.index(later), later)
+        # the «already on dest» branch (after the kit) does not run the guard
+        self.assertLess(g, SCRIPT.index('_info "VM is already on dest — skipping migration'))
+
+    def test_node_types_load_reads_the_provider(self):
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d, "firebase_admin"); pkg.mkdir()
+            (pkg / "__init__.py").write_text(FAKE_FIREBASE)
+            (pkg / "credentials.py").write_text(FAKE_CREDENTIALS)
+            (pkg / "firestore.py").write_text(FAKE_FIRESTORE_NODES)
+            env = {"PYTHONPATH": d, "FAKE_NODES": json.dumps({
+                "0000238-AX162-2-LTD": {"nodeType": "SQX"},
+                "0000266-KDM-9755": {"nodeType": "SQX", "provider": "kademar"}})}
+            body = ('SRC_NODE=0000266-KDM-9755 DST_NODE=0000238-AX162-2-LTD\n'
+                    'NODE_TYPE_SRC=""; NODE_TYPE_DST=""; NODE_PROVIDER_SRC=""; NODE_PROVIDER_DST=""; _NODE_TYPES_LOADED=0\n'
+                    + _fn("_node_types_load") + '_node_types_load\necho "P=$NODE_PROVIDER_SRC/$NODE_PROVIDER_DST T=$NODE_TYPE_SRC/$NODE_TYPE_DST"\n')
+            r = run_bash(body, env)
+            self.assertIn("P=kademar/unset T=SQX/SQX", r.stdout, r.stderr)
+
+
 class NodeMemClass(unittest.TestCase):
     """25/11/2026: the VPS-E balloon and the balloon-history copy follow
     proxmox_nodes.nodeType, not the node NAME (0000266-KDM-9755 fell into

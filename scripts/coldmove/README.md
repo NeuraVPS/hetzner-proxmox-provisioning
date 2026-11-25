@@ -12,19 +12,46 @@ Cuándo se usa:
 
 Siempre con el **cliente avisado de la hora del corte**.
 
+## Dos modos: quién abre las conexiones
+Todas las conexiones nodo↔nodo las abre **el nodo que corre el kit**. Al otro solo le llegan órdenes
+sueltas (`zfs`, `qm`, `cat`, `sha256sum`, `rm`, `mv`…), y ninguna de ellas abre SSH.
+
+| Caso | Modo | Dónde corre el kit | Variables del otro nodo |
+|---|---|---|---|
+| Entre nodos de la flota (Hetzner) | `push` (por defecto) | ORIGEN | `DST`, `DST_NODE` |
+| Hacia un nodo de otro proveedor que autoriza la clave de flota (Kademar como DESTINO) | `push` | ORIGEN (Hetzner) | `DST`, `DST_NODE` |
+| Desde un nodo de otro proveedor **sin** clave de flota (Kademar como ORIGEN) | `pull` (`RTMIG_MODE=pull`) | DESTINO (Hetzner) | `SRC`, `SRC_NODE` |
+
+**Cómo se decide:** si `proxmox_nodes/<origen>.provider` existe y no es `hetzner` (Kademar:
+`provider: kademar`), el modo es `pull` y el kit se lanza en el destino. Los nodos de Hetzner no llevan
+el campo.
+
+- **Opción «B+» de Iván (25/11/2026):** `0000266-KDM-9755` no tiene ni tendrá la clave de flota. Los
+  nodos de Hetzner pueden entrar en él, porque autoriza la pública de flota y su cortafuegos deja
+  pasar `hosts-ipv6`, pero él no puede entrar en ningún nodo nuestro.
+- **Si se intenta `push` desde un nodo sin clave de flota** (`/root/.ssh/neuravps_id`), el kit se
+  niega antes de abrir ninguna conexión y dice cómo lanzarlo en modo `pull`.
+- **`migrate_vm.sh` rechaza `remote_migrate`** si el origen o el destino es de otro proveedor, y
+  remite aquí.
+- **En los dos modos**, el estado, la copia aparcada y el cerrojo viven en `$WORK` del nodo que
+  corre el kit. En `pull`, eso es el destino: Kademar no guarda nada del traslado.
+
 ## Piezas
 | Fichero | Dónde corre | Qué hace |
 |---|---|---|
-| `rtmig_deploy.sh` | equipo del operador | copia el kit a `/root/rtmig/` de los dos nodos, pasando por una BASE (`JUMP`) |
-| `rtmig_send.sh` | nodo ORIGEN | `base` (snapshot y envío completo), `incr`, `verify`, `pending`, `last`, `resume` |
-| `rtmig_cutover.sh` | nodo ORIGEN | `shutdown`, `park`, `push`, `start`, `close`, `rollback`, `status` |
-| `rtmig_common.sh` | (lo cargan los dos) | parámetros y su validación, SSH al destino, identidad, sondas, estado, inventario de discos |
+| `rtmig_deploy.sh` | equipo del operador | copia el kit a `/root/rtmig/` de los nodos, pasando por una BASE (`JUMP`). En `pull` basta con `ONLY=dst` |
+| `rtmig_send.sh` | nodo que corre el kit | `base` (snapshot y envío completo), `incr`, `verify`, `pending`, `last`, `resume` |
+| `rtmig_cutover.sh` | nodo que corre el kit | `shutdown`, `park`, `push`, `start`, `close`, `rollback`, `status` |
+| `rtmig_common.sh` | (lo cargan los dos) | modos, parámetros y su validación, ejecución por rol, identidad, sondas, estado, inventario |
 
 **Parámetros comunes, por entorno:**
-- `VMID`.
-- `DST`: la IP del destino, tal cual está en `proxmox_nodes/<nodo>.ip`, en forma canónica y sin zona
-  (`%eth0`). En una BASE: `jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json`.
-- `DST_NODE`: el id del nodo destino. Se comprueba con `hostname` antes de hacer nada.
+- `VMID`; `RTMIG_MODE` (`push` por defecto, o `pull`).
+- En `push`, `DST` y `DST_NODE`; en `pull`, `SRC` y `SRC_NODE`.
+  - La IP es la de `proxmox_nodes/<nodo>.ip`, en forma canónica y sin zona (`%eth0`). En una BASE:
+    `jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json`.
+  - El id del nodo se comprueba con `hostname` en él antes de hacer nada.
+  - En `pull`, el nodo destino es el propio; si se pone `DST_NODE`, tiene que coincidir con
+    `hostname`.
 - Opcionales: `WORK` (por defecto `/root/rtmig`), `SSH_PORT` y `DISKS`. Si se pone `DISKS`, tiene
   que coincidir exactamente con el inventario de la config.
 
@@ -53,12 +80,13 @@ nada. En las consultas ZFS solo cuenta como «no existe» el mensaje `dataset do
 cualquier otro error de `zfs` también es INDETERMINADO. Un disco ya verificado en `push` que deja de
 dar un número de bytes escritos impide el rollback.
 
-El código no lleva IPs, VMIDs ni credenciales: usa la clave de la flota `~/.ssh/neuravps_id`, que ya
-está en cada nodo.
+El código no lleva IPs, VMIDs ni credenciales: usa la clave de la flota `~/.ssh/neuravps_id`, que
+tiene que estar en el nodo que corre el kit. El otro nodo solo necesita autorizar su pública.
 
-**Red:** va nodo↔nodo por SSH. El destino tiene que aceptar al origen en el puerto 22, igual que
-cualquier nodo de la flota: los dos tienen que estar en `proxmox_nodes` y haber pasado
-`sync-base-nat.py sync nodes` y `sync-firewall` (IPSET `hosts-ipv6`).
+**Red:** va nodo↔nodo por SSH, abierto por el nodo que corre el kit. El otro nodo tiene que aceptarlo
+en el puerto 22, igual que cualquier nodo de la flota: los dos tienen que estar en `proxmox_nodes` y
+haber pasado `sync-base-nat.py sync nodes` y `sync-firewall` (IPSET `hosts-ipv6`). En `pull`, el
+origen no necesita llegar al destino.
 
 **Ritmo:** `RATE` por defecto es `30m`, unos 250 Mbit/s por flujo; está pensado para un enlace
 no-Hetzner de ~300 Mbit/s, como Kademar. Dentro de Hetzner se puede subir a `60m`–`110m`. En la
@@ -66,7 +94,12 @@ incremental final, con la VM ya apagada, se usa `RATE=0`. `ZSTD=1` recomprime en
 es la red.
 
 ## Flujo
-En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
+- **`push`**, en el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
+- **`pull`**, en el nodo destino: `cd /root/rtmig && export RTMIG_MODE=pull VMID=… SRC=… SRC_NODE=…`.
+
+Las órdenes son las mismas en los dos modos. En `pull`, «el origen» de cada paso se ejecuta por SSH
+desde el destino: el apagado ordenado, el aparcado de la config, el `zfs send` y la restauración del
+rollback.
 
 1. **Precopia, con la VM encendida** (lanzada con `systemd-run` o `nice`, que tarda horas):
    `./rtmig_send.sh base rtmig-$(date -u +%Y%m%dT%H%MZ)` → tiene que acabar en `VERIFY OK` en todos
@@ -161,7 +194,10 @@ Antes de `park`, la VM sigue en el origen: basta con no seguir. Si ya está apar
    vuelve a reconciliar rutas y Firestore hacia el origen.
 
 Si el SSH cae a mitad del rollback, el paso aborta como INDETERMINADO. El origen no arranca, y se
-repite cuando el destino conteste.
+repite cuando el otro nodo conteste.
+
+En `pull`, el rollback se lanza igual, desde el destino: apaga y retira lo suyo en local y
+restaura el `.fw` y la config en el origen por SSH. La copia aparcada está en el destino.
 
 ## Apagado
 `shutdown` nunca usa `forceStop`. Si vence el tiempo, la VM sigue encendida en el origen y no se ha
@@ -170,4 +206,8 @@ coordinador.
 
 ## Pruebas
 `tests/test_coldmove_kit.py` ejecuta los scripts de verdad contra `qm`, `zfs`, `ssh` y `hostname`
-falsos. Cubre también el SSH que cae a mitad, la publicación truncada y la reanudación de envíos.
+falsos.
+- Cada escenario se ejecuta en los dos modos.
+- El `ssh` falso falla, y lo deja anotado, si una orden que llegó por SSH intenta abrir otro SSH. Así
+  se comprueba que el nodo remoto (Kademar, en `pull`) nunca se conecta a nadie.
+- Cubre también el SSH que cae a mitad, la publicación truncada y la reanudación de envíos.

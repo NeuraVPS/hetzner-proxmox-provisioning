@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # rtmig_send.sh — precopia ZFS nodo→nodo para el traslado en frío de una VM.
-# Se ejecuta EN EL NODO ORIGEN (root). Viaja directo nodo→nodo por SSH: los nodos se aceptan entre sí
-# por el IPSET hosts-ipv6 de cluster.fw (sale de proxmox_nodes.ip) y la clave ~/.ssh/neuravps_id.
-# NO pasa por ninguna BASE.
+# Se ejecuta EN EL NODO ORIGEN en modo push (por defecto) o EN EL DESTINO en modo pull (RTMIG_MODE=pull,
+# para un origen sin clave de flota; ver rtmig_common.sh). Viaja directo nodo→nodo por SSH, siempre
+# abierto por el nodo que corre el kit: los nodos se aceptan por el IPSET hosts-ipv6 de cluster.fw (sale
+# de proxmox_nodes.ip) y la clave ~/.ssh/neuravps_id. NO pasa por ninguna BASE.
 #
 #   rtmig_send.sh base <SNAP>            snapshot atómico @SNAP de todos los discos + envío completo
 #   rtmig_send.sh incr <PREV> <NEW>      snapshot atómico @NEW + incremental PREV→NEW
@@ -19,7 +20,8 @@
 #
 # Los nombres de snapshot deben empezar por «rtmig-» (p. ej. rtmig-$(date -u +%Y%m%dT%H%MZ)).
 #
-# Variables: las de rtmig_common.sh (VMID, DST, DST_NODE, WORK, DISKS, SSH_PORT) y además:
+# Variables: las de rtmig_common.sh (RTMIG_MODE, VMID, DST/DST_NODE o SRC/SRC_NODE, WORK, DISKS,
+# SSH_PORT) y además:
 #   RATE  (por defecto 30m)   límite de pv (-L), por flujo. 30m ≈ 250 Mbit/s: cabe en un enlace
 #                             no-Hetzner de ~300 Mbit/s por flujo (Kademar, medido 08/11) sin ahogar al
 #                             nodo. Dentro de Hetzner se puede subir (60m–110m). "0" = sin límite
@@ -38,6 +40,7 @@ source "$HERE/rtmig_common.sh"
 
 RATE="${RATE:-30m}"
 KEEP="${KEEP:-}"
+[[ "$KEEP" =~ ^[A-Za-z0-9\ _.:/-]*$ ]] || die "KEEP solo admite letras, números, espacios y _.:/- (vale '$KEEP')"
 
 [[ "$RATE" =~ ^[0-9]+[kKmMgG]?$ ]] || die "RATE no válido: '$RATE' (p. ej. 30m, 110m o 0)"
 
@@ -73,15 +76,17 @@ rate_bps() {   # RATE → bytes/s (0 = sin límite)
 
 snap_all() {   # snapshot atómico de todos los discos en UNA orden zfs (o reutiliza uno completo)
   local snap="$1" args=() have=0 n=0
+  local g
   for d in $DISKS; do
     args+=("${POOLDS}/vm-${VMID}-disk-${d}@${snap}"); n=$((n + 1))
-    zfs list -H "${POOLDS}/vm-${VMID}-disk-${d}@${snap}" >/dev/null 2>&1 && have=$((have + 1))
+    g=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${d}@${snap}") || exit 1
+    [[ "$g" == ABSENT ]] || have=$((have + 1))
   done
   if (( have == n )); then log "@${snap} ya existe en los ${n} discos: lo reutilizo (reanudación)"; return 0; fi
   (( have == 0 )) || die "@${snap} existe solo en ${have} de ${n} discos: no sería atómico. Usa otro nombre"
-  zfs snapshot "${args[@]}"
+  on_q src "zfs snapshot ${args[*]}" >/dev/null
   if [[ -n "$KEEP" ]]; then
-    for a in "${args[@]}"; do zfs set "neuravps:keep=${KEEP}" "$a"; done
+    for a in "${args[@]}"; do on_q src "zfs set 'neuravps:keep=${KEEP}' '$a'" >/dev/null; done
   fi
   log "snapshot atómico @${snap} creado en: ${args[*]}"
 }
@@ -91,10 +96,10 @@ verify() {   # guid igual en origen y destino = mismo snapshot (lref/ref solo in
   local snap="$1" bad=0 s d si di
   for dd in $DISKS; do
     local ds="${POOLDS}/vm-${VMID}-disk-${dd}@${snap}"
-    s=$(zfs get -H -o value guid "$ds" 2>/dev/null || true)
-    d=$(dst "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
-    si=$(zfs get -H -o value referenced,logicalreferenced "$ds" 2>/dev/null | paste -sd/)
-    di=$(dst "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" || true)
+    s=$(on src "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
+    d=$(on dst "zfs get -H -o value guid '$ds' 2>/dev/null" || true)
+    si=$(on src "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" || true)
+    di=$(on dst "zfs get -H -o value referenced,logicalreferenced '$ds' 2>/dev/null | paste -sd/" || true)
     if [[ -n "$s" && "$s" == "$d" ]]; then log "VERIFY OK   $ds  guid=$s  ref/lref origen=$si destino=$di"
     else log "VERIFY FAIL $ds  guid origen=[${s:-ausente}] destino=[${d:-ausente}]"; bad=1; fi
   done
@@ -104,7 +109,9 @@ verify() {   # guid igual en origen y destino = mismo snapshot (lref/ref solo in
 last_common() {   # último @rtmig-* presente en TODOS los discos de ambos lados con el mismo guid
   local cand g1 g2 ok first
   first="${DISKS%% *}"
-  for cand in $(zfs list -H -t snapshot -o name -s createtxg "${POOLDS}/vm-${VMID}-disk-${first}" | sed -n 's/.*@\(rtmig-.*\)/\1/p' | tac); do
+  local list
+  list=$(on_q src "zfs list -H -t snapshot -o name -s createtxg '${POOLDS}/vm-${VMID}-disk-${first}'") || exit 1
+  for cand in $(sed -n 's/.*@\(rtmig-.*\)/\1/p' <<< "$list" | tac); do
     ok=1
     for dd in $DISKS; do
       g1=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${dd}@${cand}") || exit 1
@@ -120,9 +127,8 @@ resume_one() {   # resume_one <ds> <token>
   local ds="$1" tok="$2" rc
   [[ "$tok" =~ ^[A-Za-z0-9+/=_.:-]+$ ]] || die "token de reanudación raro en ${ds}"
   log "reanudando ${ds} (token de recepción a medias en el destino)"
-  set +e
-  zfs send -t "$tok" | ratepipe | dst_in "zfs recv -s '${ds}'"
-  rc=("${PIPESTATUS[@]}"); set -e
+  stream_src_to_dst "zfs send -t '${tok}'" "zfs recv -s '${ds}'"
+  read -r -a rc <<< "$STREAM_RC"
   [[ "${rc[0]}" == 0 && "${rc[1]}" == 0 && "${rc[2]}" == 0 ]] || die "reanudación de ${ds} falló (send=${rc[0]} pv=${rc[1]} recv=${rc[2]}); vuelve a lanzar la misma orden"
 }
 
@@ -130,7 +136,8 @@ resume_one() {   # resume_one <ds> <token>
 send_disk() {
   local dd="$1" snap="$2" prev="${3:-}" ds gs gd tok gps gpd
   ds="${POOLDS}/vm-${VMID}-disk-${dd}"
-  gs=$(zfs get -H -o value guid "${ds}@${snap}" 2>/dev/null) || die "falta ${ds}@${snap} en origen"
+  gs=$(src_zget_guid "${ds}@${snap}") || exit 1
+  [[ "$gs" != ABSENT ]] || die "falta ${ds}@${snap} en origen"
   gd=$(dst_zget guid "${ds}@${snap}") || exit 1
   if [[ "$gd" == "$gs" ]]; then log "${ds}@${snap} ya está en el destino (guid ${gs}): lo salto"; return 0; fi
   tok=$(dst_zget receive_resume_token "$ds") || exit 1
@@ -144,7 +151,8 @@ send_disk() {
     [[ "$tok" == ABSENT ]] || die "el destino ya tiene ${ds} sin @${snap}: no piso nada (¿otro traslado? revisa a mano)"
     send_one "$dd" "$snap"
   else
-    gps=$(zfs get -H -o value guid "${ds}@${prev}" 2>/dev/null) || die "falta ${ds}@${prev} en origen"
+    gps=$(src_zget_guid "${ds}@${prev}") || exit 1
+    [[ "$gps" != ABSENT ]] || die "falta ${ds}@${prev} en origen"
     gpd=$(dst_zget guid "${ds}@${prev}") || exit 1
     [[ "$gps" == "$gpd" ]] || die "${ds}@${prev}: guid origen=[${gps}] destino=[${gpd}]: no es base común"
     send_one "$dd" "$snap" "$prev"
@@ -158,32 +166,30 @@ send_one() {   # send_one <disk> <snap> [prev]
   local recvflags="-s"; local sendargs=(-c -e)
   [[ -n "${ZSTD:-}" ]] && sendargs=(-e)
   if [[ -n "$prev" ]]; then sendargs+=(-i "@${prev}"); recvflags="-s -F"; fi
-  local est; est=$(zfs send -nP "${sendargs[@]}" "${ds}@${snap}" 2>/dev/null | awk '/^size/{print $2}')
+  local est; est=$(on src "zfs send -nP ${sendargs[*]} '${ds}@${snap}' 2>/dev/null" | awk '/^size/{print $2}' || true)
   log "send ${ds}@${snap} ${prev:+(incremental desde @$prev) }estimado=$(numfmt --to=iec "${est:-0}")B rate=${RATE} zstd=${ZSTD:-no}"
-  local t0=$SECONDS rc
-  set +e
+  local t0=$SECONDS rc sendcmd recvcmd
+  sendcmd="nice -n 19 zfs send ${sendargs[*]} '${ds}@${snap}'"
+  recvcmd="zfs recv ${recvflags} '${ds}'"
   if [[ -n "${ZSTD:-}" ]]; then
-    nice -n 19 zfs send "${sendargs[@]}" "${ds}@${snap}" | zstd -q -c "-${ZSTD}" -T"${ZSTD_T:-12}" | ratepipe \
-      | dst_in "set -o pipefail; zstd -q -d -c | zfs recv ${recvflags} '${ds}'"
-    rc=("${PIPESTATUS[0]}" "${PIPESTATUS[2]}" "${PIPESTATUS[3]}" "${PIPESTATUS[1]}")
-  else
-    nice -n 19 zfs send "${sendargs[@]}" "${ds}@${snap}" | ratepipe | dst_in "zfs recv ${recvflags} '${ds}'"
-    rc=("${PIPESTATUS[@]}" 0)
+    sendcmd="set -o pipefail; ${sendcmd} | zstd -q -c -${ZSTD} -T${ZSTD_T:-12}"
+    recvcmd="set -o pipefail; zstd -q -d -c | ${recvcmd}"
   fi
-  set -e
-  [[ "${rc[0]}" == 0 && "${rc[1]}" == 0 && "${rc[2]}" == 0 && "${rc[3]}" == 0 ]] \
-    || die "envío de ${ds} falló (send=${rc[0]} pv=${rc[1]} recv=${rc[2]} zstd=${rc[3]}); reanudar con: $0 resume"
+  stream_src_to_dst "$sendcmd" "$recvcmd"
+  read -r -a rc <<< "$STREAM_RC"
+  [[ "${rc[0]}" == 0 && "${rc[1]}" == 0 && "${rc[2]}" == 0 ]] \
+    || die "envío de ${ds} falló (send=${rc[0]} pv=${rc[1]} recv=${rc[2]}); reanudar con: $0 resume"
   log "hecho ${ds}@${snap} en $((SECONDS - t0)) s"
 }
 
-check_snap_name() { [[ "$1" == rtmig-* && "$1" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "el snapshot '$1' debe empezar por rtmig- (y sin espacios ni @)"; }
-
 CMD="${1:-}"
 case "$CMD" in base|incr|last|pending|verify|resume) ;; *) awk 'NR>1 \&\& /^#/ {print; next} NR>1 {exit}' "$0"; exit 2 ;; esac
+[[ "${ZSTD:-}" =~ ^([0-9]{1,2})?$ && "${ZSTD_T:-12}" =~ ^[0-9]{1,3}$ ]] || die "ZSTD/ZSTD_T no válidos"
 case "$CMD" in base|incr|resume) take_lock ;; esac
+check_fleet_key
+check_peer_identity
 DISKS=$(detect_disks)
-check_dst_identity
-log "VM ${VMID}: $(src_node) → ${DST_NODE} (${DST}); discos: ${DISKS}"
+log "VM ${VMID} (${RTMIG_MODE}): ${SRC_NODE} → ${DST_NODE}; el kit corre en ${LOCAL_NODE}; discos: ${DISKS}"
 # Antes de recibir nada: el destino NO puede tener ya config de la VM (respuesta positiva).
 dst_must_be_free() {
   probe dst
@@ -195,7 +201,10 @@ case "$CMD" in
     SNAP="${2:?SNAP}"; check_snap_name "$SNAP"
     dst_must_be_free
     if [[ "${REUSE_SNAP:-0}" == 1 ]]; then   # @SNAP creada a mano antes (p. ej. pool lleno)
-      for d in $DISKS; do zfs list -H "${POOLDS}/vm-${VMID}-disk-${d}@${SNAP}" >/dev/null || die "falta @${SNAP} en disk-${d}"; done
+      for d in $DISKS; do
+        g=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${d}@${SNAP}") || exit 1
+        [[ "$g" != ABSENT ]] || die "falta @${SNAP} en disk-${d}"
+      done
       log "reutilizo @${SNAP} ya existente"
     else
       snap_all "$SNAP"
@@ -233,8 +242,8 @@ case "$CMD" in
         gl=$(src_zget_guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}") || exit 1
         gr=$(dst_zget guid "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}") || exit 1
         [[ -n "$gl" && -n "$gr" ]] || die "respuesta vacía al consultar @${PREV} de disk-${d}: no borro nada"
-        [[ "$gl" == ABSENT ]] || zfs destroy "${POOLDS}/vm-${VMID}-disk-${d}@${PREV}"
-        [[ "$gr" == ABSENT ]] || dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" || die "no pude destruir @${PREV} de disk-${d} en destino"
+        [[ "$gl" == ABSENT ]] || on_q src "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" >/dev/null
+        [[ "$gr" == ABSENT ]] || on_q dst "zfs destroy '${POOLDS}/vm-${VMID}-disk-${d}@${PREV}'" >/dev/null
       done
       log "@${PREV} destruido en origen y destino (queda @${NEW} como base común)"
     fi
@@ -251,11 +260,11 @@ case "$CMD" in
     log "base común: @${P}"
     BPS=$(rate_bps)
     for d in $DISKS; do
-      w=$(zfs get -Hp -o value "written@${P}" "${POOLDS}/vm-${VMID}-disk-${d}")
+      w=$(zget src "written@${P}" "${POOLDS}/vm-${VMID}-disk-${d}" -p) || exit 1
       if (( BPS > 0 )); then eta="~$(( w / BPS ))s a RATE=${RATE}"; else eta="RATE=0 (sin límite)"; fi
       log "  disk-${d}: $(numfmt --to=iec "$w")B escritos desde @${P}  (${eta})"
     done
-    log "pool origen: $(zpool list -H -o cap,free rpool | tr '\t' ' ')"
+    log "pool origen: $(on src "zpool list -H -o cap,free rpool" | tr '\t' ' ')"
     ;;
   resume)
     for d in $DISKS; do

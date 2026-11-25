@@ -1,35 +1,50 @@
 # rtmig_common.sh — lo que comparten rtmig_send.sh y rtmig_cutover.sh. Se carga con `source`.
 #
+# DOS MODOS (RTMIG_MODE), según qué nodo puede abrir SSH hacia el otro:
+#   push (por defecto)  el kit corre en el ORIGEN y empuja al destino. Lo normal entre nodos de la
+#                       flota (todos tienen la clave de flota) y hacia un nodo de otro proveedor que
+#                       autoriza la clave de flota (p. ej. Kademar como DESTINO).
+#   pull                el kit corre en el DESTINO (un nodo de Hetzner) y tira del origen. Para un
+#                       ORIGEN sin clave de flota (proxmox_nodes.provider distinto de hetzner, p. ej.
+#                       0000266-KDM-9755, decisión de Iván «B+» del 25/11/2026): ese nodo acepta SSH
+#                       de la flota pero NO puede entrar en ningún nodo nuestro. En este modo TODAS las
+#                       conexiones las abre el destino; al origen solo le llegan órdenes sueltas
+#                       (zfs, qm, cat, sha256sum, rm, mv…) y ninguna de ellas hace ssh.
+# En los dos modos el estado, la copia aparcada y el cerrojo viven en $WORK del nodo que corre el kit.
+#
 # Variables comunes (todas por entorno; nada de valores de un traslado concreto en el código):
 #   VMID      (obligatoria) VMID de la VM; es la misma en origen y destino.
-#   DST       (obligatoria) IP del nodo DESTINO tal cual está en proxmox_nodes/<nodo>.ip (en la flota,
-#             IPv6; en una BASE: jq -r '."<nodo>"' /var/lib/base-nat/pve_nodes.json).
-#   DST_NODE  (obligatoria) id del nodo destino (= hostname = nodo PVE, p. ej. el de proxmox_nodes).
-#             Se comprueba con `hostname` en el destino antes de hacer nada: una IP mal copiada
-#             no puede mandar discos a otro nodo.
-#   WORK      (por defecto /root/rtmig) carpeta de trabajo en cada nodo (config aparcada, estado).
+#   push:  DST       IP del nodo DESTINO, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
+#          DST_NODE  id del nodo destino (= hostname = nodo PVE); se comprueba con `hostname` allí.
+#   pull:  SRC       IP del nodo ORIGEN, tal cual en proxmox_nodes/<nodo>.ip (canónica, sin zona).
+#          SRC_NODE  id del nodo origen; se comprueba con `hostname` allí.
+#          (DST_NODE es este nodo; si se pone, tiene que ser igual a `hostname`.)
+#   WORK      (por defecto /root/rtmig) carpeta de trabajo del nodo que corre el kit.
 #   DISKS     (opcional) sufijos N de rpool/data/vm-$VMID-disk-N. Si se pone, tiene que coincidir
 #             EXACTAMENTE con el inventario de la config; si no, se usa el inventario.
-#   SSH_PORT  (por defecto 22) puerto SSH del destino.
+#   SSH_PORT  (por defecto 22) puerto SSH del otro nodo.
 #
-# Rutas que se pueden desviar (solo para pruebas; en el destino las expande SU shell, así que por SSH
-# real valen siempre los valores por defecto): PVE_ETC, CPUINFO, NV_RAM_GUARD, NV_RECONCILER.
+# Rutas que se pueden desviar (solo para pruebas; en el otro nodo las expande SU shell, así que por
+# SSH real valen siempre los valores por defecto): PVE_ETC, CPUINFO, NV_RAM_GUARD, NV_RECONCILER,
+# QEMU_PIDDIR, PROC_DIR, NV_FLEET_KEY.
 #
-# Regla de las comprobaciones remotas: nunca se toma «el SSH falló» por «no hay nada». Cada consulta
-# al destino devuelve una respuesta explícita terminada en un marcador; sin él, el estado es
-# INDETERMINADO y se aborta sin tocar nada.
+# Regla de las comprobaciones: nunca se toma «el SSH falló» por «no hay nada». Cada consulta devuelve
+# una respuesta explícita terminada en un marcador; sin él, el estado es INDETERMINADO y se aborta sin
+# tocar nada.
 set -euo pipefail
 shopt -s inherit_errexit   # un die dentro de $(...) también corta la orden que lo llama
 
+RTMIG_MODE="${RTMIG_MODE:-push}"
 VMID="${VMID:?VMID}"
-DST="${DST:?DST (IP del nodo destino, de proxmox_nodes.ip)}"
-DST_NODE="${DST_NODE:?DST_NODE (id del nodo destino; se comprueba con hostname)}"
 WORK="${WORK:-/root/rtmig}"
 POOLDS="${POOLDS:-rpool/data}"
 PVE_ETC="${PVE_ETC:-/etc/pve}"
 CPUINFO="${CPUINFO:-/proc/cpuinfo}"
 NV_RAM_GUARD="${NV_RAM_GUARD:-/usr/local/sbin/neuravps-ram-guard.py}"
 NV_RECONCILER="${NV_RECONCILER:-/usr/local/sbin/neuravps-balloon-reconciler.sh}"
+QEMU_PIDDIR="${QEMU_PIDDIR:-/var/run/qemu-server}"
+PROC_DIR="${PROC_DIR:-/proc}"
+NV_FLEET_KEY="${NV_FLEET_KEY:-/root/.ssh/neuravps_id}"
 
 # ---- validación de todo lo que acaba dentro de una orden remota -----------------------------------
 [[ "$VMID" =~ ^[1-9][0-9]*$ ]] || { echo "VMID no válida: $VMID" >&2; exit 2; }
@@ -44,14 +59,30 @@ except ValueError:
     sys.exit(1)
 sys.exit(0 if "%" not in s and str(ip) == s else 1)' "$1" 2>/dev/null
 }
-canon_ip "$DST" || { echo "DST tiene que ser una IP literal canónica y sin zona (proxmox_nodes.ip), no '$DST'" >&2; exit 2; }
-[[ "$DST_NODE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { echo "DST_NODE no válido: $DST_NODE" >&2; exit 2; }
+valid_node() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; }
+LOCAL_NODE="$(hostname)"
+case "$RTMIG_MODE" in
+  push)
+    DST="${DST:?DST (IP del nodo destino, de proxmox_nodes.ip)}"
+    DST_NODE="${DST_NODE:?DST_NODE (id del nodo destino; se comprueba con hostname)}"
+    canon_ip "$DST" || { echo "DST tiene que ser una IP literal canónica y sin zona (proxmox_nodes.ip), no '$DST'" >&2; exit 2; }
+    valid_node "$DST_NODE" || { echo "DST_NODE no válido: $DST_NODE" >&2; exit 2; }
+    SRC_NODE="$LOCAL_NODE"; PEER="$DST"; PEER_NODE="$DST_NODE"; PEER_ROLE=dst ;;
+  pull)
+    SRC="${SRC:?SRC (IP del nodo origen, de proxmox_nodes.ip)}"
+    SRC_NODE="${SRC_NODE:?SRC_NODE (id del nodo origen; se comprueba con hostname)}"
+    canon_ip "$SRC" || { echo "SRC tiene que ser una IP literal canónica y sin zona (proxmox_nodes.ip), no '$SRC'" >&2; exit 2; }
+    valid_node "$SRC_NODE" || { echo "SRC_NODE no válido: $SRC_NODE" >&2; exit 2; }
+    [[ -z "${DST_NODE:-}" || "$DST_NODE" == "$LOCAL_NODE" ]] \
+      || { echo "en modo pull el kit corre en el DESTINO: DST_NODE=${DST_NODE} pero este nodo es ${LOCAL_NODE}" >&2; exit 2; }
+    DST_NODE="$LOCAL_NODE"; PEER="$SRC"; PEER_NODE="$SRC_NODE"; PEER_ROLE=src ;;
+  *) echo "RTMIG_MODE solo admite push o pull (vale '${RTMIG_MODE}')" >&2; exit 2 ;;
+esac
 [[ "$WORK" =~ ^/[A-Za-z0-9._/-]+$ && "$WORK" != *..* ]] || { echo "WORK no válido (ruta absoluta, sin espacios ni ..): $WORK" >&2; exit 2; }
 [[ "$POOLDS" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]] || { echo "POOLDS no válido: $POOLDS" >&2; exit 2; }
 [[ "${SSH_PORT:-22}" =~ ^[0-9]+$ ]] || { echo "SSH_PORT no válido: ${SSH_PORT}" >&2; exit 2; }
 
-CONF="${PVE_ETC}/qemu-server/${VMID}.conf"; FW="${PVE_ETC}/firewall/${VMID}.fw"
-# Las mismas rutas, pero escritas para que las expanda el shell del DESTINO.
+# Rutas en la forma que expande el shell de QUIEN ejecuta la orden (local o remoto).
 R_CONF="\${PVE_ETC:-/etc/pve}/qemu-server/${VMID}.conf"
 R_FW="\${PVE_ETC:-/etc/pve}/firewall/${VMID}.fw"
 STATE="$WORK/${VMID}.state"
@@ -59,24 +90,48 @@ STATE="$WORK/${VMID}.state"
 SSHO=(-p "${SSH_PORT:-22}" -c aes128-gcm@openssh.com -o BatchMode=yes -o ConnectTimeout=15
       -o ServerAliveInterval=30 -o ServerAliveCountMax=6
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-dst()    { ssh -n "${SSHO[@]}" "root@${DST}" "$@"; }    # sin stdin (no se come el del llamador)
-dst_in() { ssh "${SSHO[@]}" "root@${DST}" "$@"; }       # con stdin (flujo zfs, ficheros)
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 warn() { log "AVISO: $*"; }
 die() { log "ERROR: $*" >&2; exit 1; }   # a stderr: también se ve desde dentro de $(...)
 
-src_node() { hostname; }
+# ---- ejecución por ROL ------------------------------------------------------------------------------
+# peer: SSH al otro nodo, SIEMPRE iniciado por el nodo que corre el kit. local_sh: el mismo texto de
+# orden ejecutado aquí, con las mismas variables que vería el otro lado.
+peer()    { ssh -n "${SSHO[@]}" "root@${PEER}" "$@"; }    # sin stdin (no se come el del llamador)
+peer_in() { ssh "${SSHO[@]}" "root@${PEER}" "$@"; }       # con stdin (flujo zfs, ficheros)
+local_sh() {
+  PVE_ETC="$PVE_ETC" CPUINFO="$CPUINFO" NV_RAM_GUARD="$NV_RAM_GUARD" NV_RECONCILER="$NV_RECONCILER" \
+    QEMU_PIDDIR="$QEMU_PIDDIR" PROC_DIR="$PROC_DIR" bash -c "$1"
+}
+# on <src|dst> "<orden>" (sin stdin) / on_in <src|dst> "<orden>" (con stdin)
+on() {
+  if [[ "$1" == "$PEER_ROLE" ]]; then peer "$2"; else local_sh "$2" </dev/null; fi
+}
+on_in() {
+  if [[ "$1" == "$PEER_ROLE" ]]; then peer_in "$2"; else local_sh "$2"; fi
+}
+role_name() { [[ "$1" == src ]] && echo "origen ${SRC_NODE}" || echo "destino ${DST_NODE}"; }
 
 check_snap_name() {
   [[ "$1" =~ ^rtmig-[A-Za-z0-9_.:-]+$ ]] || die "el snapshot '$1' debe empezar por rtmig- (solo letras, números y _.:-)"
 }
 
-check_dst_identity() {
+# El nodo que corre el kit tiene que tener la clave de flota (es quien abre las conexiones). Si no la
+# tiene, es justo el caso del modo pull: el kit se corre en el otro nodo.
+check_fleet_key() {
+  [[ -s "$NV_FLEET_KEY" ]] && return 0
+  if [[ "$RTMIG_MODE" == push ]]; then
+    die "este nodo (${LOCAL_NODE}) no tiene la clave de flota (${NV_FLEET_KEY}): no puede abrir SSH hacia ${DST_NODE}. Si es un nodo de otro proveedor (proxmox_nodes.provider ≠ hetzner) y es el ORIGEN, corre el kit en el DESTINO con RTMIG_MODE=pull SRC=<IP de este nodo> SRC_NODE=${LOCAL_NODE}"
+  fi
+  die "este nodo (${LOCAL_NODE}) no tiene la clave de flota (${NV_FLEET_KEY}): en modo pull el kit tiene que correr en un nodo de Hetzner (el destino)"
+}
+
+check_peer_identity() {
   local h
-  h=$(dst hostname 2>/dev/null | tr -d '\r') || true
-  [[ -n "$h" ]] || die "no llego al destino ${DST} por SSH (puerto ${SSH_PORT:-22}); ¿está en el IPSET hosts-ipv6 y tiene la clave de la flota?"
-  [[ "$h" == "$DST_NODE" ]] || die "el destino ${DST} dice llamarse '${h}', no '${DST_NODE}': no sigo"
-  [[ "$h" != "$(src_node)" ]] || die "origen y destino son el mismo nodo (${h})"
+  h=$(peer hostname 2>/dev/null | tr -d '\r') || true
+  [[ -n "$h" ]] || die "no llego a ${PEER} por SSH (puerto ${SSH_PORT:-22}); ¿está en el IPSET hosts-ipv6 y autoriza la clave de la flota?"
+  [[ "$h" == "$PEER_NODE" ]] || die "${PEER} dice llamarse '${h}', no '${PEER_NODE}': no sigo"
+  [[ "$h" != "$LOCAL_NODE" ]] || die "origen y destino son el mismo nodo (${h})"
 }
 
 # Un solo proceso del kit por VM en este nodo (cutover y envíos que escriben).
@@ -104,8 +159,7 @@ EOF
 probe() {
   local where="$1" out line
   P_CONF=""; P_SHA=""; P_UUID=""; P_FW=""; P_FWSHA=""; P_STATUS=""; local pve="" endok=0
-  if [[ "$where" == dst ]]; then out=$(dst "$(probe_cmd)" 2>/dev/null) || true
-  else out=$(PVE_ETC="$PVE_ETC" bash -c "$(probe_cmd)" 2>/dev/null) || true; fi
+  out=$(on "$where" "$(probe_cmd)" 2>/dev/null) || true
   while IFS= read -r line; do
     case "$line" in
       PVE=*) pve="${line#PVE=}" ;; CONF=*) P_CONF="${line#CONF=}" ;; SHA=*) P_SHA="${line#SHA=}" ;;
@@ -113,7 +167,7 @@ probe() {
       FW=*) P_FW="${line#FW=}" ;; STATUS=*) P_STATUS="${line#STATUS=}" ;; PROBE-END) endok=1 ;;
     esac
   done <<< "$out"
-  local name; [[ "$where" == dst ]] && name="destino ${DST_NODE}" || name="origen $(src_node)"
+  local name; name=$(role_name "$where")
   (( endok )) || die "estado INDETERMINADO en ${name}: la consulta no terminó (¿SSH cortado?). No se ha tocado nada; repite cuando responda"
   [[ "$pve" == ok ]] || die "estado INDETERMINADO en ${name}: /etc/pve no está disponible (pmxcfs). No se ha tocado nada"
   [[ ( "$P_CONF" == present || "$P_CONF" == absent ) && ( "$P_FW" == present || "$P_FW" == absent ) ]] \
@@ -123,43 +177,61 @@ probe() {
   fi
 }
 
-# Consulta remota de una propiedad ZFS con respuesta explícita: imprime el valor, o ABSENT SOLO si ZFS
-# dice que el objeto no existe («dataset does not exist»). Cualquier otro error de zfs, o el SSH
+# Propiedad ZFS con respuesta explícita, en cualquiera de los dos lados: imprime el valor, o ABSENT SOLO
+# si ZFS dice que el objeto no existe («dataset does not exist»). Cualquier otro error de zfs, o el SSH
 # caído, es estado INDETERMINADO y se muere.
-dst_zget() {   # <prop> <objeto> [-p]
-  local out val
-  [[ "$1" =~ ^[a-z_@:.A-Za-z0-9-]+$ && "$2" =~ ^[A-Za-z0-9_./@:-]+$ && "${3:-}" =~ ^(-p)?$ ]] \
+zget() {   # <src|dst> <prop> <objeto> [-p]
+  local side="$1" out val name
+  [[ "$2" =~ ^[a-z_@:.A-Za-z0-9-]+$ && "$3" =~ ^[A-Za-z0-9_./@:-]+$ && "${4:-}" =~ ^(-p)?$ ]] \
     || die "consulta ZFS con parámetros raros: $*"
-  out=$(dst "if o=\$(zfs get -H ${3:-} -o value '$1' '$2' 2>&1); then echo \"VAL=\$o\"; elif printf '%s' \"\$o\" | grep -q 'dataset does not exist'; then echo VAL=ABSENT; else echo \"ERR=\$(printf '%s' \"\$o\" | head -1)\"; fi; echo Q-END" 2>/dev/null) || true
-  [[ "$out" == *Q-END* ]] || die "no pude consultar $1 de $2 en el destino (SSH): estado INDETERMINADO"
+  name=$(role_name "$side")
+  out=$(on "$side" "if o=\$(zfs get -H ${4:-} -o value '$2' '$3' 2>&1); then echo \"VAL=\$o\"; elif printf '%s' \"\$o\" | grep -q 'dataset does not exist'; then echo VAL=ABSENT; else echo \"ERR=\$(printf '%s' \"\$o\" | head -1)\"; fi; echo Q-END" 2>/dev/null) || true
+  [[ "$out" == *Q-END* ]] || die "no pude consultar $2 de $3 en ${name} (SSH): estado INDETERMINADO"
   if grep -q '^ERR=' <<< "$out"; then
-    die "zfs falló en el destino al leer $1 de $2 ($(sed -n 's/^ERR=//p' <<< "$out")): estado INDETERMINADO"
+    die "zfs falló en ${name} al leer $2 de $3 ($(sed -n 's/^ERR=//p' <<< "$out")): estado INDETERMINADO"
   fi
   val=$(sed -n 's/^VAL=//p' <<< "$out" | head -1)
-  [[ -n "$val" ]] || die "respuesta vacía de zfs en el destino para $1 de $2: estado INDETERMINADO"
+  [[ -n "$val" ]] || die "respuesta vacía de zfs en ${name} para $2 de $3: estado INDETERMINADO"
   printf '%s\n' "$val"
 }
+dst_zget() { zget dst "$@"; }
+src_zget_guid() { zget src guid "$1"; }
 
-# Lo mismo en el ORIGEN, para el guid de un snapshot: guid, ABSENT si ZFS dice que no existe, o muere.
-src_zget_guid() {
-  local out
-  if out=$(zfs get -H -o value guid "$1" 2>&1); then printf '%s\n' "$out"
-  elif grep -q 'dataset does not exist' <<< "$out"; then echo ABSENT
-  else die "zfs falló en origen al leer el guid de $1 (${out%%$'\n'*}): estado INDETERMINADO"; fi
+# Orden con resultado explícito en un lado: imprime su salida, o muere si falló (rc ≠ 0) o si la
+# respuesta no llegó entera (SSH cortado: INDETERMINADO).
+on_q() {   # <src|dst> "<orden>"
+  local out rc
+  out=$(on "$1" "{ $2 ; } 2>&1; echo \"RTMIG-Q-RC=\$?\"" 2>/dev/null) || true
+  [[ "$out" == *RTMIG-Q-RC=* ]] || die "la orden en $(role_name "$1") no terminó (¿SSH cortado?): estado INDETERMINADO"
+  rc=$(sed -n 's/^RTMIG-Q-RC=//p' <<< "$out" | tail -1)
+  out=$(sed '/^RTMIG-Q-RC=/d' <<< "$out")
+  [[ "$rc" == 0 ]] || die "falló en $(role_name "$1") (rc ${rc}): ${out:0:300}"
+  [[ -z "$out" ]] || printf '%s\n' "$out"
 }
 
-# Publicación segura de un fichero en /etc/pve del destino: se escribe a <final>.rtmig-tmp, se
+# Publicación segura de un fichero en /etc/pve de un lado: se escribe a <final>.rtmig-tmp, se
 # comprueba allí su sha256 y solo entonces se renombra (mv -n: nunca pisa) a la ruta final. pmxcfs
 # hace atómico el rename (es lo que usa el propio PVE). Imprime PUBLISHED, BADSHA, EXISTS, WRITEFAIL,
-# MVFAIL o NOANSWER (SSH sin respuesta completa). <fichero local> <ruta final expandible en destino>
-dst_publish() {
-  local f="$1" final="$2" sha out
+# MVFAIL o NOANSWER (sin respuesta completa). <src|dst> <fichero local> <ruta final expandible>
+publish() {
+  local side="$1" f="$2" final="$3" sha out
   sha=$(sha256sum < "$f" | cut -d' ' -f1)
-  out=$(dst_in "T=\"${final}.rtmig-tmp\"; rm -f \"\$T\"; if ! cat > \"\$T\"; then rm -f \"\$T\"; echo PUB=WRITEFAIL; elif [ \"\$(sha256sum < \"\$T\" | cut -d' ' -f1)\" != '${sha}' ]; then rm -f \"\$T\"; echo PUB=BADSHA; elif [ -e \"${final}\" ]; then rm -f \"\$T\"; echo PUB=EXISTS; elif mv -n \"\$T\" \"${final}\" && [ ! -e \"\$T\" ]; then echo PUB=PUBLISHED; else rm -f \"\$T\"; echo PUB=MVFAIL; fi; echo PUB-END" < "$f" 2>/dev/null) || true
+  out=$(on_in "$side" "T=\"${final}.rtmig-tmp\"; rm -f \"\$T\"; if ! cat > \"\$T\"; then rm -f \"\$T\"; echo PUB=WRITEFAIL; elif [ \"\$(sha256sum < \"\$T\" | cut -d' ' -f1)\" != '${sha}' ]; then rm -f \"\$T\"; echo PUB=BADSHA; elif [ -e \"${final}\" ]; then rm -f \"\$T\"; echo PUB=EXISTS; elif mv -n \"\$T\" \"${final}\" && [ ! -e \"\$T\" ]; then echo PUB=PUBLISHED; else rm -f \"\$T\"; echo PUB=MVFAIL; fi; echo PUB-END" < "$f" 2>/dev/null) || true
   if [[ "$out" == *PUB-END* ]]; then sed -n 's/^PUB=//p' <<< "$out" | head -1; else echo NOANSWER; fi
 }
+dst_publish() { publish dst "$@"; }
 
-# ---- fichero de estado (fases ligadas a VM, UUID, origen, destino, snapshot) ---------------------
+# Copia un fichero de un lado a un fichero local y comprueba su sha256. <src|dst> <ruta expandible>
+# <fichero local> <sha esperado>
+fetch() {
+  local side="$1" path="$2" out="$3" want="$4"
+  on "$side" "cat \"${path}\"" > "${out}.tmp" 2>/dev/null || { rm -f "${out}.tmp"; die "no pude leer ${path} en $(role_name "$side")"; }
+  [[ "$(sha256sum < "${out}.tmp" | cut -d' ' -f1)" == "$want" ]] \
+    || { rm -f "${out}.tmp"; die "la copia de ${path} desde $(role_name "$side") no coincide con su sha256: no sigo"; }
+  mv "${out}.tmp" "$out"
+}
+
+# ---- fichero de estado (fases ligadas a modo, VM, UUID, origen, destino, snapshot) ------------------
 state_get() { [[ -f "$STATE" ]] && sed -n "s/^$1=//p" "$STATE" | head -1 || true; }
 state_set() {   # state_set KEY=VAL ... (fusiona y escribe de forma atómica)
   local tmp="$STATE.tmp.$$" kv k
@@ -180,21 +252,26 @@ require_state() {
   local ok=0 p; for p in "$@"; do [[ "$ph" == "$p" ]] && ok=1; done
   (( ok )) || die "fase actual '${ph}', y este paso necesita: $*"
   [[ "$(state_get VMID)" == "$VMID" ]] || die "el estado es de la VM $(state_get VMID), no de ${VMID}"
-  [[ "$(state_get SRC_NODE)" == "$(src_node)" ]] || die "el estado es de un traslado desde $(state_get SRC_NODE), no desde $(src_node)"
+  [[ "$(state_get MODE)" == "$RTMIG_MODE" ]] || die "el estado es de un traslado en modo $(state_get MODE), no ${RTMIG_MODE}"
+  [[ "$(state_get SRC_NODE)" == "$SRC_NODE" ]] || die "el estado es de un traslado desde $(state_get SRC_NODE), no desde ${SRC_NODE}"
   [[ "$(state_get POOLDS)" == "$POOLDS" ]] || die "el estado es del pool $(state_get POOLDS), no de ${POOLDS}"
-  [[ "$(state_get DST_NODE)" == "$DST_NODE" && "$(state_get DST)" == "$DST" ]] \
-    || die "el estado es de un traslado hacia $(state_get DST_NODE) ($(state_get DST)), no hacia ${DST_NODE} (${DST})"
+  [[ "$(state_get DST_NODE)" == "$DST_NODE" ]] || die "el estado es de un traslado hacia $(state_get DST_NODE), no hacia ${DST_NODE}"
+  [[ "$(state_get PEER)" == "$PEER" ]] || die "el estado es de un traslado con el otro nodo en $(state_get PEER), no en ${PEER}"
   [[ -f "$WORK/${VMID}.conf.src" ]] || die "falta la config aparcada $WORK/${VMID}.conf.src"
   [[ "$(conf_uuid "$WORK/${VMID}.conf.src")" == "$(state_get UUID)" ]] \
     || die "la config aparcada no es la de este traslado (UUID $(conf_uuid "$WORK/${VMID}.conf.src") ≠ $(state_get UUID))"
 }
 
 # ---- config e inventario de discos --------------------------------------------------------------
-# Config de la VM en este nodo: la viva o, si ya se aparcó, la copia de $WORK.
-conf_file() {
-  if [[ -f "$CONF" ]]; then echo "$CONF"
-  elif [[ -f "$WORK/${VMID}.conf.src" ]]; then echo "$WORK/${VMID}.conf.src"
-  else return 1; fi
+# Config de la VM en el ORIGEN, en un fichero local: la copia aparcada si ya existe (salvo con «live»);
+# si no, la viva del origen (leída por el lado que toque) en un temporal. Imprime la ruta.
+conf_file() {   # [live]
+  if [[ "${1:-}" != live && -f "$WORK/${VMID}.conf.src" ]]; then echo "$WORK/${VMID}.conf.src"; return 0; fi
+  mkdir -p "$WORK"
+  local t="$WORK/${VMID}.conf.live"
+  on src "cat \"${R_CONF}\"" > "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+  [[ -s "$t" ]] || { rm -f "$t"; return 1; }
+  echo "$t"
 }
 
 # Inventario COMPLETO de volúmenes de una config (todas las secciones). Solo se admiten zvols
@@ -210,14 +287,14 @@ disk_inventory() {
     if [[ "$vol" =~ ^local-zfs:vm-${VMID}-disk-([0-9]+)$ ]]; then out+=("${BASH_REMATCH[1]}")
     else bad+=("${key}: ${vol}"); fi
   done < "$f"
-  (( ${#bad[@]} == 0 )) || die "volúmenes no soportados por el kit en ${f}: ${bad[*]}"
-  (( ${#out[@]} > 0 )) || die "la config ${f} no tiene discos local-zfs:vm-${VMID}-disk-N"
+  (( ${#bad[@]} == 0 )) || die "volúmenes no soportados por el kit en la config de la VM ${VMID}: ${bad[*]}"
+  (( ${#out[@]} > 0 )) || die "la config de la VM ${VMID} no tiene discos local-zfs:vm-${VMID}-disk-N"
   printf '%s\n' "${out[@]}" | sort -n -u | tr '\n' ' ' | sed 's/ $//'
 }
 
-detect_disks() {
+detect_disks() {   # [live]
   local f inv want
-  f=$(conf_file) || die "no hay config de la VM ${VMID} en este nodo (ni viva ni aparcada)"
+  f=$(conf_file "${1:-}") || die "no hay config de la VM ${VMID} en el origen (ni viva ni aparcada)"
   inv=$(disk_inventory "$f")
   if [[ -n "${DISKS:-}" ]]; then
     want=$(tr -s ' \t' '\n' <<< "$DISKS" | sed '/^$/d' | sort -n -u | tr '\n' ' ' | sed 's/ $//')
@@ -233,4 +310,20 @@ cpu_sig_from() {
            /^cpu family/ && !sf {gsub(/[ \t]/,"",$2); f=$2; sf=1}
            /^model[ \t]*:/ && !sm {gsub(/[ \t]/,"",$2); m=$2; sm=1}
            END {printf "%s|%s|%s", v, f, m}'
+}
+
+# Flujo ZFS de origen a destino, con el limitador en el nodo que corre el kit. Siempre lo abre el nodo
+# que corre el kit: en push, `zfs send` aquí | ssh destino `zfs recv`; en pull, ssh origen `zfs send` |
+# `zfs recv` aquí. Deja en STREAM_RC "envío pv recepción".  <orden de envío> <orden de recepción>
+stream_src_to_dst() {
+  local sendcmd="$1" recvcmd="$2" rc
+  set +e
+  if [[ "$RTMIG_MODE" == push ]]; then
+    local_sh "$sendcmd" </dev/null | ratepipe | peer_in "$recvcmd"
+  else
+    peer "$sendcmd" | ratepipe | local_sh "$recvcmd"
+  fi
+  rc=("${PIPESTATUS[@]}")
+  set -e
+  STREAM_RC="${rc[0]} ${rc[1]} ${rc[2]}"
 }
