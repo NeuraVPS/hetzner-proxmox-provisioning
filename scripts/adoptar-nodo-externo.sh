@@ -192,6 +192,7 @@ phase_net() {
   require_no_guests
   net_lock
   # Una sola transaccion a la vez: si hay una vuelta atras pendiente, no se pisa su copia.
+  [ ! -e "$STATE/net-rollback-failed" ] || die "la ultima vuelta atras quedo INCOMPLETA: $(cat "$STATE/net-rollback-failed"). Revisa la red a mano y borra el marcador"
   if [ -e "$STATE/net-pending" ] || systemctl is-active --quiet nv-adopt-net-rollback.timer; then
     die "hay una transaccion de red pendiente ($(cat "$STATE/net-pending" 2>/dev/null)); ejecuta confirm o espera a la vuelta atras"
   fi
@@ -265,20 +266,31 @@ PY
 exec 9>"$NET_LOCK"; flock -w 300 9 || { logger -t nv-adopt "vuelta atras: sin cerrojo"; exit 1; }
 [ -e "$STATE/net-pending" ] || { logger -t nv-adopt "vuelta atras: nada pendiente (ya confirmado)"; exit 0; }
 echo "rollback-en-curso \$(date -u +%FT%TZ)" > "$STATE/net-rollback-running"
-ok=1
+ok=1; why=""
 for f in 99-neuravps-ra.conf 99-neuravps-proxyarp.conf 99-neuravps-forwarding.conf 99-neuravps-uplink-ra.conf; do
-  if grep -qx "\$f" "$snap/sysctl.list"; then cp -a "$snap/sysctl.d/\$f" /etc/sysctl.d/ || ok=0; else rm -f "/etc/sysctl.d/\$f"; fi
+  if grep -qx "\$f" "$snap/sysctl.list"; then
+    cp -a "$snap/sysctl.d/\$f" /etc/sysctl.d/ && cmp -s "$snap/sysctl.d/\$f" "/etc/sysctl.d/\$f" || { ok=0; why="\$why sysctl:\$f"; }
+  else
+    rm -f "/etc/sysctl.d/\$f"; [ ! -e "/etc/sysctl.d/\$f" ] || { ok=0; why="\$why rm:\$f"; }
+  fi
 done
-cp -a "$snap/interfaces" /etc/network/interfaces || ok=0
-sysctl -q --system
-ifreload -a || ok=0
-[ -x /usr/local/sbin/neuravps-tunnels.sh ] && /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1
-rm -f "$STATE/net-rollback-running"
+cp -a "$snap/interfaces" /etc/network/interfaces && cmp -s "$snap/interfaces" /etc/network/interfaces || { ok=0; why="\$why eni"; }
+sysctl -q --system || { ok=0; why="\$why sysctl--system"; }
+ifreload -a || { ok=0; why="\$why ifreload"; }
+# En un nodo ya adoptado, la /32 propia y la ruta de la tabla 102 tienen que volver.
+if [ -x /usr/local/sbin/neuravps-tunnels.sh ]; then
+  /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1 || { ok=0; why="\$why tunnels"; }
+  ip -4 addr show dev lo | grep -q "inet $(node_v4)/32" || { ok=0; why="\$why lo/32"; }
+  ip -4 route get 1.1.1.1 from $(node_v4) 2>/dev/null | grep -q 'dev tun-' || { ok=0; why="\$why tabla102"; }
+fi
 if [ "\$ok" = 1 ]; then
-  rm -f "$STATE/net-pending"
+  rm -f "$STATE/net-pending" "$STATE/net-rollback-running"
   logger -t nv-adopt "red restaurada desde $snap (sin confirmar)"
 else
-  logger -t nv-adopt "vuelta atras INCOMPLETA desde $snap: net-pending se conserva, revisa a mano"
+  # Marcador de fallo explicito: confirm lo rechaza hasta que alguien lo revise.
+  echo "vuelta atras INCOMPLETA \$(date -u +%FT%TZ):\$why (copia $snap)" > "$STATE/net-rollback-failed"
+  rm -f "$STATE/net-rollback-running"
+  logger -t nv-adopt "vuelta atras INCOMPLETA desde $snap:\$why; net-pending y net-rollback-failed se conservan, revisa a mano"
   exit 1
 fi
 EOF
@@ -318,7 +330,8 @@ EOF
 
 phase_confirm() {
   net_lock
-  [ ! -e "$STATE/net-rollback-running" ] || die "hay una vuelta atras en curso o incompleta ($STATE/net-rollback-running); revisa la red antes"
+  [ ! -e "$STATE/net-rollback-running" ] || die "hay una vuelta atras en curso ($STATE/net-rollback-running); revisa la red antes"
+  [ ! -e "$STATE/net-rollback-failed" ] || die "la ultima vuelta atras quedo INCOMPLETA: $(cat "$STATE/net-rollback-failed"). Revisa la red a mano y borra el marcador"
   systemctl is-active --quiet nv-adopt-net-rollback.service && die "la vuelta atras se esta ejecutando ahora mismo; no la interrumpo"
   [ -e "$STATE/net-pending" ] || systemctl is-active --quiet nv-adopt-net-rollback.timer \
     || die "no hay transaccion de red pendiente (¿ya vencio la vuelta atras?)"
@@ -494,10 +507,17 @@ phase_node() {
   if [ -e "$hostfw" ]; then cp -a "$hostfw" "$fwbak/host.fw" || die "no pude respaldar host.fw"; else : > "$fwbak/host.fw.absent"; fi
   fw_restore_die() {
     log "cortafuegos candidato RECHAZADO: $*; repongo la configuracion anterior ($fwbak)"
-    if [ -e "$fwbak/cluster.fw.absent" ]; then rm -f /etc/pve/firewall/cluster.fw; else cp "$fwbak/cluster.fw" /etc/pve/firewall/cluster.fw; fi
-    if [ -e "$fwbak/host.fw.absent" ]; then rm -f "$hostfw"; else cp "$fwbak/host.fw" "$hostfw"; fi
-    pve-firewall restart >/dev/null 2>&1 || true
-    die "$* (configuracion anterior repuesta; el cortafuegos del piloto, si lo habia, sigue puesto)"
+    local bad=""
+    if [ -e "$fwbak/cluster.fw.absent" ]; then rm -f /etc/pve/firewall/cluster.fw; [ ! -e /etc/pve/firewall/cluster.fw ] || bad="$bad cluster.fw(borrar)"
+    else cp "$fwbak/cluster.fw" /etc/pve/firewall/cluster.fw && cmp -s "$fwbak/cluster.fw" /etc/pve/firewall/cluster.fw || bad="$bad cluster.fw(copiar)"; fi
+    if [ -e "$fwbak/host.fw.absent" ]; then rm -f "$hostfw"; [ ! -e "$hostfw" ] || bad="$bad host.fw(borrar)"
+    else cp "$fwbak/host.fw" "$hostfw" && cmp -s "$fwbak/host.fw" "$hostfw" || bad="$bad host.fw(copiar)"; fi
+    pve-firewall restart >/dev/null 2>&1 || bad="$bad pve-firewall-restart"
+    if [ ! -e "$fwbak/cluster.fw.absent" ]; then
+      sleep 3; pve-firewall status 2>/dev/null | grep -q 'enabled/running' || bad="$bad pve-firewall-no-running"
+    fi
+    [ -z "$bad" ] || die "$* | LA REPOSICION FALLO en:$bad. Respaldo en $fwbak; revisa el cortafuegos a mano YA"
+    die "$* (configuracion anterior repuesta y verificada desde $fwbak; el cortafuegos del piloto, si lo habia, sigue puesto)"
   }
   cp "$CLUSTER_FW" /etc/pve/firewall/cluster.fw || fw_restore_die "no pude escribir cluster.fw"
   if [ -n "${HOST_FW_V4:-}" ]; then
