@@ -44,17 +44,18 @@ dirección node64 sigue pudiendo salir por la uplink del nodo (fuera de pools y 
 Ante un error leyendo el estado (`ip`, `vmbr0`, `cluster.fw`, lista de excluidas) la pasada
 **no toca** lo puesto y sale con error (`ULTIMA=exit-code` en `--mirar`). Un `vmbr0` sin /64
 solo se acepta con el marcador `/etc/neuravps/node64-guard-sin64` (el despliegue lo pone en
-los nodos de `--sin64`, hoy solo 0000266-KDM-9755).
+los nodos de `--sin64`, hoy solo 0000266-KDM-9755); ahí la tabla se pone con `node64`
+vacío y solo actúa `nv-spoof` (el nodo también lleva IDENT a las bases).
 
 `MODE` va por drop-in (`/etc/systemd/system/nvx-node64.service.d/mode.conf`). El timer
 reaplica cada 5 min, pero solo reconstruye la tabla (en una transacción atómica) si el
 conjunto calculado cambia o si la tabla falta (p. ej. tras un `flush ruleset`), así que
-los contadores se conservan. Sin /64 en `vmbr0` (Kademar) no pone nada.
+los contadores se conservan.
 
 ## Operación
 
 ```bash
-scripts/despliega-node64.py --solo-mirar                       # estado de la flota
+scripts/despliega-node64.py --solo-mirar --modo drop            # ¿sigue protegida la flota?
 scripts/despliega-node64.py --nodos <a,b> --modo count          # canario: solo cuenta
 scripts/despliega-node64.py --nodos <a,b> --modo drop           # armar
 scripts/despliega-node64.py --modo drop --excluir 520,1306,...  # otra lista de excluidas

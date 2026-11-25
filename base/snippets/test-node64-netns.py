@@ -256,6 +256,7 @@ except Exception as e:print("MUERTA",type(e).__name__)
               sh("nft", "list", "table", "inet", "nvxnode64", check=False).returncode == 0)
         sh("ip", "link", "set", "vmbrX", "name", "vmbr0"); sh("ip", "link", "set", "vmbr0", "up")
         sh("ip", "-6", "addr", "add", f"{N64}::1/64", "dev", "vmbr0", "nodad")  # el down la borra
+        sh("ip", "-6", "route", "replace", "2a01:4f9:c01f:e::/64", "dev", "vmbr0")  # y la ruta IDENT
         time.sleep(1)
         run("--quitar")
         check("--quitar reabre (marcha atras)", any(tcp(inet, STRANGER, LEGACY) or time.sleep(.3)
@@ -274,9 +275,15 @@ except Exception as e:print("MUERTA",type(e).__name__)
         (tmp / "allow.x").rename(tmp / "allow")
         sh("ip", "-6", "addr", "del", f"{N64}::1/64", "dev", "vmbr0")
         (tmp / "sin64").write_text("")
+        # La puerta de enlace sigue (como /128, no cuenta como /64 propio) para medir la salida.
+        sh("ip", "-6", "addr", "add", f"{N64}::1/128", "dev", "vmbr0", "nodad")
+        sh("ip", "-6", "route", "replace", f"{N64}::/64", "dev", "vmbr0")
+        time.sleep(1)
         r = run()
-        check("vmbr0 sin /64 CON marcador (Kademar) quita y no pone nada",
-              "nada que guardar" in r.stdout and "nvxnode64" not in sh("nft", "list", "tables").stdout)
+        m = mirar()
+        check("vmbr0 sin /64 CON marcador (Kademar): tabla con node64 vacio y nv-spoof activo",
+              r.returncode == 0 and "TABLA=si" in m and "N64OK=si" in m and "NODE64=-" in m
+              and not tcp(gb, ID_RESV, STRANGER) and tcp(gb, ID_OK, STRANGER))
     finally:
         for p in procs:
             p.kill()

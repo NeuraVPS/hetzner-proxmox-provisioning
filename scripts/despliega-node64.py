@@ -11,6 +11,7 @@ codigo 1 si algun nodo queda MAL.
                       [--sin64 0000266-KDM-9755] [--hilos N] [--base b1|b0]
                       [--solo-mirar | --quitar]
 
+`--solo-mirar` verifica que cada nodo siga protegido en el `--modo` indicado.
 `--modo count` (defecto) solo cuenta y registra: canario. Con FINAL/SALIDA
 revisados, se repasa con `--modo drop`. Repetir el mismo modo no reinicia los
 contadores (la pasada solo reconstruye si algo cambia).
@@ -95,15 +96,20 @@ def veredicto(accion, modo, sin64, n, d):
     if accion == "instalar":
         unidades = (d.get("TIMER") == "enabled" and d.get("TIMERACT") == "active"
                     and d.get("SERVICIO") == "enabled" and d.get("ULTIMA") == "success")
-        if n in sin64:
-            return unidades and d.get("NODE64") == "-" and d.get("TABLA") == "no"
-        return (unidades and d.get("TABLA") == "si" and d.get("MODO") == modo
-                and d.get("N64OK") == "si")
-    # mirar
+        return unidades and protegido(modo, sin64, n, d)
+    # mirar: acredita que el nodo sigue protegido en el modo pedido
+    return protegido(modo, sin64, n, d)
+
+
+def protegido(modo, sin64, n, d):
+    """Tabla completa, en el modo pedido, con el /64 vivo cargado (vacio solo en --sin64)."""
+    p64 = d.get("NODE64")
     if n in sin64:
-        return d.get("NODE64") == "-" and d.get("TABLA") == "no"
-    return d.get("NODE64") not in ("error", "-") and (
-        d.get("TABLA") == "no" or (d.get("TABLA") == "si" and d.get("N64OK") == "si"))
+        if p64 != "-":
+            return False
+    elif p64 in ("error", "-", None):
+        return False
+    return d.get("TABLA") == "si" and d.get("MODO") == modo and d.get("N64OK") == "si"
 
 
 def main():

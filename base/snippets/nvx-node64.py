@@ -47,7 +47,8 @@
 # estructura viva no es la esperada (un `flush ruleset`, un reinicio), asi que
 # los contadores se conservan. Ante un ERROR leyendo el estado (ip, cluster.fw,
 # lista de excluidas) NO toca lo que haya puesto y sale con error. Si vmbr0
-# existe y no tiene /64 propio (Kademar), no pone nada.
+# existe y no tiene /64 propio (Kademar, con el marcador SIN64), pone la tabla
+# con node64 vacio: solo actua nv-spoof.
 #
 #   nvx-node64.py            aplica (MODE del entorno; defecto drop)
 #   nvx-node64.py --mirar    estado en una linea KEY=VALOR
@@ -323,7 +324,7 @@ def mirar():
         print(f"TABLA=no BR={br} NODE64={p64} {tail}")
         return
     mode, c, ok, s64 = st
-    n64ok = "si" if vivos and s64 == {str(n) for n in vivos} else "no"
+    n64ok = "si" if vivos is not None and s64 == {str(n) for n in vivos} else "no"
     print(f"TABLA={'si' if ok else 'incompleta'} MODO={mode} NODE64={p64} N64OK={n64ok} SPOOF={c.get('nv-spoof', 0)} "
           f"EXCL={c.get('nv-excl', 0)} AJENA={c.get('nv-excl-ajena', 0)} "
           f"INFRA={c.get('nv-infra', 0) + c.get('nv-infra-tun', 0)} "
@@ -344,13 +345,10 @@ def quitar():
 def aplicar(mode):
     st = estado()
     p64 = node64_prefixes()          # Fallo => no se toca nada
-    if not p64:
-        if not os.path.exists(SIN64):
-            raise Fallo(f"vmbr0 sin /64 propio y sin el marcador {SIN64}")
-        if st is not None or sh("nft", "list", "table", "bridge", BTABLE).returncode == 0:
-            quitar()
-        print("nvx-node64: vmbr0 sin /64 propio (marcado); nada que guardar")
-        return 0
+    if not p64 and not os.path.exists(SIN64):
+        raise Fallo(f"vmbr0 sin /64 propio y sin el marcador {SIN64}")
+    # Sin /64 (Kademar, marcado): la tabla va igual, con node64 vacio. La entrada
+    # no tiene nada que guardar, pero nv-spoof si (el nodo lleva IDENT a la base).
     try:
         sets = ipsets()
     except Fallo:
@@ -375,7 +373,7 @@ def aplicar(mode):
     with open(STATE + ".tmp", "w") as f:
         f.write(text)
     os.replace(STATE + ".tmp", STATE)
-    print(f"nvx-node64: guarda puesta (modo {mode}) en {', '.join(map(str, p64))}")
+    print(f"nvx-node64: guarda puesta (modo {mode}) en {', '.join(map(str, p64)) or 'ningun /64 (solo nv-spoof)'}")
     return 0
 
 
