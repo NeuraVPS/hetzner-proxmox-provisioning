@@ -194,6 +194,32 @@ def plan_fits_model(model, plan):
     return False
 
 
+def node_vm_cap(data):
+    """Hard VM-count cap of an SQX node (proxmox_nodes.max_vm), or None.
+
+    Mirror of NeuraVPS auto_provision.sqx_vm_cap (Kademar 0000266, 2026-11-25:
+    26 vps-e, raised by editing max_vm in admin/nodos). Only SQX nodes: on MT5
+    max_vm is a legacy secondary cap, and VPS-E nodes (max_vm == 1) take no
+    part in the defrag. Absent / 0 / garbage -> None (no cap, as before)."""
+    if node_model(data) != "SQX":
+        return None
+    try:
+        cap = int((data or {}).get("max_vm"))
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
+def dest_capped(dn):
+    """A node with a hard VM cap is NEVER a defrag/relief destination
+    (operator decision 25/11): its entries are controlled manual moves (cold
+    move kit) only. Reserving slots across a planned-from-a-snapshot batch,
+    racing new orders and moves dropped at execution time, is exactly what
+    this avoids. It can still be a SOURCE. Nodes without the field (every
+    node but 0000266 on 25/11) are unaffected."""
+    return dn.get("vm_cap") is not None
+
+
 def dest_allows(dn, vm):
     """A destination with an allow-list only takes the listed plans, and no
     node takes a plan of the other type. A VM with no known plan is refused."""
@@ -761,6 +787,7 @@ def main():
         nodes[nd.id] = {
             "model": model, "ip": d.get("ip") or "", "frozen": bool(d.get("frozen")),
             "allowed": node_allowed(d),
+            "vm_cap": node_vm_cap(d),
             "status": str(d.get("status") or "").strip(),
             "g": base_ram(d),
             # PHYSICAL RAM, for the MT RAM gate (v14). `g` is the declared
@@ -907,6 +934,8 @@ def main():
                 continue   # never SQX<->MT, whatever the caller asked for
             if not dest_allows(dn, vm):
                 continue
+            if dest_capped(dn):
+                continue   # max_vm node: manual entries only (see dest_capped)
             if not cpu_move_ok(vm_cpu, src.get("sig"), dn.get("sig")):
                 continue
             if not disk_ok(dn):
