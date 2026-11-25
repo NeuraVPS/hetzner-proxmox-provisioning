@@ -2,7 +2,8 @@
 # rtmig_cutover.sh — pasos del corte de un traslado en frío con precopia ZFS (ver README.md).
 # Se ejecuta EN EL NODO ORIGEN (root). Habla con el destino por SSH directo nodo→nodo.
 #
-#   shutdown [timeout_s]     comprobaciones previas (discos, CPU/licencias, destino libre) y
+#   shutdown [timeout_s]     comprobaciones previas (sin cambios [PENDING], discos, CPU/licencias,
+#                            destino libre) y
 #                            qm shutdown ORDENADO (nunca stop/forceStop). Si vence el tiempo, sale
 #                            con error y la VM SIGUE encendida: decide una persona.
 #   park                     con la VM parada: guarda el historial del reconciliador de globo
@@ -246,6 +247,25 @@ finish_push() {
   dst "qm config $VMID" 2>/dev/null | grep -E "^(balloon|memory|cores|cpu|scsi0|efidisk0|tpmstate0|net0|hookscript|name):" || true
 }
 
+# Config del origen sin cambios pendientes: imprime su sha256, o muere. La lectura tiene que ser
+# correcta (awk con rc 0 y una respuesta CLEAN|PENDING explícita): cualquier otra cosa aborta. La
+# cabecera se reconoce como PVE (QemuServer: /^\[PENDING\]\s*$/i, sin distinguir mayúsculas y con
+# espacios al final); los «delete:» pendientes solo existen dentro de esa sección.
+conf_clean_sha() {
+  local out sha
+  [[ -s "$CONF" ]] || die "no pude leer la config de la VM ${VMID} ($CONF)"
+  out=$(awk 'BEGIN{p=0} { l=tolower($0); sub(/[ \t\r]+$/, "", l); if (l == "[pending]") p=1 } END{print (p ? "PENDING" : "CLEAN")}' "$CONF") \
+    || die "no pude leer la config de la VM ${VMID} para buscar cambios pendientes: no apago"
+  case "$out" in
+    CLEAN) ;;
+    PENDING) die "la config de la VM ${VMID} tiene cambios pendientes ([PENDING]) que PVE aplicaría al apagarla: la config validada no sería la que se traslada. Aplícalos (reiniciando la VM) o revíertelos (qm set ${VMID} --revert <claves>) y vuelve a lanzar shutdown. No se ha tocado nada" ;;
+    *) die "respuesta rara al buscar cambios pendientes en la config de la VM ${VMID}: no apago" ;;
+  esac
+  sha=$(sha256sum < "$CONF" | cut -d' ' -f1) || die "no pude leer la config de la VM ${VMID}"
+  [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || die "no pude leer la config de la VM ${VMID}"
+  echo "$sha"
+}
+
 take_lock
 finish_archive   # archivado pendiente de una fase terminal anterior (si se cortó justo después)
 CMD="${1:-}"
@@ -258,6 +278,10 @@ case "$CMD" in
     no_active_transfer
     probe src
     [[ "$P_CONF" == present && "$P_STATUS" == running ]] || die "la VM ${VMID} no está 'running' en origen (config ${P_CONF}, estado ${P_STATUS})"
+    # Cambios pendientes: PVE los aplica al parar la VM (QemuServer vm_stop_cleanup / _do_vm_stop), así
+    # que la config que se valida aquí no sería la que se aparca y se publica. Se exige una config sin
+    # sección [PENDING] ANTES de apagar (se vuelve a comprobar justo antes de `qm shutdown`).
+    CONF_SHA0=$(conf_clean_sha)
     # Comprobaciones previas, ANTES de apagar: inventario de discos, CPU/licencias y destino libre.
     DISKS=$(detect_disks)
     RUN_CPU=$(running_cpu)
@@ -269,6 +293,11 @@ case "$CMD" in
     [[ -n "$(conf_uuid "$CONF")" ]] || die "la config no tiene smbios1 uuid: el kit no puede ligar el traslado a la VM"
     printf '%s\n' "$RUN_CPU" > "$WORK/${VMID}.run-cpu"
     log "previas OK: discos ${DISKS}; corre con ${RUN_CPU}, arrancará con ${CPU_OLD}${CPU_NEW:+ → ${CPU_NEW} en push}; destino libre"
+    # Justo antes de apagar: la config sigue sin [PENDING] y es EXACTAMENTE la que se ha comprobado (una
+    # edición concurrente durante las comprobaciones remotas hace abortar con la VM en marcha).
+    [[ "$(conf_clean_sha)" == "$CONF_SHA0" ]] \
+      || die "la config de la VM ${VMID} cambió mientras se hacían las comprobaciones: vuelve a lanzar shutdown. No se ha tocado nada"
+    printf '%s\n' "$CONF_SHA0" > "$WORK/${VMID}.shutdown-conf-sha"
     log "qm shutdown ${VMID} --timeout ${T} (ordenado; sin forceStop)"
     t0=$SECONDS
     if qm shutdown "$VMID" --timeout "$T"; then
@@ -279,11 +308,20 @@ case "$CMD" in
       die "Windows no se apagó en ${T} s. NO forzar. La VM sigue en estado '${P_STATUS}'. Escalar (README §Apagado)."
     fi
     [[ "$P_STATUS" == "stopped" ]] || die "tras el shutdown el estado es '${P_STATUS}'"
+    # Si alguien metió un cambio pendiente DURANTE el apagado, PVE lo ha aplicado al parar: la config ya
+    # no es la comprobada. No se impide, pero se detecta, y park tampoco seguirá con ella.
+    [[ "$(sha256sum < "$CONF" | cut -d' ' -f1)" == "$CONF_SHA0" ]] \
+      || die "la config de la VM ${VMID} cambió durante el apagado (¿un cambio pendiente aplicado al parar?): la VM está parada en el origen con una config distinta de la comprobada. Revísala; para seguir, arráncala (qm start ${VMID}) y repite el corte desde shutdown"
     ;;
   park)
     no_active_transfer
     probe src
     [[ "$P_CONF" == present && "$P_STATUS" == stopped ]] || die "solo con la VM parada y su config en /etc/pve (config ${P_CONF}, estado ${P_STATUS})"
+    # La config a aparcar tiene que ser la que comprobó shutdown (si el apagado lo hizo el kit).
+    if [[ -f "$WORK/${VMID}.shutdown-conf-sha" ]]; then
+      [[ "$(sha256sum < "$CONF" | cut -d' ' -f1)" == "$(head -1 "$WORK/${VMID}.shutdown-conf-sha")" ]] \
+        || die "la config de la VM ${VMID} no es la que comprobó shutdown (¿cambio pendiente aplicado al parar?): no la aparco. Revísala; para seguir, arráncala (qm start ${VMID}) y repite el corte desde shutdown"
+    fi
     for f in conf.src fw.src balloon-state conf.push; do
       [[ ! -e "$WORK/${VMID}.${f}" ]] || die "queda una copia anterior $WORK/${VMID}.${f} (¿traslado a medias o rollback antiguo?); revísala y archívala a mano"
     done
@@ -294,26 +332,50 @@ case "$CMD" in
     [[ "$P_FW" == absent ]] || die "el destino ${DST_NODE} tiene un .fw de la VM ${VMID} sin config: no es de este traslado; revísalo"
     # Historial del reconciliador de globo: export-state necesita la config viva, así que va ANTES de
     # aparcar. Solo si este nodo tiene reconciliador (en un EX44 no hay historial que llevar).
+    BALLOON_EXPORT=''   # nunca heredada del entorno
     if has_reconciler_src; then
       if B=$(python3 "$NV_RAM_GUARD" export-state "$VMID" "$(src_node)" 2>/dev/null) && [[ "$B" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-        printf '%s\n' "$B" > "$WORK/${VMID}.balloon-state"
-        log "historial del globo exportado a $WORK/${VMID}.balloon-state"
+        BALLOON_EXPORT="$B"   # se escribe solo si el park sale adelante (ver más abajo)
+        log "historial del globo exportado"
       else
         warn "no pude exportar el historial del globo (el destino lo reaprenderá de forma conservadora)"
       fi
     else
       log "este nodo no tiene reconciliador de globo: no hay historial que exportar"
     fi
-    cp -a "$CONF" "$WORK/${VMID}.conf.src"
-    [[ -f "$FW" ]] && cp -a "$FW" "$WORK/${VMID}.fw.src"
-    cmp -s "$CONF" "$WORK/${VMID}.conf.src" || die "la copia de la config no coincide"
-    if [[ -f "$FW" ]]; then cmp -s "$FW" "$WORK/${VMID}.fw.src" || die "la copia del .fw no coincide"; fi
+    # Copia PROVISIONAL, y solo si es exactamente la config que comprobó shutdown (y la del origen en
+    # este momento) se promueve a la copia aparcada. Si algo cambió durante la sonda del destino o el
+    # export, la config se queda en el origen y la provisional se descarta.
+    STG_CONF="$WORK/${VMID}.conf.staging"; STG_FW="$WORK/${VMID}.fw.staging"
+    rm -f "$STG_CONF" "$STG_FW" "$WORK/${VMID}.balloon-state.staging"
+    discard_staging() { rm -f "$STG_CONF" "$STG_FW" "$WORK/${VMID}.balloon-state.staging"; die "$1. La config se queda en el origen; no se ha aparcado nada. Revísala; para seguir, arranca la VM (qm start ${VMID}) y repite el corte desde shutdown"; }
+    cp -a "$CONF" "$STG_CONF" || discard_staging "no pude copiar la config"
+    [[ -f "$FW" ]] && { cp -a "$FW" "$STG_FW" || discard_staging "no pude copiar el .fw"; }
+    STG_SHA=$(sha256sum < "$STG_CONF" | cut -d' ' -f1)
+    if [[ -f "$WORK/${VMID}.shutdown-conf-sha" && "$STG_SHA" != "$(head -1 "$WORK/${VMID}.shutdown-conf-sha")" ]]; then
+      discard_staging "la config de la VM ${VMID} cambió desde que la comprobó shutdown"
+    fi
+    [[ "$(conf_uuid "$STG_CONF")" == "$UUID" && "$(disk_inventory "$STG_CONF")" == "$DISKS" ]] \
+      || discard_staging "la config de la VM ${VMID} cambió durante el park (UUID o discos)"
+    # Y el origen sigue siendo exactamente esa copia justo antes de aparcarla.
+    cmp -s "$CONF" "$STG_CONF" || discard_staging "la config de la VM ${VMID} cambió durante el park"
+    if [[ -f "$FW" || -f "$STG_FW" ]]; then
+      [[ -f "$FW" && -f "$STG_FW" ]] && cmp -s "$FW" "$STG_FW" || discard_staging "el .fw de la VM ${VMID} cambió durante el park"
+    fi
+    # Validado: se promueven las copias, y el historial del globo (si se exportó) se escribe ahora, no
+    # antes: un park descartado no deja nada con nombre definitivo que bloquee el reintento.
+    if [[ -n "${BALLOON_EXPORT:-}" ]]; then
+      printf '%s\n' "$BALLOON_EXPORT" > "$WORK/${VMID}.balloon-state.staging"
+      mv "$WORK/${VMID}.balloon-state.staging" "$WORK/${VMID}.balloon-state"
+    fi
+    [[ -f "$STG_FW" ]] && mv "$STG_FW" "$WORK/${VMID}.fw.src"
+    mv "$STG_CONF" "$WORK/${VMID}.conf.src"
     # El estado se abre ANTES de quitar la config: si algo cae aquí, push verá la config en origen y parará.
     rm -f "$STATE"
     state_set "VMID=${VMID}" "UUID=${UUID}" "SRC_NODE=$(src_node)" "DST_NODE=${DST_NODE}" "DST=${DST}" \
               "DISKS=${DISKS}" "POOLDS=${POOLDS}" "PHASE=parked" "PARKED_AT=$(date -u +%FT%TZ)" \
               "RUN_CPU=$(head -1 "$WORK/${VMID}.run-cpu" 2>/dev/null | tr -cd 'A-Za-z0-9._+-')"
-    rm -f "$WORK/${VMID}.run-cpu"
+    rm -f "$WORK/${VMID}.run-cpu" "$WORK/${VMID}.shutdown-conf-sha"
     rm -f "$CONF"; [[ -f "$WORK/${VMID}.fw.src" ]] && rm -f "$FW"
     probe src
     [[ "$P_CONF" == absent ]] || die "qm aún ve la config de la VM en origen"

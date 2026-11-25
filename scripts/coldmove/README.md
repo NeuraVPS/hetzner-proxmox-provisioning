@@ -79,8 +79,23 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
    los discos, usa la misma base, verifica por guid y limpia de forma idempotente.
 3. **Corte, a la hora pactada:**
    1. `./rtmig_cutover.sh shutdown 600`: primero las comprobaciones previas, **antes de apagar**:
-      inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
-      libre. Luego el apagado ordenado. Si Windows no se apaga, **no se fuerza**: decide una persona.
+      - que la config **no tenga cambios pendientes**: ninguna sección `[PENDING]`, reconocida como
+        en PVE, sin distinguir mayúsculas y con espacios finales. PVE los aplica al parar la VM, así
+        que la config validada no sería la que se traslada.
+        - Si los hay, se aplican (reiniciando la VM) o se revierten (`qm set <VMID> --revert
+          <claves>`) y se vuelve a lanzar.
+        - Si la config no se puede leer bien, también aborta.
+        - Justo antes de `qm shutdown` se vuelve a leer: tiene que seguir limpia y ser idéntica (sha256)
+          a la comprobada.
+        - Tras el apagado se compara otra vez. Si alguien metió un cambio pendiente durante el
+          apagado, PVE lo aplica al parar: `shutdown` lo detecta y `park` no aparca esa config;
+        - `park` copia primero a un fichero provisional. Solo lo promueve a la copia aparcada si su
+          sha256 es el que comprobó `shutdown`, y si el origen sigue siendo idéntico. Si no, la
+          config se queda en el origen y lo provisional se descarta;
+      - inventario de discos, CPU y licencias (ver abajo; el `ACK` va ya en esta orden) y destino
+        libre.
+
+      Luego viene el apagado ordenado. Si Windows no se apaga, **no se fuerza**: decide una persona.
    2. `./rtmig_cutover.sh park`: exporta el historial del reconciliador de globo (si el origen lo
       tiene) y aparca la config en `$WORK`. Así nadie puede arrancar la VM en origen. Los zvols se
       quedan.
@@ -93,8 +108,8 @@ En el nodo origen: `cd /root/rtmig && export VMID=… DST=… DST_NODE=…`.
         entonces se renombra con `mv -n`, que pmxcfs hace atómico. Después se relee y se comparan
         el sha256 y el UUID;
       - si el origen no tiene `.fw`, el destino tampoco puede tenerlo;
-      - con un cambio `[PENDING]` de cpu o balloon que haya que fijar, se niega. La CPU que decide
-        la guarda es la que arrancará, es decir, la de `[PENDING]` si la hay;
+      - con un cambio `[PENDING]` de cpu o balloon que haya que fijar, se niega (segundo seguro: el
+        primero es que `shutdown` ya no deja apagar con cambios pendientes);
       - la decisión de CPU y el aviso quedan en el estado antes de publicar. El cierre del push es
         uno solo para el camino normal y para la reanudación: verifica la config y el `.fw`, deja
         la constancia en `cpu-change.txt` una sola vez e importa el historial del globo una sola
@@ -127,7 +142,7 @@ La regla es la misma que en `migrate_vm.sh` y en el defrag. La vía fría direct
   `CHANGE_CPU=1`.
 - **Cambio de modelo pendiente.** `shutdown` lee con qué CPU corre de verdad la VM (la línea `-cpu`
   de QEMU) y la compara con la del próximo arranque. Si son de clase distinta, por ejemplo `host` en
-  marcha con `[PENDING] cpu: x86-64-v4`, el Hardware ID cambia aunque el silicio no cambie, y se
+  marcha con la config ya en `x86-64-v4`, el Hardware ID cambia aunque el silicio no cambie, y se
   pide la misma constancia. La CPU en marcha queda en el estado (`RUN_CPU`) para `push`.
 - **`cpu: host`/`max`, otro modelo con nombre o sin línea `cpu`, cuando el silicio cambia**
   (vendor|family|model): el Hardware ID cambia. `shutdown` y `push` se niegan si no llevan una de
