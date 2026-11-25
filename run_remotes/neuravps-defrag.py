@@ -240,6 +240,8 @@ def dest_allows(dn, vm):
 #     Ryzen 7950X3D (25/97/2) is not, so a host guest never moves AX162<->AX102.
 #   * live AMD<->Intel is never allowed, generic or not (x86-64-v4 Windows
 #     bugchecked ~20 s after resuming on Intel, 10/10/2026).
+#   * a generic guest also needs the same CPU family (25/11/2026: Zen4 25 <->
+#     Zen5 26, e.g. AX162 <-> Kademar Turin, is cold-only).
 # Everything unknown -> no move: an unreadable VM config or an unprobed node
 # never yields a destination.
 GENERIC_CPU_RE = re.compile(r"^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$")
@@ -258,6 +260,12 @@ def cpu_move_ok(vm_cpu, src_sig, dst_sig):
     if not src_sig.get("vendor") or src_sig.get("vendor") != dst_sig.get("vendor"):
         return False
     if vm_cpu_generic(vm_cpu):
+        # Same CPU FAMILY too (25/11/2026, Kademar EPYC 9755 Turin = family 26
+        # next to the Zen4 family-25 AX162/AX102): nothing live across silicon
+        # generations. migrate_vm.sh refuses it (_live_silicon_guard), so
+        # planning it would only produce a failed move. Unknown -> no.
+        if not src_sig.get("family") or src_sig.get("family") != dst_sig.get("family"):
+            return False
         # x86-64-v4 needs AVX-512 on the destination (PVE adds `enforce`: the
         # guest would refuse to run); unknown -> no.
         if str(vm_cpu).split(",")[0].strip().lower().startswith("x86-64-v4"):

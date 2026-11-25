@@ -97,14 +97,84 @@ class CrossVendorGuard(unittest.TestCase):
         r = self.guard(AMD, INTEL, env={"NV_LAB_ALLOW_CROSS_VENDOR_LIVE": ""})
         self.assertEqual(r.returncode, 1)
 
-    def test_guard_runs_for_every_model_before_the_host_branch(self):
+    def test_guard_runs_for_every_model_before_the_silicon_guard(self):
         online = SCRIPT.index('if [[ -n "$ONLINE_FLAG" ]]; then\n    CPU_RAW=')
         call = SCRIPT.index('_live_cross_vendor_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"')
-        host = SCRIPT.index('if [[ "$_cpu_lc" == "host" || "$_cpu_lc" == "max" ]]; then', online)
+        silicon = SCRIPT.index('_live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"', online)
         self.assertLess(online, call)
-        self.assertLess(call, host)
+        self.assertLess(call, silicon)
+        # ...and both before anything is copied or upgraded.
+        self.assertLess(silicon, SCRIPT.index('_apt_dist_upgrade src_ssh "source ${SRC_NODE}"'))
+        self.assertLess(silicon, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
         # The old advice was exactly what failed on 10/10.
         self.assertNotIn("or use a baseline cpu model", SCRIPT)
+
+
+TURIN = "AuthenticAMD|26|2"
+RAPHAEL = "AuthenticAMD|25|97"
+
+
+class SiliconGuard(unittest.TestCase):
+    """25/11/2026 (Kademar, EPYC 9755 Turin = AMD 26|2): nothing LIVE across
+    silicon. cpu=host only between identical vendor|family|model; any other
+    model only within the same family (Zen4 25 <-> Zen5 26 refused)."""
+
+    def guard(self, src, dst, model="x86-64-v4", env=None):
+        return run_bash(_fn("_live_silicon_guard")
+                        + 'LIVE_SILICON_MATCH="${LIVE_SILICON_MATCH:-family}"\n'
+                        + f'_live_silicon_guard "{src}" "{dst}" "{model}"\necho PASSED\n', env)
+
+    def assertRefused(self, r, *needles):
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("PASSED", r.stdout)
+        for n in needles:
+            self.assertIn(n, r.stderr)
+
+    def test_genoa_to_turin_refused_for_v4_both_ways(self):
+        for src, dst in ((AMD, TURIN), (TURIN, AMD)):
+            self.assertRefused(self.guard(src, dst), "EN CALIENTE", "FRÍO", "familia")
+
+    def test_host_needs_identical_silicon(self):
+        self.assertRefused(self.guard(AMD, TURIN, "host"), "silicios distintos", "FRÍO")
+        self.assertRefused(self.guard(AMD, RAPHAEL, "host"), "silicios distintos")
+        self.assertRefused(self.guard(AMD, RAPHAEL, "max"), "silicios distintos")
+        # the old flag-superset "upgrade" path is gone: same family, newer model
+        self.assertRefused(self.guard(RAPHAEL, AMD, "HOST"))
+        r = self.guard(AMD, AMD, "host")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("PASSED", r.stdout)
+
+    def test_same_family_generic_moves_still_pass(self):
+        # today's fleet: AX162 Genoa 25|17 and AX102 Raphael 25|97
+        for model in ("x86-64-v4", "x86-64-v3", "kvm64", "<proxmox default>"):
+            r = self.guard(AMD, RAPHAEL, model)
+            self.assertEqual(r.returncode, 0, (model, r.stderr))
+        r = self.guard(TURIN, TURIN)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_model_mode_is_stricter(self):
+        env = {"LIVE_SILICON_MATCH": "model"}
+        self.assertRefused(self.guard(AMD, RAPHAEL, env=env), "LIVE_SILICON_MATCH=model")
+        self.assertEqual(self.guard(AMD, AMD, env=env).returncode, 0)
+        self.assertRefused(self.guard(AMD, AMD, env={"LIVE_SILICON_MATCH": "nope"}),
+                           "solo admite")
+
+    def test_unreadable_signature_refused(self):
+        for src, dst in (("", AMD), (AMD, "garbage"), ("AuthenticAMD||17", AMD),
+                         (AMD, "AuthenticAMD|26|"), ("|25|17", AMD)):
+            self.assertRefused(self.guard(src, dst), "ilegible")
+
+    def test_lab_override_only_for_its_own_vmid(self):
+        r = self.guard(AMD, TURIN, env={"NV_LAB_ALLOW_CROSS_SILICON_LIVE": "777"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("LAB OVERRIDE", r.stderr)
+        for other in ("1", "", "7777"):
+            self.assertRefused(self.guard(AMD, TURIN,
+                                          env={"NV_LAB_ALLOW_CROSS_SILICON_LIVE": other}))
+
+    def test_flag_superset_rule_removed(self):
+        self.assertNotIn("_node_cpu_flags", SCRIPT)
+        self.assertNotIn("Cross-generation UPGRADE", SCRIPT)
 
 
 FAKE_QM = r'''#!/usr/bin/env python3
@@ -125,6 +195,7 @@ if args[1] == "exec":
     assert "-EncodedCommand" not in cmd
     nonce = re.search(r"NV-RUN-([0-9a-f]{32})", cmd[4]).group(1)
     open(os.path.join(state, "nonce"), "w").write(nonce)
+    open(os.path.join(state, "cmd"), "w").write(cmd[4])
     print(json.dumps({"pid": 4242}, indent=3)); sys.exit()
 assert args[1] == "exec-status" and args[2] == "777" and args[3] == "4242", args
 nonce = open(os.path.join(state, "nonce")).read()
@@ -138,6 +209,10 @@ if step == "running":
 if step == "foreign":
     print(json.dumps({"exited": 1, "exitcode": 0,
                       "out-data": "Symlink & credential deployment completed successfully.\r\n"})); sys.exit()
+if isinstance(step, dict):          # w32tm /resync answer
+    assert "w32tm /resync" in open(os.path.join(state, "cmd")).read()
+    out = "﻿NV-RUN-%s\r\nRC:%d\r\nOUT:%s\r\nNV-END-%s\r\n" % (nonce, step["rc"], step["out"], nonce)
+    print(json.dumps({"exited": 1, "exitcode": 0, "out-data": out})); sys.exit()
 boot, now = step
 out = "﻿NV-RUN-%s\r\nBOOT:%d\r\nNOW:%d\r\nNV-END-%s\r\n" % (nonce, boot, now, nonce)
 print(json.dumps({"exited": 1, "exitcode": 0, "out-data": out}, indent=3))
@@ -183,6 +258,76 @@ class GuestBootRead(unittest.TestCase):
         r, _ = self.read({"agent_down": True, "steps": []})
         self.assertEqual(r.returncode, 0)
         self.assertTrue(r.stdout.startswith("FAIL exec-error"), r.stdout)
+
+
+class GuestTimeResync(unittest.TestCase):
+    """w32tm /resync after a move that leaves Windows running (25/11/2026):
+    same nonce runner as the boot read, best-effort, never fails."""
+
+    def resync(self, scenario, live=1, env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "bin").mkdir()
+            qm = t / "bin/qm"
+            qm.write_text(FAKE_QM)
+            qm.chmod(qm.stat().st_mode | stat.S_IEXEC)
+            (t / "scenario.json").write_text(json.dumps(scenario))
+            body = (_var_heredoc("_GUEST_BOOT_PY")
+                    + 'GUEST_TIME_RESYNC="${GUEST_TIME_RESYNC:-1}" GUEST_TIME_RESYNC_BUDGET_S=20\n'
+                    + _fn("_guest_time_resync")
+                    + f'fake_ssh() {{ bash -c "$1"; }}\n_guest_time_resync fake_ssh {live}\necho RC=$?\n')
+            e = {"PATH": f"{t / 'bin'}:{os.environ['PATH']}", "FAKE_STATE": tmp}
+            e.update(env or {})
+            r = run_bash(body, e)
+            calls = (t / "calls").read_text().splitlines() if (t / "calls").exists() else []
+            return r, calls
+
+    def test_success_runs_w32tm_once_with_nonce(self):
+        r, calls = self.resync({"steps": ["running", {"rc": 0, "out": "The command completed successfully."}]})
+        self.assertIn("RC=0", r.stdout, r.stderr)
+        self.assertIn("OK: Reloj del invitado resincronizado", r.stderr)
+        self.assertIn("completed successfully", r.stderr)
+        self.assertEqual(sum('"exec"' in c for c in calls), 1)
+        self.assertNotIn("WARN", r.stderr)
+
+    def test_foreign_result_discarded(self):
+        r, calls = self.resync({"steps": ["foreign", {"rc": 0, "out": "ok"}]})
+        self.assertIn("OK: Reloj del invitado resincronizado", r.stderr)
+        self.assertEqual(sum('"exec"' in c for c in calls), 1)
+
+    def test_w32tm_error_is_a_warning_after_a_live_move(self):
+        r, _ = self.resync({"steps": [{"rc": -2147023834, "out": "The service has not been started. (0x80070426)"}]})
+        self.assertIn("RC=0", r.stdout)
+        self.assertIn("WARN: w32tm /resync en la VM 777 devolvió rc=-2147023834", r.stderr)
+        self.assertIn("0x80070426", r.stderr)
+
+    def test_agent_down_after_cold_boot_is_info_only(self):
+        r, _ = self.resync({"agent_down": True, "steps": []}, live=0)
+        self.assertIn("RC=0", r.stdout)
+        self.assertNotIn("WARN", r.stderr)
+        self.assertIn("INFO: no se pudo lanzar w32tm /resync", r.stderr)
+        self.assertIn("traslado en frío", r.stderr)
+
+    def test_agent_down_after_live_move_warns_never_fails(self):
+        r, _ = self.resync({"agent_down": True, "steps": []}, live=1)
+        self.assertIn("RC=0", r.stdout)
+        self.assertIn("WARN: no se pudo lanzar w32tm /resync", r.stderr)
+
+    def test_switch_off(self):
+        r, calls = self.resync({"steps": [{"rc": 0, "out": "x"}]}, env={"GUEST_TIME_RESYNC": "0"})
+        self.assertIn("RC=0", r.stdout)
+        self.assertEqual(calls, [])
+
+    def test_boot_read_unaffected_by_resync_mode(self):
+        self.assertIn('mode = sys.argv[3] if len(sys.argv) > 3 else "boot"', SCRIPT)
+
+    def test_wired_for_running_windows_after_firestore_before_reboot_check(self):
+        call = SCRIPT.index('  _guest_time_resync dst_ssh "$( [[ -n "$RESUMED_AT" ]] && echo 1 || echo 0 )"')
+        gate = SCRIPT[SCRIPT.rindex("if [[", 0, call):call]
+        self.assertIn('"$DST_STATUS" == "running"', gate)
+        self.assertIn("win*", gate)
+        self.assertLess(SCRIPT.index('_info "Updating Firestore servers/'), call)
+        self.assertLess(call, SCRIPT.index("\n  _guest_reboot_postcheck\n"))
 
 
 class BootChanged(unittest.TestCase):

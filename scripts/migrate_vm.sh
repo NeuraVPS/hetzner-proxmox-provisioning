@@ -140,6 +140,34 @@
 # vendor, so the customer is warned first — cold-move runbook).
 # LAB ONLY: NV_LAB_ALLOW_CROSS_VENDOR_LIVE=<vmid> lets that single VMID through,
 # to reproduce the crash on a lab VM. Never on a customer VM.
+#
+# ----- Nada en caliente entre silicios distintos (25/11/2026) -----------------
+# Mismo fabricante no basta. cpu=host/max solo entre vendor|family|model
+# idénticos; cualquier otro modelo (x86-64-v4…) solo dentro de la misma familia
+# (LIVE_SILICON_MATCH=family; =model también exige el mismo modelo). Así, entre
+# los AX162/AX102 (Zen4, familia 25) y Kademar (EPYC 9755 Turin, Zen5, familia
+# 26) TODO traslado es en frío. Ver _live_silicon_guard. LAB ONLY:
+# NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
+#
+# ----- Traslados en frío (y por qué aquí no hay precopia) ---------------------
+# Si la VM está PARADA, este script hace `remote_migrate` sin --online: PVE
+# copia los discos enteros por el túnel websocket de la API (puerto 8006) con
+# la VM apagada todo el rato, y la deja PARADA en destino (no la arranca). No
+# hay precopia. Por un enlace no-Hetzner eso es caro: en el piloto Kademar
+# (08/11) ese mismo túnel tardó 1 h 05 min con un disco de 146 GB (en caliente;
+# en frío, ese tiempo sería todo corte). Con precopia ZFS (snapshot + `zfs send` con la VM
+# encendida, apagado ordenado, incremental, config al destino) el corte fue de
+# 38 s / 18 s.
+# Esa precopia ya existe y está probada en producción (6 traslados EX44→AX162,
+# 01/10-18/11): el kit rtmig_* (rtmig_send.sh base|incr|verify|resume y
+# rtmig_cutover.sh shutdown|park|push|start|rollback, nodo→nodo por SSH directo
+# con ~/.ssh/neuravps_id y el IPSET hosts-ipv6). Tras `rtmig_cutover.sh start`
+# se ejecuta ESTE script, que entra por la rama «VM is already on dest» y solo
+# reconcilia NAT, hookscript, Firestore, sonda RDP y reloj (w32tm). No se
+# duplica aquí: el kit aparca la config del origen (nadie puede arrancarla) y
+# conserva sus zvols para el rollback, cosa que el flujo de `remote_migrate
+# --delete` de este script no hace. Copia de referencia del kit:
+# work/gabriel-traslado-20261118/ (fuera de git).
 
 set -euo pipefail
 
@@ -490,14 +518,50 @@ _node_cpu_sig() {
   ' 2>/dev/null
 }
 
-# Reads the raw CPU feature `flags` line (space-separated) of one node via the
-# given multiplexed ssh fn. Used by the upgrade/downgrade direction decision:
-# the destination is migration-safe iff its flags are a SUPERSET of the source's
-# (the source guest can only be using flags the source host has). Prints empty
-# on error.
-_node_cpu_flags() {
-  local ssh_fn="$1"
-  "$ssh_fn" 'grep -m1 "^flags" /proc/cpuinfo | cut -d: -f2' 2>/dev/null
+# LIVE migrations only, AFTER _live_cross_vendor_guard (so same vendor here).
+# Regla vigente (25/11/2026, alta del nodo Kademar 2× EPYC 9755 «Turin», AMD
+# familia 26 modelo 2, frente a los AX162 «Genoa» 25/17 y los AX102 «Raphael»
+# 25/97): nada en caliente entre silicios distintos.
+#   - cpu=host/max: el invitado ve la CPUID real del nodo → solo con
+#     vendor|family|model IDÉNTICO (EPYC 9454 y 9454P son ambos 25|17). Hasta
+#     el 25/11 se dejaba pasar un destino «superconjunto de flags»; ya no.
+#   - cualquier otro modelo (x86-64-v*, kvm64, con nombre): misma FAMILIA
+#     (Zen4 25 ↔ Zen5 26 se rechaza). LIVE_SILICON_MATCH=model exige además el
+#     mismo modelo, lo que prohibiría también AX162 ↔ AX102 en caliente (el
+#     defrag no hizo ninguno del 04/11 al 25/11: 176 AX102→AX102 y 40
+#     AX162→AX162). El defrag aplica la misma regla de familia (cpu_move_ok).
+# Firma ilegible → se rechaza (no se adivina). Escape SOLO de laboratorio:
+# NV_LAB_ALLOW_CROSS_SILICON_LIVE=<esta VMID>. Nunca en VMs de cliente.
+# Args: firma origen, firma destino ("vendor|family|model") y modelo de CPU.
+LIVE_SILICON_MATCH="${LIVE_SILICON_MATCH:-family}"
+_live_silicon_guard() {
+  local src_sig="$1" dst_sig="$2" cpu_model="$3" lc why="" sv sf sm dv df dm
+  IFS='|' read -r sv sf sm <<< "$src_sig"
+  IFS='|' read -r dv df dm <<< "$dst_sig"
+  [[ -n "$sv" && "$sf" =~ ^[0-9]+$ && "$sm" =~ ^[0-9]+$ && -n "$dv" && "$df" =~ ^[0-9]+$ && "$dm" =~ ^[0-9]+$ ]] \
+    || _die "Firma de CPU ilegible (origen '${src_sig}', destino '${dst_sig}'): no se puede descartar un cambio de silicio en caliente. Para la VM (con el cliente avisado) y repite en FRÍO, o reintenta. Abortado antes de tocar la VM."
+  lc=$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')
+  if [[ "$lc" == "host" || "$lc" == "max" ]]; then
+    [[ "$src_sig" == "$dst_sig" ]] \
+      || why="cpu=${cpu_model} enseña al invitado la CPU real y origen ${SRC_NODE} [${src_sig//|/ }] y destino ${DST_NODE} [${dst_sig//|/ }] son silicios distintos (vendor family model)"
+  else
+    case "$LIVE_SILICON_MATCH" in
+      family) [[ "$sf" == "$df" ]] \
+                || why="cpu=${cpu_model}: cambia la familia de CPU (origen ${SRC_NODE} familia ${sf}, destino ${DST_NODE} familia ${df}; p. ej. Zen4 25 ↔ Zen5 26)" ;;
+      model)  [[ "$sf" == "$df" && "$sm" == "$dm" ]] \
+                || why="cpu=${cpu_model}: cambia el silicio (origen ${SRC_NODE} [${src_sig//|/ }], destino ${DST_NODE} [${dst_sig//|/ }]) y LIVE_SILICON_MATCH=model" ;;
+      *) _die "LIVE_SILICON_MATCH solo admite 'family' o 'model' (vale '${LIVE_SILICON_MATCH}')." ;;
+    esac
+  fi
+  if [[ -z "$why" ]]; then
+    _ok "Silicio compatible para migrar en caliente: [${src_sig//|/ }] → [${dst_sig//|/ }], cpu=${cpu_model} (regla: $( [[ "$lc" == host || "$lc" == max ]] && echo 'host = idéntico' || echo "misma ${LIVE_SILICON_MATCH}" ))."
+    return 0
+  fi
+  if [[ -n "${NV_LAB_ALLOW_CROSS_SILICON_LIVE:-}" && "${NV_LAB_ALLOW_CROSS_SILICON_LIVE}" == "${VMID}" ]]; then
+    _warn "LAB OVERRIDE NV_LAB_ALLOW_CROSS_SILICON_LIVE=${VMID}: dejo pasar en caliente: ${why}. Solo VMs de laboratorio."
+    return 0
+  fi
+  _die "Cambio de silicio — se rechaza la migración EN CALIENTE de la VM ${VMID}: ${why}. Regla: nada en caliente entre fabricantes ni entre silicios distintos. Única vía: traslado en FRÍO con el cliente avisado (VM parada; con disco grande o enlace lento, kit de precopia ZFS + este script para rutas y Firestore, ver cabecera «Traslados en frío»). No cambies el modelo de CPU para esquivarlo: cambia el Hardware ID de SQX (política 10/10: solo en frío, con CHANGE_CPU=1 y el cliente avisado). Abortado antes de tocar la VM."
 }
 
 # LIVE migrations only: refuse AMD<->Intel for ANY cpu model. Args: source and
@@ -529,9 +593,13 @@ _live_cross_vendor_guard() {
 # NV-RUN-<nonce> first, the SAME pid is polled until that line shows up, a
 # foreign result is discarded and polled again, and after 3 it gives up. Never
 # relaunches. Short -Command line on purpose (no -EncodedCommand: Defender).
+# Optional 3rd arg "resync" (25/11/2026): same runner, but the guest runs
+# `w32tm /resync` and the result is "OK <exitcode> <output>" (see
+# _guest_time_resync).
 _GUEST_BOOT_PY=$(cat <<'PY'
 import json, os, subprocess, sys, time
 vmid, budget = sys.argv[1], float(sys.argv[2])
+mode = sys.argv[3] if len(sys.argv) > 3 else "boot"
 nonce = os.urandom(16).hex()
 end = time.monotonic() + budget
 
@@ -550,9 +618,13 @@ def js(raw):
 def short(raw):
     return " ".join((raw or "").split())[:160]
 
-ps = ("'NV-RUN-%s';$o=Get-CimInstance Win32_OperatingSystem;"
-      "'BOOT:'+([DateTimeOffset]$o.LastBootUpTime).ToUnixTimeSeconds();"
-      "'NOW:'+([DateTimeOffset](Get-Date)).ToUnixTimeSeconds();'NV-END-%s'") % (nonce, nonce)
+if mode == "resync":
+    ps = (r"'NV-RUN-%s';$o=(w32tm /resync 2>&1|Out-String) -replace '\s+',' ';"
+          r"'RC:'+$LASTEXITCODE;'OUT:'+$o.Trim();'NV-END-%s'") % (nonce, nonce)
+else:
+    ps = ("'NV-RUN-%s';$o=Get-CimInstance Win32_OperatingSystem;"
+          "'BOOT:'+([DateTimeOffset]$o.LastBootUpTime).ToUnixTimeSeconds();"
+          "'NOW:'+([DateTimeOffset](Get-Date)).ToUnixTimeSeconds();'NV-END-%s'") % (nonce, nonce)
 try:
     raw = qm("exec", vmid, "--synchronous", "0", "--",
              "powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
@@ -583,6 +655,17 @@ while True:
             print("FAIL foreign-result pid=%s" % pid); sys.exit()
         continue
     break
+if mode == "resync":
+    rc, out = None, ""
+    for line in rest.splitlines():
+        k, _, v = line.strip().partition(":")
+        if k == "RC" and v.strip().lstrip("-").isdigit():
+            rc = int(v.strip())
+        elif k == "OUT":
+            out = v.strip()
+    if "NV-END-" + nonce not in rest or rc is None:
+        print("FAIL unreadable exitcode=%s %s" % (d.get("exitcode"), short(rest))); sys.exit()
+    print(("OK %d %s" % (rc, short(out))).rstrip()); sys.exit()
 vals = {}
 for line in rest.splitlines():
     k, _, v = line.strip().partition(":")
@@ -600,6 +683,34 @@ _guest_boot_read() {
     "OK "*|"FAIL "*) printf '%s\n' "$out" ;;
     *) printf 'FAIL node-error %s\n' "${out:0:120}" ;;
   esac
+}
+
+# `w32tm /resync` in a Windows guest that is RUNNING on dest after the move
+# (25/11/2026). Each live pause leaves the guest clock behind (piloto Kademar
+# 08/11: −2.0 s and −4.4 s) and MetaTrader/brokers notice. Best-effort: never
+# fails the script. Args: <ssh_fn> <live 0|1>. After a live move a failure is a
+# _warn; otherwise (cold move just booted: QGA may not be up yet and Windows
+# syncs at startup anyway) only an _info. GUEST_TIME_RESYNC=0 turns it off.
+GUEST_TIME_RESYNC="${GUEST_TIME_RESYNC:-1}"
+GUEST_TIME_RESYNC_BUDGET_S="${GUEST_TIME_RESYNC_BUDGET_S:-45}"
+_guest_time_resync() {
+  local ssh_fn="$1" live="${2:-0}" out msg
+  [[ "$GUEST_TIME_RESYNC" == "1" ]] || return 0
+  out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${GUEST_TIME_RESYNC_BUDGET_S}' resync" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+  case "$out" in
+    "OK 0"|"OK 0 "*)
+      _ok "Reloj del invitado resincronizado (w32tm /resync): ${out#OK 0}"
+      return 0 ;;
+    "OK "*)   msg="w32tm /resync en la VM ${VMID} devolvió rc=$(cut -d' ' -f2 <<<"$out"): $(cut -d' ' -f3- <<<"$out")" ;;
+    "FAIL "*) msg="no se pudo lanzar w32tm /resync en la VM ${VMID} por el guest agent (${out})" ;;
+    *)        msg="no se pudo lanzar w32tm /resync en la VM ${VMID} (nodo: ${out:0:120})" ;;
+  esac
+  if [[ "$live" == "1" ]]; then
+    _warn "${msg}. El reloj de Windows puede ir unos segundos atrasado tras la pausa de la migración; se corrige solo en la siguiente sincronización de w32time, o a mano: qm guest exec ${VMID} -- w32tm /resync"
+  else
+    _info "${msg} (traslado en frío: Windows sincroniza al arrancar; no es un fallo)."
+  fi
+  return 0
 }
 
 # After a LIVE move: wait until the guest has run GUEST_REBOOT_SETTLE_S on dest,
@@ -1544,37 +1655,23 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   # bloquear migraciones perfectamente validas — y son justo las cajas mas
   # cargadas, donde el agente se cae, las que mas falta tienen de moverse.)
 
-  # 0a) CPU compatibility pre-check — ONLINE cpu=host migrations only. A VM with
-  # `cpu: host` exposes the source CPU's exact feature set to the guest; KVM live
-  # migration restores that vCPU state verbatim on the destination. The rule that
-  # decides success is DIRECTIONAL: the migration restores iff the DEST CPU is a
-  # feature SUPERSET of the source's.
-  #   - SAME cpu / UPGRADE (dest has >= the source's features) → restores fine.
-  #   - DOWNGRADE (dest is MISSING a feature the running guest has) → QEMU aborts
-  #     at the resume handshake ON THE DEST ("kvm: Restoring registers after init:
-  #     Failed to set special registers: Invalid argument") and the VM lands
-  #     STOPPED on dest. This is exactly what hit VMs 708/1670: an EPYC 9454 Genoa
-  #     guest pushed onto an EPYC 7401P Naples node (Naples lacks AVX-512 etc.).
-  # `pvesh remote_migrate` does NO cross-node CPU check, so we do it here — BEFORE
-  # the dist-upgrade and any disk copy, so a block is a clean no-op abort.
-  #
-  # How we decide: first compare vendor+family+model (from /proc/cpuinfo, NOT the
-  # marketing name — EPYC 9454 and 9224 are both AMD family 25 model 17 "Genoa"
-  # and identical here). If they match → identical CPU → allow. If they differ we
-  # don't block blindly (older→newer is the SAFE direction): we compare the actual
-  # CPU feature FLAGS — if dest is missing any non-trivial flag the source has it's
-  # a DOWNGRADE → block; otherwise it's an upgrade/lateral → allow (with a warning;
-  # the guest keeps presenting the source CPU until it's rebooted on dest).
-  # Unreadable flags → block. Offline (stopped) source skips all of this — a
-  # cold boot on dest picks up dest's features in any direction.
-  #
-  # CROSS-VENDOR (AMD<->Intel) is refused for EVERY cpu model, in both
-  # directions, before the host/max branch (2026-10-10). The old belief that
-  # named/baseline models (kvm64, x86-64-v2/-v3/-v4, …) are migration-safe "by
-  # design" holds for the feature set, NOT for the vendor: the guest keeps the
-  # vendor of the node it booted on, and two live AMD→Intel moves of an
-  # x86-64-v4 Windows VM bugchecked (0xA) ~20 s after resume. Within one
-  # vendor, named models still skip the flag comparison below.
+  # 0a) CPU pre-check — ONLINE migrations only (a stopped guest cold-boots on
+  # dest and picks up dest's CPU in any direction; only a LIVE migration
+  # restores vCPU state verbatim). `pvesh remote_migrate` does NO cross-node CPU
+  # check, so it is done here — BEFORE the dist-upgrade and any disk copy, so a
+  # block is a clean no-op abort. Two guards, in this order:
+  #   1. _live_cross_vendor_guard: AMD<->Intel refused for EVERY cpu model
+  #      (2026-10-10: two live AMD→Intel moves of an x86-64-v4 Windows VM
+  #      bugchecked 0xA ~20 s after resume; a named model does not hide the
+  #      vendor).
+  #   2. _live_silicon_guard (25/11/2026): cpu=host/max only between identical
+  #      vendor|family|model; any other model only within the same CPU family
+  #      (Genoa/Raphael 25 ↔ Turin 26 refused). Signatures come from
+  #      /proc/cpuinfo, NOT the marketing name (EPYC 9454 and 9454P are both
+  #      25|17). This replaced the old "dest is a feature-flag superset" rule
+  #      for cpu=host (VMs 708/1670, Genoa→Naples, 2026): a superset no longer
+  #      authorises a live move — different silicon goes cold, customer warned.
+  # Unreadable signature → refused (never guessed).
   if [[ -n "$ONLINE_FLAG" ]]; then
     CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
     CPU_MODEL=""
@@ -1605,56 +1702,10 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
         CPU_MODEL="$_run_model"
       fi
     fi
-    _cpu_lc=$(printf '%s' "$CPU_MODEL" | tr '[:upper:]' '[:lower:]')
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
     _live_cross_vendor_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
-    if [[ "$_cpu_lc" == "host" || "$_cpu_lc" == "max" ]]; then
-      _info "VM uses cpu=${CPU_MODEL} (host passthrough) on a LIVE migration — verifying source/dest CPU compatibility…"
-      if [[ "$SRC_CPU_SIG" == "$DST_CPU_SIG" ]]; then
-        _ok "CPU identical — source and dest are both [${SRC_CPU_SIG//|/ }] (vendor family model); live cpu=host migration is safe."
-      else
-        # CPUs differ, same vendor (cross-vendor already refused above): decide
-        # upgrade-vs-downgrade by comparing actual feature flags.
-        _info "CPUs differ (src [${SRC_CPU_SIG//|/ }] → dst [${DST_CPU_SIG//|/ }]); comparing feature flags to tell an upgrade from a downgrade…"
-        SRC_FLAGS=$(_node_cpu_flags src_ssh || true)
-        DST_FLAGS=$(_node_cpu_flags dst_ssh || true)
-        [[ -n "${SRC_FLAGS// /}" && -n "${DST_FLAGS// /}" ]] || _die "Could not read CPU feature flags from source and/or dest for the upgrade/downgrade decision. Refusing to guess. Stop the VM and migrate OFFLINE (safe in any direction), or pick a same/newer-generation dest. Aborting before any VM state is touched."
-        # Set-diff with a noise ignore-list: security mitigations, p-state/power,
-        # and Linux-synthetic flags vary host-to-host for reasons unrelated to
-        # migratable guest state. MISSING = real features the source has that the
-        # dest lacks → non-empty means DOWNGRADE. Only flags we're certain are
-        # non-ISA are ignored, so a real ISA gap (e.g. avx512*) is never masked.
-        _flagcmp=$(SRC_FLAGS="$SRC_FLAGS" DST_FLAGS="$DST_FLAGS" python3 - <<'PY' 2>/dev/null || true
-import os
-IGNORE = set('''
-ibpb ibrs ibrs_enhanced ibrs_fw stibp spec_ctrl intel_stibp amd_ibpb amd_ibrs
-ssbd amd_ssbd amd_stibp virt_ssbd ssb_no pti kaiser md_clear flush_l1d
-arch_capabilities tsx_async_abort srbds mmio_stale_data spec_store_bypass
-gather_data_sampling bhi rfds reg_file_data_sampling rsb_ctxsw retpoline
-cpb hw_pstate amd_pstate hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req
-hwp_hint aperfmperf dtherm ida arat pln pts tm tm2 acpi est eist epb ibs irperf
-cpuid cpuid_fault rep_good nopl eagerfpu xtopology amd_dcm extd_apicid
-amd_lbr_v2 amd_lbr_pmc_freeze
-sme sev sev_es sev_snp sme_coherent
-'''.split())
-src = set(os.environ.get("SRC_FLAGS", "").split())
-dst = set(os.environ.get("DST_FLAGS", "").split())
-print("MISSING:" + "".join(" " + f for f in sorted((src - dst) - IGNORE)))
-print("GAINED:"  + "".join(" " + f for f in sorted((dst - src) - IGNORE)))
-PY
-)
-        [[ "$_flagcmp" == *MISSING:* ]] || _die "Feature-flag comparison failed (could not run the flag diff). Refusing to guess direction. Stop the VM and migrate OFFLINE. Aborting before any VM state is touched."
-        _missing=$(printf '%s\n' "$_flagcmp" | sed -n 's/^MISSING://p')
-        _gained=$(printf '%s\n' "$_flagcmp" | sed -n 's/^GAINED://p')
-        if [[ -n "$_missing" ]]; then
-          _die "CPU DOWNGRADE blocked — dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is MISSING feature(s) the running guest has:${_missing}. Live-migrating a cpu=host guest onto a CPU that lacks these makes QEMU die at the resume handshake and leaves VM ${VMID} STOPPED on dest (the VMs 708/1670 failure). Options: (1) migrate to a same-or-newer generation dest (a superset of the source); (2) stop the VM and re-run — OFFLINE migration is safe in any direction; do NOT change the VM's cpu model to get around this: it changes the SQX Hardware ID and the customer loses the licence (operator policy 2026-10-10: CPU changes only in cold moves with the customer warned, see the cold-move RUNBOOK CHANGE_CPU=1). Aborting before any VM state is touched."
-        fi
-        _warn "Cross-generation UPGRADE: dest ${DST_NODE} [${DST_CPU_SIG//|/ }] is a feature superset of source ${SRC_NODE} [${SRC_CPU_SIG//|/ }]${_gained:+ (dest adds:${_gained})} — live cpu=host migration permitted. NOTE: VM ${VMID} keeps presenting the SOURCE CPU until it is rebooted on dest, so it won't use the new features until then."
-      fi
-    else
-      _info "VM cpu model=${CPU_MODEL:-<proxmox default>} (not host passthrough), same CPU vendor (${SRC_CPU_SIG%%|*}) — feature-flag check not required."
-    fi
+    _live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
   fi
 
   # 0b) Converge packages on BOTH nodes before migrating so dest pve-qemu-kvm is
@@ -2153,6 +2204,14 @@ if (( NAT_OK == 1 )); then
   fi
 else
   _warn "Skipping Firestore nodeId update (NAT reconcile failed). Re-run migrate_vm.sh ${VMID} ${NEW_NODE_NUM} once $SYNC_BASE_NAT is working."
+fi
+
+# Reloj del invitado (25/11/2026): tras dejar la VM arrancada en destino, en
+# caliente o en frío, `w32tm /resync` por el guest agent. Va después de rutas y
+# Firestore (no retrasa al cliente) y antes de la sonda RDP y de la comprobación
+# de reinicio (el ajuste son segundos; la tolerancia de esa comprobación, 120 s).
+if [[ "$DST_STATUS" == "running" && "${OSTYPE:-}" == win* ]]; then
+  _guest_time_resync dst_ssh "$( [[ -n "$RESUMED_AT" ]] && echo 1 || echo 0 )"
 fi
 
 # Comprobacion de alcance: se llama al RDP (3389) del invitado por su IPv6
