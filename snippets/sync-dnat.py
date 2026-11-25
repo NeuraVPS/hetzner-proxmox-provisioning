@@ -8,6 +8,17 @@ adapter. dnsmasq serves only IPv4 — no RA, no DHCPv6 — so Windows has zero
 auto-config to compete with the manual IPv6. This script does NOT manage any
 DHCPv6 pin database (none exists in this model).
 
+Where it writes:
+  - With /etc/firebase-credentials.json: straight to Firestore (the fleet).
+  - Without it, with /etc/neuravps-node-token: through the `node_sync_api` Cloud
+    Function, which only lets a node touch its own VMs and its own node doc
+    (nodes we do not hand the service account to; web repo functions/node_api.py).
+    The file holds only the secret, generated on the node
+    (scripts/node_token_admin.py in the web repo). NEURAVPS_NODE_API_URL and
+    NEURAVPS_NODE_TOKEN_FILE override URL and path for local testing.
+    As on the fleet, VMs are only started by the node-boot pass: one whose
+    desired state cannot be read then stays off.
+
 Commands:
   Hook (Proxmox):
     sync-dnat.py <VMID> post-start         — Set status running.
@@ -32,14 +43,20 @@ Commands:
                                               local-node VM matching
                                               (proxmoxId, nodeId).
 """
+import contextlib
 import fcntl
+import http.client
+import json
 import logging
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Firebase Admin SDK imports (optional - will be initialized if credentials available)
@@ -122,6 +139,240 @@ def ensure_firebase_initialized():
     return FIREBASE_INITIALIZED
 
 # ---------------------------------------------------------------
+# Node API: the same operations without the service account
+# ---------------------------------------------------------------
+# Standard library only: such a node needs neither firebase_admin nor requests.
+NODE_TOKEN_FILE = Path(os.environ.get("NEURAVPS_NODE_TOKEN_FILE", "/etc/neuravps-node-token"))
+NODE_API_URL = os.environ.get(
+    "NEURAVPS_NODE_API_URL", "https://europe-west1-neuravps.cloudfunctions.net/node_sync_api")
+# Generous for a cold start.
+NODE_API_TIMEOUT_S = 15
+NODE_API_RETRY_CODES = (429, 500, 502, 503, 504)
+# A status write runs inside `qm start` (post-start): total time, all attempts
+# together. Whatever does not fit is left to the watchdog.
+HOOK_BUDGET_S = 12
+HOOK_CALL_TIMEOUT_S = 8
+# node-boot must fit in TimeoutStartSec=300: shorter calls, and once reads have
+# lost this long to a failing function, stop asking.
+BOOT_CALL_TIMEOUT_S = 10
+READ_FAILURE_BUDGET_S = 90
+_read_time_lost = 0.0
+# A finalize_boot decided at node-boot whose write did not get through.
+BOOT_FINALIZE_FILE = Path("/var/lib/neuravps/boot_finalize.json")
+FINALIZE_MAX_RETRIES = 24  # watchdog ticks, ~2.5 h
+
+
+class NodeApiError(Exception):
+    """Never carries the token."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def transient(self):
+        return self.code is None or self.code in NODE_API_RETRY_CODES
+
+
+class _DeadlineExceeded(BaseException):
+    """BaseException so no `except Exception` on the way swallows it."""
+
+
+@contextlib.contextmanager
+def _hard_deadline(seconds):
+    """Wall-clock bound: socket timeouts do not cover DNS or a trickling reply."""
+    def _expired(signum, frame):
+        raise _DeadlineExceeded()
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib would carry the Authorization header to wherever it was sent.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_node_api_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def use_node_api():
+    """True only when there is no service account and there is a node token."""
+    creds = Path(os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json"))
+    return not creds.is_file() and NODE_TOKEN_FILE.is_file()
+
+
+def _node_api(op, attempts=3, timeout=None, **fields):
+    """POST one operation and return the decoded reply, or raise NodeApiError.
+
+    `attempts` covers what the Firestore SDK retries by itself on the fleet
+    (network errors, 429, 5xx). Callers with their own retry loop pass 1.
+    """
+    try:
+        secret = NODE_TOKEN_FILE.read_text().strip()
+    except (OSError, UnicodeError) as e:
+        raise NodeApiError(f"cannot read {NODE_TOKEN_FILE}: {type(e).__name__}") from None
+    if not re.fullmatch(r"[A-Za-z0-9+/=_-]{32,128}", secret):
+        # Checked here because http.client echoes an invalid header value.
+        raise NodeApiError(f"{NODE_TOKEN_FILE} does not hold a valid token", code=401)
+    request = urllib.request.Request(
+        NODE_API_URL,
+        data=json.dumps(dict(fields, op=op)).encode(),
+        headers={"Authorization": f"Bearer {NODE_NAME}.{secret}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    for attempt in range(1, attempts + 1):
+        try:
+            with _node_api_opener.open(request, timeout=timeout or NODE_API_TIMEOUT_S) as reply:
+                data = json.load(reply)
+            if not isinstance(data, dict):
+                raise ValueError("reply is not an object")
+            return data
+        except urllib.error.HTTPError as e:
+            error, code = f"HTTP {e.code}", e.code
+            retry = code in NODE_API_RETRY_CODES
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            error, code, retry = f"{type(e).__name__}: {e}", None, True
+        if not retry or attempt == attempts:
+            raise NodeApiError(f"{op}: {error}", code=code)
+        time.sleep(0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5))
+
+
+def _api_get_status(vmid):
+    """get_firestore_status through the node API. None if there is no doc or it
+    could not be read."""
+    global _read_time_lost
+    if _read_time_lost >= READ_FAILURE_BUDGET_S:
+        logger.error(f"VM {vmid}: status NOT read, the node API has been failing too long; "
+                     "if it should be running it will NOT be auto-started")
+        return None
+    began = time.monotonic()
+    try:
+        docs = _node_api("get_server", timeout=BOOT_CALL_TIMEOUT_S, vmid=vmid)["servers"]
+        if not docs:
+            return None
+        if len(docs) > 1:
+            logger.warning(f"Multiple Firestore documents for VM {vmid}; using first")
+        return docs[0].get("status")
+    except Exception as e:
+        _read_time_lost += time.monotonic() - began
+        logger.error(f"VM {vmid}: status NOT read ({e}); "
+                     "if it should be running it will NOT be auto-started")
+        return None
+
+
+def _api_update_status(vmid, status):
+    """update_status_in_firestore through the node API, within HOOK_BUDGET_S:
+    same re-check of the local state between reading the doc and writing it, and
+    the same update_time precondition (enforced by the function). Returns False
+    if it could not be written."""
+    # Until the write is acknowledged the watchdog must see this VM as drifted,
+    # even if it ends up in the state the cache remembers.
+    _forget_status(vmid)
+    try:
+        with _hard_deadline(HOOK_BUDGET_S):
+            return _api_write_status(vmid, status)
+    except _DeadlineExceeded:
+        logger.warning(f"Status of VM {vmid} not written within {HOOK_BUDGET_S}s; the watchdog will retry")
+        return False
+
+
+def _api_write_status(vmid, status):
+    began = time.monotonic()
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        timeout = max(1.0, min(HOOK_CALL_TIMEOUT_S, HOOK_BUDGET_S - (time.monotonic() - began)))
+        try:
+            docs = _node_api("get_server", attempts=1, timeout=timeout, vmid=vmid)["servers"]
+            if not docs:
+                logger.debug(f"No Firestore document found for VM {vmid} (nodeId={NODE_NAME}) to update status")
+                return True
+            if len(docs) > 1:
+                logger.warning(f"Multiple Firestore documents for VM {vmid}; updating all")
+            for doc in docs:
+                if not status_is_current_and_local(vmid, status):
+                    return True
+                _node_api("set_status", attempts=1, timeout=timeout, vmid=vmid, serverId=doc["id"],
+                          updateTime=doc["updateTime"], status=status)
+                logger.info(f"Updated Firestore server {doc['id']} (VM {vmid}): status={status}")
+            _remember_status(vmid, status)
+            return True
+        except Exception as e:
+            code_ok = not isinstance(e, NodeApiError) or e.transient or e.code == 409
+            backoff = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            # A refused credential or request will not get better: leave at once.
+            if (not code_ok or attempt == attempts
+                    or time.monotonic() - began + backoff >= HOOK_BUDGET_S - 1):
+                logger.warning(f"Failed to update status for VM {vmid} after {attempt} attempts: {e}")
+                return False
+            logger.info(f"update_status VM {vmid} attempt {attempt}/{attempts} failed ({e}); retrying in {backoff:.1f}s")
+            time.sleep(backoff)
+
+
+def _api_post_boot_action():
+    """handle_pending_post_boot_action for token mode. Only ever called by the
+    node-boot pass: it is the one place that may start the VM."""
+    BOOT_FINALIZE_FILE.unlink(missing_ok=True)  # anything older is decided again below
+    try:
+        node = _node_api("get_node", timeout=BOOT_CALL_TIMEOUT_S)
+        if not node.get("exists") or (node.get("pendingPostBootAction") is None
+                                      and not node.get("maintenance")):
+            return
+        # Only a cycle opened before this boot is the one this boot ends.
+        started, uptime = node.get("maintenanceStartedAt"), _node_uptime_sec()
+        if not started or uptime is None or started >= time.time() - uptime:
+            logger.warning(f"node-boot: the maintenance flags on {NODE_NAME} are not from before "
+                           "this boot; leaving them alone")
+            return
+    except NodeApiError as e:
+        logger.error(f"node-boot: could not read the maintenance flags of {NODE_NAME} ({e}); "
+                     "no VM auto-start, and maintenance/pendingPostBootAction may still be set")
+        return
+    decided = {"cycle": node["cycle"], "vmStarted": _auto_start_after_user_reboot(node)}
+    _api_finalize(dict(decided, tries=0))
+
+
+def _api_finalize(pending):
+    """Write the result decided at node-boot. On failure keep it for the
+    watchdog; `cycle` makes sure a newer maintenance is never closed."""
+    try:
+        _node_api("finalize_boot", attempts=2, timeout=BOOT_CALL_TIMEOUT_S,
+                  cycle=pending["cycle"], vmStarted=pending["vmStarted"])
+        logger.info(f"node-boot: finalized maintenance on {NODE_NAME} (vm_started={pending['vmStarted']})")
+    except NodeApiError as e:
+        if e.code == 409:
+            logger.warning("node-boot: a newer maintenance cycle is open; leaving it")
+        elif pending["tries"] < FINALIZE_MAX_RETRIES:
+            logger.warning(f"node-boot: could not finalize maintenance ({e}); the watchdog will retry")
+            try:
+                BOOT_FINALIZE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                tmp = BOOT_FINALIZE_FILE.with_name(BOOT_FINALIZE_FILE.name + ".tmp")
+                tmp.write_text(json.dumps(dict(pending, tries=pending["tries"] + 1)))
+                os.replace(tmp, BOOT_FINALIZE_FILE)  # atomic: watch never reads a partial file
+            except OSError as write_error:
+                logger.error(f"Could not persist {BOOT_FINALIZE_FILE}: {write_error}")
+            return
+        else:
+            logger.error(f"node-boot: giving up finalizing maintenance on {NODE_NAME} ({e}); "
+                         "clear maintenance/pendingPostBootAction by hand")
+    BOOT_FINALIZE_FILE.unlink(missing_ok=True)
+
+
+def _api_retry_finalize():
+    try:
+        pending = json.loads(BOOT_FINALIZE_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    _api_finalize(pending)
+
+
+# ---------------------------------------------------------------
 # Helper utils
 # ---------------------------------------------------------------
 def is_running_under_backup():
@@ -178,7 +429,6 @@ _STATUS_CACHE = Path("/var/lib/neuravps/vm_status_cache.json")
 
 def _load_status_cache():
     try:
-        import json
         with _STATUS_CACHE.open() as fh:
             raw = json.load(fh)
         return {int(k): str(v) for k, v in raw.items()}
@@ -190,7 +440,6 @@ def _load_status_cache():
 
 def _save_status_cache(cache):
     try:
-        import json
         _STATUS_CACHE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _STATUS_CACHE.with_suffix(".tmp")
         with tmp.open("w") as fh:
@@ -199,6 +448,12 @@ def _save_status_cache(cache):
     except Exception as e:
         # A cache we cannot persist only costs a redundant write next run.
         logger.warning(f"Could not persist VM status cache: {e}")
+
+
+def _forget_status(vmid):
+    cache = _load_status_cache()
+    if cache.pop(int(vmid), None) is not None:
+        _save_status_cache(cache)
 
 
 def _remember_status(vmid, status):
@@ -222,6 +477,8 @@ def _query_local_server_doc(db, vmid):
     return list(query.stream())
 
 def get_firestore_status(vmid):
+    if use_node_api():
+        return _api_get_status(vmid)
     if not ensure_firebase_initialized():
         return None
     try:
@@ -238,6 +495,18 @@ def get_firestore_status(vmid):
 
 def set_server_ipv6(vmid, ipv6):
     """Update servers/{id}.ipv6 for the VM on this node. Returns True on success."""
+    if use_node_api():
+        try:
+            # The function only accepts the deterministic address of the vmid.
+            reply = _node_api("set_ipv6", vmid=vmid, ipv6=ipv6)
+            if not reply.get("updated"):
+                logger.warning(f"set-server-ipv6: no server doc for VM {vmid} (nodeId={NODE_NAME})")
+                return False
+            logger.info(f"set-server-ipv6: server {reply.get('servers')} (VM {vmid}) ipv6={ipv6}")
+            return True
+        except Exception as e:
+            logger.warning(f"set-server-ipv6 failed for VM {vmid}: {e}")
+            return False
     if not ensure_firebase_initialized():
         logger.error(f"Firebase not initialized; cannot set ipv6 for VM {vmid}")
         return False
@@ -280,6 +549,8 @@ def update_status_in_firestore(vmid, status):
     if not status_is_current_and_local(vmid, status):
         logger.info(f"Status sync deferred for VM {vmid}: migrating, absent or state changed")
         return
+    if use_node_api():
+        return _api_update_status(vmid, status)
     if not ensure_firebase_initialized():
         return
     # Bounded retry with backoff + jitter. The write is idempotent (setting
@@ -319,6 +590,13 @@ def update_status_in_firestore(vmid, status):
             time.sleep(backoff)
 
 def update_proxmox_node_last_boot_at():
+    if use_node_api():
+        try:
+            _node_api("node_booted", attempts=2, timeout=BOOT_CALL_TIMEOUT_S)
+            logger.info(f"Updated proxmox_nodes/{NODE_NAME} lastNodeBootAt")
+        except Exception as e:
+            logger.warning(f"Failed to update lastNodeBootAt for proxmox_nodes/{NODE_NAME}: {e}")
+        return
     if not ensure_firebase_initialized():
         logger.debug("Firebase not initialized, skipping lastNodeBootAt update")
         return
@@ -330,6 +608,49 @@ def update_proxmox_node_last_boot_at():
         logger.info(f"Updated proxmox_nodes/{NODE_NAME} lastNodeBootAt")
     except Exception as e:
         logger.warning(f"Failed to update lastNodeBootAt for proxmox_nodes/{NODE_NAME}: {e}")
+
+
+def _auto_start_after_user_reboot(node_data):
+    """Start the dedicated node's VM if the user asked for it. Returns
+    None (not attempted) or whether the VM is up."""
+    pending = node_data.get("pendingPostBootAction")
+    # Auto-start the VM only when explicitly requested for a dedicated node.
+    vm_started = None  # None = not attempted; True/False = result
+    if pending == "start-vm":
+        try:
+            max_vm = int(node_data.get("max_vm") or 0)
+        except (TypeError, ValueError):
+            max_vm = 0
+        if max_vm != 1:
+            logger.warning(
+                f"pendingPostBootAction=start-vm on {NODE_NAME} but max_vm={max_vm}; "
+                f"refusing auto-start"
+            )
+        else:
+            all_vms = get_all_vms()
+            if not all_vms:
+                logger.warning(f"pendingPostBootAction=start-vm on {NODE_NAME} but `qm list` returned no VMs")
+            elif len(all_vms) > 1:
+                logger.warning(
+                    f"pendingPostBootAction=start-vm on {NODE_NAME} but {len(all_vms)} VMs present; "
+                    f"refusing auto-start"
+                )
+            else:
+                vmid = next(iter(all_vms.keys()))
+                if all_vms[vmid] == "running":
+                    logger.info(f"VM {vmid} already running on {NODE_NAME}")
+                    vm_started = True
+                else:
+                    logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
+                    try:
+                        run(["qm", "start", str(vmid)])
+                        vm_started = True
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"qm start {vmid} failed: {e.stderr or e}")
+                        vm_started = False
+    elif pending is not None:
+        logger.warning(f"Unknown pendingPostBootAction={pending!r} on {NODE_NAME}; clearing it")
+    return vm_started
 
 
 def handle_pending_post_boot_action():
@@ -351,6 +672,12 @@ def handle_pending_post_boot_action():
     unexpected reboots (kernel panic, hardware) leave the VM stopped and a
     crash-loop can't take down the node.
     """
+    if use_node_api():
+        try:
+            _api_post_boot_action()
+        except Exception as e:
+            logger.warning(f"handle_pending_post_boot_action failed on {NODE_NAME}: {e}")
+        return
     if not ensure_firebase_initialized():
         return
     try:
@@ -366,42 +693,7 @@ def handle_pending_post_boot_action():
         if pending is None and not has_maintenance:
             return  # nothing to finalize
 
-        # Auto-start the VM only when explicitly requested for a dedicated node.
-        vm_started = None  # None = not attempted; True/False = result
-        if pending == "start-vm":
-            try:
-                max_vm = int(node_data.get("max_vm") or 0)
-            except (TypeError, ValueError):
-                max_vm = 0
-            if max_vm != 1:
-                logger.warning(
-                    f"pendingPostBootAction=start-vm on {NODE_NAME} but max_vm={max_vm}; "
-                    f"refusing auto-start"
-                )
-            else:
-                all_vms = get_all_vms()
-                if not all_vms:
-                    logger.warning(f"pendingPostBootAction=start-vm on {NODE_NAME} but `qm list` returned no VMs")
-                elif len(all_vms) > 1:
-                    logger.warning(
-                        f"pendingPostBootAction=start-vm on {NODE_NAME} but {len(all_vms)} VMs present; "
-                        f"refusing auto-start"
-                    )
-                else:
-                    vmid = next(iter(all_vms.keys()))
-                    if all_vms[vmid] == "running":
-                        logger.info(f"VM {vmid} already running on {NODE_NAME}")
-                        vm_started = True
-                    else:
-                        logger.info(f"Auto-starting VM {vmid} on {NODE_NAME} after user-requested reboot")
-                        try:
-                            run(["qm", "start", str(vmid)])
-                            vm_started = True
-                        except subprocess.CalledProcessError as e:
-                            logger.error(f"qm start {vmid} failed: {e.stderr or e}")
-                            vm_started = False
-        elif pending is not None:
-            logger.warning(f"Unknown pendingPostBootAction={pending!r} on {NODE_NAME}; clearing it")
+        vm_started = _auto_start_after_user_reboot(node_data)
 
         # Single finalize: ALWAYS clear both fields so the panel unsticks and the
         # node accepts future maintenance. Runs whether or not a VM was started.
@@ -451,6 +743,8 @@ def watch_statuses():
     """
     if _watch_should_stand_down():
         return 0
+    if use_node_api():
+        _api_retry_finalize()
     actual = get_all_vms()
     cache = _load_status_cache()
     drifted = {vmid: st for vmid, st in actual.items() if cache.get(vmid) != st}
@@ -466,8 +760,14 @@ def watch_statuses():
     if not drifted:
         return 0
     logger.info(f"watch: {len(drifted)} VM(s) out of sync with Firestore: {drifted}")
+    failures = 0
     for vmid, status in drifted.items():
-        update_status_in_firestore(vmid, status)
+        # False only comes from the node API; give up after 3 in a row so the
+        # unit's TimeoutStartSec is not spent on a function that is down.
+        failures = failures + 1 if update_status_in_firestore(vmid, status) is False else 0
+        if failures >= 3:
+            logger.warning("watch: node API failing; the rest is left for the next tick")
+            break
     return len(drifted)
 
 
