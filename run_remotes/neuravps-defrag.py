@@ -210,14 +210,29 @@ def node_vm_cap(data):
     return cap if cap > 0 else None
 
 
+def node_vcpu_cap(data):
+    """Assigned-vCPU budget of an SQX node (proxmox_nodes.max_vcpu), or None.
+
+    Mirror of NeuraVPS auto_provision.sqx_vcpu_cap (Kademar 0000266: the node
+    takes any SQX plan, so its hard limit is vCPU, not a VM count; 500, 532
+    = E28). Same rules as node_vm_cap: SQX only, absent/0/garbage -> None."""
+    if node_model(data) != "SQX":
+        return None
+    try:
+        cap = int((data or {}).get("max_vcpu"))
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
 def dest_capped(dn):
-    """A node with a hard VM cap is NEVER a defrag/relief destination
+    """A node with a hard cap (max_vm or max_vcpu) is NEVER a defrag/relief destination
     (operator decision 25/11): its entries are controlled manual moves (cold
     move kit) only. Reserving slots across a planned-from-a-snapshot batch,
     racing new orders and moves dropped at execution time, is exactly what
-    this avoids. It can still be a SOURCE. Nodes without the field (every
+    this avoids. It can still be a SOURCE. Nodes without the fields (every
     node but 0000266 on 25/11) are unaffected."""
-    return dn.get("vm_cap") is not None
+    return dn.get("vm_cap") is not None or dn.get("vcpu_cap") is not None
 
 
 def dest_allows(dn, vm):
@@ -801,6 +816,7 @@ def main():
             "model": model, "ip": d.get("ip") or "", "frozen": bool(d.get("frozen")),
             "allowed": node_allowed(d),
             "vm_cap": node_vm_cap(d),
+            "vcpu_cap": node_vcpu_cap(d),
             "status": str(d.get("status") or "").strip(),
             "g": base_ram(d),
             # PHYSICAL RAM, for the MT RAM gate (v14). `g` is the declared

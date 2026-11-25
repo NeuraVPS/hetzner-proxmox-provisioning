@@ -41,14 +41,31 @@ class NodeVmCap(unittest.TestCase):
 
     def test_dest_capped(self):
         self.assertTrue(df.dest_capped({"vm_cap": 26}))
-        self.assertFalse(df.dest_capped({"vm_cap": None}))
+        self.assertTrue(df.dest_capped({"vcpu_cap": 500}))
+        self.assertTrue(df.dest_capped({"vm_cap": None, "vcpu_cap": 500}))
+        self.assertFalse(df.dest_capped({"vm_cap": None, "vcpu_cap": None}))
         self.assertFalse(df.dest_capped({}))
+
+
+class NodeVcpuCap(unittest.TestCase):
+    """max_vcpu (Kademar 25/11): any SQX plan, budget of assigned vCPU."""
+
+    def test_sqx_with_max_vcpu(self):
+        self.assertEqual(df.node_vcpu_cap({"nodeType": "SQX", "max_vcpu": 500}), 500)
+        self.assertEqual(df.node_vcpu_cap({"nodeType": "SQX", "max_vcpu": "532"}), 532)
+
+    def test_no_cap_when_absent_invalid_or_not_sqx(self):
+        for d in ({"nodeType": "SQX"}, {"nodeType": "SQX", "max_vcpu": 0},
+                  {"nodeType": "SQX", "max_vcpu": "x"}, {"nodeType": "SQX", "max_vcpu": -1},
+                  {"nodeType": "MT5", "max_vcpu": 500}, {"max_vcpu": 500}, None):
+            self.assertIsNone(df.node_vcpu_cap(d), d)
 
 
 SRC, KDM, AX = "0000300-AX162", "0000266-KDM-9755", "0000301-AX162"
 
 
-def sqx_store(kdm_cap=26, ax_frozen=False, src_over=True, kdm_over=False):
+def sqx_store(kdm_cap=26, ax_frozen=False, src_over=True, kdm_over=False,
+              cap_field="max_vm"):
     """Three SQX nodes, base 100 GB (commit cap 150, op floor cap 90).
     SRC holds 10 vps-a (160 GB > 150: over the gate) when src_over.
     KDM (fuller, the best fit) and AX both have room for a vps-a.
@@ -62,7 +79,7 @@ def sqx_store(kdm_cap=26, ax_frozen=False, src_over=True, kdm_over=False):
              "location": "Falkenstein", "frozen": ax_frozen},
     }
     if kdm_cap is not None:
-        nodes[KDM]["max_vm"] = kdm_cap
+        nodes[KDM][cap_field] = kdm_cap
     servers, vid = {}, 2000
 
     def add(nid, n, ram=16, fl=5.0, plan="vps-a"):
@@ -89,36 +106,58 @@ def srcs(doc):
 
 
 class PickDestEndToEnd(unittest.TestCase):
+    FIELD, CAP = "max_vm", 26
+
+    def store(self, **kw):
+        kw.setdefault("kdm_cap", self.CAP)
+        return sqx_store(cap_field=self.FIELD, **kw)
+
     def test_premise_without_cap_the_kademar_box_is_the_best_fit(self):
-        _, doc, log = h.run_main(sqx_store(kdm_cap=None))
+        _, doc, log = h.run_main(self.store(kdm_cap=None))
         self.assertTrue(dests(doc), log)
         self.assertEqual(set(dests(doc)), {"0000266"}, doc and doc["planned"])
 
     def test_capped_node_never_receives(self):
-        _, doc, log = h.run_main(sqx_store())
+        _, doc, log = h.run_main(self.store())
         self.assertTrue(dests(doc), log)
         self.assertNotIn("0000266", dests(doc))
         self.assertEqual(set(dests(doc)), {"0000301"})
 
     def test_capped_node_is_not_a_destination_even_with_free_slots(self):
         # 6 VMs on a cap of 26: plenty of slots, still refused.
-        _, doc, _ = h.run_main(sqx_store(kdm_cap=26))
+        _, doc, _ = h.run_main(self.store())
         self.assertNotIn("0000266", dests(doc))
 
     def test_only_the_capped_node_left_means_no_move(self):
-        _, doc, log = h.run_main(sqx_store(ax_frozen=True))
+        _, doc, log = h.run_main(self.store(ax_frozen=True))
         self.assertEqual(dests(doc), [], log)
         self.assertIn("0000300-AX162", log)     # still reported as over-gate
 
     def test_capped_node_can_be_a_source(self):
-        _, doc, log = h.run_main(sqx_store(src_over=False, kdm_over=True))
+        _, doc, log = h.run_main(self.store(src_over=False, kdm_over=True))
         self.assertIn("0000266", srcs(doc), log)
         self.assertTrue(dests(doc))
         self.assertNotIn("0000266", dests(doc))
 
     def test_invalid_cap_behaves_as_uncapped(self):
-        _, doc, _ = h.run_main(sqx_store(kdm_cap="x"))
+        _, doc, _ = h.run_main(self.store(kdm_cap="x"))
         self.assertEqual(set(dests(doc)), {"0000266"})
+
+
+class PickDestEndToEndVcpu(PickDestEndToEnd):
+    """Same cases with the vCPU budget (6 x 4 = 24 of 500 vCPU used: plenty
+    of room, still never a destination)."""
+    FIELD, CAP = "max_vcpu", 500
+
+
+class PickDestEndToEndBothCaps(PickDestEndToEnd):
+    """Compatibility: a node with max_vm AND max_vcpu is just as excluded."""
+
+    def store(self, **kw):
+        st = super().store(**kw)
+        if kw.get("kdm_cap", self.CAP) not in (None, "x"):
+            st["proxmox_nodes"][KDM]["max_vcpu"] = 500
+        return st
 
 
 if __name__ == "__main__":
