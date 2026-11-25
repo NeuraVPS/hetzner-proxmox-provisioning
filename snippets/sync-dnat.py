@@ -8,6 +8,15 @@ adapter. dnsmasq serves only IPv4 — no RA, no DHCPv6 — so Windows has zero
 auto-config to compete with the manual IPv6. This script does NOT manage any
 DHCPv6 pin database (none exists in this model).
 
+Where it writes:
+  - With /etc/firebase-credentials.json: straight to Firestore (the fleet).
+  - Without it, with /etc/neuravps-node-token: through the `node_sync_api` Cloud
+    Function, which only lets a node touch its own VMs and its own node doc
+    (nodes we do not hand the service account to; web repo functions/node_api.py).
+    The file holds only the secret, generated on the node
+    (scripts/node_token_admin.py in the web repo). NEURAVPS_NODE_API_URL and
+    NEURAVPS_NODE_TOKEN_FILE override URL and path for local testing.
+
 Commands:
   Hook (Proxmox):
     sync-dnat.py <VMID> post-start         — Set status running.
@@ -33,6 +42,8 @@ Commands:
                                               (proxmoxId, nodeId).
 """
 import fcntl
+import http.client
+import json
 import logging
 import os
 import random
@@ -40,6 +51,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Firebase Admin SDK imports (optional - will be initialized if credentials available)
@@ -122,6 +135,103 @@ def ensure_firebase_initialized():
     return FIREBASE_INITIALIZED
 
 # ---------------------------------------------------------------
+# Node API: the same operations without the service account
+# ---------------------------------------------------------------
+# Standard library only: such a node needs neither firebase_admin nor requests.
+NODE_TOKEN_FILE = Path(os.environ.get("NEURAVPS_NODE_TOKEN_FILE", "/etc/neuravps-node-token"))
+NODE_API_URL = os.environ.get(
+    "NEURAVPS_NODE_API_URL", "https://europe-west1-neuravps.cloudfunctions.net/node_sync_api")
+# Generous for a cold start; bounded because post-start runs inside `qm start`.
+NODE_API_TIMEOUT_S = 15
+NODE_API_RETRY_CODES = (429, 500, 502, 503, 504)
+
+
+class NodeApiError(Exception):
+    """Never carries the token."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib would carry the Authorization header to wherever it was sent.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_node_api_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def use_node_api():
+    """True only when there is no service account and there is a node token."""
+    creds = Path(os.environ.get("FIREBASE_CREDENTIALS_FILE", "/etc/firebase-credentials.json"))
+    return not creds.is_file() and NODE_TOKEN_FILE.is_file()
+
+
+def _node_api(op, attempts=3, **fields):
+    """POST one operation and return the decoded reply, or raise NodeApiError.
+
+    `attempts` covers what the Firestore SDK retries by itself on the fleet
+    (network errors, 429, 5xx). Callers with their own retry loop pass 1.
+    """
+    try:
+        secret = NODE_TOKEN_FILE.read_text().strip()
+    except (OSError, UnicodeError) as e:
+        raise NodeApiError(f"cannot read {NODE_TOKEN_FILE}: {type(e).__name__}") from None
+    if not re.fullmatch(r"[A-Za-z0-9+/=_-]{32,128}", secret):
+        # Checked here because http.client echoes an invalid header value.
+        raise NodeApiError(f"{NODE_TOKEN_FILE} does not hold a valid token")
+    request = urllib.request.Request(
+        NODE_API_URL,
+        data=json.dumps(dict(fields, op=op)).encode(),
+        headers={"Authorization": f"Bearer {NODE_NAME}.{secret}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    for attempt in range(1, attempts + 1):
+        try:
+            with _node_api_opener.open(request, timeout=NODE_API_TIMEOUT_S) as reply:
+                data = json.load(reply)
+            if not isinstance(data, dict):
+                raise ValueError("reply is not an object")
+            return data
+        except urllib.error.HTTPError as e:
+            error, retry = f"HTTP {e.code}", e.code in NODE_API_RETRY_CODES
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            error, retry = f"{type(e).__name__}: {e}", True
+        if not retry or attempt == attempts:
+            raise NodeApiError(f"{op}: {error}")
+        time.sleep(0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5))
+
+
+def _api_update_status(vmid, status):
+    """update_status_in_firestore through the node API: same retry loop, same
+    re-check of the local state between reading the doc and writing it, and the
+    same update_time precondition (enforced by the function)."""
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            docs = _node_api("get_server", attempts=1, vmid=vmid)["servers"]
+            if not docs:
+                logger.debug(f"No Firestore document found for VM {vmid} (nodeId={NODE_NAME}) to update status")
+                return
+            if len(docs) > 1:
+                logger.warning(f"Multiple Firestore documents for VM {vmid}; updating all")
+            for doc in docs:
+                if not status_is_current_and_local(vmid, status):
+                    return
+                _node_api("set_status", attempts=1, vmid=vmid, serverId=doc["id"],
+                          updateTime=doc["updateTime"], status=status)
+                logger.info(f"Updated Firestore server {doc['id']} (VM {vmid}): status={status}")
+            _remember_status(vmid, status)
+            return
+        except Exception as e:
+            if attempt == attempts:
+                logger.warning(f"Failed to update status for VM {vmid} in Firestore after {attempts} attempts: {e}")
+                return
+            backoff = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            logger.info(f"update_status VM {vmid} attempt {attempt}/{attempts} failed ({e}); retrying in {backoff:.1f}s")
+            time.sleep(backoff)
+
+
+# ---------------------------------------------------------------
 # Helper utils
 # ---------------------------------------------------------------
 def is_running_under_backup():
@@ -178,7 +288,6 @@ _STATUS_CACHE = Path("/var/lib/neuravps/vm_status_cache.json")
 
 def _load_status_cache():
     try:
-        import json
         with _STATUS_CACHE.open() as fh:
             raw = json.load(fh)
         return {int(k): str(v) for k, v in raw.items()}
@@ -190,7 +299,6 @@ def _load_status_cache():
 
 def _save_status_cache(cache):
     try:
-        import json
         _STATUS_CACHE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _STATUS_CACHE.with_suffix(".tmp")
         with tmp.open("w") as fh:
@@ -222,6 +330,17 @@ def _query_local_server_doc(db, vmid):
     return list(query.stream())
 
 def get_firestore_status(vmid):
+    if use_node_api():
+        try:
+            docs = _node_api("get_server", vmid=vmid)["servers"]
+            if not docs:
+                return None
+            if len(docs) > 1:
+                logger.warning(f"Multiple Firestore documents for VM {vmid}; using first")
+            return docs[0].get("status")
+        except Exception as e:
+            logger.warning(f"Failed to get status for VM {vmid} from Firestore: {e}")
+            return None
     if not ensure_firebase_initialized():
         return None
     try:
@@ -238,6 +357,18 @@ def get_firestore_status(vmid):
 
 def set_server_ipv6(vmid, ipv6):
     """Update servers/{id}.ipv6 for the VM on this node. Returns True on success."""
+    if use_node_api():
+        try:
+            # The function only accepts the deterministic address of the vmid.
+            reply = _node_api("set_ipv6", vmid=vmid, ipv6=ipv6)
+            if not reply.get("updated"):
+                logger.warning(f"set-server-ipv6: no server doc for VM {vmid} (nodeId={NODE_NAME})")
+                return False
+            logger.info(f"set-server-ipv6: server {reply.get('servers')} (VM {vmid}) ipv6={ipv6}")
+            return True
+        except Exception as e:
+            logger.warning(f"set-server-ipv6 failed for VM {vmid}: {e}")
+            return False
     if not ensure_firebase_initialized():
         logger.error(f"Firebase not initialized; cannot set ipv6 for VM {vmid}")
         return False
@@ -280,6 +411,9 @@ def update_status_in_firestore(vmid, status):
     if not status_is_current_and_local(vmid, status):
         logger.info(f"Status sync deferred for VM {vmid}: migrating, absent or state changed")
         return
+    if use_node_api():
+        _api_update_status(vmid, status)
+        return
     if not ensure_firebase_initialized():
         return
     # Bounded retry with backoff + jitter. The write is idempotent (setting
@@ -319,6 +453,13 @@ def update_status_in_firestore(vmid, status):
             time.sleep(backoff)
 
 def update_proxmox_node_last_boot_at():
+    if use_node_api():
+        try:
+            _node_api("node_booted")
+            logger.info(f"Updated proxmox_nodes/{NODE_NAME} lastNodeBootAt")
+        except Exception as e:
+            logger.warning(f"Failed to update lastNodeBootAt for proxmox_nodes/{NODE_NAME}: {e}")
+        return
     if not ensure_firebase_initialized():
         logger.debug("Firebase not initialized, skipping lastNodeBootAt update")
         return
@@ -351,15 +492,21 @@ def handle_pending_post_boot_action():
     unexpected reboots (kernel panic, hardware) leave the VM stopped and a
     crash-loop can't take down the node.
     """
-    if not ensure_firebase_initialized():
+    api = use_node_api()
+    if not api and not ensure_firebase_initialized():
         return
     try:
-        db = firestore.client()
-        node_ref = db.collection("proxmox_nodes").document(NODE_NAME)
-        node_snap = node_ref.get()
-        if not node_snap.exists:
-            return
-        node_data = node_snap.to_dict() or {}
+        if api:
+            node_data = _node_api("get_node")
+            if not node_data.get("exists"):
+                return
+        else:
+            db = firestore.client()
+            node_ref = db.collection("proxmox_nodes").document(NODE_NAME)
+            node_snap = node_ref.get()
+            if not node_snap.exists:
+                return
+            node_data = node_snap.to_dict() or {}
 
         pending = node_data.get("pendingPostBootAction")
         has_maintenance = bool(node_data.get("maintenance"))
@@ -408,14 +555,17 @@ def handle_pending_post_boot_action():
         # A stopped VM is already reflected in servers/{id}.status by the
         # sync_all_statuses() call that ran just before this; the start outcome
         # is also recorded here for operator visibility.
-        finalize = {
-            "pendingPostBootAction": firestore.DELETE_FIELD,
-            "maintenance": firestore.DELETE_FIELD,
-            "lastUserRebootAt": firestore.SERVER_TIMESTAMP,
-        }
-        if vm_started is not None:
-            finalize["lastUserRebootVmStarted"] = vm_started
-        node_ref.update(finalize)
+        if api:
+            _node_api("finalize_boot", vmStarted=vm_started)
+        else:
+            finalize = {
+                "pendingPostBootAction": firestore.DELETE_FIELD,
+                "maintenance": firestore.DELETE_FIELD,
+                "lastUserRebootAt": firestore.SERVER_TIMESTAMP,
+            }
+            if vm_started is not None:
+                finalize["lastUserRebootVmStarted"] = vm_started
+            node_ref.update(finalize)
         logger.info(f"node-boot: finalized maintenance on {NODE_NAME} (vm_started={vm_started})")
     except Exception as e:
         logger.warning(f"handle_pending_post_boot_action failed on {NODE_NAME}: {e}")
