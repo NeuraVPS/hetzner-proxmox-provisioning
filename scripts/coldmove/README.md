@@ -81,8 +81,11 @@ hostil, y nada suyo se ejecuta ni se evalúa.
   `balloon` nunca pasa de `memory`. El `balloon_mb` de `push` tampoco puede pasar de la memoria
   asignada. Los discos declarados no pueden sumar más que `ALLOC_DISK_GB`.
 - **MAC:** se conserva, porque cambiarla rompe la red de Windows. Pero antes de apagar, y otra vez al
-  publicar, se comprueba que tiene el prefijo esperado (`EXPECTED_MAC_PREFIX`, por defecto
-  `BC:24:11`) y que ninguna otra VM del destino la usa.
+  publicar, se comprueba que tiene uno de los prefijos esperados y que ninguna otra VM del destino la
+  usa. Los prefijos van en `EXPECTED_MAC_PREFIXES` y por defecto son `52:54:00` y `BC:24:11`:
+  - `52:54:00` es el que pone `create_vm` (`functions/proxmox_handlers.py`, `_randomize_net0_mac`) y
+    el de la mayoría de la flota;
+  - `BC:24:11` es el que genera PVE por su cuenta.
 - **Agente SSH:** nunca se reenvía. El kit usa `-a -o ForwardAgent=no -o ClearAllForwardings=yes`
   y `migrate_vm.sh` igual. Los runners de `run_remotes` solo reenvían el agente a las IPs de la
   flota (`2a01:4f8::/32` y `2a01:4f9::/32`).

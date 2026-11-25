@@ -1487,8 +1487,25 @@ class SecondHostileReview(unittest.TestCase):
             k = self.kit(tmp, conf=CONF.format(cpu="x86-64-v4").replace("BC:24:11:00:00:01", "02:00:00:00:00:01"))
             k.ok("rtmig_send.sh", "base", "rtmig-a")
             r = k.run("rtmig_cutover.sh", "shutdown", "60")
-            self.assertEqual(r.returncode, 1); self.assertIn("prefijo esperado", out(r))
-            k.ok("rtmig_cutover.sh", "shutdown", "60", EXPECTED_MAC_PREFIX="02:00:00")
+            self.assertEqual(r.returncode, 1); self.assertIn("prefijos esperados", out(r))
+            r = k.run("rtmig_cutover.sh", "shutdown", "60", EXPECTED_MAC_PREFIXES="zz")
+            self.assertEqual(r.returncode, 1); self.assertIn("prefijo de MAC no válido", out(r))
+            k.ok("rtmig_cutover.sh", "shutdown", "60", EXPECTED_MAC_PREFIXES="52:54:00,02:00:00")
+
+    def test_default_prefixes_cover_create_vm_and_pve(self):
+        # create_vm: functions/proxmox_handlers.py _randomize_net0_mac → 52:54:00:xx:xx:xx (most of the
+        # fleet); PVE's own: BC:24:11. Both pass by default; uniqueness on the destination still applies.
+        for mac in ("52:54:00:6a:0f:3c", "BC:24:11:00:00:01"):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = self.kit(tmp, conf=CONF.format(cpu="x86-64-v4").replace("BC:24:11:00:00:01", mac))
+                k.ok("rtmig_send.sh", "base", "rtmig-a")
+                k.ok("rtmig_cutover.sh", "shutdown", "60")
+        with tempfile.TemporaryDirectory() as tmp:
+            k = self.kit(tmp, conf=CONF.format(cpu="x86-64-v4").replace("BC:24:11:00:00:01", "52:54:00:6a:0f:3c"))
+            k.ok("rtmig_send.sh", "base", "rtmig-a")
+            (k.t / "dst/etc/pve/qemu-server/777.conf").write_text("net0: virtio=52:54:00:6A:0F:3C,bridge=vmbr0\n")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("ya la usa otra VM", out(r))
 
     def test_rtmig_alloc_reads_the_trusted_allocation(self):
         fb = textwrap.dedent("""\

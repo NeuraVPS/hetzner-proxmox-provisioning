@@ -264,14 +264,23 @@ profile_check() {   # <conf> <uuid> [fw]
 
 # MAC de net0 (del perfil): prefijo esperado y que ninguna otra VM del DESTINO la use (antes de apagar
 # y al publicar). La MAC no se cambia: cambiarla rompe la red de Windows.
-EXPECTED_MAC_PREFIX="${EXPECTED_MAC_PREFIX:-BC:24:11}"
+# Prefijos admitidos por defecto: 52:54:00, el que pone create_vm (NeuraVPS functions/proxmox_handlers.py,
+# _randomize_net0_mac: '52:54:00:%02x:%02x:%02x' con secrets.randbelow(256)), y BC:24:11, el que genera
+# PVE por su cuenta. Medido el 25/11/2026: la mayoría de la flota es 52:54:00 (0000231: 8 de 11; la 1517
+# del 238 y KDMLAB-E1 del 266 también). EXPECTED_MAC_PREFIXES (lista separada por espacios o comas)
+# lo cambia; EXPECTED_MAC_PREFIX (uno solo) se sigue aceptando.
+EXPECTED_MAC_PREFIXES="${EXPECTED_MAC_PREFIXES:-${EXPECTED_MAC_PREFIX:-52:54:00 BC:24:11}}"
 mac_check() {   # <config del perfil>
-  local mac others
-  [[ "$EXPECTED_MAC_PREFIX" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){0,5}$ ]] || die "EXPECTED_MAC_PREFIX no válido"
+  local mac others p ok=0 list
+  list=$(tr ',' ' ' <<< "$EXPECTED_MAC_PREFIXES" | tr 'a-f' 'A-F')
+  for p in $list; do
+    [[ "$p" =~ ^[0-9A-F]{2}(:[0-9A-F]{2}){0,5}$ ]] || die "prefijo de MAC no válido en EXPECTED_MAC_PREFIXES: ${p}"
+  done
+  [[ -n "${list// /}" ]] || die "EXPECTED_MAC_PREFIXES vacío"
   mac=$(sed -n 's/^net0: virtio=\([0-9A-Fa-f:]\{17\}\),.*/\1/p' "$1" | head -1 | tr 'a-f' 'A-F')
   [[ -n "$mac" ]] || die "la config no tiene una MAC de net0 reconocible"
-  [[ "$mac" == "$(tr 'a-f' 'A-F' <<< "$EXPECTED_MAC_PREFIX")"* ]] \
-    || die "la MAC ${mac} no tiene el prefijo esperado (${EXPECTED_MAC_PREFIX}); si es legítima, fija EXPECTED_MAC_PREFIX a mano"
+  for p in $list; do [[ "$mac" == "$p"* ]] && ok=1; done
+  (( ok )) || die "la MAC ${mac} no tiene ninguno de los prefijos esperados (${list}); si es legítima, añade el suyo a EXPECTED_MAC_PREFIXES"
   others=$(on_q dst "cd \"\${PVE_ETC:-/etc/pve}/qemu-server\" && for f in *.conf; do [ -e \"\$f\" ] || continue; [ \"\$f\" = ${VMID}.conf ] && continue; grep -il '${mac}' \"\$f\" || true; done") \
     || die "no pude comprobar las MAC del destino"
   [[ -z "$others" ]] || die "la MAC ${mac} ya la usa otra VM en ${DST_NODE} (${others//$'\n'/ }): no sigo"
