@@ -1218,8 +1218,9 @@ has_src()   { ip -4 -o addr show dev "$DEV" 2>/dev/null | grep -q " inet ${NODE_
 is_local()  { ip -4 route show table local "$NODE_V4" 2>/dev/null | grep -q '^local '; }
 tun_up()    { ip link show "$1" 2>/dev/null | grep -q ',UP'; }
 tuns()      { tun_up tun-fsn && tun_up tun-hel; }
-rules()     { ip -6 rule show pref 100 | grep -q 'lookup 100' && ip -4 rule show pref 101 | grep -q 'lookup 101' \
-              && ip -4 rule show pref 102 | grep -q "from ${NODE_V4} lookup 102"; }
+# -N: tablas en numero (en 0000228/0000238 rt_tables llama ident/ident4 a 100/101).
+rules()     { ip -N -6 rule show pref 100 | grep -q 'lookup 100' && ip -N -4 rule show pref 101 | grep -q 'lookup 101' \
+              && ip -N -4 rule show pref 102 | grep -q "from ${NODE_V4} lookup 102"; }
 defs()      { ip -6 route show default table 100 | grep -q 'dev tun-' && ip -4 route show default table 101 | grep -q 'dev tun-' \
               && ip -4 route show default table 102 | grep -q "dev tun-.* src ${NODE_V4}"; }
 defmain()   { [ "${DEFAULT_V4_VIA_TUNNEL:-0}" != 1 ] || ip -4 route show default | grep -q "dev tun-.* src ${NODE_V4}"; }

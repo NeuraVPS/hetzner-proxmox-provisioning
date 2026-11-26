@@ -83,7 +83,13 @@ def test_veredicto_previo():
     d.update(NVXFIN="1", PREVIO="si", CT="1", TUNSVC="si", NVXSRC="no", HOOK="no", DROPIN="no")
     assert dn.veredicto("previo", d)
     assert not dn.veredicto("previo", {**d, "DEFS": "no"})
-    assert not dn.veredicto("previo", {**d, "CT": "3"})
+    assert dn.veredicto("previo", {**d, "CT": "3"})
+    assert not dn.veredicto("previo", {**d, "CT": "0"})
+    assert not dn.veredicto("previo", {**d, "TUNSVC": "no"})
+
+
+def test_reglas_en_numerico():
+    assert "ip -N -6 rule show pref 100" in dn.heredoc(dn.GUARD)
 
 
 def test_veredicto_quitar_incompleto():

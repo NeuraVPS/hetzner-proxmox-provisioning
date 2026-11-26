@@ -152,7 +152,10 @@ def veredicto(accion, d):
     # unidad de tuneles activa (si no, el hook es inerte).
     base = d.get("CT") == "1" and d.get("TUNSVC") == "si"
     if accion == "previo":
-        return d.get("PREVIO") == "si" and base and all(d.get(k) == "si" for k in PREVIOS)
+        # Antes de instalar puede haber copias de mas (la guarda las quita); 0 no.
+        ct = d.get("CT", "")
+        return (d.get("PREVIO") == "si" and ct.isdigit() and int(ct) >= 1 and d.get("TUNSVC") == "si"
+                and all(d.get(k) == "si" for k in PREVIOS))
     return (base and d.get("INSTALADO") == "si" and all(d.get(k) == "si" for k in CHEQUEOS)
             and d.get("HOOK") == "si" and d.get("DROPIN") == "si")
 
