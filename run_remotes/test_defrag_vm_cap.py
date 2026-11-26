@@ -144,6 +144,76 @@ class PickDestEndToEnd(unittest.TestCase):
         self.assertEqual(set(dests(doc)), {"0000266"})
 
 
+    def test_opt_in_lets_the_capped_node_receive_within_margins(self):
+        # 26/11/2026: config/defrag.cappedDestEnabled=true
+        st = self.store()
+        st["config"]["defrag"]["cappedDestEnabled"] = True
+        _, doc, log = h.run_main(st)
+        self.assertIn("cappedDestEnabled", log)
+        self.assertIn("0000266", dests(doc), log)
+
+    def test_opt_in_keeps_the_margins(self):
+        # cap just above what is there: no room once the margin is kept
+        st = self.store(kdm_cap=(6 + 1 if self.FIELD == "max_vm" else 6 * 4 + 4 + 19))
+        st["config"]["defrag"]["cappedDestEnabled"] = True
+        _, doc, log = h.run_main(st)
+        self.assertNotIn("0000266", dests(doc), log)
+
+    def test_opt_in_must_be_true_exactly(self):
+        st = self.store()
+        st["config"]["defrag"]["cappedDestEnabled"] = "true"
+        _, doc, _ = h.run_main(st)
+        self.assertNotIn("0000266", dests(doc))
+
+
+GENOA_SIG = "SIG|AuthenticAMD|25|17|1|AMD EPYC 9454P 48-Core Processor|1|1"
+TURIN_SIG = "SIG|AuthenticAMD|26|2|1|AMD EPYC 9755 128-Core Processor|1|1"
+
+
+class KademarSiliconEndToEnd(unittest.TestCase):
+    """26/11/2026: Kademar (Turin) <-> AX162 (Genoa) live for generic guests."""
+
+    def store(self, model, **kw):
+        st = sqx_store(kdm_cap=26, **kw)
+        st["_sigs"] = {"n300": GENOA_SIG, "n301": GENOA_SIG, "n266": TURIN_SIG}
+        st["_cpu_model"] = model
+        return st
+
+    def test_generic_guest_leaves_kademar_for_genoa(self):
+        _, doc, log = h.run_main(self.store("x86-64-v4", src_over=False, kdm_over=True))
+        self.assertIn("0000266", srcs(doc), log)
+        self.assertTrue(set(dests(doc)) <= {"0000300", "0000301"} and dests(doc), log)
+
+    def test_host_guest_stays_on_kademar(self):
+        _, doc, log = h.run_main(self.store("host", src_over=False, kdm_over=True))
+        self.assertNotIn("0000266", srcs(doc), log)
+
+    def test_generic_guest_enters_kademar_only_with_the_switch(self):
+        st = self.store("x86-64-v4")
+        _, doc, _ = h.run_main(st)
+        self.assertNotIn("0000266", dests(doc))
+        st = self.store("x86-64-v4")
+        st["config"]["defrag"]["cappedDestEnabled"] = True
+        _, doc, log = h.run_main(st)
+        self.assertIn("0000266", dests(doc), log)
+        st = self.store("host")
+        st["config"]["defrag"]["cappedDestEnabled"] = True
+        _, doc, _ = h.run_main(st)
+        self.assertNotIn("0000266", dests(doc))
+
+
+class CappedDestRoom(unittest.TestCase):
+    def test_margins(self):
+        vm = {"cores": 20}
+        self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 0}, vm, False))
+        self.assertTrue(df.capped_dest_room({"vm_cap": 26, "n_all": 24}, vm, True))
+        self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 25}, vm, True))
+        self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 20, "booked_in": 1}, vm, True))  # one entry per run
+        self.assertTrue(df.capped_dest_room({"vcpu_cap": 500, "cores": 460}, vm, True))
+        self.assertFalse(df.capped_dest_room({"vcpu_cap": 500, "cores": 461}, vm, True))
+        self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 1, "vcpu_cap": 500, "cores": 470}, vm, True))
+
+
 class PickDestEndToEndVcpu(PickDestEndToEnd):
     """Same cases with the vCPU budget (6 x 4 = 24 of 500 vCPU used: plenty
     of room, still never a destination)."""

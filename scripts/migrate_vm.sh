@@ -141,13 +141,15 @@
 # LAB ONLY: NV_LAB_ALLOW_CROSS_VENDOR_LIVE=<vmid> lets that single VMID through,
 # to reproduce the crash on a lab VM. Never on a customer VM.
 #
-# ----- Nada en caliente entre silicios distintos (25/11/2026) -----------------
-# Mismo fabricante no basta. cpu=host/max solo entre vendor|family|model
-# idénticos, y cualquier otro modelo (x86-64-v4…) también solo entre el mismo
-# vendor|family|model (sin modo global para relajarlo). Así, entre AX162
-# (Genoa), AX102 (Raphael) y Kademar (EPYC 9755 Turin) TODO traslado es en
-# frío. Ver _live_silicon_guard. LAB ONLY:
-# NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
+# ----- Silicios distintos en caliente (25/11 y 26/11/2026) --------------------
+# Mismo fabricante no basta. cpu=host/max, kvm64 o un modelo con nombre: solo
+# entre vendor|family|model idénticos. Una CPU genérica x86-64-v2/v3/v4 sin
+# opciones, además, entre los silicios de un grupo probado
+# (LIVE_GENERIC_SILICON_GROUPS: hoy AX162 Genoa ↔ Kademar Turin, 26/11, Iván:
+# «Se debe poder migrar en caliente»). AX102 (Raphael) no está en el grupo.
+# Si el origen es un nodo externo (B+), el token del destino es acotado
+# (_token_create) y, con un extremo externo, la migración usa BBR (_bbr_route_arm).
+# Ver _live_silicon_guard. LAB ONLY: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
 #
 # ----- Traslados en frío (y por qué aquí no hay precopia) ---------------------
 # Si la VM está PARADA, este script hace `remote_migrate` sin --online: PVE
@@ -519,26 +521,90 @@ _node_cpu_sig() {
 }
 
 # LIVE migrations only, AFTER _live_cross_vendor_guard (so same vendor here).
-# Regla vigente (25/11/2026, alta del nodo Kademar 2× EPYC 9755 «Turin», AMD
-# familia 26 modelo 2, frente a los AX162 «Genoa» 25/17 y los AX102 «Raphael»
-# 25/97): nada en caliente entre silicios distintos.
+# Regla (25/11/2026, alta del nodo Kademar 2× EPYC 9755 «Turin», AMD familia 26
+# modelo 2, frente a los AX162 «Genoa» 25/17 y los AX102 «Raphael» 25/97):
 #   - cpu=host/max: el invitado ve la CPUID real del nodo → solo con
-#     vendor|family|model IDÉNTICO (EPYC 9454 y 9454P son ambos 25|17). Hasta
-#     el 25/11 se dejaba pasar un destino «superconjunto de flags»; ya no.
-#   - cualquier otro modelo (x86-64-v*, kvm64, con nombre): mismo
-#     vendor|family|model también (revisión del PR #291): Genoa 25|17 ↔
-#     Raphael 25|97 ↔ Turin 26|2 son silicios distintos y se rechazan. Cambio
-#     de comportamiento: AX162 → AX102-SQX (0000260/0000261) con CPU genérica
-#     ya no va en caliente (el defrag no hizo ninguno del 04/11 al 25/11: 176
-#     AX102→AX102 y 40 AX162→AX162). El defrag aplica la misma regla
-#     (cpu_move_ok). No hay modo global para relajarla (LIVE_SILICON_MATCH solo
-#     admite «model»; el antiguo «family» se quitó en la 2.ª revisión).
+#     vendor|family|model IDÉNTICO (EPYC 9454 y 9454P son ambos 25|17). Sin
+#     excepciones: entre silicios distintos, en frío y con el cliente avisado.
+#   - cualquier otro modelo (kvm64, con nombre…): mismo vendor|family|model.
+#   - modelo GENÉRICO x86-64-v2/v3/v4 (26/11/2026, Iván: «Se debe poder migrar
+#     en caliente» entre Kademar y la flota): además del mismo silicio, entre
+#     los silicios de UN MISMO GRUPO de LIVE_GENERIC_SILICON_GROUPS (hoy Genoa
+#     25|17 ↔ Turin 26|2, medido en el piloto 08/11 y otra vez el 26/11 en las
+#     dos direcciones, sin BugCheck ni reinicio). El invitado ve la misma CPU
+#     virtual (qemu64 + flags, familia/modelo de QEMU, no los del nodo) en los
+#     dos lados. Condiciones, todas comprobadas aquí y si falta un dato se
+#     rechaza:
+#       · el QEMU en marcha lleva `enforce` en -cpu: si al destino le faltara
+#         una flag, su QEMU no arranca y la migración falla ANTES del corte, con
+#         la VM intacta en el origen (PVE lo pone siempre en los x86-64-v*);
+#       · el destino tiene `tsc_scale`: Genoa cuenta el TSC a 2,75 GHz y Turin a
+#         2,70; QEMU migra la frecuencia del invitado y KVM la reescala;
+#       · x86-64-v4: el destino tiene AVX-512 (f, bw, cd, dq, vl).
+#     Raphael (AX102, 25|97) NO está en el grupo: no se ha probado y hoy no hay
+#     AX102 de SQX en servicio. Ampliar un grupo = medir antes (ida y vuelta en
+#     caliente con una VM de laboratorio) y cambiar esta constante en un PR. No
+#     es configurable por entorno (`readonly`), como pidió la revisión de #291.
 # Firma ilegible → se rechaza (no se adivina). Único escape, SOLO de
 # laboratorio y por VMID: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<esta VMID>.
-# Args: firma origen, firma destino ("vendor|family|model") y modelo de CPU.
+# Args: firma origen, firma destino ("vendor|family|model"), modelo de CPU y,
+# para el caso genérico entre silicios del grupo, los argumentos de -cpu del
+# QEMU en marcha y la línea `flags` del destino.
 LIVE_SILICON_MATCH="${LIVE_SILICON_MATCH:-model}"
+readonly LIVE_GENERIC_SILICON_GROUPS="AuthenticAMD|25|17,AuthenticAMD|26|2"
+# 0 si las dos firmas están en el mismo grupo (grupos separados por «;»,
+# miembros por «,»).
+_silicon_same_group() {
+  local a="$1" b="$2" g m in_a in_b
+  local -a _members
+  local IFS=';'
+  for g in $LIVE_GENERIC_SILICON_GROUPS; do
+    in_a=0; in_b=0
+    IFS=',' read -r -a _members <<< "$g"
+    for m in "${_members[@]}"; do
+      [[ "$m" == "$a" ]] && in_a=1
+      [[ "$m" == "$b" ]] && in_b=1
+    done
+    (( in_a == 1 && in_b == 1 )) && return 0
+  done
+  return 1
+}
+# Caso genérico entre silicios del mismo grupo. Imprime el motivo del rechazo
+# (vacío = se puede). Args: modelo, args de -cpu en marcha, flags del destino.
+_generic_cross_silicon_why() {
+  local cpu_model="$1" run_args="$2" dst_flags="$3" cfg_raw="${4-}" lc f tok
+  lc=$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')
+  [[ "$lc" =~ ^x86-64-v[234](-[a-z0-9]+)?$ ]] \
+    || { echo "cpu=${cpu_model} no es un modelo genérico x86-64-v2/v3/v4"; return; }
+  # La línea cpu: de la config, sin opciones: phys-bits=host, flags=… o
+  # hidden=… pueden enseñar al invitado algo que depende del nodo (revisión).
+  [[ "$cfg_raw" != *,* ]] \
+    || { echo "la línea cpu: lleva opciones ('${cfg_raw}'), que pueden depender del nodo"; return; }
+  [[ ",${run_args}," == *",enforce,"* ]] \
+    || { echo "no pude confirmar 'enforce' en el -cpu del QEMU en marcha ('${run_args:0:80}')"; return; }
+  local IFS=','
+  for tok in $run_args; do
+    case "$tok" in
+      host-*|*phys-bits*|migratable=*|l3-cache*|hv-passthrough*|vendor=*|model-id=*|level=*|xlevel=*)
+        echo "el -cpu en marcha lleva '${tok}', que depende del nodo"; return ;;
+    esac
+  done
+  unset IFS
+  # El modelo EFECTIVO manda: si el QEMU corre con AVX-512, el destino lo
+  # necesita aunque la config ya diga otra cosa (cambio pendiente).
+  [[ ",${run_args}," == *",+avx512f,"* ]] && lc="x86-64-v4"
+  [[ -n "${dst_flags// /}" ]] || { echo "no pude leer las flags de CPU del destino"; return; }
+  grep -qw tsc_scale <<< "$dst_flags" \
+    || { echo "el destino no tiene tsc_scale (no puede conservar la frecuencia del TSC del invitado)"; return; }
+  if [[ "$lc" == x86-64-v4* ]]; then
+    for f in avx512f avx512bw avx512cd avx512dq avx512vl; do
+      grep -qw "$f" <<< "$dst_flags" || { echo "x86-64-v4 y el destino no tiene ${f}"; return; }
+    done
+  fi
+}
 _live_silicon_guard() {
-  local src_sig="$1" dst_sig="$2" cpu_model="$3" lc why="" sv sf sm dv df dm
+  local src_sig="$1" dst_sig="$2" cpu_model="$3" run_args="${4:-}" dst_flags="${5:-}" cfg_raw="${6-}"
+  local lc why="" rule="mismo vendor|family|model" gwhy sv sf sm dv df dm
   IFS='|' read -r sv sf sm <<< "$src_sig"
   IFS='|' read -r dv df dm <<< "$dst_sig"
   [[ -n "$sv" && "$sf" =~ ^[0-9]+$ && "$sm" =~ ^[0-9]+$ && -n "$dv" && "$df" =~ ^[0-9]+$ && "$dm" =~ ^[0-9]+$ ]] \
@@ -550,18 +616,29 @@ _live_silicon_guard() {
   else
     [[ "$LIVE_SILICON_MATCH" == model ]] \
       || _die "LIVE_SILICON_MATCH solo admite 'model' (vale '${LIVE_SILICON_MATCH}'): no hay modo global para relajar la regla. Para una VM de laboratorio: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>."
-    [[ "$sv" == "$dv" && "$sf" == "$df" && "$sm" == "$dm" ]] \
-      || why="cpu=${cpu_model}: cambia el silicio (origen ${SRC_NODE} [${src_sig//|/ }], destino ${DST_NODE} [${dst_sig//|/ }]; regla vendor|family|model)"
+    if [[ "$sv" == "$dv" && "$sf" == "$df" && "$sm" == "$dm" ]]; then
+      :
+    elif [[ "$sv" == "$dv" ]] && _silicon_same_group "${sv}|${sf}|${sm}" "${dv}|${df}|${dm}"; then
+      gwhy=$(_generic_cross_silicon_why "$cpu_model" "$run_args" "$dst_flags" "$cfg_raw")
+      if [[ -z "$gwhy" ]]; then
+        rule="CPU genérica entre silicios del mismo grupo (enforce, tsc_scale"
+        if [[ "$lc" == x86-64-v4* ]]; then rule+=", AVX-512)"; else rule+=")"; fi
+      else
+        why="cpu=${cpu_model}: origen ${SRC_NODE} [${src_sig//|/ }] y destino ${DST_NODE} [${dst_sig//|/ }] son silicios del mismo grupo, pero ${gwhy}"
+      fi
+    else
+      why="cpu=${cpu_model}: cambia el silicio (origen ${SRC_NODE} [${src_sig//|/ }], destino ${DST_NODE} [${dst_sig//|/ }]; regla vendor|family|model, y no están en el mismo grupo de LIVE_GENERIC_SILICON_GROUPS)"
+    fi
   fi
   if [[ -z "$why" ]]; then
-    _ok "Silicio compatible para migrar en caliente: [${src_sig//|/ }] → [${dst_sig//|/ }], cpu=${cpu_model} (regla: mismo vendor|family|model)."
+    _ok "Silicio compatible para migrar en caliente: [${src_sig//|/ }] → [${dst_sig//|/ }], cpu=${cpu_model} (regla: ${rule})."
     return 0
   fi
   if [[ -n "${NV_LAB_ALLOW_CROSS_SILICON_LIVE:-}" && "${NV_LAB_ALLOW_CROSS_SILICON_LIVE}" == "${VMID}" ]]; then
     _warn "LAB OVERRIDE NV_LAB_ALLOW_CROSS_SILICON_LIVE=${VMID}: dejo pasar en caliente: ${why}. Solo VMs de laboratorio."
     return 0
   fi
-  _die "Cambio de silicio — se rechaza la migración EN CALIENTE de la VM ${VMID}: ${why}. Regla: nada en caliente entre fabricantes ni entre silicios distintos. Única vía: traslado en FRÍO con el cliente avisado (VM parada; con disco grande o enlace lento, kit de precopia ZFS + este script para rutas y Firestore, ver cabecera «Traslados en frío»). No cambies el modelo de CPU para esquivarlo: cambia el Hardware ID de SQX (política 10/10: solo en frío, con CHANGE_CPU=1 y el cliente avisado). Abortado antes de tocar la VM."
+  _die "Cambio de silicio — se rechaza la migración EN CALIENTE de la VM ${VMID}: ${why}. Regla: nada en caliente entre fabricantes; entre silicios distintos solo una CPU genérica x86-64-v* dentro de un grupo probado (hoy Genoa ↔ Turin). Si no, única vía: traslado en FRÍO con el cliente avisado (VM parada; con disco grande o enlace lento, kit de precopia ZFS + este script para rutas y Firestore, ver cabecera «Traslados en frío»). No cambies el modelo de CPU para esquivarlo: cambia el Hardware ID de SQX (política 10/10: solo en frío, con CHANGE_CPU=1 y el cliente avisado). Abortado antes de tocar la VM."
 }
 
 # LIVE migrations only: refuse AMD<->Intel for ANY cpu model. Args: source and
@@ -726,14 +803,35 @@ _guest_boot_read() {
 # syncs at startup anyway) only an _info. GUEST_TIME_RESYNC=0 turns it off.
 GUEST_TIME_RESYNC="${GUEST_TIME_RESYNC:-1}"
 GUEST_TIME_RESYNC_BUDGET_S="${GUEST_TIME_RESYNC_BUDGET_S:-45}"
+# w32tm sale con 0 también cuando NO sincroniza porque w32time aún no tiene
+# muestras (26/11/2026, VMs 963/1267 tras salir de Kademar: «El equipo no se
+# sincronizó porque no tenía información hora disponible» / «did not resync
+# because no time data was available»). Ese caso se reintenta y, si persiste, es
+# un aviso, no un ✅ (medido: w32time lo corrige solo en ~5 min).
+GUEST_TIME_RESYNC_RETRIES="${GUEST_TIME_RESYNC_RETRIES:-2}"
+GUEST_TIME_RESYNC_RETRY_S="${GUEST_TIME_RESYNC_RETRY_S:-15}"
+_w32tm_no_data() {
+  grep -qiE 'no time data|did not resync|no se sincroniz|no ten.a informaci' <<< "$1"
+}
 _guest_time_resync() {
-  local ssh_fn="$1" live="${2:-0}" out msg
+  local ssh_fn="$1" live="${2:-0}" out msg try=0
   [[ "$GUEST_TIME_RESYNC" == "1" ]] || return 0
-  out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${GUEST_TIME_RESYNC_BUDGET_S}' resync" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+  while :; do
+    out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${GUEST_TIME_RESYNC_BUDGET_S}' resync" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+    case "$out" in "OK 0"|"OK 0 "*) _w32tm_no_data "$out" || break ;; *) break ;; esac
+    (( try >= GUEST_TIME_RESYNC_RETRIES )) && break
+    try=$(( try + 1 ))
+    _info "w32tm /resync: w32time aún sin muestras de hora; reintento ${try}/${GUEST_TIME_RESYNC_RETRIES} en ${GUEST_TIME_RESYNC_RETRY_S}s."
+    sleep "$GUEST_TIME_RESYNC_RETRY_S"
+  done
   case "$out" in
     "OK 0"|"OK 0 "*)
-      _ok "Reloj del invitado resincronizado (w32tm /resync): ${out#OK 0}"
-      return 0 ;;
+      if _w32tm_no_data "$out"; then
+        msg="w32tm /resync en la VM ${VMID} no sincronizó (w32time sin muestras de hora tras ${try} reintentos: ${out#OK 0 })"
+      else
+        _ok "Reloj del invitado resincronizado (w32tm /resync): ${out#OK 0}"
+        return 0
+      fi ;;
     "OK "*)   msg="w32tm /resync en la VM ${VMID} devolvió rc=$(cut -d' ' -f2 <<<"$out"): $(cut -d' ' -f3- <<<"$out")" ;;
     "FAIL "*) msg="no se pudo lanzar w32tm /resync en la VM ${VMID} por el guest agent (${out})" ;;
     *)        msg="no se pudo lanzar w32tm /resync en la VM ${VMID} (nodo: ${out:0:120})" ;;
@@ -889,6 +987,10 @@ _apt_dist_upgrade() {
 # Si Firestore no contesta, respaldo por nombre (*AX162*/*-KDM-* → shared,
 # *EX44* → dedicated) y se avisa: nunca peor que antes.
 NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0
+# proxmox_nodes.provider (26/11/2026): "" / "hetzner" = flota Hetzner; otro
+# valor (hoy "kademar") = nodo externo, sin clave de flota (B+). Ver
+# _node_is_external.
+NODE_PROVIDER_SRC=""; NODE_PROVIDER_DST=""
 # Rellena NODE_TYPE_SRC / NODE_TYPE_DST una sola vez.
 _node_types_load() {
   (( _NODE_TYPES_LOADED == 1 )) && return 0
@@ -905,14 +1007,21 @@ db = firestore.client()
 for node in sys.argv[1:3]:
     snap = db.collection("proxmox_nodes").document(node).get()
     if not snap.exists:
-        t = "NO-DOC"
+        t, prov = "NO-DOC", "-"
     else:
-        t = str((snap.to_dict() or {}).get("nodeType") or "").strip().replace(" ", "_") or "NO-FIELD"
-    print("NT %s %s" % (node, t))
+        d = snap.to_dict() or {}
+        t = str(d.get("nodeType") or "").strip().replace(" ", "_") or "NO-FIELD"
+        # Sin campo = desconocido ("-"), NO "hetzner": _node_is_external cae
+        # entonces al respaldo por nombre/IPv6 (revisión: un doc de Kademar sin
+        # provider no puede llevarse un token de root).
+        prov = str(d.get("provider") or "").strip().lower().replace(" ", "_") or "-"
+    print("NT %s %s %s" % (node, t, prov))
 PYNT
 ) || true
   NODE_TYPE_SRC=$(awk -v n="$SRC_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
   NODE_TYPE_DST=$(awk -v n="$DST_NODE" '$1=="NT" && $2==n {print $3; exit}' <<<"$out")
+  NODE_PROVIDER_SRC=$(awk -v n="$SRC_NODE" '$1=="NT" && $2==n {print $4; exit}' <<<"$out")
+  NODE_PROVIDER_DST=$(awk -v n="$DST_NODE" '$1=="NT" && $2==n {print $4; exit}' <<<"$out")
   if [[ -z "$NODE_TYPE_SRC" || -z "$NODE_TYPE_DST" ]]; then
     _warn "No pude leer proxmox_nodes.nodeType de ${SRC_NODE}/${DST_NODE} en Firestore; la clase de memoria sale del nombre (respaldo)."
     return 0
@@ -941,6 +1050,163 @@ _mem_class() {
     *EX44*)          echo dedicated ;;
     *)               echo other ;;
   esac
+}
+
+# ----- Nodos externos (Kademar, B+) -------------------------------------------
+# 0 si el nodo es externo (no Hetzner). Fuente: proxmox_nodes.provider; si
+# Firestore no contesta o no hay dato, respaldo conservador: nombre *-KDM-* o
+# IPv6 fuera de los prefijos de Hetzner (2a01:4f8::/32, 2a01:4f9::/32) cuentan
+# como externos. Args: nodo, provider ("" si no se leyó), IPv6 del nodo.
+_node_is_external() {
+  local node="$1" prov="${2:-}" ip="${3:-}"
+  prov=$(printf '%s' "$prov" | tr '[:upper:]' '[:lower:]')
+  case "$prov" in
+    hetzner) return 1 ;;
+    ""|-)    ;;
+    *)       return 0 ;;
+  esac
+  [[ "$node" == *-KDM-* ]] && return 0
+  ip=$(printf '%s' "$ip" | tr '[:upper:]' '[:lower:]')
+  [[ "$ip" == 2a01:4f8:* || "$ip" == 2a01:4f9:* ]] && return 1
+  return 0
+}
+
+# ----- Token de migración ------------------------------------------------------
+# `pvesh remote_migrate` corre en el ORIGEN y entra en el API del destino con un
+# token creado en el destino para esta migración. Entre nodos Hetzner (todos con
+# la clave de flota) es un token de root@pam con --privsep=0, como siempre.
+# Si el ORIGEN es un nodo externo (Kademar en B+: sin clave de flota ni service
+# account), darle un token de root completo de un nodo Hetzner rompería B+. Ahí
+# el token es ACOTADO (26/11/2026): --privsep=1, caduca a las TOKEN_TTL_S y solo
+# lleva lo que exige el destino de una migración remota (Qemu.pm `mtunnel`:
+# VM.Allocate en /vms/<vmid> y Sys.Incoming en /; Datastore.AllocateSpace en el
+# almacenamiento; SDN.Use en el puente):
+#   /vms/<vmid>                 NVMigInVM  (VM.*: crear y configurar ESA VM)
+#   /                           NVMigInSys (Sys.Incoming, sin propagar)
+#   /storage/<TARGET_STORAGE>   NVMigInDS
+#   /sdn/zones/localnetwork     NVMigInSDN
+# Con ese token no se puede tocar ninguna otra VM ni el nodo. Los roles se
+# quedan definidos en el nodo (no dan nada sin una ACL); las ACL y el token se
+# borran al acabar, también si la migración falla.
+TOKEN_TTL_S="${TOKEN_TTL_S:-43200}"
+TOKEN_RESTRICTED=0
+readonly _NVMIG_PRIVS_VM="VM.Allocate,VM.Audit,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,VM.Migrate,VM.PowerMgmt"
+_token_create() {
+  local out acl_tok="root@pam!${TOKEN_NAME}" code
+  dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 || true
+  if (( TOKEN_RESTRICTED == 1 )); then
+    _info "Creating RESTRICTED migration token on dest (source ${SRC_NODE} is external, B+)…"
+    out=$(dst_ssh "set -e
+      ensure_role() { pveum role add \"\$1\" --privs \"\$2\" >/dev/null 2>&1 || pveum role modify \"\$1\" --privs \"\$2\" >/dev/null; }
+      ensure_role NVMigInVM '${_NVMIG_PRIVS_VM}'
+      ensure_role NVMigInSys 'Sys.Audit,Sys.Incoming'
+      ensure_role NVMigInDS 'Datastore.AllocateSpace,Datastore.Audit'
+      ensure_role NVMigInSDN 'SDN.Use'
+      echo ROLES-OK" 2>&1) || true
+    [[ "$out" == *ROLES-OK* ]] || _die "Could not prepare the NVMigIn* roles on dest: ${out:0:300}"
+    # Alta del token aparte: su salida lleva el secreto y nunca va a un mensaje.
+    TOKEN_CREATED=1
+    out=$(dst_ssh "pveum user token add root@pam '${TOKEN_NAME}' --privsep 1 --expire \$(( \$(date +%s) + ${TOKEN_TTL_S} )) --comment 'migrate_vm ${VMID} from external ${SRC_NODE}' 2>&1") \
+      || _die "pveum token add (restricted) failed on dest (output withheld: it may contain the secret)."
+  else
+    _info "Creating migration token on dest…"
+    TOKEN_CREATED=1
+    out=$(dst_ssh "pveum user token add root@pam '${TOKEN_NAME}' --privsep=0 2>&1") \
+      || _die "pveum token add failed on dest (output withheld: it may contain the secret)."
+  fi
+  TOKEN_SECRET=$(printf '%s' "$out" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1 || true)
+  [[ -n "$TOKEN_SECRET" ]] || _die "Could not parse token secret from pveum output."
+  if (( TOKEN_RESTRICTED == 1 )); then
+    out=$(dst_ssh "set -e
+      pveum acl modify '/vms/${VMID}' --tokens '${acl_tok}' --roles NVMigInVM --propagate 0
+      pveum acl modify / --tokens '${acl_tok}' --roles NVMigInSys --propagate 0
+      pveum acl modify '/storage/${TARGET_STORAGE}' --tokens '${acl_tok}' --roles NVMigInDS --propagate 0
+      pveum acl modify /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN --propagate 1
+      echo ACL-OK" 2>&1) || true
+    [[ "$out" == *ACL-OK* ]] || _die "Could not grant the restricted token's ACLs on dest: ${out//${TOKEN_SECRET}/<secret>}"
+    # Comprobación con el propio token de las lecturas que hace remote_migrate
+    # antes de abrir el túnel (GET /cluster/status → Sys.Audit). Se hace EN el
+    # destino, contra 127.0.0.1, por el SSH ya autenticado: el token no viaja a
+    # un 8006 sin verificar (revisión) ni aparece en la línea de órdenes (va por
+    # stdin como cabecera).
+    code=$(printf 'Authorization: PVEAPIToken=root@pam!%s=%s\n' "$TOKEN_NAME" "$TOKEN_SECRET" \
+             | dst_ssh "curl -sk -o /dev/null -w '%{http_code}' --max-time 15 -H @- https://127.0.0.1:8006/api2/json/cluster/status" 2>/dev/null || true)
+    if [[ "$code" == 000 || -z "$code" ]]; then
+      _warn "Could not pre-check the restricted token on ${DST_NODE} (HTTP ${code:-none}); remote_migrate will tell."
+    elif [[ "$code" != 200 ]]; then
+      _die "The restricted token cannot read /cluster/status on ${DST_NODE} (HTTP ${code}): remote_migrate would fail before copying anything."
+    fi
+  fi
+  _ok "Token created on dest$( (( TOKEN_RESTRICTED == 1 )) && echo " (restricted to VM ${VMID}, expires in ${TOKEN_TTL_S}s)")."
+}
+# Borra el token (y sus ACL si era acotado). Idempotente; nunca aborta.
+_token_cleanup() {
+  (( TOKEN_CREATED == 1 )) || return 0
+  local acl_tok="root@pam!${TOKEN_NAME}"
+  if (( TOKEN_RESTRICTED == 1 )); then
+    dst_ssh "pveum acl delete '/vms/${VMID}' --tokens '${acl_tok}' --roles NVMigInVM >/dev/null 2>&1
+      pveum acl delete / --tokens '${acl_tok}' --roles NVMigInSys >/dev/null 2>&1
+      pveum acl delete '/storage/${TARGET_STORAGE}' --tokens '${acl_tok}' --roles NVMigInDS >/dev/null 2>&1
+      pveum acl delete /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN >/dev/null 2>&1
+      true" >/dev/null 2>&1 || true
+  fi
+  # Éxito solo si el listado responde con JSON válido y el token ya no está
+  # (revisión: con remove y list fallando a la vez se daba por borrado).
+  if dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}' >/dev/null 2>&1
+      out=\$(pveum user token list root@pam --output-format json 2>/dev/null) || exit 3
+      printf '%s' \"\$out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(1 if any(t.get(\"tokenid\")==sys.argv[1] for t in d) else 0)' '${TOKEN_NAME}'" >/dev/null 2>&1; then
+    _ok "Token removed on dest."
+    TOKEN_CREATED=0
+  else
+    _warn "Could not confirm the migration token is gone on ${DST_NODE}: remove it by hand (pveum user token remove root@pam ${TOKEN_NAME}; restricted tokens also expire on their own)."
+  fi
+}
+
+# ----- BBR solo hacia el destino, solo durante el traslado ------------------------
+# Medido el 26/11/2026 (un flujo TCP, 0000265 FSN ↔ Kademar): hacia Kademar,
+# cubic da 268-348 Mbit/s y BBR 851; desde Kademar, ~840 con los dos. La ruta de
+# entrada a Kademar pierde paquetes y cubic se frena; el túnel de la migración
+# (websocket al 8006 del destino) es UN flujo que abre el ORIGEN. Así que, si
+# uno de los dos extremos es externo, se pone en el origen una ruta /128 hacia
+# el destino con `congctl bbr` mientras dura el remote_migrate y se quita
+# después (también si falla). No toca el resto del tráfico del nodo, ni el de
+# los túneles GRE (el control de congestión solo afecta a TCP local).
+# MIGRATE_BBR=auto (por defecto: solo con un extremo externo) | 1 | 0.
+MIGRATE_BBR="${MIGRATE_BBR:-auto}"
+BBR_ROUTE_ADDED=0
+_bbr_route_arm() {
+  local out
+  out=$(src_ssh "modprobe tcp_bbr 2>/dev/null
+    if [ -n \"\$(ip -6 route show '${DST_IPV6}/128' 2>/dev/null)\" ]; then echo EXISTS; exit 0; fi
+    set -- \$(ip -6 route get '${DST_IPV6}' 2>/dev/null | sed -n 's/.* via \\([^ ]*\\) dev \\([^ ]*\\).*/\\1 \\2/p')
+    [ -n \"\${2:-}\" ] || { echo NOGW; exit 0; }
+    ip -6 route add '${DST_IPV6}/128' via \"\$1\" dev \"\$2\" congctl bbr && echo ADDED || echo FAIL" 2>/dev/null || true)
+  case "$out" in
+    *ADDED*)  BBR_ROUTE_ADDED=1; _ok "BBR toward ${DST_NODE} on ${SRC_NODE} for this migration (temporary /128 route)." ;;
+    *EXISTS*) _info "There is already a /128 route to ${DST_IPV6} on ${SRC_NODE}; left as is (no BBR route added)." ;;
+    *NOGW*|*FAIL*) _warn "Could not add the temporary BBR route on ${SRC_NODE} (${out}); the migration goes on with the default congestion control (slower toward an external node)." ;;
+    *)        BBR_ROUTE_ADDED=2   # respuesta perdida: puede que sí se pusiera; el desarme lo comprueba
+              _warn "No answer while adding the temporary BBR route on ${SRC_NODE}; it may or may not be there (checked again when removing)." ;;
+  esac
+}
+# Solo borra una /128 hacia el destino que siga siendo la nuestra (congctl
+# bbr). Si dos traslados comparten origen y destino y el primero la quita, el
+# segundo no pierde nada: el control de congestión se fija al abrir la conexión.
+_bbr_route_disarm() {
+  if (( BBR_ROUTE_ADDED == 2 )); then
+    # Propiedad incierta (respuesta perdida): podría ser una /128 ajena. Se deja.
+    _warn "Not touching any /128 route to ${DST_IPV6} on ${SRC_NODE}: whether this run added it is unknown. If 'ip -6 route show ${DST_IPV6}/128' shows 'congctl bbr' and nobody else set it, remove it by hand."
+    BBR_ROUTE_ADDED=0
+    return 0
+  fi
+  (( BBR_ROUTE_ADDED == 1 )) || return 0
+  if src_ssh "r=\$(ip -6 route show '${DST_IPV6}/128' 2>/dev/null)
+      case \"\$r\" in *'congctl bbr'*) ip -6 route del '${DST_IPV6}/128' ;; *) true ;; esac" >/dev/null 2>&1; then
+    _info "Temporary BBR route to ${DST_IPV6} removed on ${SRC_NODE}."
+  else
+    _warn "Could not remove the temporary BBR route on ${SRC_NODE}: ip -6 route del ${DST_IPV6}/128 (harmless if the source VM is gone, but remove it)."
+  fi
+  BBR_ROUTE_ADDED=0
 }
 
 # ----- Globo de la VPS E al cambiar de clase de memoria -----------------------
@@ -1647,6 +1913,7 @@ _cutover_cleanup() {
 
 # ----- Cleanup / rollback state machine ----------------------------------------
 TOKEN_CREATED=0
+SRC_EXTERNAL=0; DST_EXTERNAL=0
 HOOKSCRIPT_DETACHED=0
 MIGRATION_DONE=0
 WAS_STOPPED=0  # 1 if the source VM was stopped pre-migration (we started it temporarily on dest)
@@ -1671,7 +1938,11 @@ _rollback() {
   local rc=$?
   set +e
   _cutover_cleanup
+  # Token y ruta BBR temporales: fuera también cuando la migración ya está
+  # hecha y algo posterior falla (antes el token se quedaba en ese caso).
+  _bbr_route_disarm
   if (( MIGRATION_DONE == 1 )); then
+    _token_cleanup
     _ssh_close
     return
   fi
@@ -1688,7 +1959,7 @@ _rollback() {
   fi
   if (( TOKEN_CREATED == 1 )); then
     _info "Removing migration token on dest…"
-    dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 || true
+    _token_cleanup
   fi
   # A failed/aborted migration can leave the BASEs' NAT entry for this VM
   # missing or stale (e.g. the aborted dest stub's stop event clobbers it via
@@ -1854,8 +2125,14 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     fi
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
+    # Para el caso genérico entre silicios del mismo grupo (26/11/2026): los
+    # argumentos de -cpu del QEMU en marcha (¿lleva enforce?) y las flags del
+    # destino (tsc_scale, AVX-512). Vacíos si no se pueden leer → se rechaza.
+    CPU_RUN_ARGS=""
+    [[ -n "${_run_cpu:-}" && "$_run_cpu" != "-cpu" ]] && CPU_RUN_ARGS="$_run_cpu"
+    DST_CPU_FLAGS=$(dst_ssh 'grep -m1 "^flags" /proc/cpuinfo' 2>/dev/null | tr -d '\r' || true)
     _live_cross_vendor_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
-    _live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
+    _live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}" "$CPU_RUN_ARGS" "$DST_CPU_FLAGS" "${CPU_RAW:-}"
   else
     # Offline: la CPU que verá el invitado es la de la config (sección principal).
     CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
@@ -1910,15 +2187,23 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   HOOKSCRIPT_DETACHED=1
   _ok "Hookscript detached on source."
 
-  # 3) Token on dest (clean any stale, then create fresh)
-  dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 || true
-  _info "Creating migration token on dest…"
-  TOKEN_OUT=$(dst_ssh "pveum user token add root@pam '${TOKEN_NAME}' --privsep=0 2>&1") \
-    || _die "pveum token add failed on dest: ${TOKEN_OUT}"
-  TOKEN_SECRET=$(printf '%s' "$TOKEN_OUT" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
-  [[ -n "$TOKEN_SECRET" ]] || _die "Could not parse token secret from pveum output."
-  TOKEN_CREATED=1
-  _ok "Token created on dest."
+  # 3) Token on dest (clean any stale, then create fresh). Acotado si el
+  # ORIGEN es externo (B+, ver _token_create).
+  _node_types_load
+  SRC_EXTERNAL=0; DST_EXTERNAL=0
+  _node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" && SRC_EXTERNAL=1
+  _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6" && DST_EXTERNAL=1
+  (( SRC_EXTERNAL == 1 )) && TOKEN_RESTRICTED=1
+  if (( TOKEN_RESTRICTED == 1 )); then
+    # Con el token acotado, el comando `config` del túnel rechazaría estas
+    # opciones DESPUÉS de copiar el disco (args: solo root@pam; startup:
+    # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes.
+    _bad_keys=$(src_ssh "sed '/^\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null \
+      | grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' | tr -d ':' | tr '\n' ' ' || true)
+    [[ -z "${_bad_keys// /}" ]] \
+      || _die "VM ${VMID} lleva ${_bad_keys}en su config: con el token acotado de un origen externo (B+) el destino la rechazaría tras copiar el disco. Quita esas opciones o muévela en frío. Abortado antes de copiar nada."
+  fi
+  _token_create
 
   # 4) Dest pveproxy SSL fingerprint — read from cert file (faster + more reliable
   # than openssl s_client). Try uploaded cert first, fall back to default.
@@ -2101,6 +2386,11 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     _ESC_PID=$!
     _info "downtime-escalator armed (pid ${_ESC_PID}): start ${MIGRATE_DOWNTIME_INITIAL}s, ceiling ${MIGRATE_DOWNTIME}s, hard-escalate at ${DOWNTIME_ESCALATE_HARD_S}s."
   fi
+  case "$MIGRATE_BBR" in
+    1) _bbr_route_arm ;;
+    0) ;;
+    *) (( SRC_EXTERNAL == 1 || DST_EXTERNAL == 1 )) && _bbr_route_arm ;;
+  esac
   _cutover_arm
   _migrate_rc=0
   src_ssh "pvesh create '/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate' \
@@ -2115,6 +2405,7 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     wait "$_ESC_PID" 2>/dev/null || true
   fi
   _cutover_settle
+  _bbr_route_disarm
   [[ "$_migrate_rc" -eq 0 ]] || _die "pvesh remote_migrate failed."
   _ok "remote_migrate command returned."
 
@@ -2447,12 +2738,7 @@ if [[ -n "${BALLOON_HISTORY:-}" ]]; then
 fi
 
 # Cleanup the migration token (only if we created it this run).
-if (( TOKEN_CREATED == 1 )); then
-  dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 \
-    || _warn "Token cleanup had issues (may already be removed)."
-  TOKEN_CREATED=0
-  _ok "Token removed on dest."
-fi
+_token_cleanup
 
 # Restore original power state: if we started this VM ourselves to apply
 # in-guest config, gracefully shut it back down. The hookscript on dest will

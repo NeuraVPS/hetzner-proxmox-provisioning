@@ -226,13 +226,46 @@ def node_vcpu_cap(data):
 
 
 def dest_capped(dn):
-    """A node with a hard cap (max_vm or max_vcpu) is NEVER a defrag/relief destination
-    (operator decision 25/11): its entries are controlled manual moves (cold
-    move kit) only. Reserving slots across a planned-from-a-snapshot batch,
+    """A node with a hard cap (max_vm or max_vcpu) is not a defrag/relief destination
+    (operator decision 25/11) unless config/defrag.cappedDestEnabled (26/11,
+    see capped_dest_room): its entries are controlled manual moves only. Reserving slots across a planned-from-a-snapshot batch,
     racing new orders and moves dropped at execution time, is exactly what
     this avoids. It can still be a SOURCE. Nodes without the fields (every
     node but 0000266 on 25/11) are unaffected."""
     return dn.get("vm_cap") is not None or dn.get("vcpu_cap") is not None
+
+
+# Opt-in (26/11/2026): config/defrag.cappedDestEnabled=true lets a capped node
+# (Kademar) RECEIVE defrag/relief moves, keeping this much of each cap free
+# after the move. The margin is what keeps a new order admitted by
+# auto_provision while the move is in flight (create_vm counts only server docs
+# already ON the node) from pushing the node over its cap: one more VM and the
+# vCPU of the largest SQX plan (E = 20). Off by default: Iván 25/11, «no se
+# mueve ningún cliente existente» a Kademar; manual moves (migrate_vm.sh /
+# migrate_vms_batch.sh with an explicit destination) need no switch.
+CAPPED_DEST_VM_MARGIN = 1
+CAPPED_DEST_VCPU_MARGIN = 20
+
+
+def capped_dest_room(dn, vm, enabled):
+    """False unless the switch is on and the capped node keeps its margins
+    after receiving `vm`. VMs: every server doc on the node + those booked in
+    this run; vCPU: `cores`, which book() keeps up to date."""
+    if not enabled:
+        return False
+    # At most ONE entry per capped node per run: the margin only covers one
+    # order racing one move (review: the plan is a snapshot, the batch can
+    # take hours).
+    if int(dn.get("booked_in") or 0) >= 1:
+        return False
+    if dn.get("vm_cap") is not None and \
+            int(dn.get("n_all") or 0) + int(dn.get("booked_in") or 0) + 1 \
+            + CAPPED_DEST_VM_MARGIN > dn["vm_cap"]:
+        return False
+    if dn.get("vcpu_cap") is not None and \
+            int(dn.get("cores") or 0) + int(vm.get("cores") or 0) + CAPPED_DEST_VCPU_MARGIN > dn["vcpu_cap"]:
+        return False
+    return True
 
 
 def dest_allows(dn, vm):
@@ -247,8 +280,13 @@ def dest_allows(dn, vm):
 # CPU (operator rule 2026-11-04, safe mode). The SQX licence Hardware ID and a
 # live migration's survival both depend on the CPU the guest SEES:
 #   * a guest with a GENERIC model (x86-64-v2/v3/v4) sees the same virtual CPU
-#     on every host of the vendor, but since 25/11/2026 it still only moves
-#     live to the same silicon model (vendor + family + model, see below);
+#     on every host of the vendor. It moves live to the same silicon model
+#     (vendor + family + model) and, since 26/11/2026 (Iván: Kademar must be
+#     able to go in and out live), between the silicon models of one group of
+#     LIVE_GENERIC_SILICON_GROUPS — today Genoa 25/17 <-> Turin 26/2 (AX162 <->
+#     Kademar), measured both ways. Mirror of migrate_vm.sh
+#     (_live_silicon_guard); the destination also needs tsc_scale (Genoa and
+#     Turin count the TSC at 2.75 vs 2.70 GHz) and, for v4, AVX-512.
 #   * anything else (`cpu: host`, a named model, the kvm64 default of a config
 #     without a cpu line) sees the host -> only a destination whose CPU is the
 #     SAME silicon: vendor + family + model + stepping, from /proc/cpuinfo.
@@ -256,15 +294,25 @@ def dest_allows(dn, vm):
 #     Ryzen 7950X3D (25/97/2) is not, so a host guest never moves AX162<->AX102.
 #   * live AMD<->Intel is never allowed, generic or not (x86-64-v4 Windows
 #     bugchecked ~20 s after resuming on Intel, 10/10/2026).
-#   * a generic guest also needs the same silicon model, vendor + family +
-#     model (25/11/2026): AX162 <-> AX102 <-> Kademar Turin are cold-only.
+#   * Raphael (AX102, 25/97) is in no group: generic AX162 <-> AX102 stays cold.
 # Everything unknown -> no move: an unreadable VM config or an unprobed node
 # never yields a destination.
 GENERIC_CPU_RE = re.compile(r"^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$")
+CROSS_SILICON_CPU_RE = re.compile(r"^x86-64-v[234](-[a-z0-9]+)?$")  # whole value, no options
+# (vendor, family, model) groups; keep in sync with migrate_vm.sh.
+LIVE_GENERIC_SILICON_GROUPS = (
+    frozenset({("AuthenticAMD", "25", "17"), ("AuthenticAMD", "26", "2")}),
+)
 
 
 def vm_cpu_generic(cpu):
     return bool(cpu) and bool(GENERIC_CPU_RE.match(str(cpu).split(",")[0].strip()))
+
+
+def silicon_same_group(src_sig, dst_sig):
+    a = tuple(src_sig.get(k) for k in ("vendor", "family", "model"))
+    b = tuple(dst_sig.get(k) for k in ("vendor", "family", "model"))
+    return any(a in g and b in g for g in LIVE_GENERIC_SILICON_GROUPS)
 
 
 def cpu_move_ok(vm_cpu, src_sig, dst_sig):
@@ -276,19 +324,21 @@ def cpu_move_ok(vm_cpu, src_sig, dst_sig):
     if not src_sig.get("vendor") or src_sig.get("vendor") != dst_sig.get("vendor"):
         return False
     if vm_cpu_generic(vm_cpu):
-        # Same SILICON too: vendor + family + model (25/11/2026, review of PR
-        # #291): nothing live between different silicon models, generic CPU
-        # included — Genoa 25/17, Raphael 25/97 and Kademar's Turin 26/2 are
-        # three. migrate_vm.sh refuses it (_live_silicon_guard,
-        # LIVE_SILICON_MATCH=model), so planning it would only produce a failed
-        # move. Behaviour change: AX162 -> AX102-SQX (260/261) no longer moves
-        # live (0 such moves 04/11-25/11). Unknown -> no.
-        if not all(src_sig.get(k) not in (None, "") and src_sig.get(k) == dst_sig.get(k)
-                   for k in ("vendor", "family", "model")):
-            return False
+        model = str(vm_cpu).split(",")[0].strip().lower()
+        same = all(src_sig.get(k) not in (None, "") and src_sig.get(k) == dst_sig.get(k)
+                   for k in ("vendor", "family", "model"))
+        if not same:
+            # Different silicon: only inside a tested group, with a generic
+            # v2/v3/v4 model and a destination that can rescale the guest TSC
+            # (migrate_vm.sh also checks `enforce` on the running QEMU, which
+            # PVE always sets for these models). Unknown -> no.
+            if not (CROSS_SILICON_CPU_RE.match(model) and "," not in str(vm_cpu)
+                    and silicon_same_group(src_sig, dst_sig)
+                    and dst_sig.get("tsc_scale") is True):
+                return False
         # x86-64-v4 needs AVX-512 on the destination (PVE adds `enforce`: the
         # guest would refuse to run); unknown -> no.
-        if str(vm_cpu).split(",")[0].strip().lower().startswith("x86-64-v4"):
+        if model.startswith("x86-64-v4"):
             return dst_sig.get("avx512") is True
         return True
     key = ("vendor", "family", "model", "stepping")
@@ -309,9 +359,11 @@ for line in open('/proc/cpuinfo'):
         info[k] = v.strip()
     if not line.strip() and info:
         break
-avx = '1' if ' avx512f ' in ' %s ' % info.get('flags', '') else '0'
-print('SIG|%s|%s|%s|%s|%s|%s' % (info.get('vendor_id', ''), info.get('cpu family', ''),
-      info.get('model', ''), info.get('stepping', ''), info.get('model name', ''), avx))
+flags = ' %s ' % info.get('flags', '')
+avx = '1' if all(' %s ' % f in flags for f in ('avx512f', 'avx512bw', 'avx512cd', 'avx512dq', 'avx512vl')) else '0'
+tsc = '1' if ' tsc_scale ' in flags else '0'
+print('SIG|%s|%s|%s|%s|%s|%s|%s' % (info.get('vendor_id', ''), info.get('cpu family', ''),
+      info.get('model', ''), info.get('stepping', ''), info.get('model name', ''), avx, tsc))
 for path in sorted(glob.glob('/etc/pve/qemu-server/*.conf')):
     vmid = os.path.basename(path)[:-5]
     cpu = 'kvm64'
@@ -320,7 +372,9 @@ for path in sorted(glob.glob('/etc/pve/qemu-server/*.conf')):
             if line.startswith('['):
                 break
             if line.startswith('cpu:'):
-                cpu = line.split(':', 1)[1].strip().split(',')[0] or 'kvm64'
+                # whole value: options such as phys-bits=host keep a guest
+                # off the cross-silicon path (cpu_move_ok)
+                cpu = line.split(':', 1)[1].strip().replace('|', ',') or 'kvm64'
                 break
     except OSError:
         cpu = ''
@@ -377,9 +431,11 @@ def parse_node_probe(text):
             vendor, family, model, stepping = (p.strip() for p in parts[1:5])
             if vendor and family.isdigit() and model.isdigit() and stepping.isdigit():
                 avx = parts[6].strip() if len(parts) >= 7 else ""
+                tsc = parts[7].strip() if len(parts) >= 8 else ""
                 sig = {"vendor": vendor, "family": family, "model": model,
                        "stepping": stepping, "name": parts[5].strip(),
-                       "avx512": {"1": True, "0": False}.get(avx)}
+                       "avx512": {"1": True, "0": False}.get(avx),
+                       "tsc_scale": {"1": True, "0": False}.get(tsc)}
         elif parts[0] == "VM" and len(parts) >= 3 and parts[1].isdigit():
             cpus[int(parts[1])] = effective_vm_cpu(
                 parts[2], parts[3] if len(parts) >= 4 else None)
@@ -789,6 +845,10 @@ def main():
     # destinations. mtRamGateCrossRegion=false forbids crossing for it.
     mt_ram_cross = cfg.get("mtRamGateCrossRegion", True) is not False
     cooldown_h = float(cfg.get("moveCooldownH") or 72)
+    capped_dest_enabled = cfg.get("cappedDestEnabled") is True
+    if capped_dest_enabled:
+        log(f"cappedDestEnabled: nodos con tope (max_vm/max_vcpu) pueden recibir, "
+            f"dejando libres {CAPPED_DEST_VM_MARGIN} VM y {CAPPED_DEST_VCPU_MARGIN} vCPU")
     recent_vmids = load_recent_moves(cooldown_h)
     if recent_vmids:
         log(f"cooldown {cooldown_h:.0f}h: {len(recent_vmids)} VM(s) moved "
@@ -963,8 +1023,8 @@ def main():
                 continue   # never SQX<->MT, whatever the caller asked for
             if not dest_allows(dn, vm):
                 continue
-            if dest_capped(dn):
-                continue   # max_vm node: manual entries only (see dest_capped)
+            if dest_capped(dn) and not capped_dest_room(dn, vm, capped_dest_enabled):
+                continue   # capped node: manual entries only unless opted in (see capped_dest_room)
             if not cpu_move_ok(vm_cpu, src.get("sig"), dn.get("sig")):
                 continue
             if not disk_ok(dn):
@@ -1109,6 +1169,11 @@ def main():
         dn["ram"] += vm["ram"]
         dn["fl"] += vm["fl"]
         dn["cores"] += vm["cores"]
+        # VMs booked INTO the node this run: only capped_dest_room reads it.
+        # Never decremented (a rolled-back consolidation leaves it high), so
+        # it can only make that check stricter. n_all is left alone: the
+        # consolidation pass compares it with len(vms).
+        dn["booked_in"] = dn.get("booked_in", 0) + 1
         sn["vms"] = [v for v in sn["vms"] if v["vmid"] != vm["vmid"]]
         booked.add(vm["vmid"])
         moves.append((vm["vmid"], src, dst, reason))

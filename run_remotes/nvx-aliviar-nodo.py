@@ -31,14 +31,19 @@ SALVAGUARDAS
   · Solo saca del nodo que se le nombra. Nunca de otro.
   · El destino tiene que ser del MISMO tipo (nodeType, no el nombre), admitir
     el plan de la VM (allowedServerTypes), tener una CPU compatible con la de
-    la VM (una `cpu: host` solo va a la misma CPU; sin dato no se mueve),
-    pasar el gate de disco del 80% (el mismo que la venta y el defrag), no estar
-    ya dañado de CPU (cpu_ok: contención > 50 ms/s reciente o, en MT, p95
-    laborable >= 85 %; el mismo criterio que el defrag) y tener holgura de cores.
+    la VM (una `cpu: host` solo va a la misma CPU; una generica, al mismo
+    silicio o, desde el 26/11, entre Genoa y Turin (AX162 <-> Kademar); sin
+    dato no se mueve), pasar el gate de disco del 80% (el mismo que la venta y
+    el defrag), no estar ya dañado de CPU (cpu_ok: contención > 50 ms/s
+    reciente o, en MT, p95 laborable >= 85 %; el mismo criterio que el defrag)
+    y tener holgura de cores (un nodo con tope max_vm/max_vcpu, como Kademar,
+    solo con config/defrag.cappedDestEnabled=true y dejando libres 1 VM y 20
+    vCPU).
   · Se mueve de UNA EN UNA, remidiendo el pool despues de cada una. Un fallo
     para la tanda en vez de arrastrarla.
 """
 import argparse
+import re
 import json
 import subprocess
 import sys
@@ -125,20 +130,28 @@ def uso_real(nid):
     return uso
 
 
-_SIG_CMD = ("grep -m4 -E '^(vendor_id|cpu family|model|stepping)[[:space:]]*:' "
+_SIG_CMD = ("grep -m5 -E '^(vendor_id|cpu family|model|stepping|flags)[[:space:]]*:' "
             "/proc/cpuinfo")
+_AVX512 = ("avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl")
 
 
 def firma_cpu(nid):
-    """(vendor, familia, modelo, stepping) del nodo, de /proc/cpuinfo; None si
-    no se puede leer. Misma regla que el defrag (cpu_move_ok)."""
+    """(vendor, familia, modelo, stepping, avx512, tsc_scale) del nodo, de
+    /proc/cpuinfo; None si no se puede leer. Misma regla que el defrag
+    (cpu_move_ok): los dos ultimos son '1'/'0'."""
     out = en_nodo(nid, _SIG_CMD, timeout=30) or ""
     campos = {}
     for linea in out.split("\n"):
         k, _, v = linea.partition(":")
         campos.setdefault(k.strip(), v.strip())
     firma = tuple(campos.get(k) or "" for k in ("vendor_id", "cpu family", "model", "stepping"))
-    return firma if all(firma) else None
+    if not all(firma):
+        return None
+    flags = set((campos.get("flags") or "").split())
+    if not flags:
+        return None
+    return firma + ("1" if all(f in flags for f in _AVX512) else "0",
+                    "1" if "tsc_scale" in flags else "0")
 
 
 def cpu_de_vm(nid, vmid):
@@ -158,7 +171,7 @@ def cpu_de_vm(nid, vmid):
     lineas = [l for l in out[:-3].strip().split("\n") if l.strip()]
     run = next((l[4:].strip() for l in lineas if l.startswith("RUN:")), None)
     cfg = next((l for l in lineas if l.startswith("cpu:")), None)
-    cfg = cfg.split(":", 1)[1].strip().split(",")[0] if cfg else "kvm64"
+    cfg = cfg.split(":", 1)[1].strip() if cfg else "kvm64"   # entero: las opciones cuentan
     if run is not None:
         if not run:
             return None
@@ -167,17 +180,64 @@ def cpu_de_vm(nid, vmid):
     return cfg or "kvm64"
 
 
+# Grupos de silicio entre los que una CPU generica x86-64-v2/v3/v4 si migra en
+# caliente (26/11/2026: Genoa 25/17 <-> Turin 26/2, AX162 <-> Kademar). Igual
+# que neuravps-defrag.py y migrate_vm.sh (LIVE_GENERIC_SILICON_GROUPS).
+GRUPOS_SILICIO = (frozenset({("AuthenticAMD", "25", "17"), ("AuthenticAMD", "26", "2")}),)
+
+
 def cpu_permite(cpu_vm, firma_origen, firma_destino):
-    """Modo seguro (operador 04/11): sin dato, no se mueve. CPU generica
-    (x86-64-vN) -> mismo fabricante; cualquier otra (`host`, kvm64, modelos
-    con nombre) -> el MISMO silicio (fabricante, familia, modelo, stepping)."""
+    """Modo seguro (operador 04/11): sin dato, no se mueve. Misma regla que el
+    defrag (cpu_move_ok) y que migrate_vm.sh:
+      · CPU generica (x86-64-vN): mismo fabricante, familia y modelo; o, con
+        v2/v3/v4, dos silicios del mismo grupo y destino con tsc_scale;
+        x86-64-v4 ademas necesita AVX-512 en el destino;
+      · cualquier otra (`host`, kvm64, con nombre): el MISMO silicio
+        (fabricante, familia, modelo, stepping).
+    Hasta el 26/11 una generica pasaba con solo el mismo fabricante, y planeaba
+    movimientos que migrate_vm.sh rechaza desde el PR #291."""
     if not cpu_vm or not firma_origen or not firma_destino:
         return False
     if firma_origen[0] != firma_destino[0]:
         return False
-    if cpu_vm.startswith("x86-64-v"):
+    modelo = cpu_vm.split(",")[0].strip().lower()
+    if modelo.startswith("x86-64-v"):
+        if tuple(firma_origen[:3]) != tuple(firma_destino[:3]):
+            if "," in cpu_vm or not re.match(r"^x86-64-v[234](-[a-z0-9]+)?$", modelo):
+                return False
+            if not any(tuple(firma_origen[:3]) in g and tuple(firma_destino[:3]) in g
+                       for g in GRUPOS_SILICIO):
+                return False
+            if len(firma_destino) < 6 or firma_destino[5] != "1":
+                return False
+        if modelo.startswith("x86-64-v4"):
+            return len(firma_destino) >= 5 and firma_destino[4] == "1"
         return True
-    return firma_origen == firma_destino
+    return tuple(firma_origen[:4]) == tuple(firma_destino[:4])
+
+
+def holgura_tope(n, nid, vms_en_nodo, cores_usados, cores_vm):
+    """Topes de nodos SQX (max_vm / max_vcpu, Kademar): None si el nodo no
+    tiene; True/False si cabe dejando libre 1 VM y 20 vCPU (el plan mas grande),
+    margen para un pedido nuevo que entre mientras dura el traslado (el mismo
+    que el defrag con cappedDestEnabled). Los recuentos salen de Firestore en
+    cada eleccion: migrate_vm.sh cambia el nodeId al acabar cada traslado."""
+    if str(n.get("nodeType") or "").strip() != "SQX":
+        return None
+    def _cap(k):
+        try:
+            v = int(n.get(k))
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+    vm_cap, vcpu_cap = _cap("max_vm"), _cap("max_vcpu")
+    if vm_cap is None and vcpu_cap is None:
+        return None
+    if vm_cap is not None and vms_en_nodo.get(nid, 0) + 1 + 1 > vm_cap:
+        return False
+    if vcpu_cap is not None and cores_usados.get(nid, 0) + cores_vm + 20 > vcpu_cap:
+        return False
+    return True
 
 
 def permitidos(n):
@@ -244,11 +304,15 @@ def elige_destino(nid_origen, vmid, db, reservado):
         log("vm%d: no puedo leer su cpu (%r) o la del origen (%r) — no se mueve"
             % (vmid, cpu_vm, firma_origen))
         return None
+    capped_ok = ((db.collection("config").document("defrag").get().to_dict() or {})
+                 .get("cappedDestEnabled") is True)
     usados = {}
+    vms_en_nodo = {}
     for d in db.collection("servers").select(["nodeId", "cores"]).stream():
         s = d.to_dict() or {}
         if s.get("nodeId"):
             usados[s["nodeId"]] = usados.get(s["nodeId"], 0) + int(s.get("cores") or 2)
+            vms_en_nodo[s["nodeId"]] = vms_en_nodo.get(s["nodeId"], 0) + 1
     mejor = None
     for nd in db.collection("proxmox_nodes").stream():
         n = nd.to_dict() or {}
@@ -268,7 +332,17 @@ def elige_destino(nid_origen, vmid, db, reservado):
         pct = float(pct) + reservado.get(nd.id, 0.0)
         if pct >= DISK_REAL_MAX_PCT:
             continue
-        if int(n.get("max_cores") or 0) - usados.get(nd.id, 0) - cores_vm < 0:
+        tope = holgura_tope(n, nd.id, vms_en_nodo, usados, cores_vm)
+        # Un nodo con tope (Kademar) solo recibe con el MISMO consentimiento que
+        # el defrag: config/defrag.cappedDestEnabled=true (Iván 25/11: no se
+        # mueve ningun cliente existente a Kademar sin decidirlo).
+        if tope is not None and not capped_ok:
+            continue
+        if tope is False:
+            continue
+        # max_cores sigue mandando si el nodo lo tiene; sin el, solo vale un tope.
+        mc = int(n.get("max_cores") or 0)
+        if (mc > 0 or tope is None) and mc - usados.get(nd.id, 0) - cores_vm < 0:
             continue
         if not cpu_ok(n):
             continue
