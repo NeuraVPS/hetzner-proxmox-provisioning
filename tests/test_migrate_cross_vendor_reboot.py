@@ -249,6 +249,24 @@ class SiliconGuard(unittest.TestCase):
         self.assertLess(SCRIPT.index("DST_CPU_FLAGS=$(dst_ssh 'grep -m1 \"^flags\" /proc/cpuinfo'", online), call)
 
 
+class ColdIntoExternal(unittest.TestCase):
+    """26/11/2026: a STOPPED VM only goes to an external node with a generic CPU without options
+    (ACK_HWID_CHANGE is not enough there), and templates must be exactly x86-64-v4."""
+
+    def test_offline_branch_refuses_before_the_hwid_guard(self):
+        off = SCRIPT.index("    # Offline: la CPU que verá el invitado es la de la config")
+        hw = SCRIPT.index('_cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"', off)
+        block = SCRIPT[off:hw]
+        self.assertIn('_node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"', block)
+        self.assertIn('"${CPU_RAW:-}" != *,*', block)
+        self.assertLess(hw, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
+
+    def test_template_export_requires_bare_v4(self):
+        exp = (ROOT / "scripts/export_template_vm_to_shared_storage.sh").read_text()
+        self.assertIn('"${TPL_CPU#cputype=}"', exp)
+        self.assertIn("expected exactly x86-64-v4 (generic, no options)", exp)
+
+
 class ExternalNode(unittest.TestCase):
     """26/11/2026: Kademar (provider kademar, B+) is an external node."""
 

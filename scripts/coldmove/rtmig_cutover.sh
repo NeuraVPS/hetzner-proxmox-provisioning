@@ -79,6 +79,15 @@ pending_touches() {
        END{exit t ? 0 : 1}' "$1"
 }
 is_generic_cpu() { [[ "$1" =~ ^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$ ]]; }
+# La línea cpu: efectiva COMPLETA (con opciones; la de [PENDING] si la hay), para el destino externo.
+conf_cpu_full() {
+  awk 'BEGIN{sec="main"}
+       /^\[/ {sec=$0; next}
+       sec=="main" && /^cpu:/ {m=$0}
+       sec=="[PENDING]" && /^cpu:/ {p=$0}
+       sec=="[PENDING]" && /^delete:/ {s=$0; sub(/^delete:[ \t]*/,"",s); n=split(s,a,/[ ,]+/); for(i=1;i<=n;i++) if(a[i]=="cpu") d=1}
+       END{v = (p!="") ? p : (d ? "" : m); sub(/^cpu:[ \t]*/,"",v); sub(/^cputype=/,"",v); print v}' "$1"
+}
 
 # Pone «key: value» en la sección PRINCIPAL de una config: sustituye la línea si está, o la añade al
 # final de esa sección. Las secciones [PENDING]/[snapshot] no cuentan ni se tocan.
@@ -158,12 +167,17 @@ cpu_decision() {
       die "el Hardware ID de SQX y las licencias del Market cambiarán (${reason}). Hace falta dejar constancia del aviso al cliente: CHANGE_CPU=1 (pone ${tgt}) o ACK_HWID_CHANGE=${VMID} (deja ${cpu}), con CPU_NOTICE='…'. No se ha tocado nada"
     fi
   fi
-  # Hacia un nodo EXTERNO (Kademar, *-KDM-*; 26/11/2026) la VM tiene que quedar con CPU genérica: es la
-  # única que puede volver a salir EN CALIENTE (migrate_vm.sh, Genoa <-> Turin). Dejar `cpu: host` con
-  # ACK_HWID_CHANGE la atraparía allí: si el nodo se avería, solo saldría en frío. El aviso al cliente
-  # ya hace falta igual (el silicio cambia), así que se pide CHANGE_CPU=1.
-  if [[ "$DST_NODE" == *-KDM-* && "${CHANGE_CPU:-0}" != 1 ]] && ! is_generic_cpu "$lc"; then
-    die "destino externo ${DST_NODE}: la VM tiene cpu=${cpu} y solo una CPU genérica puede volver a salir de allí en caliente. Usa CHANGE_CPU=1 (pone ${tgt}) con CPU_NOTICE='…' (el Hardware ID de SQX cambia de todas formas). No se ha tocado nada"
+  # Hacia un nodo EXTERNO (Kademar, *-KDM-*; 26/11/2026) la VM tiene que quedar con CPU genérica SIN
+  # opciones: es la única que puede volver a salir EN CALIENTE (migrate_vm.sh, Genoa <-> Turin). Dejar
+  # `cpu: host` (ACK_HWID_CHANGE) o `x86-64-v4,phys-bits=host` la atraparía allí. Con CHANGE_CPU=1 se
+  # reescribe la línea entera a ${tgt}; sin él, se rechaza (el aviso al cliente hace falta igual).
+  if [[ "$DST_NODE" == *-KDM-* ]]; then
+    local full; full=$(conf_cpu_full "$conf")
+    if [[ "${CHANGE_CPU:-0}" == 1 ]]; then
+      [[ "${full,,}" == "$tgt" ]] || new="$tgt"
+    elif ! is_generic_cpu "$lc" || [[ "$full" == *,* ]]; then
+      die "destino externo ${DST_NODE}: la VM tiene cpu=${full:-kvm64} y solo una CPU genérica sin opciones puede volver a salir de allí en caliente. Usa CHANGE_CPU=1 (pone ${tgt}) con CPU_NOTICE='…'. No se ha tocado nada"
+    fi
   fi
   CPU_NEW="$new"; CPU_OLD="$cpu"; CPU_ACK_REASON=""
   [[ -n "${ACK_HWID_CHANGE:-}" ]] && CPU_ACK_REASON="${reason:-sin cambio de Hardware ID detectado}"

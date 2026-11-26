@@ -1040,6 +1040,17 @@ class CpuGuard(unittest.TestCase):
         k, r = self.push("x86-64-v4")                           # generic: nothing to do
         self.assertEqual(r.returncode, 0, out(r))
 
+    def test_generic_with_options_is_normalised_or_refused_toward_kademar(self):
+        # review: x86-64-v4,phys-bits=host would pass a model-only check and stay stuck on Kademar
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, cpu="x86-64-v4,phys-bits=host"); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("sin opciones", out(r))
+        k, r = self.push("x86-64-v4,phys-bits=host", CHANGE_CPU="1", CPU_NOTICE="correo 26/11")
+        self.assertEqual(r.returncode, 0, out(r))
+        conf = k.read(f"dst/etc/pve/qemu-server/{VMID}.conf")
+        self.assertIn("cpu: x86-64-v4\n", conf); self.assertNotIn("phys-bits", conf)
+
     def test_ack_keeps_host_and_records_it_once_published(self):
         k, r = self.push("host", dst_node="0000234-AX162-2-LTD", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo 20/11")
         self.assertEqual(r.returncode, 0, out(r))

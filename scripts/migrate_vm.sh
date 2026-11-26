@@ -2139,6 +2139,15 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     _cpu_first="${CPU_RAW%%,*}"; CPU_MODEL="${_cpu_first#cputype=}"
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
+    # Hacia un nodo externo (Kademar) solo entra CPU genérica sin opciones, la única que podrá volver
+    # a salir en caliente; ACK_HWID_CHANGE no vale aquí (26/11/2026). Para normalizarla: kit
+    # scripts/coldmove con CHANGE_CPU=1 y el cliente avisado.
+    _node_types_load
+    if _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"; then
+      _lcm=$(printf '%s' "${CPU_MODEL:-kvm64}" | tr '[:upper:]' '[:lower:]')
+      [[ "$_lcm" =~ ^x86-64-v[234](-[a-z0-9]+)?$ && "${CPU_RAW:-}" != *,* ]] \
+        || _die "Destino externo ${DST_NODE}: la VM ${VMID} tiene cpu=${CPU_RAW:-kvm64} y solo una CPU genérica x86-64-v* sin opciones puede volver a salir de allí en caliente. Normalízala con el kit scripts/coldmove (CHANGE_CPU=1, cliente avisado). Abortado antes de tocar la VM."
+    fi
     _cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-kvm64}"
     _cold_avx512_guard "${CPU_MODEL:-kvm64}" "$(dst_ssh 'grep -m1 "^flags" /proc/cpuinfo' 2>/dev/null || true)"
   fi

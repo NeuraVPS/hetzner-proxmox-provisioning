@@ -290,8 +290,11 @@ case "$(printf '%s' "$TPL_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" in
     die "VM ${VMID} has no cpu: line — set the generic model with: qm set ${VMID} --cpu x86-64-v4"
     ;;
   *)
-    if [[ "$REQUIRE_BASELINE_CPU" == "1" && "$(printf '%s' "$TPL_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" != "x86-64-v4" ]]; then
-      die "VM ${VMID} has cpu: ${TPL_CPU}; expected generic x86-64-v4"
+    # Exactly x86-64-v4, no options (26/11/2026): an option such as phys-bits=host would reach every new
+    # VM and keep it from moving live between AX162 and Kademar (migrate_vm.sh refuses cpu options
+    # across silicon).
+    if [[ "$REQUIRE_BASELINE_CPU" == "1" && "$(printf '%s' "${TPL_CPU#cputype=}" | tr '[:upper:]' '[:lower:]')" != "x86-64-v4" ]]; then
+      die "VM ${VMID} has cpu: ${TPL_CPU}; expected exactly x86-64-v4 (generic, no options)"
     fi
     echo "VM ${VMID} cpu model: ${TPL_CPU}"
     ;;
