@@ -109,7 +109,8 @@ reapply_tunnels() {
 }
 check_node_v4() {
   local v4; v4="$(node_v4)"
-  ip -4 addr show dev lo | grep -q "inet ${v4}/32" || { log "falta ${v4}/32 en lo"; return 1; }
+  # En `lo` (neuravps-tunnels.sh) o en la dummy nvx-src (nvx-netguard.sh).
+  ip -4 addr show | grep -q "inet ${v4}/32" || { log "falta ${v4}/32 (ni en lo ni en nvx-src)"; return 1; }
   ip -4 route get 1.1.1.1 from "$v4" 2>/dev/null | grep -q 'dev tun-.* table 102' || { log "sin ruta por tunel con origen $v4 (tabla 102)"; return 1; }
 }
 
@@ -140,7 +141,8 @@ phase_check() {
   done
   for f in /usr/local/sbin/neuravps-tunnels.sh /usr/local/sbin/neuravps-tunnel-select.sh \
            /usr/local/sbin/neuravps-tunnel-probe.sh /usr/local/sbin/nvx-mss.sh /usr/local/sbin/nvx-aisla.sh \
-           /usr/local/sbin/nvx-aisla-l3.sh; do
+           /usr/local/sbin/nvx-aisla-l3.sh /usr/local/sbin/nvx-netguard.sh /etc/network/if-up.d/nvx-netguard \
+           /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf; do
     heredoc "$INSTALL_SH" "$f" >/dev/null && echo "extraible: $f" || { echo "NO EXTRAIBLE: $f"; bad=1; }
   done
   [ -e /etc/network/interfaces.new ] && { echo "HAY /etc/network/interfaces.new pendiente: revisalo antes de net"; bad=1; }
@@ -389,6 +391,10 @@ phase_tunnels() {
     put_heredoc "$INSTALL_SH" "/etc/systemd/system/$f" 644
   done
   put_heredoc "$INSTALL_SH" /etc/sysctl.d/zz-neuravps-rpfilter.conf 644
+  # Guarda frente a ifreload/«Apply» de la GUI (base/docs/ifreload-guard.md).
+  put_heredoc "$INSTALL_SH" /usr/local/sbin/nvx-netguard.sh 755
+  put_heredoc "$INSTALL_SH" /etc/network/if-up.d/nvx-netguard 755
+  put_heredoc "$INSTALL_SH" /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf 644
   grep -q 'TUN_MTU' /usr/local/sbin/neuravps-tunnels.sh || die "neuravps-tunnels.sh sin TUN_MTU: el repo copiado es anterior al cambio"
   # DEFAULT_V4_VIA_TUNNEL=0: el nodo conserva su IPv4 publica para su propio
   # trafico; solo los invitados (tablas 100/101) salen por el tunel.
@@ -413,6 +419,7 @@ EOF
   systemctl daemon-reload
   systemctl enable neuravps-tunnels.service neuravps-tunnel-probe.timer nvx-mss.service nvx-aisla.service nvx-aisla-l3.service >/dev/null 2>&1
   /usr/local/sbin/neuravps-tunnels.sh || log "AVISO: neuravps-tunnels.sh rc!=0 (normal si las bases aun no tienen el nodo en Firestore)"
+  /usr/local/sbin/nvx-netguard.sh
   systemctl restart nvx-mss.service nvx-aisla.service nvx-aisla-l3.service
   systemctl start neuravps-tunnels.service neuravps-tunnel-probe.timer
   for f in tun-fsn tun-hel; do
