@@ -141,13 +141,15 @@
 # LAB ONLY: NV_LAB_ALLOW_CROSS_VENDOR_LIVE=<vmid> lets that single VMID through,
 # to reproduce the crash on a lab VM. Never on a customer VM.
 #
-# ----- Nada en caliente entre silicios distintos (25/11/2026) -----------------
-# Mismo fabricante no basta. cpu=host/max solo entre vendor|family|model
-# idénticos, y cualquier otro modelo (x86-64-v4…) también solo entre el mismo
-# vendor|family|model (sin modo global para relajarlo). Así, entre AX162
-# (Genoa), AX102 (Raphael) y Kademar (EPYC 9755 Turin) TODO traslado es en
-# frío. Ver _live_silicon_guard. LAB ONLY:
-# NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
+# ----- Silicios distintos en caliente (25/11 y 26/11/2026) --------------------
+# Mismo fabricante no basta. cpu=host/max, kvm64 o un modelo con nombre: solo
+# entre vendor|family|model idénticos. Una CPU genérica x86-64-v2/v3/v4 sin
+# opciones, además, entre los silicios de un grupo probado
+# (LIVE_GENERIC_SILICON_GROUPS: hoy AX162 Genoa ↔ Kademar Turin, 26/11, Iván:
+# «Se debe poder migrar en caliente»). AX102 (Raphael) no está en el grupo.
+# Si el origen es un nodo externo (B+), el token del destino es acotado
+# (_token_create) y, con un extremo externo, la migración usa BBR (_bbr_route_arm).
+# Ver _live_silicon_guard. LAB ONLY: NV_LAB_ALLOW_CROSS_SILICON_LIVE=<vmid>.
 #
 # ----- Traslados en frío (y por qué aquí no hay precopia) ---------------------
 # Si la VM está PARADA, este script hace `remote_migrate` sin --online: PVE
