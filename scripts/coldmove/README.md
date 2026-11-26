@@ -150,6 +150,11 @@ La regla es la misma que en `migrate_vm.sh` y en el defrag. La vía fría direct
   - `CHANGE_CPU=1`: pone la CPU de las altas (`x86-64-v4`, o v3 sin AVX-512).
   - `ACK_HWID_CHANGE=<VMID>`: deja la CPU tal cual.
   - En los dos casos hace falta `CPU_NOTICE='<cuándo y por dónde se avisó al cliente>'`.
+- **Hacia Kademar (`DST_NODE` `*-KDM-*`, 26/11/2026) solo entra CPU genérica.** Una VM `host`/`max`,
+  `kvm64` o con modelo con nombre exige `CHANGE_CPU=1` (`ACK_HWID_CHANGE` se rechaza en `shutdown`, antes
+  de apagar nada): es la única CPU con la que podrá volver a salir EN CALIENTE (`migrate_vm.sh`,
+  Genoa ↔ Turin) si Kademar se avería. El aviso al cliente hace falta igual, porque el silicio cambia.
+  Con CPU genérica, mejor que el kit: `migrate_vm.sh` en caliente (ver `docs/KADEMAR_NODE.md`).
 - Todo queda en `$WORK/cpu-change.txt`, una vez publicada la config.
 
 ## Rollback

@@ -39,7 +39,8 @@
 #   - Con cpu=host/max, otro modelo con nombre o sin línea cpu (kvm64), si el silicio
 #     (vendor|family|model de /proc/cpuinfo) cambia, el Hardware ID cambia: se exige UNA de
 #       CHANGE_CPU=1                pone en el destino la CPU de las altas (x86-64-v4, o v3 sin AVX-512);
-#       ACK_HWID_CHANGE=<VMID>      deja la CPU tal cual (el invitado verá el silicio nuevo);
+#       ACK_HWID_CHANGE=<VMID>      deja la CPU tal cual (el invitado verá el silicio nuevo); NO vale hacia
+#                                   Kademar (*-KDM-*) con una CPU no genérica: ahí solo CHANGE_CPU=1;
 #     y en los dos casos CPU_NOTICE='<cuándo y por dónde se avisó al cliente de reactivar licencias>'.
 #   - x86-64-v4 hacia un destino sin AVX-512 no arrancaría (PVE pone enforce): solo con CHANGE_CPU=1.
 #   Se registra en $WORK/cpu-change.txt al publicar. El rollback recupera la CPU antigua (la config del
@@ -156,6 +157,13 @@ cpu_decision() {
     if [[ -n "$reason" && -z "${ACK_HWID_CHANGE:-}" ]]; then
       die "el Hardware ID de SQX y las licencias del Market cambiarán (${reason}). Hace falta dejar constancia del aviso al cliente: CHANGE_CPU=1 (pone ${tgt}) o ACK_HWID_CHANGE=${VMID} (deja ${cpu}), con CPU_NOTICE='…'. No se ha tocado nada"
     fi
+  fi
+  # Hacia un nodo EXTERNO (Kademar, *-KDM-*; 26/11/2026) la VM tiene que quedar con CPU genérica: es la
+  # única que puede volver a salir EN CALIENTE (migrate_vm.sh, Genoa <-> Turin). Dejar `cpu: host` con
+  # ACK_HWID_CHANGE la atraparía allí: si el nodo se avería, solo saldría en frío. El aviso al cliente
+  # ya hace falta igual (el silicio cambia), así que se pide CHANGE_CPU=1.
+  if [[ "$DST_NODE" == *-KDM-* && "${CHANGE_CPU:-0}" != 1 ]] && ! is_generic_cpu "$lc"; then
+    die "destino externo ${DST_NODE}: la VM tiene cpu=${cpu} y solo una CPU genérica puede volver a salir de allí en caliente. Usa CHANGE_CPU=1 (pone ${tgt}) con CPU_NOTICE='…' (el Hardware ID de SQX cambia de todas formas). No se ha tocado nada"
   fi
   CPU_NEW="$new"; CPU_OLD="$cpu"; CPU_ACK_REASON=""
   [[ -n "${ACK_HWID_CHANGE:-}" ]] && CPU_ACK_REASON="${reason:-sin cambio de Hardware ID detectado}"
