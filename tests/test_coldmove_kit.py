@@ -1040,6 +1040,19 @@ class CpuGuard(unittest.TestCase):
         k, r = self.push("x86-64-v4")                           # generic: nothing to do
         self.assertEqual(r.returncode, 0, out(r))
 
+    def test_args_or_v1_cannot_enter_kademar(self):
+        # review: a clean cpu but an `args:` line (or x86-64-v1/v5) could enter and never leave live
+        for conf_extra, cpu in (("args: -no-hpet\n", "x86-64-v4"), ("", "x86-64-v1"), ("", "x86-64-v5")):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp, cpu=cpu)
+                if conf_extra:
+                    f = k.t / f"src/etc/pve/qemu-server/{VMID}.conf"
+                    f.write_text(f.read_text() + conf_extra)
+                k.ok("rtmig_send.sh", "base", "rtmig-a")
+                r = k.run("rtmig_cutover.sh", "shutdown", "60")
+                self.assertEqual(r.returncode, 1, (cpu, out(r))); self.assertIn("destino externo", out(r))
+                self.assertNotIn("shutdown", k.read("qm.log"))
+
     def test_generic_with_options_is_normalised_or_refused_toward_kademar(self):
         # review: x86-64-v4,phys-bits=host would pass a model-only check and stay stuck on Kademar
         with tempfile.TemporaryDirectory() as tmp:

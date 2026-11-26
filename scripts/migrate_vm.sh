@@ -2144,6 +2144,11 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     # scripts/coldmove con CHANGE_CPU=1 y el cliente avisado.
     _node_types_load
     if _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"; then
+      # `qm config` sin --current devuelve el cambio [PENDING], pero el túnel de PVE importa la
+      # sección principal: se exige que las dos coincidan (revisión).
+      _cpu_cur=$(src_ssh "qm config '${VMID}' --current 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+      [[ "${_cpu_cur}" == "${CPU_RAW:-}" ]] \
+        || _die "Destino externo ${DST_NODE}: la VM ${VMID} tiene un cambio de CPU PENDIENTE (actual '${_cpu_cur:-kvm64}', pendiente '${CPU_RAW:-kvm64}'). Aplícalo (arrancando la VM) o descártalo antes. Abortado antes de tocar la VM."
       _lcm=$(printf '%s' "${CPU_MODEL:-kvm64}" | tr '[:upper:]' '[:lower:]')
       [[ "$_lcm" =~ ^x86-64-v[234](-[a-z0-9]+)?$ && "${CPU_RAW:-}" != *,* ]] \
         || _die "Destino externo ${DST_NODE}: la VM ${VMID} tiene cpu=${CPU_RAW:-kvm64} y solo una CPU genérica x86-64-v* sin opciones puede volver a salir de allí en caliente. Normalízala con el kit scripts/coldmove (CHANGE_CPU=1, cliente avisado). Abortado antes de tocar la VM."

@@ -259,6 +259,7 @@ class ColdIntoExternal(unittest.TestCase):
         block = SCRIPT[off:hw]
         self.assertIn('_node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"', block)
         self.assertIn('"${CPU_RAW:-}" != *,*', block)
+        self.assertIn("--current", block)                      # [PENDING] vs what PVE imports
         self.assertLess(hw, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
 
     def test_template_export_requires_bare_v4(self):

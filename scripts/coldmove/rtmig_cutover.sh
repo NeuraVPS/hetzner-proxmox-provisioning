@@ -175,9 +175,15 @@ cpu_decision() {
     local full; full=$(conf_cpu_full "$conf")
     if [[ "${CHANGE_CPU:-0}" == 1 ]]; then
       [[ "${full,,}" == "$tgt" ]] || new="$tgt"
-    elif ! is_generic_cpu "$lc" || [[ "$full" == *,* ]]; then
-      die "destino externo ${DST_NODE}: la VM tiene cpu=${full:-kvm64} y solo una CPU genérica sin opciones puede volver a salir de allí en caliente. Usa CHANGE_CPU=1 (pone ${tgt}) con CPU_NOTICE='…'. No se ha tocado nada"
+    elif [[ ! "$lc" =~ ^x86-64-v[234](-[a-z0-9]+)?$ || "$full" == *,* ]]; then
+      die "destino externo ${DST_NODE}: la VM tiene cpu=${full:-kvm64} y solo una CPU genérica x86-64-v2/v3/v4 sin opciones puede volver a salir de allí en caliente. Usa CHANGE_CPU=1 (pone ${tgt}) con CPU_NOTICE='…'. No se ha tocado nada"
     fi
+    # Lo que el token acotado de la salida (migrate_vm.sh, origen externo) no podría importar.
+    local bad
+    bad=$(grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' \
+            <(awk '/^\[/ && $0!="[PENDING]" {exit} {print}' "$conf") | tr -d ':' | sort -u | tr '\n' ' ' || true)
+    [[ -z "${bad// /}" ]] \
+      || die "destino externo ${DST_NODE}: la config lleva ${bad}y con eso la VM no podría volver a salir de Kademar en caliente (el token acotado del destino lo rechaza). Quítalo antes. No se ha tocado nada"
   fi
   CPU_NEW="$new"; CPU_OLD="$cpu"; CPU_ACK_REASON=""
   [[ -n "${ACK_HWID_CHANGE:-}" ]] && CPU_ACK_REASON="${reason:-sin cambio de Hardware ID detectado}"
