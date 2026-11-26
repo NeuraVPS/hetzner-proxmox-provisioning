@@ -223,9 +223,12 @@ class FakeDb:
         return _Coll(self.store, name)
 
 
-def fake_run_factory(vm_cpus):
-    """subprocess.run stand-in: no manual migration, CPU probe = 7950X3D with
-    the given per-node VM cpu lines, every guest agent alive, no rates."""
+def fake_run_factory(vm_cpus, sigs=None, cpu_model="x86-64-v4"):
+    """subprocess.run stand-in: no manual migration, CPU probe = 7950X3D (or
+    sigs[host]) with the given per-node VM cpu lines, every guest agent alive,
+    no rates."""
+    sigs = sigs or {}
+
     def fake_run(cmd, *a, **kw):
         out = ""
         if cmd[0] == "ps":
@@ -234,8 +237,8 @@ def fake_run_factory(vm_cpus):
             remote = cmd[-1]
             host = next((c for c in cmd if c.startswith("root@")), "root@")[5:]
             if "python3 -c" in remote:
-                out = RYZEN + "\n" + "".join(
-                    f"VM|{v}|x86-64-v4|x86-64-v4\n" for v in vm_cpus.get(host, ()))
+                out = sigs.get(host, RYZEN) + "\n" + "".join(
+                    f"VM|{v}|{cpu_model}|{cpu_model}\n" for v in vm_cpus.get(host, ()))
             elif "qm agent" in remote:
                 out = "RC=0\n"
         return types.SimpleNamespace(stdout=out, stderr="", returncode=0)
@@ -257,7 +260,8 @@ def run_main(store, argv=("--dry-run",)):
         vm_cpus.setdefault(ip, []).append(s["proxmoxId"])
     log = io.StringIO()
     with mock.patch.object(df, "open", fake_open, create=True), \
-         mock.patch.object(df.subprocess, "run", fake_run_factory(vm_cpus)), \
+         mock.patch.object(df.subprocess, "run", fake_run_factory(
+             vm_cpus, store.get("_sigs"), store.get("_cpu_model", "x86-64-v4"))), \
          mock.patch.object(df.firebase_admin, "initialize_app"), \
          mock.patch.object(df.credentials, "Certificate"), \
          mock.patch.object(df.firestore, "client", lambda: FakeDb(store)), \

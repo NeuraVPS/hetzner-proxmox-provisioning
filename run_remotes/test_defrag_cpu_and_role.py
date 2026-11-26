@@ -23,12 +23,12 @@ df = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(df)
 
 EPYC_P = {"vendor": "AuthenticAMD", "family": "25", "model": "17", "stepping": "1",
-          "name": "AMD EPYC 9454P 48-Core Processor", "avx512": True}
+          "name": "AMD EPYC 9454P 48-Core Processor", "avx512": True, "tsc_scale": True}
 EPYC = dict(EPYC_P, name="AMD EPYC 9454 48-Core Processor")
 RYZEN = {"vendor": "AuthenticAMD", "family": "25", "model": "97", "stepping": "2",
-         "name": "AMD Ryzen 9 7950X3D 16-Core Processor", "avx512": True}
+         "name": "AMD Ryzen 9 7950X3D 16-Core Processor", "avx512": True, "tsc_scale": True}
 TURIN = {"vendor": "AuthenticAMD", "family": "26", "model": "2", "stepping": "1",
-         "name": "AMD EPYC 9755 128-Core Processor", "avx512": True}
+         "name": "AMD EPYC 9755 128-Core Processor", "avx512": True, "tsc_scale": True}
 INTEL = {"vendor": "GenuineIntel", "family": "6", "model": "183", "stepping": "1",
          "name": "13th Gen Intel(R) Core(TM) i5-13500", "avx512": False}
 
@@ -106,15 +106,35 @@ class CpuRule(unittest.TestCase):
         self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, INTEL))   # never live AMD<->Intel
         self.assertFalse(df.cpu_move_ok("x86-64-v3", INTEL, EPYC))
 
-    def test_generic_vm_never_changes_cpu_family(self):
-        # 25/11/2026: Zen4 (AX162/AX102, family 25) <-> Zen5 Turin (Kademar,
-        # family 26) is cold-only, as migrate_vm.sh's _live_silicon_guard.
-        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, TURIN))
-        self.assertFalse(df.cpu_move_ok("x86-64-v4", TURIN, EPYC))
+    def test_generic_vm_crosses_genoa_turin_only(self):
+        # 26/11/2026 (Iván): generic x86-64-v2/v3/v4 moves live between the
+        # silicon of one group (Genoa 25/17 <-> Turin 26/2), as migrate_vm.sh.
+        for model in ("x86-64-v4", "x86-64-v3", "x86-64-v2-AES"):
+            self.assertTrue(df.cpu_move_ok(model, EPYC, TURIN), model)
+            self.assertTrue(df.cpu_move_ok(model, TURIN, EPYC_P), model)
+        # Raphael is in no group
         self.assertFalse(df.cpu_move_ok("x86-64-v3", RYZEN, TURIN))
-        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC, family="")))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", TURIN, RYZEN))
+        # never for host / named / kvm64
+        for model in ("host", "kvm64", "EPYC-Genoa"):
+            self.assertFalse(df.cpu_move_ok(model, EPYC, TURIN), model)
+            self.assertFalse(df.cpu_move_ok(model, TURIN, EPYC), model)
         self.assertTrue(df.cpu_move_ok("x86-64-v4", TURIN, dict(TURIN)))
-        self.assertFalse(df.cpu_move_ok("host", EPYC, TURIN))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC, family="")))
+
+    def test_cross_silicon_needs_tsc_scale_and_avx512_for_v4(self):
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(TURIN, tsc_scale=False)))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(TURIN, tsc_scale=None)))
+        self.assertFalse(df.cpu_move_ok("x86-64-v4", TURIN, dict(EPYC, avx512=None)))
+        self.assertTrue(df.cpu_move_ok("x86-64-v3", TURIN, dict(EPYC, avx512=False)))
+        # same silicon: tsc_scale is not needed (unchanged behaviour)
+        self.assertTrue(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC_P, tsc_scale=None)))
+
+    def test_groups_mirror_migrate_vm(self):
+        script = (PATH.parents[1] / "scripts/migrate_vm.sh").read_text()
+        m = re.search(r'(?m)^readonly LIVE_GENERIC_SILICON_GROUPS="(.*)"$', script)
+        groups = [frozenset(tuple(x.split("|")) for x in g.split(",")) for g in m.group(1).split(";")]
+        self.assertEqual(tuple(groups), df.LIVE_GENERIC_SILICON_GROUPS)
 
     def test_host_vm_needs_the_same_silicon(self):
         self.assertFalse(df.cpu_move_ok("host", EPYC, RYZEN))    # AX162 -> AX102
@@ -145,7 +165,7 @@ class CpuRule(unittest.TestCase):
         self.assertFalse(df.cpu_move_ok("host", dict(EPYC, stepping=""), EPYC))
 
     def test_probe_parsing(self):
-        out = ("SIG|AuthenticAMD|25|97|2|AMD Ryzen 9 7950X3D 16-Core Processor|1\n"
+        out = ("SIG|AuthenticAMD|25|97|2|AMD Ryzen 9 7950X3D 16-Core Processor|1|1\n"
                "VM|1751|x86-64-v3|qemu64\nVM|936|host|host\nVM|12|kvm64|-\nVM|bad|host|-\n"
                "VM|55|x86-64-v4|host\nVM|56|x86-64-v4|\n")
         sig, cpus = df.parse_node_probe(out)
@@ -154,6 +174,10 @@ class CpuRule(unittest.TestCase):
                                 55: "host", 56: None})
         old_sig, _ = df.parse_node_probe("SIG|AuthenticAMD|25|97|2|x\n")
         self.assertIsNone(old_sig["avx512"])
+        self.assertIsNone(old_sig["tsc_scale"])
+        sig7, _ = df.parse_node_probe("SIG|AuthenticAMD|25|97|2|x|1\n")
+        self.assertTrue(sig7["avx512"])
+        self.assertIsNone(sig7["tsc_scale"])
         self.assertEqual(df.parse_node_probe("SIG|||||\n"), (None, {}))
         self.assertEqual(df.parse_node_probe(""), (None, {}))
 

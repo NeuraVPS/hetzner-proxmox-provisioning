@@ -114,17 +114,28 @@ TURIN = "AuthenticAMD|26|2"
 RAPHAEL = "AuthenticAMD|25|97"
 
 
+V4_RUN = ("qemu64,+abm,+aes,+avx,+avx2,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512vl,"
+          "+bmi1,+bmi2,-cet-ibt,-cet-ss,enforce,+f16c,+fma,hv_ipi,hv_relaxed,hv_time,"
+          "+kvm_pv_eoi,+kvm_pv_unhalt,+movbe,+pni,+popcnt,+sse4.1,+sse4.2,+ssse3,+xsave")
+GENOA_FLAGS = "flags\t\t: fpu vme tsc msr avx2 avx512f avx512dq avx512cd avx512bw avx512vl svm tsc_scale vmcb_clean"
+TURIN_FLAGS = GENOA_FLAGS + " avx_vnni avx512_vp2intersect"
+
+
 class SiliconGuard(unittest.TestCase):
     """25/11/2026 (Kademar, EPYC 9755 Turin = AMD 26|2): nothing LIVE across
-    silicon. Since the review of PR #291 every cpu model needs identical
-    vendor|family|model (LIVE_SILICON_MATCH=model by default); =family relaxes
-    generic models to the same family, by hand only."""
+    silicon for cpu=host or named models. 26/11/2026 (Iván): a GENERIC
+    x86-64-v2/v3/v4 guest may move live between the silicon models of one
+    group of LIVE_GENERIC_SILICON_GROUPS (Genoa 25|17 <-> Turin 26|2), if the
+    running QEMU has `enforce` and the destination has tsc_scale (+AVX-512
+    for v4)."""
 
     DEFAULT = re.search(r'(?m)^LIVE_SILICON_MATCH="\$\{LIVE_SILICON_MATCH:-\w+\}"$', SCRIPT).group()
+    GROUPS = re.search(r'(?m)^readonly LIVE_GENERIC_SILICON_GROUPS=".*"$', SCRIPT).group()
 
-    def guard(self, src, dst, model="x86-64-v4", env=None):
-        return run_bash(_fn("_live_silicon_guard") + self.DEFAULT + "\n"
-                        + f'_live_silicon_guard "{src}" "{dst}" "{model}"\necho PASSED\n', env)
+    def guard(self, src, dst, model="x86-64-v4", env=None, run=V4_RUN, flags=TURIN_FLAGS):
+        return run_bash(self.DEFAULT + "\n" + self.GROUPS + "\n" + _fn("_silicon_same_group")
+                        + _fn("_generic_cross_silicon_why") + _fn("_live_silicon_guard")
+                        + f'_live_silicon_guard "{src}" "{dst}" "{model}" "{run}" "{flags}"\necho PASSED\n', env)
 
     def assertRefused(self, r, *needles):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
@@ -132,34 +143,64 @@ class SiliconGuard(unittest.TestCase):
         for n in needles:
             self.assertIn(n, r.stderr)
 
-    def test_genoa_to_turin_refused_for_v4_both_ways(self):
-        for src, dst in ((AMD, TURIN), (TURIN, AMD)):
-            self.assertRefused(self.guard(src, dst), "EN CALIENTE", "FRÍO", "silicio")
+    def assertPassed(self, r, *needles):
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PASSED", r.stdout)
+        for n in needles:
+            self.assertIn(n, r.stderr)
+
+    def test_genoa_turin_generic_passes_both_ways(self):
+        self.assertPassed(self.guard(AMD, TURIN, flags=TURIN_FLAGS), "mismo grupo", "AVX-512")
+        self.assertPassed(self.guard(TURIN, AMD, flags=GENOA_FLAGS), "mismo grupo")
+        for model in ("x86-64-v3", "x86-64-v2-AES", "X86-64-V4"):
+            self.assertPassed(self.guard(AMD, TURIN, model), model)
+
+    def test_cross_silicon_needs_enforce(self):
+        for run in ("", V4_RUN.replace("enforce,", ""), "qemu64,+avx2,enforced"):
+            self.assertRefused(self.guard(AMD, TURIN, run=run), "enforce", "FRÍO")
+
+    def test_cross_silicon_needs_tsc_scale_and_readable_flags(self):
+        self.assertRefused(self.guard(AMD, TURIN, flags=TURIN_FLAGS.replace(" tsc_scale", "")), "tsc_scale")
+        self.assertRefused(self.guard(AMD, TURIN, flags=""), "flags de CPU del destino")
+
+    def test_cross_silicon_v4_needs_avx512(self):
+        self.assertRefused(self.guard(TURIN, AMD, flags=GENOA_FLAGS.replace(" avx512vl", "")), "avx512vl")
+        self.assertPassed(self.guard(TURIN, AMD, "x86-64-v3", flags=GENOA_FLAGS.replace(" avx512vl", "")))
+
+    def test_same_silicon_needs_none_of_that(self):
+        # unchanged path: identical silicon, no enforce/flags needed
+        for sig in (AMD, RAPHAEL, TURIN):
+            self.assertPassed(self.guard(sig, sig, run="", flags=""))
 
     def test_host_needs_identical_silicon(self):
         self.assertRefused(self.guard(AMD, TURIN, "host"), "silicios distintos", "FRÍO")
+        self.assertRefused(self.guard(TURIN, AMD, "host"), "silicios distintos")
         self.assertRefused(self.guard(AMD, RAPHAEL, "host"), "silicios distintos")
         self.assertRefused(self.guard(AMD, RAPHAEL, "max"), "silicios distintos")
-        # the old flag-superset "upgrade" path is gone: same family, newer model
         self.assertRefused(self.guard(RAPHAEL, AMD, "HOST"))
-        r = self.guard(AMD, AMD, "host")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("PASSED", r.stdout)
+        self.assertPassed(self.guard(AMD, AMD, "host"))
+
+    def test_non_generic_models_never_cross(self):
+        for model in ("kvm64", "<proxmox default>", "EPYC-Genoa", "x86-64-v1", "x86-64-v5"):
+            self.assertRefused(self.guard(AMD, TURIN, model), "EN CALIENTE")
 
     def test_default_is_model(self):
         self.assertIn('LIVE_SILICON_MATCH:-model', self.DEFAULT)
 
-    def test_genoa_raphael_refused_by_default_even_generic(self):
-        # behaviour change (PR #291 review): AX162 Genoa 25|17 <-> AX102 Raphael 25|97
+    def test_raphael_is_in_no_group(self):
         for model in ("x86-64-v4", "x86-64-v3", "kvm64", "<proxmox default>"):
             self.assertRefused(self.guard(AMD, RAPHAEL, model), "vendor|family|model")
             self.assertRefused(self.guard(RAPHAEL, AMD, model))
-        for sig in (AMD, RAPHAEL, TURIN):
-            r = self.guard(sig, sig)
-            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertRefused(self.guard(RAPHAEL, TURIN, model))
+            self.assertRefused(self.guard(TURIN, RAPHAEL, model))
+
+    def test_groups_are_not_configurable(self):
+        # readonly: an environment value cannot widen the groups
+        env = {"LIVE_GENERIC_SILICON_GROUPS": "AuthenticAMD|25|17,AuthenticAMD|25|97"}
+        self.assertRefused(self.guard(AMD, RAPHAEL, env=env))
+        self.assertIn('readonly LIVE_GENERIC_SILICON_GROUPS="AuthenticAMD|25|17,AuthenticAMD|26|2"', SCRIPT)
 
     def test_no_global_relax_switch(self):
-        # 2nd review of PR #291: «family» was a global escape without a VMID; gone.
         for v in ("family", "nope"):
             self.assertRefused(self.guard(AMD, RAPHAEL, env={"LIVE_SILICON_MATCH": v}), "solo admite 'model'")
         self.assertNotIn("family)", SCRIPT[SCRIPT.index("_live_silicon_guard() {"):SCRIPT.index("_cold_hwid_guard() {")])
@@ -169,17 +210,170 @@ class SiliconGuard(unittest.TestCase):
                          (AMD, "AuthenticAMD|26|"), ("|25|17", AMD)):
             self.assertRefused(self.guard(src, dst), "ilegible")
 
+    def test_cross_vendor_still_refused_first(self):
+        # the cross-vendor guard runs before and is untouched
+        self.assertNotIn("GenuineIntel", re.search(r'(?m)^readonly LIVE_GENERIC_SILICON_GROUPS=".*"$', SCRIPT).group())
+
     def test_lab_override_only_for_its_own_vmid(self):
-        r = self.guard(AMD, TURIN, env={"NV_LAB_ALLOW_CROSS_SILICON_LIVE": "777"})
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("LAB OVERRIDE", r.stderr)
+        r = self.guard(AMD, RAPHAEL, env={"NV_LAB_ALLOW_CROSS_SILICON_LIVE": "777"})
+        self.assertPassed(r, "LAB OVERRIDE")
         for other in ("1", "", "7777"):
-            self.assertRefused(self.guard(AMD, TURIN,
+            self.assertRefused(self.guard(AMD, RAPHAEL,
                                           env={"NV_LAB_ALLOW_CROSS_SILICON_LIVE": other}))
 
     def test_flag_superset_rule_removed(self):
         self.assertNotIn("_node_cpu_flags", SCRIPT)
         self.assertNotIn("Cross-generation UPGRADE", SCRIPT)
+
+    def test_call_site_passes_running_args_and_dest_flags(self):
+        online = SCRIPT.index('if [[ -n "$ONLINE_FLAG" ]]; then\n    CPU_RAW=')
+        call = SCRIPT.index('_live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"', online)
+        line = SCRIPT[call:SCRIPT.index("\n", call)]
+        self.assertIn('"$CPU_RUN_ARGS" "$DST_CPU_FLAGS"', line)
+        self.assertLess(SCRIPT.index('CPU_RUN_ARGS="$_run_cpu"', online), call)
+        self.assertLess(SCRIPT.index("DST_CPU_FLAGS=$(dst_ssh 'grep -m1 \"^flags\" /proc/cpuinfo'", online), call)
+
+
+class ExternalNode(unittest.TestCase):
+    """26/11/2026: Kademar (provider kademar, B+) is an external node."""
+
+    def ext(self, node, prov, ip):
+        return run_bash(_fn("_node_is_external")
+                        + f'_node_is_external "{node}" "{prov}" "{ip}" && echo EXT || echo HZ\n').stdout.strip()
+
+    def test_provider_decides(self):
+        self.assertEqual(self.ext("0000266-KDM-9755", "kademar", "2a0c:4ac1:3:8::2"), "EXT")
+        self.assertEqual(self.ext("0000265-AX162-2-LTD", "hetzner", "2a01:4f8:2220:3c0d::2"), "HZ")
+        self.assertEqual(self.ext("0000999-AX162", "OtroDC", "2a01:4f8::2"), "EXT")
+        self.assertEqual(self.ext("0000266-KDM-9755", "Hetzner", "2a0c::2"), "HZ")   # field wins
+
+    def test_fallback_without_provider_is_conservative(self):
+        for prov in ("", "-"):
+            self.assertEqual(self.ext("0000266-KDM-9755", prov, "2a01:4f8::2"), "EXT")
+            self.assertEqual(self.ext("0000999-X", prov, "2a0c:4ac1:3:8::2"), "EXT")
+            self.assertEqual(self.ext("0000999-X", prov, ""), "EXT")
+            self.assertEqual(self.ext("0000265-AX162-2-LTD", prov, "2A01:4F8:2220:3c0d::2"), "HZ")
+            self.assertEqual(self.ext("0000017-AX162-R", prov, "2a01:4f9:3a:18ad::2"), "HZ")
+
+
+FAKE_SSH = r"""
+dst_ssh() { printf '%s\n----\n' "$*" >> "$CALLS"; case "$*" in
+  *"token add"*) echo "│ value        │ 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b │" ;;
+  *) : ;; esac; return "${DST_RC:-0}"; }
+src_ssh() { printf '%s\n----\n' "$*" >> "$CALLS"; echo "${SRC_OUT-ADDED}"; }
+"""
+
+
+class MigrationToken(unittest.TestCase):
+    """B+: with an EXTERNAL source the dest token is restricted, expires and
+    is cleaned up with its ACLs; between Hetzner nodes nothing changes."""
+
+    def run_tok(self, restricted, extra="", env=None):
+        with tempfile.TemporaryDirectory() as d:
+            calls = Path(d, "calls")
+            body = (FAKE_SSH + 'TOKEN_NAME=migrate-full-777 TARGET_STORAGE=local-zfs TOKEN_TTL_S=43200\n'
+                    f'TOKEN_CREATED=0 TOKEN_RESTRICTED={restricted}\n'
+                    + re.search(r'(?m)^readonly _NVMIG_PRIVS_VM=".*"$', SCRIPT).group() + "\n"
+                    + _fn("_token_create") + _fn("_token_cleanup")
+                    + '_token_create; echo "SECRET=$TOKEN_SECRET CREATED=$TOKEN_CREATED"\n' + extra)
+            e = {"CALLS": str(calls)}
+            e.update(env or {})
+            r = run_bash(body, e)
+            return r, calls.read_text() if calls.exists() else ""
+
+    def test_hetzner_source_keeps_privsep0(self):
+        r, calls = self.run_tok(0)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SECRET=0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b CREATED=1", r.stdout)
+        self.assertIn("pveum user token add root@pam 'migrate-full-777' --privsep=0", calls)
+        self.assertNotIn("acl modify", calls)
+
+    def test_external_source_gets_a_restricted_expiring_token(self):
+        r, calls = self.run_tok(1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SECRET=0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b CREATED=1", r.stdout)
+        self.assertIn("--privsep 1 --expire $(( $(date +%s) + 43200 ))", calls)
+        self.assertNotIn("--privsep=0", calls)
+        for acl in ("acl modify '/vms/777' --tokens 'root@pam!migrate-full-777' --roles NVMigInVM --propagate 0",
+                    "acl modify / --tokens 'root@pam!migrate-full-777' --roles NVMigInSys --propagate 0",
+                    "acl modify '/storage/local-zfs' --tokens 'root@pam!migrate-full-777' --roles NVMigInDS --propagate 0",
+                    "acl modify /sdn/zones/localnetwork --tokens 'root@pam!migrate-full-777' --roles NVMigInSDN"):
+            self.assertIn(acl, calls)
+        self.assertIn("ensure_role NVMigInSys 'Sys.Incoming'", calls)
+        # no Sys.* / Datastore / SDN privilege in the role that sits on /vms/<vmid>
+        privs = re.search(r'_NVMIG_PRIVS_VM="(.*)"', SCRIPT).group(1).split(",")
+        self.assertIn("VM.Allocate", privs)
+        self.assertTrue(all(p.startswith("VM.") for p in privs), privs)
+        self.assertNotIn("Sys.Incoming", privs)
+
+    def test_restricted_cleanup_removes_acls_then_token(self):
+        r, calls = self.run_tok(1, extra="_token_cleanup; echo CREATED=$TOKEN_CREATED\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CREATED=0", r.stdout.splitlines()[-1])
+        tail = calls[calls.index("acl delete"):]
+        for path in ("'/vms/777'", "/ --tokens", "'/storage/local-zfs'", "/sdn/zones/localnetwork"):
+            self.assertIn(path, tail)
+        self.assertLess(tail.index("acl delete"), tail.index("token remove root@pam 'migrate-full-777'"))
+
+    def test_failed_restricted_creation_still_cleans_up(self):
+        r, calls = self.run_tok(1, env={"DST_RC": "1"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("restricted migration token", r.stderr)
+        # TOKEN_CREATED=1 before _die, so the rollback's _token_cleanup runs
+        self.assertIn("{ TOKEN_CREATED=1; _die", _fn("_token_create"))
+
+    def test_wiring(self):
+        tok = SCRIPT.index("  _token_create\n")
+        block = SCRIPT[SCRIPT.rindex("# 3) Token on dest", 0, tok):tok]
+        self.assertIn('_node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" && SRC_EXTERNAL=1', block)
+        self.assertIn("(( SRC_EXTERNAL == 1 )) && TOKEN_RESTRICTED=1", block)
+        self.assertNotIn("DST_EXTERNAL == 1 )) && TOKEN_RESTRICTED", block)
+        # rollback: also cleans the token when the migration was already done
+        rb = _fn("_rollback")
+        done = rb.index("if (( MIGRATION_DONE == 1 )); then")
+        self.assertIn("_token_cleanup", rb[done:rb.index("return", done)])
+        self.assertIn("\n_token_cleanup\n", SCRIPT)
+        self.assertNotIn("dst_ssh \"pveum user token add root@pam '${TOKEN_NAME}' --privsep=0 2>&1\") \\\n    || _die \"pveum token add failed on dest: ${TOKEN_OUT}\"", SCRIPT)
+
+
+class BbrRoute(unittest.TestCase):
+    def run_bbr(self, src_out, extra=""):
+        with tempfile.TemporaryDirectory() as d:
+            calls = Path(d, "calls")
+            body = (FAKE_SSH + "SRC_NODE=0000266-KDM-9755 DST_NODE=0000265-AX162-2-LTD DST_IPV6=2a01:4f8:2220:3c0d::2\n"
+                    "BBR_ROUTE_ADDED=0\n" + _fn("_bbr_route_arm") + _fn("_bbr_route_disarm")
+                    + "_bbr_route_arm; echo ADDED=$BBR_ROUTE_ADDED\n" + extra)
+            r = run_bash(body, {"CALLS": str(calls), "SRC_OUT": src_out})
+            return r, calls.read_text() if calls.exists() else ""
+
+    def test_adds_and_removes_only_its_own_route(self):
+        r, calls = self.run_bbr("ADDED", "_bbr_route_disarm; echo ADDED=$BBR_ROUTE_ADDED\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ADDED=1", r.stdout)
+        self.assertIn("congctl bbr", calls)
+        self.assertIn("ip -6 route add '2a01:4f8:2220:3c0d::2/128' via", calls)
+        self.assertIn("ip -6 route del '2a01:4f8:2220:3c0d::2/128'", calls)
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "ADDED=0")
+
+    def test_existing_route_is_left_alone(self):
+        r, calls = self.run_bbr("EXISTS", "_bbr_route_disarm\n")
+        self.assertIn("ADDED=0", r.stdout)
+        self.assertNotIn("route del", calls)
+
+    def test_failure_is_only_a_warning(self):
+        for out in ("NOGW", "FAIL", ""):
+            r, _ = self.run_bbr(out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ADDED=0", r.stdout)
+            self.assertIn("WARN", r.stderr)
+
+    def test_wiring(self):
+        rm = SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'")
+        arm = SCRIPT.rindex('case "$MIGRATE_BBR" in', 0, rm)
+        self.assertIn("(( SRC_EXTERNAL == 1 || DST_EXTERNAL == 1 )) && _bbr_route_arm", SCRIPT[arm:rm])
+        self.assertLess(SCRIPT.index("_bbr_route_disarm", rm), SCRIPT.index('[[ "$_migrate_rc" -eq 0 ]] || _die "pvesh remote_migrate failed."'))
+        self.assertIn("_bbr_route_disarm", _fn("_rollback"))
+        self.assertIn('MIGRATE_BBR="${MIGRATE_BBR:-auto}"', SCRIPT)
 
 
 FAKE_QM = r'''#!/usr/bin/env python3
@@ -681,6 +875,25 @@ class NodeMemClass(unittest.TestCase):
         self.assertIn("SRC=VPS-E DST=SQX", r.stdout)
         self.assertIn("CLS=dedicated>shared", r.stdout)
         self.assertNotIn("WARN", r.stderr)
+
+    def test_reads_provider_too(self):
+        # 26/11/2026: provider decides _node_is_external (Kademar = B+)
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d, "firebase_admin")
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text(FAKE_FIREBASE)
+            (pkg / "credentials.py").write_text(FAKE_CREDENTIALS)
+            (pkg / "firestore.py").write_text(FAKE_FIRESTORE_NODES)
+            nodes = {"0000265-AX162-2-LTD": {"nodeType": "SQX"},
+                     "0000266-KDM-9755": {"nodeType": "SQX", "provider": "Kademar"}}
+            body = ('SRC_NODE=0000265-AX162-2-LTD DST_NODE=0000266-KDM-9755\n'
+                    'NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0\n'
+                    'NODE_PROVIDER_SRC=""; NODE_PROVIDER_DST=""\n'
+                    + _fn("_node_types_load") + '_node_types_load\n'
+                    'echo "P=$NODE_PROVIDER_SRC>$NODE_PROVIDER_DST T=$NODE_TYPE_SRC>$NODE_TYPE_DST"\n')
+            r = run_bash(body, {"PYTHONPATH": d, "FAKE_NODES": json.dumps(nodes)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("P=hetzner>kademar T=SQX>SQX", r.stdout)
 
     def test_missing_doc_or_field_falls_back_to_the_name_and_warns(self):
         r = self.load({"0000181-EX44": {}})
