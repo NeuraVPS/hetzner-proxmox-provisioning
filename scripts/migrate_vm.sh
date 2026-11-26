@@ -801,14 +801,35 @@ _guest_boot_read() {
 # syncs at startup anyway) only an _info. GUEST_TIME_RESYNC=0 turns it off.
 GUEST_TIME_RESYNC="${GUEST_TIME_RESYNC:-1}"
 GUEST_TIME_RESYNC_BUDGET_S="${GUEST_TIME_RESYNC_BUDGET_S:-45}"
+# w32tm sale con 0 también cuando NO sincroniza porque w32time aún no tiene
+# muestras (26/11/2026, VMs 963/1267 tras salir de Kademar: «El equipo no se
+# sincronizó porque no tenía información hora disponible» / «did not resync
+# because no time data was available»). Ese caso se reintenta y, si persiste, es
+# un aviso, no un ✅ (medido: w32time lo corrige solo en ~5 min).
+GUEST_TIME_RESYNC_RETRIES="${GUEST_TIME_RESYNC_RETRIES:-2}"
+GUEST_TIME_RESYNC_RETRY_S="${GUEST_TIME_RESYNC_RETRY_S:-15}"
+_w32tm_no_data() {
+  grep -qiE 'no time data|did not resync|no se sincroniz|no ten.a informaci' <<< "$1"
+}
 _guest_time_resync() {
-  local ssh_fn="$1" live="${2:-0}" out msg
+  local ssh_fn="$1" live="${2:-0}" out msg try=0
   [[ "$GUEST_TIME_RESYNC" == "1" ]] || return 0
-  out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${GUEST_TIME_RESYNC_BUDGET_S}' resync" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+  while :; do
+    out=$("$ssh_fn" "echo $(printf '%s' "$_GUEST_BOOT_PY" | base64 -w0) | base64 -d | python3 - '${VMID}' '${GUEST_TIME_RESYNC_BUDGET_S}' resync" 2>/dev/null | tail -n 1 | tr -d '\r') || true
+    case "$out" in "OK 0"|"OK 0 "*) _w32tm_no_data "$out" || break ;; *) break ;; esac
+    (( try >= GUEST_TIME_RESYNC_RETRIES )) && break
+    try=$(( try + 1 ))
+    _info "w32tm /resync: w32time aún sin muestras de hora; reintento ${try}/${GUEST_TIME_RESYNC_RETRIES} en ${GUEST_TIME_RESYNC_RETRY_S}s."
+    sleep "$GUEST_TIME_RESYNC_RETRY_S"
+  done
   case "$out" in
     "OK 0"|"OK 0 "*)
-      _ok "Reloj del invitado resincronizado (w32tm /resync): ${out#OK 0}"
-      return 0 ;;
+      if _w32tm_no_data "$out"; then
+        msg="w32tm /resync en la VM ${VMID} no sincronizó (w32time sin muestras de hora tras ${try} reintentos: ${out#OK 0 })"
+      else
+        _ok "Reloj del invitado resincronizado (w32tm /resync): ${out#OK 0}"
+        return 0
+      fi ;;
     "OK "*)   msg="w32tm /resync en la VM ${VMID} devolvió rc=$(cut -d' ' -f2 <<<"$out"): $(cut -d' ' -f3- <<<"$out")" ;;
     "FAIL "*) msg="no se pudo lanzar w32tm /resync en la VM ${VMID} por el guest agent (${out})" ;;
     *)        msg="no se pudo lanzar w32tm /resync en la VM ${VMID} (nodo: ${out:0:120})" ;;

@@ -552,7 +552,8 @@ class GuestTimeResync(unittest.TestCase):
             (t / "scenario.json").write_text(json.dumps(scenario))
             body = (_var_heredoc("_GUEST_BOOT_PY")
                     + 'GUEST_TIME_RESYNC="${GUEST_TIME_RESYNC:-1}" GUEST_TIME_RESYNC_BUDGET_S=20\n'
-                    + _fn("_guest_time_resync")
+                    + 'GUEST_TIME_RESYNC_RETRIES="${GUEST_TIME_RESYNC_RETRIES:-2}" GUEST_TIME_RESYNC_RETRY_S=0\n'
+                    + _fn("_w32tm_no_data") + _fn("_guest_time_resync")
                     + f'fake_ssh() {{ bash -c "$1"; }}\n_guest_time_resync fake_ssh {live}\necho RC=$?\n')
             e = {"PATH": f"{t / 'bin'}:{os.environ['PATH']}", "FAKE_STATE": tmp}
             e.update(env or {})
@@ -567,6 +568,24 @@ class GuestTimeResync(unittest.TestCase):
         self.assertIn("completed successfully", r.stderr)
         self.assertEqual(sum('"exec"' in c for c in calls), 1)
         self.assertNotIn("WARN", r.stderr)
+
+    def test_no_time_data_is_retried_then_ok(self):
+        # 26/11/2026: rc 0 but not synced (VMs 963/1267 leaving Kademar)
+        nd = {"rc": 0, "out": "El equipo no se sincroniz\u00a2 porque no ten\u00a1a informaci\u00a2n hora disponible."}
+        r, calls = self.resync({"steps": [nd, {"rc": 0, "out": "El comando se ha completado correctamente."}]})
+        self.assertIn("RC=0", r.stdout, r.stderr)
+        self.assertIn("reintento 1/2", r.stderr)
+        self.assertIn("OK: Reloj del invitado resincronizado", r.stderr)
+        self.assertEqual(sum('"exec"' in c for c in calls), 2)
+
+    def test_no_time_data_every_time_is_a_warning_not_ok(self):
+        nd = {"rc": 0, "out": "The computer did not resync because no time data was available."}
+        r, calls = self.resync({"steps": [nd]})
+        self.assertIn("RC=0", r.stdout, r.stderr)
+        self.assertNotIn("OK: Reloj", r.stderr)
+        self.assertIn("WARN", r.stderr)
+        self.assertIn("no sincroniz", r.stderr)
+        self.assertEqual(sum('"exec"' in c for c in calls), 3)
 
     def test_foreign_result_discarded(self):
         r, calls = self.resync({"steps": ["foreign", {"rc": 0, "out": "ok"}]})
