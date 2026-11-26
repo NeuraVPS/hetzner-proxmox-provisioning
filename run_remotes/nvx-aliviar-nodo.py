@@ -36,8 +36,9 @@ SALVAGUARDAS
     dato no se mueve), pasar el gate de disco del 80% (el mismo que la venta y
     el defrag), no estar ya dañado de CPU (cpu_ok: contención > 50 ms/s
     reciente o, en MT, p95 laborable >= 85 %; el mismo criterio que el defrag)
-    y tener holgura de cores (en un nodo con tope max_vm/max_vcpu, como
-    Kademar: dejar libres 1 VM y 20 vCPU).
+    y tener holgura de cores (un nodo con tope max_vm/max_vcpu, como Kademar,
+    solo con config/defrag.cappedDestEnabled=true y dejando libres 1 VM y 20
+    vCPU).
   · Se mueve de UNA EN UNA, remidiendo el pool despues de cada una. Un fallo
     para la tanda en vez de arrastrarla.
 """
@@ -170,7 +171,7 @@ def cpu_de_vm(nid, vmid):
     lineas = [l for l in out[:-3].strip().split("\n") if l.strip()]
     run = next((l[4:].strip() for l in lineas if l.startswith("RUN:")), None)
     cfg = next((l for l in lineas if l.startswith("cpu:")), None)
-    cfg = cfg.split(":", 1)[1].strip().split(",")[0] if cfg else "kvm64"
+    cfg = cfg.split(":", 1)[1].strip() if cfg else "kvm64"   # entero: las opciones cuentan
     if run is not None:
         if not run:
             return None
@@ -202,7 +203,7 @@ def cpu_permite(cpu_vm, firma_origen, firma_destino):
     modelo = cpu_vm.split(",")[0].strip().lower()
     if modelo.startswith("x86-64-v"):
         if tuple(firma_origen[:3]) != tuple(firma_destino[:3]):
-            if not re.match(r"^x86-64-v[234](-[a-z0-9]+)?$", modelo):
+            if "," in cpu_vm or not re.match(r"^x86-64-v[234](-[a-z0-9]+)?$", modelo):
                 return False
             if not any(tuple(firma_origen[:3]) in g and tuple(firma_destino[:3]) in g
                        for g in GRUPOS_SILICIO):
@@ -303,6 +304,8 @@ def elige_destino(nid_origen, vmid, db, reservado):
         log("vm%d: no puedo leer su cpu (%r) o la del origen (%r) — no se mueve"
             % (vmid, cpu_vm, firma_origen))
         return None
+    capped_ok = ((db.collection("config").document("defrag").get().to_dict() or {})
+                 .get("cappedDestEnabled") is True)
     usados = {}
     vms_en_nodo = {}
     for d in db.collection("servers").select(["nodeId", "cores"]).stream():
@@ -330,9 +333,16 @@ def elige_destino(nid_origen, vmid, db, reservado):
         if pct >= DISK_REAL_MAX_PCT:
             continue
         tope = holgura_tope(n, nd.id, vms_en_nodo, usados, cores_vm)
+        # Un nodo con tope (Kademar) solo recibe con el MISMO consentimiento que
+        # el defrag: config/defrag.cappedDestEnabled=true (Iván 25/11: no se
+        # mueve ningun cliente existente a Kademar sin decidirlo).
+        if tope is not None and not capped_ok:
+            continue
         if tope is False:
             continue
-        if tope is None and int(n.get("max_cores") or 0) - usados.get(nd.id, 0) - cores_vm < 0:
+        # max_cores sigue mandando si el nodo lo tiene; sin el, solo vale un tope.
+        mc = int(n.get("max_cores") or 0)
+        if (mc > 0 or tope is None) and mc - usados.get(nd.id, 0) - cores_vm < 0:
             continue
         if not cpu_ok(n):
             continue

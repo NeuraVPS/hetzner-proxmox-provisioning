@@ -121,6 +121,9 @@ class CpuRule(unittest.TestCase):
             self.assertFalse(df.cpu_move_ok(model, TURIN, EPYC), model)
         self.assertTrue(df.cpu_move_ok("x86-64-v4", TURIN, dict(TURIN)))
         self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(EPYC, family="")))
+        # options keep a guest off the cross-silicon path (review), not off same silicon
+        self.assertFalse(df.cpu_move_ok("x86-64-v4,phys-bits=host", EPYC, TURIN))
+        self.assertTrue(df.cpu_move_ok("x86-64-v4,phys-bits=host", EPYC, EPYC_P))
 
     def test_cross_silicon_needs_tsc_scale_and_avx512_for_v4(self):
         self.assertFalse(df.cpu_move_ok("x86-64-v4", EPYC, dict(TURIN, tsc_scale=False)))

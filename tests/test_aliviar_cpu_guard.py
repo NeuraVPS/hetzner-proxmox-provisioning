@@ -68,6 +68,15 @@ class CpuPermite(unittest.TestCase):
         self.assertTrue(al.cpu_permite("x86-64-v3", TURIN, GENOA[:4] + ("0", "1")))
         self.assertFalse(al.cpu_permite("x86-64-v4", GENOA, TURIN[:4]))            # firma corta
 
+    def test_opciones_no_cruzan(self):
+        self.assertFalse(al.cpu_permite("x86-64-v4,phys-bits=host", GENOA, TURIN))
+        self.assertTrue(al.cpu_permite("x86-64-v4,phys-bits=host", GENOA, GENOA))
+
+    def test_kademar_destino_solo_con_interruptor(self):
+        src = (ROOT / "run_remotes/nvx-aliviar-nodo.py").read_text()
+        self.assertIn('.get("cappedDestEnabled") is True', src)
+        self.assertIn("if tope is not None and not capped_ok:", src)
+
     def test_host_solo_mismo_silicio(self):
         self.assertFalse(al.cpu_permite("host", GENOA, TURIN))
         self.assertFalse(al.cpu_permite("kvm64", TURIN, GENOA))

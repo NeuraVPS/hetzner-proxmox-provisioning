@@ -132,10 +132,24 @@ class SiliconGuard(unittest.TestCase):
     DEFAULT = re.search(r'(?m)^LIVE_SILICON_MATCH="\$\{LIVE_SILICON_MATCH:-\w+\}"$', SCRIPT).group()
     GROUPS = re.search(r'(?m)^readonly LIVE_GENERIC_SILICON_GROUPS=".*"$', SCRIPT).group()
 
-    def guard(self, src, dst, model="x86-64-v4", env=None, run=V4_RUN, flags=TURIN_FLAGS):
+    def guard(self, src, dst, model="x86-64-v4", env=None, run=V4_RUN, flags=TURIN_FLAGS, cfg=None):
+        cfg = model if cfg is None else cfg
         return run_bash(self.DEFAULT + "\n" + self.GROUPS + "\n" + _fn("_silicon_same_group")
                         + _fn("_generic_cross_silicon_why") + _fn("_live_silicon_guard")
-                        + f'_live_silicon_guard "{src}" "{dst}" "{model}" "{run}" "{flags}"\necho PASSED\n', env)
+                        + f'_live_silicon_guard "{src}" "{dst}" "{model}" "{run}" "{flags}" "{cfg}"\necho PASSED\n', env)
+
+    def test_cpu_options_never_cross(self):
+        # review: phys-bits=host and friends depend on the node
+        for cfg in ("x86-64-v4,phys-bits=host", "x86-64-v4,flags=+pdpe1gb", "x86-64-v3,hidden=1"):
+            self.assertRefused(self.guard(AMD, TURIN, cfg=cfg), "opciones")
+        for extra in ("host-phys-bits=true", "host-cache-info=on", "migratable=off", "l3-cache=on", "vendor=AuthenticAMD"):
+            self.assertRefused(self.guard(AMD, TURIN, run=V4_RUN + "," + extra), "depende del nodo")
+        # same silicon: options still fine
+        self.assertPassed(self.guard(AMD, AMD, cfg="x86-64-v4,phys-bits=host", run=V4_RUN + ",host-phys-bits=true"))
+
+    def test_effective_model_from_running_flags(self):
+        # config already says v3 (pending), QEMU still runs AVX-512: dest needs it
+        self.assertRefused(self.guard(TURIN, AMD, "x86-64-v3", flags=GENOA_FLAGS.replace(" avx512f", "")), "avx512f")
 
     def assertRefused(self, r, *needles):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
@@ -165,7 +179,8 @@ class SiliconGuard(unittest.TestCase):
 
     def test_cross_silicon_v4_needs_avx512(self):
         self.assertRefused(self.guard(TURIN, AMD, flags=GENOA_FLAGS.replace(" avx512vl", "")), "avx512vl")
-        self.assertPassed(self.guard(TURIN, AMD, "x86-64-v3", flags=GENOA_FLAGS.replace(" avx512vl", "")))
+        self.assertPassed(self.guard(TURIN, AMD, "x86-64-v3", run=V4_RUN.replace("+avx512f,", ""),
+                                     flags=GENOA_FLAGS.replace(" avx512vl", "")))
 
     def test_same_silicon_needs_none_of_that(self):
         # unchanged path: identical silicon, no enforce/flags needed
@@ -229,7 +244,7 @@ class SiliconGuard(unittest.TestCase):
         online = SCRIPT.index('if [[ -n "$ONLINE_FLAG" ]]; then\n    CPU_RAW=')
         call = SCRIPT.index('_live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"', online)
         line = SCRIPT[call:SCRIPT.index("\n", call)]
-        self.assertIn('"$CPU_RUN_ARGS" "$DST_CPU_FLAGS"', line)
+        self.assertIn('"$CPU_RUN_ARGS" "$DST_CPU_FLAGS" "${CPU_RAW:-}"', line)
         self.assertLess(SCRIPT.index('CPU_RUN_ARGS="$_run_cpu"', online), call)
         self.assertLess(SCRIPT.index("DST_CPU_FLAGS=$(dst_ssh 'grep -m1 \"^flags\" /proc/cpuinfo'", online), call)
 
@@ -258,8 +273,11 @@ class ExternalNode(unittest.TestCase):
 
 FAKE_SSH = r"""
 dst_ssh() { printf '%s\n----\n' "$*" >> "$CALLS"; case "$*" in
-  *"token add"*) echo "│ value        │ 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b │" ;;
+  *"token add"*) echo "│ value        │ 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b │"; return "${TOKADD_RC:-0}" ;;
+  *ensure_role*) [ -n "${ROLES_FAIL:-}" ] && { echo "role boom"; return 1; }; echo ROLES-OK ;;
+  *"acl modify"*) [ -n "${ACL_FAIL:-}" ] && { echo "acl boom 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"; return 1; }; echo ACL-OK ;;
   *) : ;; esac; return "${DST_RC:-0}"; }
+curl() { echo "$*" >> "$CALLS.curl"; printf '%s' "${CURL_CODE:-200}"; }
 src_ssh() { printf '%s\n----\n' "$*" >> "$CALLS"; echo "${SRC_OUT-ADDED}"; }
 """
 
@@ -271,7 +289,7 @@ class MigrationToken(unittest.TestCase):
     def run_tok(self, restricted, extra="", env=None):
         with tempfile.TemporaryDirectory() as d:
             calls = Path(d, "calls")
-            body = (FAKE_SSH + 'TOKEN_NAME=migrate-full-777 TARGET_STORAGE=local-zfs TOKEN_TTL_S=43200\n'
+            body = (FAKE_SSH + 'TOKEN_NAME=migrate-full-777 TARGET_STORAGE=local-zfs TOKEN_TTL_S=43200 DST_IPV6=2a01:4f8::2 DST_NODE=0000265-AX162-2-LTD\n'
                     f'TOKEN_CREATED=0 TOKEN_RESTRICTED={restricted}\n'
                     + re.search(r'(?m)^readonly _NVMIG_PRIVS_VM=".*"$', SCRIPT).group() + "\n"
                     + _fn("_token_create") + _fn("_token_cleanup")
@@ -299,7 +317,7 @@ class MigrationToken(unittest.TestCase):
                     "acl modify '/storage/local-zfs' --tokens 'root@pam!migrate-full-777' --roles NVMigInDS --propagate 0",
                     "acl modify /sdn/zones/localnetwork --tokens 'root@pam!migrate-full-777' --roles NVMigInSDN"):
             self.assertIn(acl, calls)
-        self.assertIn("ensure_role NVMigInSys 'Sys.Incoming'", calls)
+        self.assertIn("ensure_role NVMigInSys 'Sys.Audit,Sys.Incoming'", calls)   # GET /cluster/status (review)
         # no Sys.* / Datastore / SDN privilege in the role that sits on /vms/<vmid>
         privs = re.search(r'_NVMIG_PRIVS_VM="(.*)"', SCRIPT).group(1).split(",")
         self.assertIn("VM.Allocate", privs)
@@ -315,12 +333,44 @@ class MigrationToken(unittest.TestCase):
             self.assertIn(path, tail)
         self.assertLess(tail.index("acl delete"), tail.index("token remove root@pam 'migrate-full-777'"))
 
-    def test_failed_restricted_creation_still_cleans_up(self):
-        r, calls = self.run_tok(1, env={"DST_RC": "1"})
+    def test_acl_failure_dies_without_leaking_the_secret(self):
+        r, calls = self.run_tok(1, env={"ACL_FAIL": "1"})
         self.assertEqual(r.returncode, 1)
-        self.assertIn("restricted migration token", r.stderr)
-        # TOKEN_CREATED=1 before _die, so the rollback's _token_cleanup runs
-        self.assertIn("{ TOKEN_CREATED=1; _die", _fn("_token_create"))
+        self.assertIn("ACLs", r.stderr)
+        self.assertNotIn("0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", r.stderr)
+
+    def test_token_marked_created_before_parsing(self):
+        # a token that exists must reach the rollback even if parsing fails
+        body = _fn("_token_create")
+        for add in ("--privsep 1 --expire", "--privsep=0"):
+            i = body.index(add)
+            self.assertLess(body.rindex("TOKEN_CREATED=1", 0, i), i)
+        self.assertLess(body.index("TOKEN_CREATED=1"), body.index("TOKEN_SECRET=$("))
+        r, _ = self.run_tok(0, env={"TOKADD_RC": "1"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("output withheld", r.stderr)
+        self.assertNotIn("0f1e2d3c", r.stderr)
+
+    def test_roles_failure_creates_no_token(self):
+        r, calls = self.run_tok(1, env={"ROLES_FAIL": "1"})
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("token add", calls)
+
+    def test_precheck_with_the_token_itself(self):
+        r, _ = self.run_tok(1, env={"CURL_CODE": "403"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("/cluster/status", r.stderr)
+        r, _ = self.run_tok(1, env={"CURL_CODE": "000"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WARN", r.stderr)
+        r, _ = self.run_tok(0, env={"CURL_CODE": "403"})    # Hetzner source: no pre-check
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_bad_config_keys_refused_before_copying(self):
+        tok = SCRIPT.index("  _token_create\n")
+        block = SCRIPT[SCRIPT.rindex("# 3) Token on dest", 0, tok):tok]
+        self.assertIn("args|startup|hostpci", block)
+        self.assertLess(tok, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
 
     def test_wiring(self):
         tok = SCRIPT.index("  _token_create\n")
@@ -353,6 +403,7 @@ class BbrRoute(unittest.TestCase):
         self.assertIn("congctl bbr", calls)
         self.assertIn("ip -6 route add '2a01:4f8:2220:3c0d::2/128' via", calls)
         self.assertIn("ip -6 route del '2a01:4f8:2220:3c0d::2/128'", calls)
+        self.assertIn("*'congctl bbr'*)", calls)
         self.assertEqual(r.stdout.strip().splitlines()[-1], "ADDED=0")
 
     def test_existing_route_is_left_alone(self):
@@ -361,11 +412,18 @@ class BbrRoute(unittest.TestCase):
         self.assertNotIn("route del", calls)
 
     def test_failure_is_only_a_warning(self):
-        for out in ("NOGW", "FAIL", ""):
+        for out in ("NOGW", "FAIL"):
             r, _ = self.run_bbr(out)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("ADDED=0", r.stdout)
             self.assertIn("WARN", r.stderr)
+
+    def test_lost_answer_is_checked_when_disarming(self):
+        r, calls = self.run_bbr("", "_bbr_route_disarm; echo ADDED=$BBR_ROUTE_ADDED\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ADDED=2", r.stdout)
+        self.assertIn("congctl bbr'*) ip -6 route del", calls)   # only if still ours
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "ADDED=0")
 
     def test_wiring(self):
         rm = SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'")
@@ -884,7 +942,7 @@ class NodeMemClass(unittest.TestCase):
             (pkg / "__init__.py").write_text(FAKE_FIREBASE)
             (pkg / "credentials.py").write_text(FAKE_CREDENTIALS)
             (pkg / "firestore.py").write_text(FAKE_FIRESTORE_NODES)
-            nodes = {"0000265-AX162-2-LTD": {"nodeType": "SQX"},
+            nodes = {"0000265-AX162-2-LTD": {"nodeType": "SQX", "provider": "hetzner"},
                      "0000266-KDM-9755": {"nodeType": "SQX", "provider": "Kademar"}}
             body = ('SRC_NODE=0000265-AX162-2-LTD DST_NODE=0000266-KDM-9755\n'
                     'NODE_TYPE_SRC=""; NODE_TYPE_DST=""; _NODE_TYPES_LOADED=0\n'
@@ -894,6 +952,13 @@ class NodeMemClass(unittest.TestCase):
             r = run_bash(body, {"PYTHONPATH": d, "FAKE_NODES": json.dumps(nodes)})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("P=hetzner>kademar T=SQX>SQX", r.stdout)
+
+    def test_missing_provider_stays_unknown(self):
+        # review: a Kademar doc without `provider` must fall back to name/IPv6
+        self.assertIn('or "-"', _fn("_node_types_load"))
+        self.assertNotIn('or "hetzner"', _fn("_node_types_load"))
+        r = run_bash(_fn("_node_is_external") + '_node_is_external 0000266-KDM-9755 - 2a01:4f8::2 && echo EXT\n')
+        self.assertIn("EXT", r.stdout)
 
     def test_missing_doc_or_field_falls_back_to_the_name_and_warns(self):
         r = self.load({"0000181-EX44": {}})

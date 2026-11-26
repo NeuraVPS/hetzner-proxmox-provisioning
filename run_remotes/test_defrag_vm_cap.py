@@ -208,7 +208,7 @@ class CappedDestRoom(unittest.TestCase):
         self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 0}, vm, False))
         self.assertTrue(df.capped_dest_room({"vm_cap": 26, "n_all": 24}, vm, True))
         self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 25}, vm, True))
-        self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 23, "booked_in": 2}, vm, True))
+        self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 20, "booked_in": 1}, vm, True))  # one entry per run
         self.assertTrue(df.capped_dest_room({"vcpu_cap": 500, "cores": 460}, vm, True))
         self.assertFalse(df.capped_dest_room({"vcpu_cap": 500, "cores": 461}, vm, True))
         self.assertFalse(df.capped_dest_room({"vm_cap": 26, "n_all": 1, "vcpu_cap": 500, "cores": 470}, vm, True))

@@ -253,6 +253,11 @@ def capped_dest_room(dn, vm, enabled):
     this run; vCPU: `cores`, which book() keeps up to date."""
     if not enabled:
         return False
+    # At most ONE entry per capped node per run: the margin only covers one
+    # order racing one move (review: the plan is a snapshot, the batch can
+    # take hours).
+    if int(dn.get("booked_in") or 0) >= 1:
+        return False
     if dn.get("vm_cap") is not None and \
             int(dn.get("n_all") or 0) + int(dn.get("booked_in") or 0) + 1 \
             + CAPPED_DEST_VM_MARGIN > dn["vm_cap"]:
@@ -293,7 +298,7 @@ def dest_allows(dn, vm):
 # Everything unknown -> no move: an unreadable VM config or an unprobed node
 # never yields a destination.
 GENERIC_CPU_RE = re.compile(r"^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$")
-CROSS_SILICON_CPU_RE = re.compile(r"^x86-64-v[234](-[a-z0-9]+)?$")
+CROSS_SILICON_CPU_RE = re.compile(r"^x86-64-v[234](-[a-z0-9]+)?$")  # whole value, no options
 # (vendor, family, model) groups; keep in sync with migrate_vm.sh.
 LIVE_GENERIC_SILICON_GROUPS = (
     frozenset({("AuthenticAMD", "25", "17"), ("AuthenticAMD", "26", "2")}),
@@ -327,7 +332,8 @@ def cpu_move_ok(vm_cpu, src_sig, dst_sig):
             # v2/v3/v4 model and a destination that can rescale the guest TSC
             # (migrate_vm.sh also checks `enforce` on the running QEMU, which
             # PVE always sets for these models). Unknown -> no.
-            if not (CROSS_SILICON_CPU_RE.match(model) and silicon_same_group(src_sig, dst_sig)
+            if not (CROSS_SILICON_CPU_RE.match(model) and "," not in str(vm_cpu)
+                    and silicon_same_group(src_sig, dst_sig)
                     and dst_sig.get("tsc_scale") is True):
                 return False
         # x86-64-v4 needs AVX-512 on the destination (PVE adds `enforce`: the
@@ -366,7 +372,9 @@ for path in sorted(glob.glob('/etc/pve/qemu-server/*.conf')):
             if line.startswith('['):
                 break
             if line.startswith('cpu:'):
-                cpu = line.split(':', 1)[1].strip().split(',')[0] or 'kvm64'
+                # whole value: options such as phys-bits=host keep a guest
+                # off the cross-silicon path (cpu_move_ok)
+                cpu = line.split(':', 1)[1].strip().replace('|', ',') or 'kvm64'
                 break
     except OSError:
         cpu = ''

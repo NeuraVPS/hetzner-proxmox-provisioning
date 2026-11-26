@@ -570,12 +570,27 @@ _silicon_same_group() {
 # Caso genérico entre silicios del mismo grupo. Imprime el motivo del rechazo
 # (vacío = se puede). Args: modelo, args de -cpu en marcha, flags del destino.
 _generic_cross_silicon_why() {
-  local cpu_model="$1" run_args="$2" dst_flags="$3" lc f
+  local cpu_model="$1" run_args="$2" dst_flags="$3" cfg_raw="${4-}" lc f tok
   lc=$(printf '%s' "$cpu_model" | tr '[:upper:]' '[:lower:]')
   [[ "$lc" =~ ^x86-64-v[234](-[a-z0-9]+)?$ ]] \
     || { echo "cpu=${cpu_model} no es un modelo genérico x86-64-v2/v3/v4"; return; }
+  # La línea cpu: de la config, sin opciones: phys-bits=host, flags=… o
+  # hidden=… pueden enseñar al invitado algo que depende del nodo (revisión).
+  [[ "$cfg_raw" != *,* ]] \
+    || { echo "la línea cpu: lleva opciones ('${cfg_raw}'), que pueden depender del nodo"; return; }
   [[ ",${run_args}," == *",enforce,"* ]] \
     || { echo "no pude confirmar 'enforce' en el -cpu del QEMU en marcha ('${run_args:0:80}')"; return; }
+  local IFS=','
+  for tok in $run_args; do
+    case "$tok" in
+      host-*|*phys-bits*|migratable=*|l3-cache*|hv-passthrough*|vendor=*|model-id=*|level=*|xlevel=*)
+        echo "el -cpu en marcha lleva '${tok}', que depende del nodo"; return ;;
+    esac
+  done
+  unset IFS
+  # El modelo EFECTIVO manda: si el QEMU corre con AVX-512, el destino lo
+  # necesita aunque la config ya diga otra cosa (cambio pendiente).
+  [[ ",${run_args}," == *",+avx512f,"* ]] && lc="x86-64-v4"
   [[ -n "${dst_flags// /}" ]] || { echo "no pude leer las flags de CPU del destino"; return; }
   grep -qw tsc_scale <<< "$dst_flags" \
     || { echo "el destino no tiene tsc_scale (no puede conservar la frecuencia del TSC del invitado)"; return; }
@@ -586,7 +601,7 @@ _generic_cross_silicon_why() {
   fi
 }
 _live_silicon_guard() {
-  local src_sig="$1" dst_sig="$2" cpu_model="$3" run_args="${4:-}" dst_flags="${5:-}"
+  local src_sig="$1" dst_sig="$2" cpu_model="$3" run_args="${4:-}" dst_flags="${5:-}" cfg_raw="${6-}"
   local lc why="" rule="mismo vendor|family|model" gwhy sv sf sm dv df dm
   IFS='|' read -r sv sf sm <<< "$src_sig"
   IFS='|' read -r dv df dm <<< "$dst_sig"
@@ -602,7 +617,7 @@ _live_silicon_guard() {
     if [[ "$sv" == "$dv" && "$sf" == "$df" && "$sm" == "$dm" ]]; then
       :
     elif [[ "$sv" == "$dv" ]] && _silicon_same_group "${sv}|${sf}|${sm}" "${dv}|${df}|${dm}"; then
-      gwhy=$(_generic_cross_silicon_why "$cpu_model" "$run_args" "$dst_flags")
+      gwhy=$(_generic_cross_silicon_why "$cpu_model" "$run_args" "$dst_flags" "$cfg_raw")
       if [[ -z "$gwhy" ]]; then
         rule="CPU genérica entre silicios del mismo grupo (enforce, tsc_scale"
         if [[ "$lc" == x86-64-v4* ]]; then rule+=", AVX-512)"; else rule+=")"; fi
@@ -973,7 +988,10 @@ for node in sys.argv[1:3]:
     else:
         d = snap.to_dict() or {}
         t = str(d.get("nodeType") or "").strip().replace(" ", "_") or "NO-FIELD"
-        prov = str(d.get("provider") or "").strip().lower().replace(" ", "_") or "hetzner"
+        # Sin campo = desconocido ("-"), NO "hetzner": _node_is_external cae
+        # entonces al respaldo por nombre/IPv6 (revisión: un doc de Kademar sin
+        # provider no puede llevarse un token de root).
+        prov = str(d.get("provider") or "").strip().lower().replace(" ", "_") or "-"
     print("NT %s %s %s" % (node, t, prov))
 PYNT
 ) || true
@@ -1051,30 +1069,50 @@ TOKEN_TTL_S="${TOKEN_TTL_S:-43200}"
 TOKEN_RESTRICTED=0
 readonly _NVMIG_PRIVS_VM="VM.Allocate,VM.Audit,VM.Config.CDROM,VM.Config.CPU,VM.Config.Cloudinit,VM.Config.Disk,VM.Config.HWType,VM.Config.Memory,VM.Config.Network,VM.Config.Options,VM.Migrate,VM.PowerMgmt"
 _token_create() {
-  local out acl_tok="root@pam!${TOKEN_NAME}"
+  local out acl_tok="root@pam!${TOKEN_NAME}" code
   dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1 || true
   if (( TOKEN_RESTRICTED == 1 )); then
     _info "Creating RESTRICTED migration token on dest (source ${SRC_NODE} is external, B+)…"
     out=$(dst_ssh "set -e
       ensure_role() { pveum role add \"\$1\" --privs \"\$2\" >/dev/null 2>&1 || pveum role modify \"\$1\" --privs \"\$2\" >/dev/null; }
       ensure_role NVMigInVM '${_NVMIG_PRIVS_VM}'
-      ensure_role NVMigInSys 'Sys.Incoming'
+      ensure_role NVMigInSys 'Sys.Audit,Sys.Incoming'
       ensure_role NVMigInDS 'Datastore.AllocateSpace,Datastore.Audit'
       ensure_role NVMigInSDN 'SDN.Use'
-      pveum user token add root@pam '${TOKEN_NAME}' --privsep 1 --expire \$(( \$(date +%s) + ${TOKEN_TTL_S} )) --comment 'migrate_vm ${VMID} from external ${SRC_NODE}'
+      echo ROLES-OK" 2>&1) || true
+    [[ "$out" == *ROLES-OK* ]] || _die "Could not prepare the NVMigIn* roles on dest: ${out:0:300}"
+    # Alta del token aparte: su salida lleva el secreto y nunca va a un mensaje.
+    TOKEN_CREATED=1
+    out=$(dst_ssh "pveum user token add root@pam '${TOKEN_NAME}' --privsep 1 --expire \$(( \$(date +%s) + ${TOKEN_TTL_S} )) --comment 'migrate_vm ${VMID} from external ${SRC_NODE}' 2>&1") \
+      || _die "pveum token add (restricted) failed on dest (output withheld: it may contain the secret)."
+  else
+    _info "Creating migration token on dest…"
+    TOKEN_CREATED=1
+    out=$(dst_ssh "pveum user token add root@pam '${TOKEN_NAME}' --privsep=0 2>&1") \
+      || _die "pveum token add failed on dest (output withheld: it may contain the secret)."
+  fi
+  TOKEN_SECRET=$(printf '%s' "$out" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1 || true)
+  [[ -n "$TOKEN_SECRET" ]] || _die "Could not parse token secret from pveum output."
+  if (( TOKEN_RESTRICTED == 1 )); then
+    out=$(dst_ssh "set -e
       pveum acl modify '/vms/${VMID}' --tokens '${acl_tok}' --roles NVMigInVM --propagate 0
       pveum acl modify / --tokens '${acl_tok}' --roles NVMigInSys --propagate 0
       pveum acl modify '/storage/${TARGET_STORAGE}' --tokens '${acl_tok}' --roles NVMigInDS --propagate 0
-      pveum acl modify /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN --propagate 1" 2>&1) \
-      || { TOKEN_CREATED=1; _die "Could not create the restricted migration token on dest: ${out}"; }
-  else
-    _info "Creating migration token on dest…"
-    out=$(dst_ssh "pveum user token add root@pam '${TOKEN_NAME}' --privsep=0 2>&1") \
-      || _die "pveum token add failed on dest: ${out}"
+      pveum acl modify /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN --propagate 1
+      echo ACL-OK" 2>&1) || true
+    [[ "$out" == *ACL-OK* ]] || _die "Could not grant the restricted token's ACLs on dest: ${out//${TOKEN_SECRET}/<secret>}"
+    # Comprobación con el propio token, desde la base, de las lecturas que hace
+    # remote_migrate antes de abrir el túnel (GET /cluster/status → Sys.Audit;
+    # GET /nodes/localhost/storage). Falla aquí, no tras desacoplar nada más.
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
+             -H "Authorization: PVEAPIToken=root@pam!${TOKEN_NAME}=${TOKEN_SECRET}" \
+             "https://[${DST_IPV6}]:8006/api2/json/cluster/status" 2>/dev/null || true)
+    if [[ "$code" == 000 || -z "$code" ]]; then
+      _warn "Could not reach ${DST_NODE}:8006 from this BASE to pre-check the restricted token (HTTP ${code:-none}); remote_migrate will tell."
+    elif [[ "$code" != 200 ]]; then
+      _die "The restricted token cannot read /cluster/status on ${DST_NODE} (HTTP ${code}): remote_migrate would fail before copying anything."
+    fi
   fi
-  TOKEN_SECRET=$(printf '%s' "$out" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
-  TOKEN_CREATED=1
-  [[ -n "$TOKEN_SECRET" ]] || _die "Could not parse token secret from pveum output."
   _ok "Token created on dest$( (( TOKEN_RESTRICTED == 1 )) && echo " (restricted to VM ${VMID}, expires in ${TOKEN_TTL_S}s)")."
 }
 # Borra el token (y sus ACL si era acotado). Idempotente; nunca aborta.
@@ -1088,12 +1126,13 @@ _token_cleanup() {
       pveum acl delete /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN >/dev/null 2>&1
       true" >/dev/null 2>&1 || true
   fi
-  if dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}'" >/dev/null 2>&1; then
+  if dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}' >/dev/null 2>&1 || true
+      ! pveum user token list root@pam --output-format json 2>/dev/null | grep -q '\"tokenid\":\"${TOKEN_NAME}\"'" >/dev/null 2>&1; then
     _ok "Token removed on dest."
+    TOKEN_CREATED=0
   else
-    _warn "Token cleanup had issues (may already be removed): check 'pveum user token list root@pam' on ${DST_NODE}."
+    _warn "Could not confirm the migration token is gone on ${DST_NODE}: remove it by hand (pveum user token remove root@pam ${TOKEN_NAME}; restricted tokens also expire on their own)."
   fi
-  TOKEN_CREATED=0
 }
 
 # ----- BBR solo hacia el destino, solo durante el traslado ------------------------
@@ -1118,12 +1157,18 @@ _bbr_route_arm() {
   case "$out" in
     *ADDED*)  BBR_ROUTE_ADDED=1; _ok "BBR toward ${DST_NODE} on ${SRC_NODE} for this migration (temporary /128 route)." ;;
     *EXISTS*) _info "There is already a /128 route to ${DST_IPV6} on ${SRC_NODE}; left as is (no BBR route added)." ;;
-    *)        _warn "Could not add the temporary BBR route on ${SRC_NODE} (${out:-no answer}); the migration goes on with the default congestion control (slower toward an external node)." ;;
+    *NOGW*|*FAIL*) _warn "Could not add the temporary BBR route on ${SRC_NODE} (${out}); the migration goes on with the default congestion control (slower toward an external node)." ;;
+    *)        BBR_ROUTE_ADDED=2   # respuesta perdida: puede que sí se pusiera; el desarme lo comprueba
+              _warn "No answer while adding the temporary BBR route on ${SRC_NODE}; it may or may not be there (checked again when removing)." ;;
   esac
 }
+# Solo borra una /128 hacia el destino que siga siendo la nuestra (congctl
+# bbr). Si dos traslados comparten origen y destino y el primero la quita, el
+# segundo no pierde nada: el control de congestión se fija al abrir la conexión.
 _bbr_route_disarm() {
-  (( BBR_ROUTE_ADDED == 1 )) || return 0
-  if src_ssh "ip -6 route del '${DST_IPV6}/128'" >/dev/null 2>&1; then
+  (( BBR_ROUTE_ADDED != 0 )) || return 0
+  if src_ssh "r=\$(ip -6 route show '${DST_IPV6}/128' 2>/dev/null)
+      case \"\$r\" in *'congctl bbr'*) ip -6 route del '${DST_IPV6}/128' ;; *) true ;; esac" >/dev/null 2>&1; then
     _info "Temporary BBR route to ${DST_IPV6} removed on ${SRC_NODE}."
   else
     _warn "Could not remove the temporary BBR route on ${SRC_NODE}: ip -6 route del ${DST_IPV6}/128 (harmless if the source VM is gone, but remove it)."
@@ -2054,7 +2099,7 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     [[ -n "${_run_cpu:-}" && "$_run_cpu" != "-cpu" ]] && CPU_RUN_ARGS="$_run_cpu"
     DST_CPU_FLAGS=$(dst_ssh 'grep -m1 "^flags" /proc/cpuinfo' 2>/dev/null | tr -d '\r' || true)
     _live_cross_vendor_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}"
-    _live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}" "$CPU_RUN_ARGS" "$DST_CPU_FLAGS"
+    _live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-<proxmox default>}" "$CPU_RUN_ARGS" "$DST_CPU_FLAGS" "${CPU_RAW:-}"
   else
     # Offline: la CPU que verá el invitado es la de la config (sección principal).
     CPU_RAW=$(src_ssh "qm config '${VMID}' 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
@@ -2116,6 +2161,15 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   _node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" && SRC_EXTERNAL=1
   _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6" && DST_EXTERNAL=1
   (( SRC_EXTERNAL == 1 )) && TOKEN_RESTRICTED=1
+  if (( TOKEN_RESTRICTED == 1 )); then
+    # Con el token acotado, el comando `config` del túnel rechazaría estas
+    # opciones DESPUÉS de copiar el disco (args: solo root@pam; startup:
+    # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes.
+    _bad_keys=$(src_ssh "sed '/^\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null \
+      | grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' | tr -d ':' | tr '\n' ' ' || true)
+    [[ -z "${_bad_keys// /}" ]] \
+      || _die "VM ${VMID} lleva ${_bad_keys}en su config: con el token acotado de un origen externo (B+) el destino la rechazaría tras copiar el disco. Quita esas opciones o muévela en frío. Abortado antes de copiar nada."
+  fi
   _token_create
 
   # 4) Dest pveproxy SSL fingerprint — read from cert file (faster + more reliable
