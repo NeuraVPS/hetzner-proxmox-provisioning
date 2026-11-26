@@ -1146,11 +1146,11 @@ NVXEOF
 # `ifreload -a` (y el «Apply Configuration» de la red en la GUI de PVE) purga de
 # `lo` la /32 propia del nodo que pone neuravps-tunnels.sh, y con ella se va la
 # ruta por defecto IPv4 del HOST. nvx-netguard.sh mantiene una copia en la dummy
-# `nvx-src` (ifupdown2 no la conoce), y el hook de if-up.d comprueba y repara
+# `nvx-src` (ifupdown2 no la conoce), y el hook de if-post-up.d comprueba y repara
 # tras cada recarga. Ver base/docs/ifreload-guard.md.
 # ⚠️ Fuente unica: scripts/despliega-netguard.py y adoptar-nodo-externo.sh
 # extraen estos heredocs LITERALMENTE de aqui.
-mkdir -p /mnt/etc/network/if-up.d /mnt/etc/systemd/system/neuravps-tunnels.service.d
+mkdir -p /mnt/etc/network/if-post-up.d /mnt/etc/systemd/system/neuravps-tunnels.service.d
 cat > /mnt/usr/local/sbin/nvx-netguard.sh <<'NVXEOF'
 #!/usr/bin/env bash
 # Guarda de red del NODO frente a recargas de ifupdown2 (`ifreload -a`, «Apply
@@ -1180,9 +1180,10 @@ cat > /mnt/usr/local/sbin/nvx-netguard.sh <<'NVXEOF'
 # Uso:
 #   nvx-netguard.sh            asegurar + comprobar + reparar (arranque, despliegue)
 #   nvx-netguard.sh --hook     igual, pero solo si neuravps-tunnels.service ya
-#                              esta activo (desde /etc/network/if-up.d; en el
-#                              arranque no hace nada: ahi manda la unidad)
+#                              esta activo (desde /etc/network/if-post-up.d; en
+#                              el arranque no hace nada: ahi manda la unidad)
 #   nvx-netguard.sh --check    solo mirar; imprime CLAVE=valor y sale 1 si falta algo
+# Sin --hook sale 1 si tras reparar sigue faltando algo (el hook sale siempre 0).
 #
 # Nunca hace `ifreload`, nunca toca /etc/network/interfaces y nunca recrea vmbr0.
 set -u
@@ -1230,6 +1231,7 @@ gw6_cfg()   { grep -qs 'ip -6 addr add fe80::1/64 dev vmbr0' /etc/network/interf
 gw4()       { ! gw4_cfg || ip -4 -o addr show dev vmbr0 | grep -q ' inet 10.64.255.1/16 '; }
 gw6()       { ! gw6_cfg || ip -6 -o addr show dev vmbr0 | grep -q ' inet6 fe80::1/64 '; }
 ctcount()   { iptables -w 5 -t raw -S PREROUTING 2>/dev/null | grep -c -- '-i fwbr+ -j CT --zone 1'; }
+tunsvc()    { systemctl is-active -q neuravps-tunnels.service; }
 
 check_all() {
   FALTA=""
@@ -1243,7 +1245,8 @@ check_all() {
   chk GW4 gw4
   chk GW6 gw6
   echo "CT=$(ctcount)"
-  echo "HOOK=$([ -x /etc/network/if-up.d/nvx-netguard ] && echo si || echo no)"
+  echo "TUNSVC=$(tunsvc && echo si || echo no)"
+  echo "HOOK=$([ -x /etc/network/if-post-up.d/nvx-netguard ] && echo si || echo no)"
   echo "DROPIN=$(grep -qs nvx-netguard /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf && echo si || echo no)"
 }
 
@@ -1261,6 +1264,8 @@ flock -w 60 9 || { log "no consigo el cerrojo; otra pasada en curso"; exit 0; }
 
 ensure_src() {
   if ! ip link show "$DEV" >/dev/null 2>&1; then
+    # numdummies=0: que cargar el modulo no cree ademas una dummy0 inutil.
+    [ -d /sys/module/dummy ] || modprobe dummy numdummies=0 2>/dev/null
     ip link add "$DEV" type dummy || { log "no pude crear $DEV"; return 1; }
   fi
   # Sin IPv6 en la dummy: no debe aparecer ninguna direccion (ni link-local)
@@ -1287,28 +1292,39 @@ ensure_src
 ensure_gw
 dedupe_ct
 check_all >/dev/null
-if [ -n "$FALTA" ]; then
-  log "falta:${FALTA} (${MODE:-manual}${IFACE:+ iface=$IFACE}) -> relanzo neuravps-tunnels.sh"
-  timeout 90 /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1 || log "neuravps-tunnels.sh rc=$?"
-  ensure_src
-  check_all >/dev/null
-  if [ -n "$FALTA" ]; then log "sigue faltando:${FALTA}"; else log "reparado"; fi
-fi
-exit 0
+# Relanzar los tuneles solo arregla lo suyo; NVXSRC/GW4/GW6 los reponen
+# ensure_src/ensure_gw. Asi un fallo persistente de esos no relanza los tuneles
+# (microcortes, y vuelta a casa si el sondeo habia cambiado de region) en cada
+# recarga.
+case " $FALTA " in
+  *" LOCAL4 "*|*" TUNS "*|*" RULES "*|*" DEFS "*|*" DEFMAIN "*|*" IDENT6 "*)
+    log "falta:${FALTA} (${MODE:-manual}${IFACE:+ iface=$IFACE}) -> relanzo neuravps-tunnels.sh"
+    # 9>&- : que ningun hijo herede el cerrojo.
+    timeout 90 /usr/local/sbin/neuravps-tunnels.sh >/dev/null 2>&1 9>&- || log "neuravps-tunnels.sh rc=$?"
+    ensure_src
+    check_all >/dev/null
+    if [ -n "$FALTA" ]; then log "sigue faltando:${FALTA}"; else log "reparado"; fi ;;
+  "  ") ;;
+  *) log "falta:${FALTA} y no se pudo reponer" ;;
+esac
+[ "$MODE" = --hook ] && exit 0
+[ -z "$FALTA" ]
 NVXEOF
 chmod 755 /mnt/usr/local/sbin/nvx-netguard.sh
 
-cat > /mnt/etc/network/if-up.d/nvx-netguard <<'NVXEOF'
+cat > /mnt/etc/network/if-post-up.d/nvx-netguard <<'NVXEOF'
 #!/bin/sh
 # ifupdown2 (ifreload/ifup, «Apply» de la GUI de PVE) -> guarda de red NeuraVPS.
-# Una vez por interfaz y fase; la guarda es idempotente y lleva cerrojo. Nunca
+# En if-post-up.d (fase post-up, DESPUES de los post-up de la estrofa: en
+# if-up.d correria antes y el post-up de vmbr0 volveria a duplicar la regla
+# raw). Una vez por interfaz; la guarda es idempotente y lleva cerrojo. Nunca
 # devuelve error: un hook que falla no debe romper la recarga de red.
 [ "${MODE:-}" = start ] || exit 0
 [ -x /usr/local/sbin/nvx-netguard.sh ] || exit 0
 /usr/local/sbin/nvx-netguard.sh --hook >/dev/null 2>&1 || true
 exit 0
 NVXEOF
-chmod 755 /mnt/etc/network/if-up.d/nvx-netguard
+chmod 755 /mnt/etc/network/if-post-up.d/nvx-netguard
 
 cat > /mnt/etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf <<'NVXEOF'
 [Service]

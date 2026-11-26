@@ -5,7 +5,7 @@ Desde el 26/11/2026. Ficheros (fuente única: heredocs de `install.sh`):
 | Fichero | Qué es |
 |---|---|
 | `/usr/local/sbin/nvx-netguard.sh` | La guarda: asegura, comprueba y repara. `--check` solo mira. |
-| `/etc/network/if-up.d/nvx-netguard` | Hook de ifupdown2: llama a la guarda (`--hook`) tras cada `up` de cada interfaz. |
+| `/etc/network/if-post-up.d/nvx-netguard` | Hook de ifupdown2: llama a la guarda (`--hook`) en la fase `post-up` de cada interfaz, después de los `post-up` de la estrofa. |
 | `/etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf` | `ExecStartPost=-` de la guarda: en cada arranque, tras los túneles. |
 
 Despliegue y marcha atrás: `scripts/despliega-netguard.py` (extrae los tres de `install.sh`).
@@ -39,11 +39,14 @@ misma recarga (ver medidas abajo).
    nunca toca. Con una copia viva, que ifupdown2 quite la de `lo` no arrastra ninguna ruta (el kernel solo
    borra rutas con ese `src` cuando la dirección deja de ser local): **no hay ni un instante sin salida**.
    La de `lo` la sigue poniendo `neuravps-tunnels.sh`; es prescindible y no se toca.
-2. **Hook de ifupdown2** (`if-up.d`, `addon_scripts_support=1` en los 200 nodos): tras cada `up`, si
+2. **Hook de ifupdown2** (`if-post-up.d`, `addon_scripts_support=1` en los 200 nodos; en `if-up.d` correría
+   ANTES de los `post-up` de la estrofa —por fase, ifupdown2 ejecuta primero los módulos y luego los scripts—
+   y el de `vmbr0` volvería a duplicar la regla raw): tras cada `up`, si
    `neuravps-tunnels.service` ya está activo (en el arranque no hace nada), comprueba túneles, reglas
    100/101/102, rutas por defecto de 100/101/102 y main, IDENT6 por `vmbr0` y pasarelas de invitados en
-   `vmbr0`; si falta algo, repone las pasarelas que declara el fichero y **relanza `neuravps-tunnels.sh`**
-   (la recuperación de siempre, idempotente). Deja una sola copia de la regla raw. Es la red de seguridad
+   `vmbr0`; repone la dummy y las pasarelas que declara el fichero y, **solo si falta algo de los túneles**
+   (local, túneles, reglas, rutas por defecto, IDENT6), **relanza `neuravps-tunnels.sh`** (la recuperación de
+   siempre, idempotente). Deja una sola copia de la regla raw. Es la red de seguridad
    para lo que no previene la dummy (p. ej. un `ifdown/ifup vmbr0`, que borra la ruta IDENT6).
 3. **Drop-in `ExecStartPost=-`** en `neuravps-tunnels.service`: la dummy se recrea en cada arranque.
 
@@ -63,8 +66,9 @@ la reapunta en ≤15 s × n, igual que tras una recuperación manual.
 ## Operación
 
 ```bash
-nvx-netguard.sh --check            # NVXSRC LOCAL4 TUNS RULES DEFS DEFMAIN IDENT6 GW4 GW6 =si|no, CT, HOOK, DROPIN
+nvx-netguard.sh --check            # NVXSRC LOCAL4 TUNS RULES DEFS DEFMAIN IDENT6 GW4 GW6 =si|no, CT, TUNSVC, HOOK, DROPIN
 journalctl -t nvx-netguard         # qué ha reparado y por qué
+scripts/despliega-netguard.py --previo                         # SOLO LECTURA antes de instalar: ¿casan las comprobaciones?
 scripts/despliega-netguard.py --solo-mirar                     # toda la flota, desde el sandbox
 scripts/despliega-netguard.py --nodos 0000038-AX162-R          # instalar en uno
 scripts/despliega-netguard.py --nodos ... --quitar             # marcha atrás

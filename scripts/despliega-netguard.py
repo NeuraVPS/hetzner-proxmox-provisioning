@@ -5,7 +5,7 @@ Corre en el SANDBOX. Hermano de despliega-node64.py. Extrae LITERALMENTE de
 install.sh (fuente unica) los tres ficheros:
 
   /usr/local/sbin/nvx-netguard.sh                                  (la guarda)
-  /etc/network/if-up.d/nvx-netguard                                (hook de ifupdown2)
+  /etc/network/if-post-up.d/nvx-netguard                                (hook de ifupdown2)
   /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf (ExecStartPost)
 
 los instala con sustitucion atomica, hace daemon-reload, ejecuta UNA pasada de
@@ -19,12 +19,17 @@ clientes solo se instala y se comprueba. La prueba de recarga se hace aparte, en
 un nodo vacio (ver base/docs/ifreload-guard.md).
 
   despliega-netguard.py [--nodos a,b,c] [--hilos N] [--base b1|b0]
-                        [--solo-mirar | --quitar]
+                        [--previo | --solo-mirar | --quitar]
+
+`--previo` = SOLO LECTURA antes de instalar: copia la guarda a /tmp, ejecuta
+`--check` y la borra. Acredita que las comprobaciones casan con lo que ya hay en
+el nodo (si no, instalar relanzaria los tuneles en el acto). NVXSRC/HOOK/DROPIN
+aun no existen y no cuentan. Pasarlo por toda la flota ANTES de instalar.
 
 `--quitar` = marcha atras: borra hook y drop-in (daemon-reload) y la dummy
 nvx-src SOLO si la /32 sigue en `lo` (asi nunca se queda el nodo sin ella).
 Deja nvx-netguard.sh, inerte. En un nodo a mano:
-  rm -f /etc/network/if-up.d/nvx-netguard /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf
+  rm -f /etc/network/if-post-up.d/nvx-netguard /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf
   systemctl daemon-reload; ip link del nvx-src   # solo si `ip -4 a show lo` tiene la 10.65.x.y/32
 """
 import argparse
@@ -39,7 +44,7 @@ from pathlib import Path
 
 INSTALL_SH = Path(__file__).resolve().parent.parent / "install.sh"
 GUARD = "/usr/local/sbin/nvx-netguard.sh"
-HOOK = "/etc/network/if-up.d/nvx-netguard"
+HOOK = "/etc/network/if-post-up.d/nvx-netguard"
 DROPIN = "/etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf"
 
 
@@ -79,7 +84,7 @@ _INSTALA_SH = """\
 set -o pipefail
 grep -qE '^addon_scripts_support=1' /etc/network/ifupdown2/ifupdown2.conf || echo SCRIPTS=desactivados
 [ -r /etc/default/neuravps-tunnels ] || echo CONF=falta
-mkdir -p /etc/network/if-up.d /etc/systemd/system/neuravps-tunnels.service.d
+mkdir -p /etc/network/if-post-up.d /etc/systemd/system/neuravps-tunnels.service.d
 put() {{ # put <b64> <destino> <modo>
   echo "$1" | base64 -d > "$2.nvxnew" && chmod "$3" "$2.nvxnew" && mv -f "$2.nvxnew" "$2" || echo INSTALAR=fallo
 }}
@@ -91,6 +96,7 @@ put {DROPIN} {dropin_path} 644
 systemctl daemon-reload || echo RELOAD=fallo
 systemctl show -p ExecStartPost --value neuravps-tunnels.service | grep -q nvx-netguard || echo DROPIN_CARGADO=no
 # Una pasada: nvx-src + una sola regla raw (+ reparacion si ya faltaba algo).
+# Sale 1 si tras reparar sigue faltando algo.
 {guard_path} || echo PASADA=fallo
 """
 
@@ -113,13 +119,26 @@ def node_script(accion):
                                   hook_path=HOOK, dropin_path=DROPIN)
     elif accion == "quitar":
         body = _QUITAR_SH.format(hook_path=HOOK, dropin_path=DROPIN)
+    elif accion == "previo":
+        # Sin _MIRAR_SH: no se deja nada instalado.
+        return base64.b64encode(_PREVIO_SH.format(GUARD=_b64(heredoc(GUARD))).encode()).decode()
     else:
         body = ""
     return base64.b64encode((body + _MIRAR_SH).encode()).decode()
 
 
-ERRORES = ("INSTALAR", "SINTAXIS", "RELOAD", "DROPIN_CARGADO", "PASADA", "SCRIPTS", "CONF", "NVXG")
+ERRORES = ("INSTALAR", "SINTAXIS", "RELOAD", "DROPIN_CARGADO", "PASADA", "SCRIPTS", "CONF", "NVXG",
+           "NVXSRC_CONSERVADA")
 CHEQUEOS = ("NVXSRC", "LOCAL4", "TUNS", "RULES", "DEFS", "DEFMAIN", "IDENT6", "GW4", "GW6")
+# Lo que ya tiene que estar bien ANTES de instalar (lo demas lo pone la guarda).
+PREVIOS = tuple(k for k in CHEQUEOS if k != "NVXSRC")
+
+_PREVIO_SH = """\
+T=$(mktemp /tmp/nvx-netguard.XXXXXX)
+echo {GUARD} | base64 -d > "$T" && chmod 700 "$T"
+echo NVXFIN=1 PREVIO=si $(bash "$T" --check 2>&1 | tr '\\n' ' ')
+rm -f "$T"
+"""
 
 
 def veredicto(accion, d):
@@ -129,8 +148,13 @@ def veredicto(accion, d):
         return False
     if accion == "quitar":
         return d.get("HOOK") == "no" and d.get("DROPIN") == "no"
-    return (d.get("INSTALADO") == "si" and all(d.get(k) == "si" for k in CHEQUEOS)
-            and d.get("CT") in ("0", "1") and d.get("HOOK") == "si" and d.get("DROPIN") == "si")
+    # Una sola regla raw (0 = falta la del post-up o iptables no responde) y la
+    # unidad de tuneles activa (si no, el hook es inerte).
+    base = d.get("CT") == "1" and d.get("TUNSVC") == "si"
+    if accion == "previo":
+        return d.get("PREVIO") == "si" and base and all(d.get(k) == "si" for k in PREVIOS)
+    return (base and d.get("INSTALADO") == "si" and all(d.get(k) == "si" for k in CHEQUEOS)
+            and d.get("HOOK") == "si" and d.get("DROPIN") == "si")
 
 
 def parse(stdout):
@@ -149,10 +173,12 @@ def main():
     p.add_argument("--hilos", type=int, default=8)
     p.add_argument("--base", default="b1")
     g = p.add_mutually_exclusive_group()
+    g.add_argument("--previo", action="store_true")
     g.add_argument("--solo-mirar", action="store_true")
     g.add_argument("--quitar", action="store_true")
     a = p.parse_args()
-    accion = "mirar" if a.solo_mirar else "quitar" if a.quitar else "instalar"
+    accion = ("previo" if a.previo else "mirar" if a.solo_mirar
+              else "quitar" if a.quitar else "instalar")
     orden = f"echo {node_script(accion)} | base64 -d | bash"
 
     r = subprocess.run(["ssh", "-n", a.base, "cat /var/lib/base-nat/pve_nodes.json"],
@@ -195,7 +221,7 @@ def main():
             ok = veredicto(accion, d)
             cuenta["OK" if ok else "MAL"] += 1
             resumen = " ".join(f"{k}={d[k]}" for k in
-                               ("INSTALADO", *CHEQUEOS, "CT", "HOOK", "DROPIN", *ERRORES, "NVXSRC_CONSERVADA", "ERROR")
+                               ("PREVIO", "INSTALADO", *CHEQUEOS, "CT", "TUNSVC", "HOOK", "DROPIN", *ERRORES, "ERROR")
                                if k in d)
             print(f"{'OK ' if ok else 'MAL'} {n:24s} {resumen}", flush=True)
             if not ok:

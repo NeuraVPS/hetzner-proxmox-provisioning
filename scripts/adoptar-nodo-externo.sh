@@ -141,7 +141,7 @@ phase_check() {
   done
   for f in /usr/local/sbin/neuravps-tunnels.sh /usr/local/sbin/neuravps-tunnel-select.sh \
            /usr/local/sbin/neuravps-tunnel-probe.sh /usr/local/sbin/nvx-mss.sh /usr/local/sbin/nvx-aisla.sh \
-           /usr/local/sbin/nvx-aisla-l3.sh /usr/local/sbin/nvx-netguard.sh /etc/network/if-up.d/nvx-netguard \
+           /usr/local/sbin/nvx-aisla-l3.sh /usr/local/sbin/nvx-netguard.sh /etc/network/if-post-up.d/nvx-netguard \
            /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf; do
     heredoc "$INSTALL_SH" "$f" >/dev/null && echo "extraible: $f" || { echo "NO EXTRAIBLE: $f"; bad=1; }
   done
@@ -393,7 +393,7 @@ phase_tunnels() {
   put_heredoc "$INSTALL_SH" /etc/sysctl.d/zz-neuravps-rpfilter.conf 644
   # Guarda frente a ifreload/«Apply» de la GUI (base/docs/ifreload-guard.md).
   put_heredoc "$INSTALL_SH" /usr/local/sbin/nvx-netguard.sh 755
-  put_heredoc "$INSTALL_SH" /etc/network/if-up.d/nvx-netguard 755
+  put_heredoc "$INSTALL_SH" /etc/network/if-post-up.d/nvx-netguard 755
   put_heredoc "$INSTALL_SH" /etc/systemd/system/neuravps-tunnels.service.d/nvx-netguard.conf 644
   grep -q 'TUN_MTU' /usr/local/sbin/neuravps-tunnels.sh || die "neuravps-tunnels.sh sin TUN_MTU: el repo copiado es anterior al cambio"
   # DEFAULT_V4_VIA_TUNNEL=0: el nodo conserva su IPv4 publica para su propio
