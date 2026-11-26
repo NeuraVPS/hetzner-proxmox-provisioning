@@ -262,6 +262,18 @@ class ColdIntoExternal(unittest.TestCase):
         self.assertIn("--current", block)                      # [PENDING] vs what PVE imports
         self.assertLess(hw, SCRIPT.index("'/nodes/${SRC_NODE}/qemu/${VMID}/remote_migrate'"))
 
+    def test_live_branch_also_compares_current_cpu_with_external_end(self):
+        online = SCRIPT.index('if [[ -n "$ONLINE_FLAG" ]]; then\n    CPU_RAW=')
+        guard = SCRIPT.index('_live_silicon_guard "$SRC_CPU_SIG" "$DST_CPU_SIG"', online)
+        block = SCRIPT[online:guard]
+        self.assertIn("--current", block)
+        self.assertIn('_node_is_external "$DST_NODE"', block)
+
+    def test_bad_config_keys_checked_entering_an_external_node_too(self):
+        tok = SCRIPT.index("  _token_create\n")
+        block = SCRIPT[SCRIPT.rindex("# 3) Token on dest", 0, tok):tok]
+        self.assertIn("if (( SRC_EXTERNAL == 1 || DST_EXTERNAL == 1 )); then", block)
+
     def test_template_export_requires_bare_v4(self):
         exp = (ROOT / "scripts/export_template_vm_to_shared_storage.sh").read_text()
         self.assertIn('"${TPL_CPU#cputype=}"', exp)

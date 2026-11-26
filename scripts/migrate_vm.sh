@@ -2123,6 +2123,15 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
         CPU_MODEL="$_run_model"
       fi
     fi
+    # Con un extremo externo, la línea cpu: que importa el túnel de PVE es la de
+    # la sección principal (descarta [PENDING]): tiene que coincidir con la que
+    # se valida aquí, o la VM podría entrar en Kademar y no volver a salir.
+    _node_types_load
+    if _node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" || _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"; then
+      _cpu_cur=$(src_ssh "qm config '${VMID}' --current 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+      [[ "${_cpu_cur}" == "${CPU_RAW:-}" ]] \
+        || _die "Traslado con un nodo externo: la VM ${VMID} tiene un cambio de CPU PENDIENTE (actual '${_cpu_cur:-kvm64}', pendiente '${CPU_RAW:-kvm64}'). Aplícalo en el próximo reinicio del cliente o descártalo antes. Abortado antes de tocar la VM."
+    fi
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
     # Para el caso genérico entre silicios del mismo grupo (26/11/2026): los
@@ -2208,10 +2217,11 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   _node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" && SRC_EXTERNAL=1
   _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6" && DST_EXTERNAL=1
   (( SRC_EXTERNAL == 1 )) && TOKEN_RESTRICTED=1
-  if (( TOKEN_RESTRICTED == 1 )); then
+  if (( SRC_EXTERNAL == 1 || DST_EXTERNAL == 1 )); then
     # Con el token acotado, el comando `config` del túnel rechazaría estas
     # opciones DESPUÉS de copiar el disco (args: solo root@pam; startup:
-    # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes.
+    # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes,
+    # también al ENTRAR en un nodo externo: una VM así no podría volver a salir.
     _bad_keys=$(src_ssh "sed '/^\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null \
       | grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' | tr -d ':' | tr '\n' ' ' || true)
     [[ -z "${_bad_keys// /}" ]] \
