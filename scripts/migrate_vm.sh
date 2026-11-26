@@ -2123,6 +2123,15 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
         CPU_MODEL="$_run_model"
       fi
     fi
+    # Con un extremo externo, la línea cpu: que importa el túnel de PVE es la de
+    # la sección principal (descarta [PENDING]): tiene que coincidir con la que
+    # se valida aquí, o la VM podría entrar en Kademar y no volver a salir.
+    _node_types_load
+    if _node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" || _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"; then
+      _cpu_cur=$(src_ssh "qm config '${VMID}' --current 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+      [[ "${_cpu_cur}" == "${CPU_RAW:-}" ]] \
+        || _die "Traslado con un nodo externo: la VM ${VMID} tiene un cambio de CPU PENDIENTE (actual '${_cpu_cur:-kvm64}', pendiente '${CPU_RAW:-kvm64}'). Aplícalo en el próximo reinicio del cliente o descártalo antes. Abortado antes de tocar la VM."
+    fi
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
     # Para el caso genérico entre silicios del mismo grupo (26/11/2026): los
@@ -2139,6 +2148,20 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     _cpu_first="${CPU_RAW%%,*}"; CPU_MODEL="${_cpu_first#cputype=}"
     SRC_CPU_SIG=$(_node_cpu_sig src_ssh || true)
     DST_CPU_SIG=$(_node_cpu_sig dst_ssh || true)
+    # Hacia un nodo externo (Kademar) solo entra CPU genérica sin opciones, la única que podrá volver
+    # a salir en caliente; ACK_HWID_CHANGE no vale aquí (26/11/2026). Para normalizarla: kit
+    # scripts/coldmove con CHANGE_CPU=1 y el cliente avisado.
+    _node_types_load
+    if _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6"; then
+      # `qm config` sin --current devuelve el cambio [PENDING], pero el túnel de PVE importa la
+      # sección principal: se exige que las dos coincidan (revisión).
+      _cpu_cur=$(src_ssh "qm config '${VMID}' --current 2>/dev/null" | sed -n 's/^cpu:[[:space:]]*//p' | head -1 | tr -d '\r' || true)
+      [[ "${_cpu_cur}" == "${CPU_RAW:-}" ]] \
+        || _die "Destino externo ${DST_NODE}: la VM ${VMID} tiene un cambio de CPU PENDIENTE (actual '${_cpu_cur:-kvm64}', pendiente '${CPU_RAW:-kvm64}'). Aplícalo (arrancando la VM) o descártalo antes. Abortado antes de tocar la VM."
+      _lcm=$(printf '%s' "${CPU_MODEL:-kvm64}" | tr '[:upper:]' '[:lower:]')
+      [[ "$_lcm" =~ ^x86-64-v[234](-[a-z0-9]+)?$ && "${CPU_RAW:-}" != *,* ]] \
+        || _die "Destino externo ${DST_NODE}: la VM ${VMID} tiene cpu=${CPU_RAW:-kvm64} y solo una CPU genérica x86-64-v* sin opciones puede volver a salir de allí en caliente. Normalízala con el kit scripts/coldmove (CHANGE_CPU=1, cliente avisado). Abortado antes de tocar la VM."
+    fi
     _cold_hwid_guard "$SRC_CPU_SIG" "$DST_CPU_SIG" "${CPU_MODEL:-kvm64}"
     _cold_avx512_guard "${CPU_MODEL:-kvm64}" "$(dst_ssh 'grep -m1 "^flags" /proc/cpuinfo' 2>/dev/null || true)"
   fi
@@ -2194,12 +2217,16 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
   _node_is_external "$SRC_NODE" "$NODE_PROVIDER_SRC" "$SRC_IPV6" && SRC_EXTERNAL=1
   _node_is_external "$DST_NODE" "$NODE_PROVIDER_DST" "$DST_IPV6" && DST_EXTERNAL=1
   (( SRC_EXTERNAL == 1 )) && TOKEN_RESTRICTED=1
-  if (( TOKEN_RESTRICTED == 1 )); then
+  if (( SRC_EXTERNAL == 1 || DST_EXTERNAL == 1 )); then
     # Con el token acotado, el comando `config` del túnel rechazaría estas
     # opciones DESPUÉS de copiar el disco (args: solo root@pam; startup:
-    # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes.
-    _bad_keys=$(src_ssh "sed '/^\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null \
-      | grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' | tr -d ':' | tr '\n' ' ' || true)
+    # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes,
+    # también al ENTRAR en un nodo externo: una VM así no podría volver a salir.
+    # Falla CERRADO: sin config legible no se sigue (revisión).
+    _conf_top=$(src_ssh "sed '/^\\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null) || _conf_top=""
+    [[ "$_conf_top" == *"memory:"* ]] \
+      || _die "No pude leer la config de la VM ${VMID} en ${SRC_NODE} para comprobar opciones incompatibles con un nodo externo. Abortado antes de copiar nada."
+    _bad_keys=$(grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' <<< "$_conf_top" | tr -d ':' | tr '\n' ' ' || true)
     [[ -z "${_bad_keys// /}" ]] \
       || _die "VM ${VMID} lleva ${_bad_keys}en su config: con el token acotado de un origen externo (B+) el destino la rechazaría tras copiar el disco. Quita esas opciones o muévela en frío. Abortado antes de copiar nada."
   fi

@@ -939,6 +939,7 @@ class ThirdReview(unittest.TestCase):
     def test_lost_answer_after_rename_still_finishes_the_push(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, cpu="host", dst_cpu=TURIN)
+            k.env.update({"DST_NODE": "0000234-AX162-2-LTD", "FAKE_HOST_DST": "0000234-AX162-2-LTD"})  # ACK: not toward Kademar
             env = {"ACK_HWID_CHANGE": VMID, "CPU_NOTICE": "correo 22/11"}
             k.to_final(**env)
             r = k.run("rtmig_cutover.sh", "push", FINAL, FAKE_SSH_LOSE_MATCH="qemu-server/4242.conf.rtmig-tmp", **env)
@@ -950,6 +951,7 @@ class ThirdReview(unittest.TestCase):
     def test_resumed_push_runs_the_same_finish_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             k = Kit(tmp, cpu="host", dst_cpu=TURIN)
+            k.env.update({"DST_NODE": "0000234-AX162-2-LTD", "FAKE_HOST_DST": "0000234-AX162-2-LTD"})  # ACK: not toward Kademar
             env = {"ACK_HWID_CHANGE": VMID, "CPU_NOTICE": "correo 22/11"}
             k.to_final(**env)
             # the first push dies right after the rename, before its finish (answer AND probe lost)
@@ -1000,9 +1002,11 @@ class ThirdReview(unittest.TestCase):
 
 
 class CpuGuard(unittest.TestCase):
-    def push(self, cpu, src_cpu=GENOA, dst_cpu=TURIN, **env):
+    def push(self, cpu, src_cpu=GENOA, dst_cpu=TURIN, dst_node=None, **env):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         k = Kit(tmp.name, cpu=cpu, src_cpu=src_cpu, dst_cpu=dst_cpu)
+        if dst_node:                       # a Hetzner destination (not *-KDM-*)
+            k.env.update({"DST_NODE": dst_node, "FAKE_HOST_DST": dst_node})
         k.to_final(**env)
         return k, k.run("rtmig_cutover.sh", "push", FINAL, **env)
 
@@ -1023,8 +1027,45 @@ class CpuGuard(unittest.TestCase):
                 r = k.run("rtmig_cutover.sh", "shutdown", "60", **env)
                 self.assertEqual(r.returncode, 1); self.assertIn(needle, out(r))
 
+    def test_ack_cannot_trap_a_host_vm_on_kademar(self):
+        # 26/11/2026: toward an external node only a generic CPU can leave live again;
+        # refused at shutdown, before the source VM is touched
+        for cpu, extra in (("host", {}), ("kvm64", {}), ("EPYC-Genoa", {}), ("host", {"dst_cpu": GENOA})):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp, cpu=cpu, **extra); k.ok("rtmig_send.sh", "base", "rtmig-a")
+                r = k.run("rtmig_cutover.sh", "shutdown", "60", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo 26/11")
+                self.assertEqual(r.returncode, 1, cpu)
+                self.assertIn("destino externo", out(r)); self.assertIn("CHANGE_CPU=1", out(r))
+                self.assertNotIn("shutdown", k.read("qm.log"))
+        k, r = self.push("x86-64-v4")                           # generic: nothing to do
+        self.assertEqual(r.returncode, 0, out(r))
+
+    def test_args_or_v1_cannot_enter_kademar(self):
+        # review: a clean cpu but an `args:` line (or x86-64-v1/v5) could enter and never leave live
+        for conf_extra, cpu in (("args: -no-hpet\n", "x86-64-v4"), ("", "x86-64-v1"), ("", "x86-64-v5")):
+            with tempfile.TemporaryDirectory() as tmp:
+                k = Kit(tmp, cpu=cpu)
+                if conf_extra:
+                    f = k.t / f"src/etc/pve/qemu-server/{VMID}.conf"
+                    f.write_text(f.read_text() + conf_extra)
+                k.ok("rtmig_send.sh", "base", "rtmig-a")
+                r = k.run("rtmig_cutover.sh", "shutdown", "60")
+                self.assertEqual(r.returncode, 1, (cpu, out(r))); self.assertIn("destino externo", out(r))
+                self.assertNotIn("shutdown", k.read("qm.log"))
+
+    def test_generic_with_options_is_normalised_or_refused_toward_kademar(self):
+        # review: x86-64-v4,phys-bits=host would pass a model-only check and stay stuck on Kademar
+        with tempfile.TemporaryDirectory() as tmp:
+            k = Kit(tmp, cpu="x86-64-v4,phys-bits=host"); k.ok("rtmig_send.sh", "base", "rtmig-a")
+            r = k.run("rtmig_cutover.sh", "shutdown", "60")
+            self.assertEqual(r.returncode, 1); self.assertIn("sin opciones", out(r))
+        k, r = self.push("x86-64-v4,phys-bits=host", CHANGE_CPU="1", CPU_NOTICE="correo 26/11")
+        self.assertEqual(r.returncode, 0, out(r))
+        conf = k.read(f"dst/etc/pve/qemu-server/{VMID}.conf")
+        self.assertIn("cpu: x86-64-v4\n", conf); self.assertNotIn("phys-bits", conf)
+
     def test_ack_keeps_host_and_records_it_once_published(self):
-        k, r = self.push("host", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo 20/11")
+        k, r = self.push("host", dst_node="0000234-AX162-2-LTD", ACK_HWID_CHANGE=VMID, CPU_NOTICE="correo 20/11")
         self.assertEqual(r.returncode, 0, out(r))
         self.assertIn("cpu: host", k.read(f"dst/etc/pve/qemu-server/{VMID}.conf"))
         rec = k.read("work/cpu-change.txt")
@@ -1046,7 +1087,7 @@ class CpuGuard(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("excluyentes", out(r))
 
     def test_host_on_identical_silicon_needs_nothing(self):
-        k, r = self.push("host", dst_cpu=GENOA)
+        k, r = self.push("host", dst_cpu=GENOA, dst_node="0000234-AX162-2-LTD")
         self.assertEqual(r.returncode, 0, out(r))
         self.assertFalse((k.work / "cpu-change.txt").exists())
 

@@ -39,7 +39,8 @@
 #   - Con cpu=host/max, otro modelo con nombre o sin línea cpu (kvm64), si el silicio
 #     (vendor|family|model de /proc/cpuinfo) cambia, el Hardware ID cambia: se exige UNA de
 #       CHANGE_CPU=1                pone en el destino la CPU de las altas (x86-64-v4, o v3 sin AVX-512);
-#       ACK_HWID_CHANGE=<VMID>      deja la CPU tal cual (el invitado verá el silicio nuevo);
+#       ACK_HWID_CHANGE=<VMID>      deja la CPU tal cual (el invitado verá el silicio nuevo); NO vale hacia
+#                                   Kademar (*-KDM-*) con una CPU no genérica: ahí solo CHANGE_CPU=1;
 #     y en los dos casos CPU_NOTICE='<cuándo y por dónde se avisó al cliente de reactivar licencias>'.
 #   - x86-64-v4 hacia un destino sin AVX-512 no arrancaría (PVE pone enforce): solo con CHANGE_CPU=1.
 #   Se registra en $WORK/cpu-change.txt al publicar. El rollback recupera la CPU antigua (la config del
@@ -78,6 +79,15 @@ pending_touches() {
        END{exit t ? 0 : 1}' "$1"
 }
 is_generic_cpu() { [[ "$1" =~ ^x86-64-v[0-9]+(-[A-Za-z0-9]+)?$ ]]; }
+# La línea cpu: efectiva COMPLETA (con opciones; la de [PENDING] si la hay), para el destino externo.
+conf_cpu_full() {
+  awk 'BEGIN{sec="main"}
+       /^\[/ {sec=$0; next}
+       sec=="main" && /^cpu:/ {m=$0}
+       sec=="[PENDING]" && /^cpu:/ {p=$0}
+       sec=="[PENDING]" && /^delete:/ {s=$0; sub(/^delete:[ \t]*/,"",s); n=split(s,a,/[ ,]+/); for(i=1;i<=n;i++) if(a[i]=="cpu") d=1}
+       END{v = (p!="") ? p : (d ? "" : m); sub(/^cpu:[ \t]*/,"",v); sub(/^cputype=/,"",v); print v}' "$1"
+}
 
 # Pone «key: value» en la sección PRINCIPAL de una config: sustituye la línea si está, o la añade al
 # final de esa sección. Las secciones [PENDING]/[snapshot] no cuentan ni se tocan.
@@ -156,6 +166,24 @@ cpu_decision() {
     if [[ -n "$reason" && -z "${ACK_HWID_CHANGE:-}" ]]; then
       die "el Hardware ID de SQX y las licencias del Market cambiarán (${reason}). Hace falta dejar constancia del aviso al cliente: CHANGE_CPU=1 (pone ${tgt}) o ACK_HWID_CHANGE=${VMID} (deja ${cpu}), con CPU_NOTICE='…'. No se ha tocado nada"
     fi
+  fi
+  # Hacia un nodo EXTERNO (Kademar, *-KDM-*; 26/11/2026) la VM tiene que quedar con CPU genérica SIN
+  # opciones: es la única que puede volver a salir EN CALIENTE (migrate_vm.sh, Genoa <-> Turin). Dejar
+  # `cpu: host` (ACK_HWID_CHANGE) o `x86-64-v4,phys-bits=host` la atraparía allí. Con CHANGE_CPU=1 se
+  # reescribe la línea entera a ${tgt}; sin él, se rechaza (el aviso al cliente hace falta igual).
+  if [[ "$DST_NODE" == *-KDM-* ]]; then
+    local full; full=$(conf_cpu_full "$conf")
+    if [[ "${CHANGE_CPU:-0}" == 1 ]]; then
+      [[ "${full,,}" == "$tgt" ]] || new="$tgt"
+    elif [[ ! "$lc" =~ ^x86-64-v[234](-[a-z0-9]+)?$ || "$full" == *,* ]]; then
+      die "destino externo ${DST_NODE}: la VM tiene cpu=${full:-kvm64} y solo una CPU genérica x86-64-v2/v3/v4 sin opciones puede volver a salir de allí en caliente. Usa CHANGE_CPU=1 (pone ${tgt}) con CPU_NOTICE='…'. No se ha tocado nada"
+    fi
+    # Lo que el token acotado de la salida (migrate_vm.sh, origen externo) no podría importar.
+    local bad
+    bad=$(grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' \
+            <(awk '/^\[/ && $0!="[PENDING]" {exit} {print}' "$conf") | tr -d ':' | sort -u | tr '\n' ' ' || true)
+    [[ -z "${bad// /}" ]] \
+      || die "destino externo ${DST_NODE}: la config lleva ${bad}y con eso la VM no podría volver a salir de Kademar en caliente (el token acotado del destino lo rechaza). Quítalo antes. No se ha tocado nada"
   fi
   CPU_NEW="$new"; CPU_OLD="$cpu"; CPU_ACK_REASON=""
   [[ -n "${ACK_HWID_CHANGE:-}" ]] && CPU_ACK_REASON="${reason:-sin cambio de Hardware ID detectado}"
