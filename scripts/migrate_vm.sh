@@ -2222,8 +2222,11 @@ PYEOF" || _die "Memory mismatch auto-fix failed — align manually: config memor
     # opciones DESPUÉS de copiar el disco (args: solo root@pam; startup:
     # Sys.Modify en /; dispositivos del host: permisos de mapeo). Se mira antes,
     # también al ENTRAR en un nodo externo: una VM así no podría volver a salir.
-    _bad_keys=$(src_ssh "sed '/^\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null \
-      | grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' | tr -d ':' | tr '\n' ' ' || true)
+    # Falla CERRADO: sin config legible no se sigue (revisión).
+    _conf_top=$(src_ssh "sed '/^\\[/q' /etc/pve/qemu-server/${VMID}.conf" 2>/dev/null) || _conf_top=""
+    [[ "$_conf_top" == *"memory:"* ]] \
+      || _die "No pude leer la config de la VM ${VMID} en ${SRC_NODE} para comprobar opciones incompatibles con un nodo externo. Abortado antes de copiar nada."
+    _bad_keys=$(grep -oE '^(args|startup|hostpci[0-9]+|usb[0-9]+|serial[0-9]+|parallel[0-9]+|virtiofs[0-9]+):' <<< "$_conf_top" | tr -d ':' | tr '\n' ' ' || true)
     [[ -z "${_bad_keys// /}" ]] \
       || _die "VM ${VMID} lleva ${_bad_keys}en su config: con el token acotado de un origen externo (B+) el destino la rechazaría tras copiar el disco. Quita esas opciones o muévela en frío. Abortado antes de copiar nada."
   fi
