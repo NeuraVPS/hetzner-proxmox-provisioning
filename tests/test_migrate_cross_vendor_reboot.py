@@ -276,8 +276,10 @@ dst_ssh() { printf '%s\n----\n' "$*" >> "$CALLS"; case "$*" in
   *"token add"*) echo "│ value        │ 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b │"; return "${TOKADD_RC:-0}" ;;
   *ensure_role*) [ -n "${ROLES_FAIL:-}" ] && { echo "role boom"; return 1; }; echo ROLES-OK ;;
   *"acl modify"*) [ -n "${ACL_FAIL:-}" ] && { echo "acl boom 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"; return 1; }; echo ACL-OK ;;
+  *"curl -sk"*) cat > "$CALLS.stdin"; printf '%s' "${CURL_CODE:-200}" ;;
+  *"token list"*) return "${LIST_RC:-0}" ;;
   *) : ;; esac; return "${DST_RC:-0}"; }
-curl() { echo "$*" >> "$CALLS.curl"; printf '%s' "${CURL_CODE:-200}"; }
+curl() { echo "LOCAL CURL $*" >> "$CALLS"; printf '%s' 999; }
 src_ssh() { printf '%s\n----\n' "$*" >> "$CALLS"; echo "${SRC_OUT-ADDED}"; }
 """
 
@@ -356,6 +358,23 @@ class MigrationToken(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertNotIn("token add", calls)
 
+    def test_precheck_runs_on_the_dest_with_the_secret_on_stdin(self):
+        r, calls = self.run_tok(1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("LOCAL CURL", calls)                      # never from the BASE to an unverified 8006
+        self.assertIn("https://127.0.0.1:8006/api2/json/cluster/status", calls)
+        line = [l for l in calls.splitlines() if "curl -sk" in l][0]
+        self.assertNotIn("0f1e2d3c", line)                         # not on a command line
+        self.assertIn("-H @-", line)
+
+    def test_cleanup_needs_a_valid_listing(self):
+        body = _fn("_token_cleanup")
+        self.assertIn("|| exit 3", body)
+        self.assertIn("json.load(sys.stdin)", body)
+        r, _ = self.run_tok(0, extra="LIST_RC=3; _token_cleanup; echo CREATED=$TOKEN_CREATED\n", env={"LIST_RC": "3"})
+        self.assertIn("CREATED=1", r.stdout.splitlines()[-1])
+        self.assertIn("Could not confirm", r.stderr)
+
     def test_precheck_with_the_token_itself(self):
         r, _ = self.run_tok(1, env={"CURL_CODE": "403"})
         self.assertEqual(r.returncode, 1)
@@ -418,11 +437,13 @@ class BbrRoute(unittest.TestCase):
             self.assertIn("ADDED=0", r.stdout)
             self.assertIn("WARN", r.stderr)
 
-    def test_lost_answer_is_checked_when_disarming(self):
+    def test_lost_answer_leaves_the_route_alone(self):
+        # review round 2: ownership unknown -> never delete, warn
         r, calls = self.run_bbr("", "_bbr_route_disarm; echo ADDED=$BBR_ROUTE_ADDED\n")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("ADDED=2", r.stdout)
-        self.assertIn("congctl bbr'*) ip -6 route del", calls)   # only if still ours
+        self.assertNotIn("route del", calls)
+        self.assertIn("Not touching", r.stderr)
         self.assertEqual(r.stdout.strip().splitlines()[-1], "ADDED=0")
 
     def test_wiring(self):

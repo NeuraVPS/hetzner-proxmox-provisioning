@@ -1101,14 +1101,15 @@ _token_create() {
       pveum acl modify /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN --propagate 1
       echo ACL-OK" 2>&1) || true
     [[ "$out" == *ACL-OK* ]] || _die "Could not grant the restricted token's ACLs on dest: ${out//${TOKEN_SECRET}/<secret>}"
-    # Comprobación con el propio token, desde la base, de las lecturas que hace
-    # remote_migrate antes de abrir el túnel (GET /cluster/status → Sys.Audit;
-    # GET /nodes/localhost/storage). Falla aquí, no tras desacoplar nada más.
-    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
-             -H "Authorization: PVEAPIToken=root@pam!${TOKEN_NAME}=${TOKEN_SECRET}" \
-             "https://[${DST_IPV6}]:8006/api2/json/cluster/status" 2>/dev/null || true)
+    # Comprobación con el propio token de las lecturas que hace remote_migrate
+    # antes de abrir el túnel (GET /cluster/status → Sys.Audit). Se hace EN el
+    # destino, contra 127.0.0.1, por el SSH ya autenticado: el token no viaja a
+    # un 8006 sin verificar (revisión) ni aparece en la línea de órdenes (va por
+    # stdin como cabecera).
+    code=$(printf 'Authorization: PVEAPIToken=root@pam!%s=%s\n' "$TOKEN_NAME" "$TOKEN_SECRET" \
+             | dst_ssh "curl -sk -o /dev/null -w '%{http_code}' --max-time 15 -H @- https://127.0.0.1:8006/api2/json/cluster/status" 2>/dev/null || true)
     if [[ "$code" == 000 || -z "$code" ]]; then
-      _warn "Could not reach ${DST_NODE}:8006 from this BASE to pre-check the restricted token (HTTP ${code:-none}); remote_migrate will tell."
+      _warn "Could not pre-check the restricted token on ${DST_NODE} (HTTP ${code:-none}); remote_migrate will tell."
     elif [[ "$code" != 200 ]]; then
       _die "The restricted token cannot read /cluster/status on ${DST_NODE} (HTTP ${code}): remote_migrate would fail before copying anything."
     fi
@@ -1126,8 +1127,11 @@ _token_cleanup() {
       pveum acl delete /sdn/zones/localnetwork --tokens '${acl_tok}' --roles NVMigInSDN >/dev/null 2>&1
       true" >/dev/null 2>&1 || true
   fi
-  if dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}' >/dev/null 2>&1 || true
-      ! pveum user token list root@pam --output-format json 2>/dev/null | grep -q '\"tokenid\":\"${TOKEN_NAME}\"'" >/dev/null 2>&1; then
+  # Éxito solo si el listado responde con JSON válido y el token ya no está
+  # (revisión: con remove y list fallando a la vez se daba por borrado).
+  if dst_ssh "pveum user token remove root@pam '${TOKEN_NAME}' >/dev/null 2>&1
+      out=\$(pveum user token list root@pam --output-format json 2>/dev/null) || exit 3
+      printf '%s' \"\$out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(1 if any(t.get(\"tokenid\")==sys.argv[1] for t in d) else 0)' '${TOKEN_NAME}'" >/dev/null 2>&1; then
     _ok "Token removed on dest."
     TOKEN_CREATED=0
   else
@@ -1166,7 +1170,13 @@ _bbr_route_arm() {
 # bbr). Si dos traslados comparten origen y destino y el primero la quita, el
 # segundo no pierde nada: el control de congestión se fija al abrir la conexión.
 _bbr_route_disarm() {
-  (( BBR_ROUTE_ADDED != 0 )) || return 0
+  if (( BBR_ROUTE_ADDED == 2 )); then
+    # Propiedad incierta (respuesta perdida): podría ser una /128 ajena. Se deja.
+    _warn "Not touching any /128 route to ${DST_IPV6} on ${SRC_NODE}: whether this run added it is unknown. If 'ip -6 route show ${DST_IPV6}/128' shows 'congctl bbr' and nobody else set it, remove it by hand."
+    BBR_ROUTE_ADDED=0
+    return 0
+  fi
+  (( BBR_ROUTE_ADDED == 1 )) || return 0
   if src_ssh "r=\$(ip -6 route show '${DST_IPV6}/128' 2>/dev/null)
       case \"\$r\" in *'congctl bbr'*) ip -6 route del '${DST_IPV6}/128' ;; *) true ;; esac" >/dev/null 2>&1; then
     _info "Temporary BBR route to ${DST_IPV6} removed on ${SRC_NODE}."
