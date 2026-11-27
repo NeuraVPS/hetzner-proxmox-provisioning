@@ -84,7 +84,7 @@ State in /var/lib/neuravps-defrag-recent.json ({vmid: last-move epoch}).
 
 --dry-run flag: plan + journal (as dryRun) but never execute, without
 touching the config/defrag kill-switch the hourly timers read.
-#NDFVER=14
+#NDFVER=15
 """
 import fcntl
 import json
@@ -491,23 +491,45 @@ MT_RELIEF_CEILING = 0.70
 
 
 def plan_mt_cpu_relief(hot, victims_of, pick_dest, load_of, threads_of,
-                       agent_alive, book, ceiling=MT_RELIEF_CEILING):
-    """One CPU-relief move at most, and a classified outcome per node tried.
+                       agent_alive, book, ceiling=MT_RELIEF_CEILING, max_moves=1):
+    """Up to `max_moves` CPU-relief moves (at most ONE per hot node), and a
+    classified outcome per node tried.
 
-    `hot` is the ordered list of MT nodes with sustained CPU harm. Every node
-    up to and including the one that gets the move is classified; the nodes
-    after it are NOT probed (one move per tick is the design, and probing costs
-    one SSH per VM) -- they are "rate-limited", not "no destination", and
-    appear in neither list. Returns (moved_nid or None, {nid: outcome})."""
+    `hot` is the ordered list of MT nodes with sustained CPU harm (the caller
+    puts the worst first). Every node up to and including the one that gets
+    the last move is classified; the nodes after it are NOT probed (probing
+    costs one SSH per VM) -- they are "rate-limited", not "no destination",
+    and appear in neither list. The destination is the coolest measured one
+    that fits (not pick_dest's best-fit order). Its measured load is raised by
+    every demand already booked onto it in this tick, so two moves never
+    count the same headroom twice.
+
+    max_moves=1 was the only behaviour until 2026-11-27: one move per hourly
+    tick, always to the lowest node id first. With 6 saturated nodes and three
+    near-empty AX102 (260/261/262, reactivated 25/11) the relief moved ~1 VM
+    a day into them (only while contention lasts, 14-18 UTC) and the same
+    node (0000006) took every slot. Returns (first moved nid or None,
+    {nid: outcome})."""
     outcomes = {}
+    booked_load = {}
+    first = None
+    moves = 0
     for nid in hot:
+        if moves >= max_moves:
+            break
         victims = victims_of(nid)
         if not victims:
             outcomes[nid] = "no-victim"
             continue
         unmeasured = agent_down = False
         for demand, vm in victims:
-            excluded = {nid}
+            # Every destination pick_dest allows (its own guards: model, CPU
+            # compatibility, cores, RAM, disk, contention), then the COOLEST
+            # measured one that fits under the ceiling. pick_dest's order is
+            # best-fit by cores -- right for packing, wrong for CPU relief: it
+            # offered the fullest nodes first and left the near-empty ones
+            # (260/261/262, 2026-11-27) for last.
+            excluded, measured = {nid}, []
             while True:
                 dst = pick_dest(vm, excluded)
                 if not dst:
@@ -517,17 +539,26 @@ def plan_mt_cpu_relief(hot, victims_of, pick_dest, load_of, threads_of,
                 if load is None or not threads or threads <= 0:
                     unmeasured = True
                     continue
+                measured.append((load + booked_load.get(dst, 0.0), dst, threads))
+            for load, dst, threads in sorted(measured):
                 if load + demand / threads > ceiling:
-                    continue
+                    break   # sorted: every later one is hotter
                 if not agent_alive(nid, vm):
                     agent_down = True
                     break
                 book(vm, nid, dst, demand)
+                booked_load[dst] = booked_load.get(dst, 0.0) + demand / threads
                 outcomes[nid] = "moved"
-                return nid, outcomes
+                break
+            if outcomes.get(nid) == "moved":
+                break
+        if outcomes.get(nid) == "moved":
+            moves += 1
+            first = first or nid
+            continue
         outcomes[nid] = ("unmeasured" if unmeasured
                          else "agent-down" if agent_down else "no-dest")
-    return None, outcomes
+    return first, outcomes
 
 
 def no_dest_nodes(mt_outcomes, sqx_failed):
@@ -1361,15 +1392,23 @@ def main():
                     dest_load[dst] = cpu_p95(dst)
                 return dest_load[dst]
 
-            mt_hot = [nid for nid, n in nodes.items()
-                      if n['model'] == 'MT5' and placeable(n)
-                      and sustained_cpu_harm(n['cpu_history'])]
+            # Worst first: the latest contention sample (ms/s per vCPU). By id,
+            # 0000006 always took the single move and 242/243 never got one.
+            mt_hot = sorted((nid for nid, n in nodes.items()
+                             if n['model'] == 'MT5' and placeable(n)
+                             and sustained_cpu_harm(n['cpu_history'])),
+                            key=lambda k: (-(nodes[k].get('cpu_ms') or 0), k))
+            # config/defrag.mtReliefMaxMovesPerTick (default 1 = the historic
+            # behaviour); never above what the run's relief budget has left.
+            mt_max = max(1, min(int(cfg.get('mtReliefMaxMovesPerTick') or 1),
+                                relief_max - len(moves)))
             _moved, mt_outcomes = plan_mt_cpu_relief(
                 mt_hot, victims_of,
                 lambda vm, excluded: pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False,vm=vm),
                 load_of, lambda dst: nodes[dst]['threads'],
                 lambda nid, vm: agent_alive(nid,vm['vmid']),
-                lambda vm, nid, dst, demand: book(vm,nid,dst,f'cpu-relief (two sustained wait windows; guest p95 {demand:.2f} CPUs)'))
+                lambda vm, nid, dst, demand: book(vm,nid,dst,f'cpu-relief (two sustained wait windows; guest p95 {demand:.2f} CPUs)'),
+                max_moves=mt_max)
             mt_evaluated = True
             for nid, outcome in mt_outcomes.items():
                 if outcome != 'moved':
