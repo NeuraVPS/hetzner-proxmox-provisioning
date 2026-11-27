@@ -230,10 +230,11 @@ def boost(vmid, expected_node, boot_token=None):
             guards[str(vmid)] = {'token':boot_token, 'floor':floor, 'target':target,
                                  'uuid':config(vmid).get('smbios1'), 'held':False}
             atomic_json(path, guards)
-        # Never SHRINK a live guest: a band target can sit below what the guest
-        # already has (ent < actual < memory); then only the floor moves.
-        if actual < target:
-            qmp(vmid, 'balloon', {'value': target * 1048576})
+        # Always push the live target (qm set alone never moves it — and at
+        # boot `qm start` has seeded it at the old floor while `actual` still
+        # reads the full RAM), but never BELOW what the guest already has: a
+        # band target can sit under it (ent < actual < memory).
+        qmp(vmid, 'balloon', {'value': max(target, actual) * 1048576})
         result = {'status': 'boosted', 'before': actual, 'target': target}
         if capped:
             result['capped'] = 'entitlement'

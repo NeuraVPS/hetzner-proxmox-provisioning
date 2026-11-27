@@ -275,7 +275,12 @@ def main():
             if state.get(vmid) != st:
                 continue  # ownership changed while querying
             res = boost_vm(node, vmid, st['nodeId'])
-            if res:
+            if res and res.get('status') == 'full':
+                handled[flow] = now + HANDLED_TTL_S
+                skip_until[vmid] = (now + BOOST_COOLDOWN_S, "ya-a-tope")
+                log(f"vm {vmid}: login detectado, sin subida: {res.get('reason') or 'a tope'} "
+                    f"(actual {actual}MB, suelo {floor}MB)")
+            elif res:
                 handled[flow] = now + HANDLED_TTL_S
                 skip_until[vmid] = (now + BOOST_COOLDOWN_S, "boosted")
                 target = res.get('target') or memory

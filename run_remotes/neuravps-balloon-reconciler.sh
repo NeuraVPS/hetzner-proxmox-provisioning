@@ -561,7 +561,8 @@ PY
         if [ $(( budget_mb - floors_sum )) -ge "$STEP_MB" ] \
            && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + STEP_MB )) ]; then
           lower_ok=1
-        elif [ "$ENTITLE_ENABLED" = 1 ] && [ $(( fl - STEP_MB )) -le "$(entitle_mb "$mx")" ] \
+        elif [ "$ENTITLE_ENABLED" = 1 ] \
+           && [ "$(( fl - STEP_MB > $(floor_target "$mx" 0) ? fl - STEP_MB : $(floor_target "$mx" 0) ))" -le "$(entitle_mb "$mx")" ] \
            && [ "$conservative_avail" -ge $(( ENTITLE_AVAIL_MIN_MB + STEP_MB )) ]; then
           # the floor AFTER the step must sit inside the band (so the band can
           # give it back); a floor at max from an older boost qualifies once

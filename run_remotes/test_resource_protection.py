@@ -120,7 +120,31 @@ class Capacity(unittest.TestCase):
                                          inspected=(61440,18432,58000))
         self.assertEqual(result['target'],51200)
         self.assertEqual(calls,1)          # qm set --balloon 51200
-        self.assertIsNone(args)            # no qmp call at all
+        self.assertEqual(args.args,(99,'balloon',{'value':58000*1048576}))  # never below actual
+
+    def test_boot_guard_always_pushes_live_target(self):
+        # review 2026-11-27: at +5 s of qm start actual reads the full RAM while
+        # the live target sits at the old floor; the boot path must still send
+        # qmp (value >= target), with or without the band.
+        from io import StringIO
+        for floors, ent, expect in ((100000, None, 19456), (230000, 1, 19456)):
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.object(guard,'STATE_DIR',Path(directory)), \
+                 patch.object(guard,'RECONCILER_TIMER',Path(directory)), \
+                 patch.object(guard,'RECONCILER_DEFAULTS',Path(directory)/'d'), \
+                 patch('builtins.open',return_value=MagicMock()), \
+                 patch.object(guard.fcntl,'flock'), \
+                 patch.object(guard,'inspect',return_value=(19456,9932,19456,60000)), \
+                 patch.object(guard,'config',return_value={'smbios1':'uuid=one'}), \
+                 patch.object(guard,'meminfo',return_value={'MemTotal':257000,'MemAvailable':60000}), \
+                 patch.object(guard,'floor_total',return_value=floors), \
+                 patch.object(guard.subprocess,'run'), \
+                 patch.object(guard,'qmp') as qmp:
+                if ent is not None:
+                    (Path(directory)/'d').write_text(f'ENTITLE_ENABLED={ent}\n')
+                result = guard.boost(99,'node-AX162','tok')
+                self.assertEqual(result['status'],'boosted')
+                self.assertEqual(qmp.call_args.args,(99,'balloon',{'value':expect*1048576}))
 
     def test_already_at_entitlement_is_full_not_a_retry_loop(self):
         result,calls,_=self.run_boost(available=60000, floors=230000, entitle=1,
@@ -310,7 +334,7 @@ class ReconcilerEntitlement(unittest.TestCase):
     and an entitled floor can still decay on an over-budget node."""
 
     def run_node(self, entitle, avail_mb, floor=4915, faults_ps=200, idle=0, actual=7000, big=True,
-                 n98_floor=230000):
+                 n98_floor=230000, mem99=16384):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = Path(__file__).with_name('neuravps-balloon-reconciler.sh').read_text()
@@ -324,7 +348,7 @@ class ReconcilerEntitlement(unittest.TestCase):
             (root/'proc/pressure/io').write_text('some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
             # vm 99: vps-a 16G squeezed; vm 98: a big neighbour whose floor
             # eats the paper budget (90 % of 256 GB = 235,929 MB).
-            (root/'etc/pve/qemu-server/99.conf').write_text(f'memory: 16384\nballoon: {floor}\n')
+            (root/'etc/pve/qemu-server/99.conf').write_text(f'memory: {mem99}\nballoon: {floor}\n')
             (root/'etc/pve/qemu-server/98.conf').write_text(
                 f'memory: 240000\nballoon: {n98_floor}\n' if big else 'memory: 20000\nballoon: 10000\n')
             for v in (98, 99):
@@ -397,6 +421,12 @@ fi
         writes, status, _ = self.run_node(1, 40000, floor=16384, faults_ps=0, idle=5000, actual=16384)
         self.assertEqual(writes.strip(), 'set 99 --balloon 12288')
         self.assertEqual(status['entitle_lowers'], 1)
+
+    def test_band_lower_never_lands_above_entitlement(self):
+        # vps-e 42G: target 41164 > entitlement 39936 -> no band lower
+        writes, _, _ = self.run_node(1, 60000, floor=43008, faults_ps=0, idle=5000, actual=43008,
+                                     mem99=43008, n98_floor=200000)
+        self.assertEqual(writes, '')
 
     def test_rounding_gap_does_not_lower(self):
         writes, _, _ = self.run_node(0, 200000, floor=8398, faults_ps=0, idle=5000, actual=16384, big=False)
