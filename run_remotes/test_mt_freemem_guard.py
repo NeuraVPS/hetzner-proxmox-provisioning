@@ -101,6 +101,35 @@ class Decay(unittest.TestCase):
         for (_, a), (_, b) in zip(steps, steps[1:]):
             self.assertGreaterEqual(b - a, H)                       # paced 1 h
 
+    def test_plan_floor_pct_75_decays_only_to_3g(self):
+        # 2026-11-27: PLAN_FLOOR_PCT=75 on nodes where it fits -> MT 3 GB.
+        c = cfg(PLAN_FLOOR_PCT=75); e = g.new_entry(vm())
+        floor, t, steps = 4096, NOW, []
+        while True:
+            action, new, t = self.run_until_lower(e, c, boosted(floor=floor, free=3100), t)
+            if not action:
+                break
+            steps.append(new); floor = new; e['last_floor'] = new
+        self.assertEqual(steps, [3584, 3072])
+
+    def test_high_record_does_not_pin_a_50pct_node_at_3g(self):
+        # review 2026-11-27: a 3072 orig (from a 75 % node / welcome-boost
+        # seed) must not stop the decay at 3 GB on a node set to 50 %.
+        c = cfg(); e = g.new_entry(vm())
+        floor, t, steps = 4096, NOW, []
+        while True:
+            action, new, t = self.run_until_lower(e, c, boosted(floor=floor, free=3100), t, orig=3072)
+            if not action:
+                break
+            steps.append(new); floor = new; e['last_floor'] = new
+        self.assertEqual(steps, [3584, 3072, 2560, 2048])
+
+    def test_plan_floor_values_and_clamp(self):
+        self.assertEqual([g.plan_floor(4096), g.plan_floor(8192)], [2048, 4096])
+        self.assertEqual([g.plan_floor(4096, 75), g.plan_floor(8192, 75)], [3072, 6144])
+        self.assertEqual(g.plan_floor(4096, 10), 2048)      # never under the old 50 %
+        self.assertEqual(g.plan_floor(4096, 200), 4096)     # never above memory
+
     def test_decay_stops_where_a_squeeze_would_breach_target_free(self):
         c = cfg(); e = g.new_entry(vm())
         floor, t, got = 4096, NOW, []

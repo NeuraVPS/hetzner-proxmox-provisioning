@@ -150,18 +150,23 @@ def query_vm(node, vmid, expected_node):
 
 
 def boost_vm(node, vmid, expected_node):
-    """Sembrar floor original + suelo=plan + empujón HMP. True si aplicado."""
+    """Sembrar floor original + suelo=plan + empujón HMP.
+
+    Devuelve el dict del ram-guard si se aplicó (o ya estaba a tope), None si
+    no. Desde v11 (27/11) el guard puede devolver `target` < plan con
+    `capped: entitlement` (nodo por encima del presupuesto de papel: suelo a
+    memory - 3 GB en vez de rechazar)."""
     script = shlex.join(['python3', '/usr/local/sbin/neuravps-ram-guard.py',
                          'boost', str(vmid), expected_node])
     try:
         rc, out = ssh_out(node, script, timeout=30)
         result = json.loads(out)
         if rc == 0 and result.get('status') in ('boosted', 'full'):
-            return True
+            return result
         log(f"vm {vmid}: boost no aplicado: {result}")
-        return False
+        return None
     except Exception:  # noqa: BLE001
-        return False
+        return None
 
 
 def main():
@@ -269,11 +274,20 @@ def main():
                 continue
             if state.get(vmid) != st:
                 continue  # ownership changed while querying
-            if boost_vm(node, vmid, st['nodeId']):
+            res = boost_vm(node, vmid, st['nodeId'])
+            if res and res.get('status') == 'full':
+                handled[flow] = now + HANDLED_TTL_S
+                skip_until[vmid] = (now + BOOST_COOLDOWN_S, "ya-a-tope")
+                log(f"vm {vmid}: login detectado, sin subida: {res.get('reason') or 'a tope'} "
+                    f"(actual {actual}MB, suelo {floor}MB)")
+            elif res:
                 handled[flow] = now + HANDLED_TTL_S
                 skip_until[vmid] = (now + BOOST_COOLDOWN_S, "boosted")
-                log(f"BOOST vm {vmid}: {actual}->{memory}MB al detectar login "
-                    f"(suelo original {floor}MB sembrado; nodo avail {avail}MB)")
+                target = res.get('target') or memory
+                band = (" [banda de derecho: por encima del presupuesto de papel, "
+                        "suelo = RAM - 3 GB]" if res.get('capped') == 'entitlement' else "")
+                log(f"BOOST vm {vmid}: {actual}->{target}MB al detectar login "
+                    f"(suelo original {floor}MB sembrado; nodo avail {avail}MB){band}")
             else:
                 skip_until[vmid] = (now + BLOCKED_TTL_S, "boost-fail")
                 log(f"vm {vmid}: boost FALLÓ en {node} — reintentable en 5 min")

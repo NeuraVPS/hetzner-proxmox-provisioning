@@ -558,6 +558,25 @@ def no_dest_nodes(mt_outcomes, sqx_failed):
 # mtRamDestMaxPct (0.80). A malformed value DISABLES the gate (logged), it
 # never widens it.
 MT_RAM_GATE_PCT = 0.85
+
+
+# ---- SQX floor over-gate for ORIGINS (2026-11-27) ----
+# Phase 1 used FLOOR (0.90) both to call a node "over" and to size destination
+# room. Since the reconciler v11 / ram-guard ENTITLEMENT BAND (approved by
+# Ivan 2026-11-27) a node may legitimately carry floors above the 90 % paper
+# budget — up to RAM - 12 GB, only with >= 28 GB really available — and phase
+# 1 would undo it every night with live migrations. config/defrag
+# `sqxFloorOverGatePct` moves ONLY the origin test (destinations keep FLOOR).
+# Valid range 0.85..1.00; missing or malformed -> FLOOR (old behaviour).
+def sqx_floor_over_gate(cfg):
+    raw = (cfg or {}).get("sqxFloorOverGatePct")
+    if raw is None:
+        return FLOOR
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return FLOOR
+    return val if 0.85 <= val <= 1.0 else FLOOR
 MT_RAM_DEST_MAX_PCT = 0.80
 MT_RAM_MAX_MOVES_PER_NODE = 16
 
@@ -697,7 +716,8 @@ PLANS = [("vps-a", 16, 8.2), ("vps-b", 19, 9.7), ("vps-c", 31, 15.5),
 CPU_MAX_MS = float(os.getenv("DEFRAG_CPU_MAX_MS", "50"))
 CPU_MAX_AGE_H = float(os.getenv("DEFRAG_CPU_MAX_AGE_H", "6"))
 
-EXPECTED_FLOOR = {"mt": 2.0, "mt-plus": 4.0, "vps-a": 9.7, "vps-b": 11.9,
+EXPECTED_FLOOR = {"mt": 3.0, "mt-plus": 6.0,  # MT 3/6 GB since 2026-11-27
+                  "vps-a": 9.7, "vps-b": 11.9,
                   "vps-c": 15.5, "vps-d": 25.2, "vps-e": 52.2}
 WORST_FLOOR = max(EXPECTED_FLOOR.values())
 MIN_STRANDED = 5.0
@@ -835,6 +855,9 @@ def main():
     max_moves = int(cfg.get("maxMovesPerRun") or 8)
     if not relief:
         max_moves = min(max_moves, int(cfg.get('routineMaxMovesPerRun') or 4))
+    sqx_over_gate = sqx_floor_over_gate(cfg)
+    if sqx_over_gate != FLOOR:
+        log(f"sqx floor over-gate (origins) at {sqx_over_gate:.2f} (destinations keep {FLOOR:.2f})")
     mt_ram = mt_ram_settings(cfg)
     if mt_ram is None and cfg.get("mtRamGateEnabled", True) is True:
         log(f"WARN mt RAM gate DISABLED: invalid mtRamGatePct/mtRamDestMaxPct "
@@ -1360,7 +1383,8 @@ def main():
         if n["model"] == "SQX" and n["g"] > 0:
             guard = 0
             while guard < 6 and len(moves) < max_moves:
-                ch, fh = sqx_head(n)
+                ch, _ = sqx_head(n)
+                fh = sqx_over_gate * n["g"] - n["fl"]
                 if ch >= 0 and fh >= 0:
                     break
                 cand = order_victims(n["vms"], nid)

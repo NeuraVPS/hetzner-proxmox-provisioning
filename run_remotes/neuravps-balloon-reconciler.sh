@@ -103,6 +103,25 @@
 #         scored four bounces and a 336h block instead of 48h.
 #       * First-lower credit 12h -> 24h: canary guests resumed 4.5-5.7 h after
 #         being lowered, one at 1258 faults/s for a few minutes.
+#
+#     v11 (2026-11-27, approved by Ivan the same day) — ENTITLEMENT BAND.
+#     Fleet audit (work/balloon-audit-20261127): in 7 days 16,698 VM-minutes of
+#     "NO BUDGET" and EVERY ONE was the PAPER budget (sum of floors > 90 % of
+#     RAM); MemAvailable never fell below 28 GB at those instants and the
+#     physical guard (HOST_FREE_MIN_MB) never fired. Customer case: vm 2148
+#     (vps-a 16G, -Xmx9g) squeezed to ~7 GB for days, 203 blocked minutes with
+#     44-52 GB free on its host, until SQX died. So, below the guest's
+#     ENTITLEMENT — canonical -Xmx + 4 GB = memory - 3 GB (60 GB vps-e:
+#     -Xmx46 + 4 = 50 GB) — a RAISE blocked only by the paper budget may go
+#     ahead, straight to the entitlement, when the host has at least
+#     ENTITLE_AVAIL_MIN_MB really available (and still HOST_FREE_MIN_MB after
+#     the grant). Above the entitlement nothing changes: the 90 % gate rules.
+#     LOWER gets the mirror rule, or a node pushed over budget by entitled
+#     raises could never decay again (LOWER needs budget headroom): a step
+#     that stays inside the band may start when the host passes the same
+#     physical check. Kill switch: ENTITLE_ENABLED=0 in
+#     /etc/default/neuravps-balloon-reconciler (also read by
+#     neuravps-ram-guard.py for welcome-boost/boot guard).
 # Original floors persist in /var/lib/neuravps-balloon/floors.json. A VM that
 # arrives already-bumped (migrated in) with no record: original is estimated as
 # min(current_floor, 30% of max) — observed plan floors are ~30% of max.
@@ -119,7 +138,7 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=10
+#NBRVER=11
 set -u
 # ON BY DEFAULT since 2026-08-19, after v8 ran the whole fleet clean.
 # It was 0 through v7/v8's canary for the right reason — first_boot.sh curls
@@ -203,6 +222,11 @@ FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-90}  # sum(floors) cap as % of node RAM
 # And defrag.py's FLOOR must move WITH this one: it measures destination room
 # against the same ceiling, and leaving them out of step broke relief on the 28th.
 HOST_FREE_MIN_MB=${HOST_FREE_MIN_MB:-12288}
+# v11 entitlement band (see header). Default 0 while the 24 h canary runs
+# (first_boot.sh curls this file from master onto new nodes); flipped to 1
+# after the canary. /etc/default wins either way.
+ENTITLE_ENABLED=${ENTITLE_ENABLED:-0}
+ENTITLE_AVAIL_MIN_MB=${ENTITLE_AVAIL_MIN_MB:-28672}  # real MemAvailable needed to exceed the paper budget
 BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # leaky blocked-counter level (+1 blocked/-1 calm run) that asks for relief
 [ -f /etc/default/neuravps-balloon-reconciler ] && . /etc/default/neuravps-balloon-reconciler
 
@@ -249,6 +273,18 @@ floor_target() {  # $1 = max MB, $2 = orig MB -> echoes target MB
   [ "$t" -lt "$orig" ] && t=$orig
   echo "$t"
 }
+
+# v11: what the guest needs to run SQX at its canonical heap: -Xmx + 4 GB,
+# -Xmx = RAM - 7 GB (neuravps-sqx-xmx-fixed-overhead) -> memory - 3 GB; the
+# 60 GB grandfathered vps-e runs -Xmx46 -> 50 GB. Never above max.
+entitle_mb() {  # $1 = max MB -> echoes entitlement MB
+  local mx=$1 e
+  if [ "$mx" -ge 61440 ]; then e=51200; else e=$(( mx - 3072 )); fi
+  [ "$e" -gt "$mx" ] && e=$mx
+  [ "$e" -lt 0 ] && e=0
+  echo "$e"
+}
+entitle_raises=0; entitle_lowers=0
 
 ram_mb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
 avail_mb=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1024 ))
@@ -299,9 +335,10 @@ write_status() {  # $1 = blocked-entries JSON fragment ("" when none)
   local tmp
   tmp=$(mktemp /var/run/.neuravps-balloon-status.XXXXXX) || return 0
   chmod 644 "$tmp"
-  printf '{"ts":%s,"ram_mb":%s,"avail_mb":%s,"committed_mb":%s,"floors_sum_mb":%s,"budget_mb":%s,"pswpin_ps":%s,"psi_io_pct":%s,"overcommitted":%s,"blocked":[%s]}\n' \
+  printf '{"ts":%s,"ram_mb":%s,"avail_mb":%s,"committed_mb":%s,"floors_sum_mb":%s,"budget_mb":%s,"pswpin_ps":%s,"psi_io_pct":%s,"overcommitted":%s,"entitle_enabled":%s,"entitle_raises":%s,"entitle_lowers":%s,"blocked":[%s]}\n' \
     "$now" "$ram_mb" "$avail_mb" "${committed:-0}" "${floors_sum:-0}" "${budget_mb:-0}" \
-    "${pswpin_ps:-0}" "${psi_io_pct:-0}" "${overcommitted:-0}" "$1" > "$tmp"
+    "${pswpin_ps:-0}" "${psi_io_pct:-0}" "${overcommitted:-0}" "${ENTITLE_ENABLED:-0}" \
+    "${entitle_raises:-0}" "${entitle_lowers:-0}" "$1" > "$tmp"
   mv "$tmp" "$RUN_STATUS"
 }
 
@@ -424,9 +461,23 @@ for v in "${!CUR_FLOOR[@]}"; do
         blocked=0   # nothing placement or the floor can do for this guest
         new=$fl     # fall through to the sample write without touching it
       fi
+      # v11 entitlement band: blocked ONLY by the paper budget, still below
+      # memory - 3 GB, and the host has the RAM for real -> go straight to the
+      # entitlement (not +4G a minute: the guest is already paging).
+      ent_raise=0
+      if [ "$new" -gt "$fl" ] && [ "$ENTITLE_ENABLED" = 1 ] \
+         && [ $(( floors_sum + new - fl )) -gt "$budget_mb" ]; then
+        ent=$(entitle_mb "$mx")
+        # absolute cap: guaranteed minimums never exceed RAM - HOST_FREE_MIN
+        if [ "$fl" -lt "$ent" ] && [ "$conservative_avail" -ge "$ENTITLE_AVAIL_MIN_MB" ] \
+           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + ent - fl )) ] \
+           && [ $(( floors_sum + ent - fl )) -le $(( ram_mb - HOST_FREE_MIN_MB )) ]; then
+          new=$ent; ent_raise=1
+        fi
+      fi
       if [ "$new" -gt "$fl" ]; then
-        if [ $(( floors_sum + new - fl )) -le "$budget_mb" ] \
-           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + new - fl )) ]; then
+        if [ "$ent_raise" = 1 ] || { [ $(( floors_sum + new - fl )) -le "$budget_mb" ] \
+           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + new - fl )) ]; }; then
           # remember the ORIGINAL floor before our first touch
           python3 - "$FLOORS" "$v" "$fl" <<'PY'
 import json,sys
@@ -438,7 +489,26 @@ PY
             granted_mb=$(( granted_mb + new - fl ))
             floors_sum=$(( floors_sum + new - fl ))
             blocked=0
-            logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
+            if [ "$ent_raise" = 1 ]; then
+              entitle_raises=$(( entitle_raises + 1 ))
+              # Reserve the grant for welcome-boost/boot guard (ram-guard reads
+              # pending-boosts.json): QEMU has not consumed it yet, and a band
+              # raise can be 20-30 GB, so MemAvailable alone would lend the
+              # same pages twice.
+              python3 - "$STATE_DIR/pending-boosts.json" "$v" "$(( new - fl ))" <<'PY' || true
+import json,os,sys,time
+p,v,mb=sys.argv[1],sys.argv[2],int(sys.argv[3])
+try: d=json.load(open(p))
+except Exception: d={}
+now=time.time()
+d={k:x for k,x in d.items() if x.get('until',0)>now}
+d['rec-'+v]={'mb':mb,'until':now+120}
+t=p+'.%d.tmp'%os.getpid(); json.dump(d,open(t,'w')); os.replace(t,p)
+PY
+              logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; ENTITLEMENT over paper budget: floors_sum=${floors_sum}MB budget=${budget_mb}MB avail=${conservative_avail}MB)"
+            else
+              logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
+            fi
             # v7 bounce memory: a raise soon after OUR lower means we probed
             # below the real working set — back off exponentially.
             #
@@ -481,9 +551,25 @@ PY
         # re-raise needs a step of budget headroom AND a healthy host. The
         # 0.80 sales gate under the 0.90 ceiling keeps the last band
         # reconciler-only, so released budget cannot ALL be resold.
+        fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
+        # v11: over the paper budget a step may still start if giving it back
+        # is possible through the entitlement band (floor within it and the
+        # host passes the same physical check) — otherwise entitled raises
+        # could never decay and the node would stay over budget for good.
+        ent_lower=0
+        lower_ok=0
         if [ $(( budget_mb - floors_sum )) -ge "$STEP_MB" ] \
            && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + STEP_MB )) ]; then
-          fl=${CUR_FLOOR[$v]}; mx=${CUR_MAX[$v]}
+          lower_ok=1
+        elif [ "$ENTITLE_ENABLED" = 1 ] \
+           && [ "$(( fl - STEP_MB > $(floor_target "$mx" 0) ? fl - STEP_MB : $(floor_target "$mx" 0) ))" -le "$(entitle_mb "$mx")" ] \
+           && [ "$conservative_avail" -ge $(( ENTITLE_AVAIL_MIN_MB + STEP_MB )) ]; then
+          # the floor AFTER the step must sit inside the band (so the band can
+          # give it back); a floor at max from an older boost qualifies once
+          # one 4G step lands it under memory - 3 GB.
+          lower_ok=1; ent_lower=1
+        fi
+        if [ "$lower_ok" = 1 ]; then
           orig=$(python3 - "$FLOORS" "$v" "$mx" "$fl" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1])); v=sys.argv[2]; mx=int(sys.argv[3]); fl=int(sys.argv[4])
@@ -552,12 +638,15 @@ PY
           # v7: the target is the plan's measured settle floor, never `orig`.
           if [ -n "$orig" ]; then
             tgt=$(floor_target "$mx" "$orig")
-            if [ "$fl" -gt "$tgt" ]; then
+            # >= 256 MB above target: a 1 MB rounding gap (9.7 GB = 9933 vs
+            # 9932) must not cost a LOWER that arms bounce accounting.
+            if [ "$fl" -ge $(( tgt + 256 )) ]; then
               new=$(( fl - STEP_MB )); [ "$new" -lt "$tgt" ] && new=$tgt
               if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
                 floors_sum=$(( floors_sum - fl + new ))
                 last_lower=$now
-                logger -t neuravps-balloon " LOWER vm $v floor ${fl}->${new}MB (idle credit ${idle}; target=${tgt}MB bounces=${bounces})"
+                [ "$ent_lower" = 1 ] && entitle_lowers=$(( entitle_lowers + 1 ))
+                logger -t neuravps-balloon " LOWER vm $v floor ${fl}->${new}MB (idle credit ${idle}; target=${tgt}MB bounces=${bounces}$([ "$ent_lower" = 1 ] && echo '; via entitlement band'))"
                 # PACE the walk-back: spend the credit so the next -4G step
                 # needs LOWER_COOLDOWN_RUNS more calm runs.
                 idle=$(( IDLE_RUNS_TO_LOWER - LOWER_COOLDOWN_RUNS ))
