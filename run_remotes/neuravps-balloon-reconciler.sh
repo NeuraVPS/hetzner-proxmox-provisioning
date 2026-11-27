@@ -494,7 +494,8 @@ PY
             # 15872->28672, actual stuck at 21731 until the HMP push, then
             # 28672 in 30 s. Never below what the guest has.
             if [ -n "${actual:-}" ] && [ "$actual" -lt "$new" ]; then
-              printf 'balloon %s\n' "$new" | timeout 5 qm monitor "$v" >/dev/null 2>&1 || true
+              printf 'balloon %s\n' "$new" | timeout 3 qm monitor "$v" >/dev/null 2>&1 \
+                || logger -t neuravps-balloon " PUSH-FAIL vm $v live target ${new}MB (floor set; guest still at ${actual}MB)"
             fi
             granted_mb=$(( granted_mb + new - fl ))
             floors_sum=$(( floors_sum + new - fl ))
