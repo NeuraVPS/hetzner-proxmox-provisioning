@@ -360,6 +360,8 @@ class ReconcilerEntitlement(unittest.TestCase):
             qm = root/'bin/qm'
             qm.write_text(f"""#!/bin/sh
 if [ "$1" = monitor ]; then
+ read -r line || true
+ case "$line" in "balloon "*) echo "$2 $line" >> '{root}/hmp-writes'; exit 0;; esac
  if [ "$2" = 99 ]; then echo 'balloon: actual={actual} major_page_faults={f99} last_update={now}'
  else echo 'balloon: actual=240000 major_page_faults=100 last_update={now}'; fi
 else
@@ -376,6 +378,7 @@ fi
             pend = root/'var/lib/neuravps-balloon/pending-boosts.json'
             self.pending = json.loads(pend.read_text()) if pend.exists() else {}
             log = (root/'log').read_text() if (root/'log').exists() else ''
+            self.hmp = (root/'hmp-writes').read_text() if (root/'hmp-writes').exists() else ''
             return writes, status, log
 
     def test_paper_budget_blocks_without_entitlement(self):
@@ -389,6 +392,8 @@ fi
         self.assertEqual(writes.strip(), 'set 99 --balloon 13312')
         self.assertEqual(status['entitle_raises'], 1)
         self.assertEqual(self.pending['rec-99']['mb'], 13312 - 4915)
+        # the live target is pushed too (pvestatd never grows it in shrink mode)
+        self.assertEqual(self.hmp.strip(), '99 balloon 13312')
         self.assertIn('ENTITLEMENT over paper budget', log)
 
     def test_entitlement_needs_real_free_ram(self):
@@ -404,6 +409,11 @@ fi
         writes, _, log = self.run_node(1, 60000, n98_floor=239000)
         self.assertEqual(writes, '')
         self.assertIn('NO BUDGET', log)
+
+    def test_no_push_when_guest_already_above_new_floor(self):
+        writes, _, _ = self.run_node(1, 40000, actual=15000)
+        self.assertEqual(writes.strip(), 'set 99 --balloon 13312')
+        self.assertEqual(self.hmp, '')
 
     def test_never_above_entitlement_over_budget(self):
         writes, _, _ = self.run_node(1, 40000, floor=13312, actual=13312)

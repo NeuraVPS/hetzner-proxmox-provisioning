@@ -138,7 +138,7 @@
 # a successful raise / floor==max (local automation worked or is exhausted
 # entitlement-side — only moving a VM off this node can help otherwise).
 # Config knobs via /etc/default/neuravps-balloon-reconciler.
-#NBRVER=11
+#NBRVER=12
 set -u
 # ON BY DEFAULT since 2026-08-19, after v8 ran the whole fleet clean.
 # It was 0 through v7/v8's canary for the right reason — first_boot.sh curls
@@ -486,6 +486,17 @@ d=json.load(open(p))
 if v not in d: d[v]=fl; json.dump(d,open(p,"w"))
 PY
           if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
+            # `qm set` only moves the MINIMUM. Above the host's ballooning
+            # target pvestatd runs in SHRINK mode and never grows a guest that
+            # sits below its new minimum (PVE::AutoBalloon: grow only when the
+            # host goal is positive), so without this push the raise gave the
+            # guest nothing — seen 2026-11-27 on 0000096 vm 430: floor
+            # 15872->28672, actual stuck at 21731 until the HMP push, then
+            # 28672 in 30 s. Never below what the guest has.
+            if [ -n "${actual:-}" ] && [ "$actual" -lt "$new" ]; then
+              printf 'balloon %s\n' "$new" | timeout 3 qm monitor "$v" >/dev/null 2>&1 \
+                || logger -t neuravps-balloon " PUSH-FAIL vm $v live target ${new}MB (floor set; guest still at ${actual}MB)"
+            fi
             granted_mb=$(( granted_mb + new - fl ))
             floors_sum=$(( floors_sum + new - fl ))
             blocked=0
