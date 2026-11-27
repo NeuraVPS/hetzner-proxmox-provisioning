@@ -34,7 +34,7 @@ class MtCpuReliefSeveralMoves(unittest.TestCase):
         moved, outcomes, booked = plan(['a', 'b'], {'a': [(1.5, 'v1')], 'b': [(1.5, 'v2')]},
                                        ['cool'], {'cool': .10})
         self.assertEqual((moved, booked), ('a', [('v1', 'a', 'cool')]))
-        self.assertEqual(outcomes, {'a': 'moved'})
+        self.assertEqual(outcomes, {'a': 'moved'})   # b not probed
 
     def test_one_move_per_hot_node_up_to_the_cap(self):
         victims = {n: [(1.5, 'v' + n), (1.0, 'w' + n)] for n in 'abcd'}
@@ -64,6 +64,32 @@ class MtCpuReliefSeveralMoves(unittest.TestCase):
             lambda d: 32, lambda nid, vm: vm != 'dead',
             lambda vm, nid, dst, demand: booked.append(vm), max_moves=3)
         self.assertEqual((moved, booked, outcomes), ('a', ['alive'], {'a': 'moved'}))
+
+
+class MtCpuReliefSeveralMovesEdges(unittest.TestCase):
+    def test_unreadable_destination_mixed_with_measured(self):
+        victims = {'a': [(1.5, 'va')], 'b': [(1.5, 'vb')]}
+        _, outcomes, booked = plan(['a', 'b'], victims, ['x', 'dead'],
+                                   {'x': .10, 'dead': None}, max_moves=2)
+        self.assertEqual(booked[0], ('va', 'a', 'x'))
+        self.assertEqual(outcomes['a'], 'moved')
+        # b: x is still measurable and has room (.10 + 1.5/32*1 + 1.5/32 < .70)
+        self.assertEqual(outcomes['b'], 'moved')
+        _, outcomes, _ = plan(['a'], {'a': [(30.0, 'big')]}, ['x', 'dead'],
+                              {'x': .10, 'dead': None}, max_moves=2)
+        self.assertEqual(outcomes, {'a': 'unmeasured'})   # never no-dest
+
+    def test_no_victim_does_not_use_the_quota(self):
+        victims = {'b': [(1.5, 'vb')], 'c': [(1.5, 'vc')]}
+        _, outcomes, booked = plan(['a', 'b', 'c'], victims, ['x', 'y'],
+                                   {'x': .10, 'y': .10}, max_moves=2)
+        self.assertEqual(outcomes, {'a': 'no-victim', 'b': 'moved', 'c': 'moved'})
+        self.assertEqual(len(booked), 2)
+
+    def test_a_hot_node_is_never_a_destination(self):
+        _, _, booked = plan(['a', 'b'], {'a': [(1.5, 'va')], 'b': []}, ['b', 'x'],
+                            {'b': .01, 'x': .30}, max_moves=2)
+        self.assertEqual(booked, [('va', 'a', 'x')])
 
 
 class MtCpuReliefCoolestDestination(unittest.TestCase):

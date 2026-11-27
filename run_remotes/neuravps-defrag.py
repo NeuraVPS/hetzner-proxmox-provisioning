@@ -529,7 +529,8 @@ def plan_mt_cpu_relief(hot, victims_of, pick_dest, load_of, threads_of,
             # best-fit by cores -- right for packing, wrong for CPU relief: it
             # offered the fullest nodes first and left the near-empty ones
             # (260/261/262, 2026-11-27) for last.
-            excluded, measured = {nid}, []
+            # Never another hot node as destination (it would also be an origin).
+            excluded, measured = {nid} | set(hot), []
             while True:
                 dst = pick_dest(vm, excluded)
                 if not dst:
@@ -1400,8 +1401,11 @@ def main():
                             key=lambda k: (-(nodes[k].get('cpu_ms') or 0), k))
             # config/defrag.mtReliefMaxMovesPerTick (default 1 = the historic
             # behaviour); never above what the run's relief budget has left.
-            mt_max = max(1, min(int(cfg.get('mtReliefMaxMovesPerTick') or 1),
-                                relief_max - len(moves)))
+            try:
+                mt_cap = int(cfg.get('mtReliefMaxMovesPerTick') or 1)
+            except (TypeError, ValueError):
+                mt_cap = 1   # junk in config/defrag must not kill the whole run
+            mt_max = max(1, min(mt_cap, relief_max - len(moves)))
             _moved, mt_outcomes = plan_mt_cpu_relief(
                 mt_hot, victims_of,
                 lambda vm, excluded: pick_dest('MT5',vm['ram'],vm['fl'],vm['cores'],excluded,tidy=False,vm=vm),
