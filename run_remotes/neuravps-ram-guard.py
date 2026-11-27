@@ -15,6 +15,10 @@ CONF_DIR = Path('/etc/pve/qemu-server')
 STATE_DIR = Path('/var/lib/neuravps-balloon')
 RESERVE_MB = 12288
 RECONCILER_TIMER = Path('/etc/systemd/system/neuravps-balloon-reconciler.timer')
+# v11 entitlement band (2026-11-27, approved by Ivan): shared knobs with the
+# balloon reconciler, same file, same defaults — see the reconciler header.
+RECONCILER_DEFAULTS = Path('/etc/default/neuravps-balloon-reconciler')
+ENTITLE_DEFAULTS = {'ENTITLE_ENABLED': 0, 'ENTITLE_AVAIL_MIN_MB': 28672}
 
 
 LOCK_PATH = '/run/neuravps-ram.lock'
@@ -98,6 +102,37 @@ def meminfo():
             if line.startswith(('MemTotal:', 'MemAvailable:'))}
 
 
+def entitle_cfg(path=None):
+    """ENTITLE_* knobs from the reconciler's /etc/default (shell KEY=VALUE).
+
+    Anything unreadable or malformed keeps the default (disabled): a broken
+    file must never widen what a boost may take."""
+    cfg = dict(ENTITLE_DEFAULTS)
+    try:
+        text = Path(path or RECONCILER_DEFAULTS).read_text()
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip().removeprefix('export ').strip()
+        if key in cfg:
+            try:
+                cfg[key] = int(value.strip().strip('"\''))
+            except ValueError:
+                return dict(ENTITLE_DEFAULTS)
+    return cfg
+
+
+def entitle_mb(maximum):
+    """Canonical SQX heap + 4 GB: -Xmx = RAM - 7 GB -> memory - 3 GB; the
+    60 GB grandfathered vps-e runs -Xmx46 -> 50 GB. Mirrors the reconciler."""
+    ent = 51200 if maximum >= 61440 else maximum - 3072
+    return max(0, min(ent, maximum))
+
+
 def floor_total():
     total = 0
     for path in CONF_DIR.glob('*.conf'):
@@ -151,26 +186,46 @@ def boost(vmid, expected_node, boot_token=None):
         # not on the node's name (2026-11-04: an AX102 assigned to SQX runs it
         # too). Measured 04/11: installed on 86/86 SQX nodes, 0/36 MT nodes —
         # identical to the old '-AX162' test for the whole fleet.
-        budget = info['MemTotal'] * (90 if RECONCILER_TIMER.exists() else 100) // 100
-        if (info['MemAvailable'] < need + reserved + RESERVE_MB
-                or floor_total() + maximum - floor > budget):
+        has_reconciler = RECONCILER_TIMER.exists()
+        budget = info['MemTotal'] * (90 if has_reconciler else 100) // 100
+        target = maximum
+        capped = False
+        if floor_total() + maximum - floor > budget:
+            # v11 entitlement band: over the PAPER budget the boost may still
+            # bring the floor up to memory - 3 GB (never to the full plan) when
+            # the host really has the RAM. Only where the reconciler runs (SQX):
+            # the band is defined by the SQX heap and the reconciler is what
+            # walks the floor back down afterwards.
+            cfg = entitle_cfg() if has_reconciler else ENTITLE_DEFAULTS
+            ent = entitle_mb(maximum)
+            need_e = max(0, ent - actual)
+            avail_e = info['MemAvailable'] - reserved
+            if not (cfg['ENTITLE_ENABLED'] == 1 and ent > floor
+                    and avail_e >= cfg['ENTITLE_AVAIL_MIN_MB']
+                    and avail_e - need_e >= RESERVE_MB):
+                return {'status': 'blocked', 'reason': 'capacity'}
+            target, need, capped = ent, need_e, True
+        elif info['MemAvailable'] < need + reserved + RESERVE_MB:
             return {'status': 'blocked', 'reason': 'capacity'}
         floors_path = STATE_DIR / 'floors.json'
         floors = json.loads(floors_path.read_text()) if floors_path.exists() else {}
         floors.setdefault(str(vmid), floor)
         atomic_json(floors_path, floors)
-        subprocess.run(['qm', 'set', str(vmid), '--balloon', str(maximum)],
+        subprocess.run(['qm', 'set', str(vmid), '--balloon', str(target)],
                        check=True, capture_output=True, timeout=15)
         pending[str(vmid)] = {'mb': need, 'until': now + 120}
         atomic_json(pending_path, pending)
         if boot_token is not None:
             path = STATE_DIR / 'boot-guards.json'
             guards = json.loads(path.read_text()) if path.exists() else {}
-            guards[str(vmid)] = {'token':boot_token, 'floor':floor, 'target':maximum,
+            guards[str(vmid)] = {'token':boot_token, 'floor':floor, 'target':target,
                                  'uuid':config(vmid).get('smbios1'), 'held':False}
             atomic_json(path, guards)
-        qmp(vmid, 'balloon', {'value': maximum * 1048576})
-        return {'status': 'boosted', 'before': actual, 'target': maximum}
+        qmp(vmid, 'balloon', {'value': target * 1048576})
+        result = {'status': 'boosted', 'before': actual, 'target': target}
+        if capped:
+            result['capped'] = 'entitlement'
+        return result
 
 
 def boot_control(vmid, expected_node, token=None):

@@ -62,10 +62,11 @@ class Capacity(unittest.TestCase):
                 (Path(directory)/f'{vmid}.conf').write_text(f'memory: 4096\nballoon: {floor}\n[snapshot]\nmemory: 99999\n')
             self.assertEqual(guard.floor_total(),6144)
 
-    def run_boost(self, available=30000, floors=100000, pending=0, reconciler=True):
+    def run_boost(self, available=30000, floors=100000, pending=0, reconciler=True, entitle=None):
         from io import StringIO
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(guard,'STATE_DIR',Path(directory)), \
+             patch.object(guard,'RECONCILER_DEFAULTS',Path(directory)/'reconciler-defaults'), \
              patch.object(guard,'RECONCILER_TIMER',
                           Path(directory) if reconciler else Path(directory)/'absent.timer'), \
              patch('builtins.open',return_value=MagicMock()), \
@@ -75,6 +76,8 @@ class Capacity(unittest.TestCase):
              patch.object(guard,'floor_total',return_value=floors), \
              patch.object(guard.subprocess,'run') as qm, \
              patch.object(guard,'qmp') as qmp:
+            if entitle is not None:
+                (Path(directory)/'reconciler-defaults').write_text(f'# test\nENTITLE_ENABLED={entitle}\n')
             if pending:
                 (Path(directory)/'pending-boosts.json').write_text(json.dumps({'other':{'mb':pending,'until':1e12}}))
             result=guard.boost(99,'node-AX162')
@@ -91,6 +94,32 @@ class Capacity(unittest.TestCase):
         # nodes, including an AX102 assigned to SQX); 100 % without it (MT).
         self.assertEqual(self.run_boost(floors=230000)[0]['status'], 'blocked')
         self.assertEqual(self.run_boost(floors=230000, reconciler=False)[0]['status'], 'boosted')
+
+    def test_entitlement_caps_over_budget_boost_at_memory_minus_3g(self):
+        # 2026-11-27: over the PAPER budget, boost to memory - 3 GB (19456 ->
+        # 16384) instead of refusing, when >= 28 GB are really available.
+        result,calls,args=self.run_boost(available=40000, floors=230000, entitle=1)
+        self.assertEqual(result, {'status':'boosted','before':12000,'target':16384,'capped':'entitlement'})
+        self.assertEqual(calls,1)
+        self.assertEqual(args.args,(99,'balloon',{'value':16384*1048576}))
+
+    def test_entitlement_needs_real_ram_switch_and_reconciler(self):
+        self.assertEqual(self.run_boost(available=25000, floors=230000, entitle=1)[0]['status'],'blocked')
+        self.assertEqual(self.run_boost(available=40000, floors=230000, entitle=0)[0]['status'],'blocked')
+        self.assertEqual(self.run_boost(available=40000, floors=230000)[0]['status'],'blocked')
+        self.assertEqual(self.run_boost(available=40000, floors=230000, entitle=1, pending=15000)[0]['status'],'blocked')
+        # MT (no reconciler): the band does not apply, 100 % budget unchanged
+        self.assertEqual(self.run_boost(available=40000, floors=260000, entitle=1, reconciler=False)[0]['status'],'blocked')
+
+    def test_entitlement_config_parsing_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p=Path(directory)/'d'
+            p.write_text('ENTITLE_ENABLED=1\nENTITLE_AVAIL_MIN_MB=30000\n')
+            self.assertEqual(guard.entitle_cfg(p),{'ENTITLE_ENABLED':1,'ENTITLE_AVAIL_MIN_MB':30000})
+            p.write_text('ENTITLE_ENABLED=yes\n')
+            self.assertEqual(guard.entitle_cfg(p)['ENTITLE_ENABLED'],0)
+            self.assertEqual(guard.entitle_cfg(Path(directory)/'missing')['ENTITLE_ENABLED'],0)
+        self.assertEqual([guard.entitle_mb(m) for m in (16384,19456,31744,61440,4096)],[13312,16384,28672,51200,1024])
 
     def test_qmp_uses_bytes_and_only_after_budget_passes(self):
         result,calls,args=self.run_boost()
@@ -250,6 +279,84 @@ fi
 
     def test_fresh_idle_guest_keeps_the_existing_decay_behavior(self):
         self.assertTrue(self.run_sample(False))
+
+
+class ReconcilerEntitlement(unittest.TestCase):
+    """v11 (2026-11-27): below memory - 3 GB a raise blocked ONLY by the paper
+    budget goes straight to the entitlement when the host really has the RAM;
+    and an entitled floor can still decay on an over-budget node."""
+
+    def run_node(self, entitle, avail_mb, floor=4915, faults_ps=200, idle=0, actual=7000):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = Path(__file__).with_name('neuravps-balloon-reconciler.sh').read_text()
+            script = __import__('re').sub(r'/var/run|/var/lib|/etc/pve|/etc/default|/proc|/run',
+                lambda match: str(root/match.group().lstrip('/')), script)
+            for part in ('var/run/qemu-server','var/lib/neuravps-balloon','etc/pve/qemu-server','etc/default','proc/pressure','run','bin'):
+                (root/part).mkdir(parents=True, exist_ok=True)
+            now = int(time.time())
+            (root/'proc/meminfo').write_text(f'MemTotal: {262144*1024} kB\nMemAvailable: {avail_mb*1024} kB\n')
+            (root/'proc/vmstat').write_text('pswpin 0\n')
+            (root/'proc/pressure/io').write_text('some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n')
+            # vm 99: vps-a 16G squeezed; vm 98: a big neighbour whose floor
+            # eats the paper budget (90 % of 256 GB = 235,929 MB).
+            (root/'etc/pve/qemu-server/99.conf').write_text(f'memory: 16384\nballoon: {floor}\n')
+            (root/'etc/pve/qemu-server/98.conf').write_text('memory: 240000\nballoon: 230000\n')
+            for v in (98, 99):
+                (root/f'var/run/qemu-server/{v}.pid').write_text('1')
+            (root/'var/lib/neuravps-balloon/floors.json').write_text('{"99":4915,"98":230000}')
+            (root/'var/lib/neuravps-balloon/samples.tsv').write_text(
+                f'99\t100\t{now-60}\t{idle}\t0\t0\t0\t0\n98\t100\t{now-60}\t0\t0\t0\t0\t0\n')
+            f99 = 100 + faults_ps * 60
+            qm = root/'bin/qm'
+            qm.write_text(f"""#!/bin/sh
+if [ "$1" = monitor ]; then
+ if [ "$2" = 99 ]; then echo 'balloon: actual={actual} major_page_faults={f99} last_update={now}'
+ else echo 'balloon: actual=240000 major_page_faults=100 last_update={now}'; fi
+else
+ echo "$*" >> '{root}/qm-writes'
+fi
+""")
+            qm.chmod(0o755)
+            logger = root/'bin/logger'; logger.write_text(f'#!/bin/sh\necho "$*" >> {root}/log\n'); logger.chmod(0o755)
+            run = root/'reconcile.sh'; run.write_text(script)
+            env = {**os.environ, 'PATH': str(root/'bin')+':'+os.environ['PATH'], 'ENTITLE_ENABLED': str(entitle)}
+            subprocess.run(['bash', str(run)], env=env, capture_output=True, text=True, check=True)
+            writes = (root/'qm-writes').read_text() if (root/'qm-writes').exists() else ''
+            status = json.loads((root/'var/run/neuravps-balloon-status.json').read_text())
+            log = (root/'log').read_text() if (root/'log').exists() else ''
+            return writes, status, log
+
+    def test_paper_budget_blocks_without_entitlement(self):
+        writes, status, log = self.run_node(0, 40000)
+        self.assertEqual(writes, '')
+        self.assertIn('NO BUDGET', log)
+        self.assertEqual(status['entitle_enabled'], 0)
+
+    def test_entitled_raise_goes_straight_to_memory_minus_3g(self):
+        writes, status, log = self.run_node(1, 40000)
+        self.assertEqual(writes.strip(), 'set 99 --balloon 13312')
+        self.assertEqual(status['entitle_raises'], 1)
+        self.assertIn('ENTITLEMENT over paper budget', log)
+
+    def test_entitlement_needs_real_free_ram(self):
+        writes, _, log = self.run_node(1, 28000)   # < 28672 available
+        self.assertEqual(writes, '')
+        self.assertIn('NO BUDGET', log)
+
+    def test_never_above_entitlement_over_budget(self):
+        writes, _, _ = self.run_node(1, 40000, floor=13312, actual=13312)
+        self.assertEqual(writes, '')
+
+    def test_entitled_floor_can_decay_on_over_budget_node(self):
+        writes, status, log = self.run_node(1, 40000, floor=13312, faults_ps=0, idle=5000, actual=16384)
+        self.assertEqual(writes.strip(), 'set 99 --balloon 9216')
+        self.assertEqual(status['entitle_lowers'], 1)
+        self.assertIn('via entitlement band', log)
+
+    def test_decay_still_blocked_over_budget_without_entitlement(self):
+        writes, _, _ = self.run_node(0, 40000, floor=13312, faults_ps=0, idle=5000, actual=16384)
+        self.assertEqual(writes, '')
 
 
 if __name__ == '__main__':

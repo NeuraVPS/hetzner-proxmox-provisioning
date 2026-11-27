@@ -121,6 +121,12 @@ DEFAULTS = {
     'BACKOFF_BASE_S': 172800,
     'BACKOFF_MAX_S': 1209600,
     'FORCE_SCOPE': 0,
+    # 2026-11-27 (approved by Ivan): plan floor the decay walks back to, as %
+    # of memory. 50 = the old ram_min (MT 2 GB / MT+ 4 GB); 75 = MT 3 GB /
+    # MT+ 6 GB. Set PER NODE in /etc/default only where the node's floors stay
+    # under the defrag MT RAM gate (0.85 x RAM) — otherwise the nightly
+    # defrag would start moving VMs. Clamped to 50..100 (never below the old).
+    'PLAN_FLOOR_PCT': 50,
 }
 OBSERVED = ('uuid', 'fresh_seen', 'last_floor', 'raised_at', 'last_session', 'credit')
 
@@ -155,8 +161,11 @@ def round_up(mb, step):
     return int(math.ceil(mb / step) * step)
 
 
-def plan_floor(memory):
-    return memory // 2  # ram_min of mt (4 -> 2 GB) and mt-plus (8 -> 4 GB)
+def plan_floor(memory, pct=50):
+    """Decay floor of an MT guest: pct % of memory (50 -> MT 2 GB / MT+ 4 GB,
+    75 -> 3 / 6 GB), rounded down to 256 MB, never under 50 %."""
+    pct = min(100, max(50, int(pct)))
+    return max(memory // 2, (memory * pct // 100) // 256 * 256)
 
 
 def new_entry(vm):
@@ -218,7 +227,7 @@ def decide(vm, entry, now, cfg, ctx):
         if new > floor:
             return raise_to(new, f"libre {free_pct:.1f}% ({vm['free']}MB) con {held}MB retenidos", 'pin')
 
-    target = max(ctx['orig'], plan_floor(mem))
+    target = max(ctx['orig'], plan_floor(mem, cfg.get('PLAN_FLOOR_PCT', 50)))
     if not cfg['DECAY_ENABLED'] or floor <= target:
         return None, floor, ''
     after_pct = 100.0 * (vm['free'] - cfg['STEP_DOWN_MB']) / vm['total']
@@ -256,7 +265,7 @@ def decay_step(vm, ctx, cfg):
     or None. Needs fresh stats, no live session, >= RELEASE_FREE_PCT free after
     the step, and never under what keeps TARGET_FREE_PCT if squeezed to it."""
     mem, floor = vm['memory'], vm['floor']
-    target = max(ctx['orig'], plan_floor(mem))
+    target = max(ctx['orig'], plan_floor(mem, cfg.get('PLAN_FLOOR_PCT', 50)))
     if floor <= target or not ctx['fresh'] or ctx['session'] or vm['total'] <= 0:
         return None
     if 100.0 * (vm['free'] - cfg['STEP_DOWN_MB']) / vm['total'] < cfg['RELEASE_FREE_PCT']:
@@ -456,7 +465,7 @@ def run(cfg, node, now, vms, state, avail_mb, pending, floors, sessions, session
               'decayEnabled': bool(cfg['DECAY_ENABLED']), 'availMb': avail_mb,
               'pendingMb': pending_mb, 'reserveMb': cfg['HOST_FREE_MIN_MB'],
               'sessionDetection': session_known, 'rdpSessions': len(sessions),
-              'protectEnabled': bool(cfg['PROTECT_ENABLED']), 'hostSwapoutPs': swapout_ps,
+              'protectEnabled': bool(cfg['PROTECT_ENABLED']), 'planFloorPct': cfg.get('PLAN_FLOOR_PCT', 50), 'hostSwapoutPs': swapout_ps,
               'blockedSwap': 0,
               'raised': [], 'lowered': [], 'blockedHost': [], 'errors': [],
               'noStats': 0, 'stale': 0, 'lowFreeFixed': 0, 'aboveTarget': 0,
@@ -479,8 +488,9 @@ def run(cfg, node, now, vms, state, avail_mb, pending, floors, sessions, session
         elif vm['floor'] >= vm['memory'] and 100.0 * vm['free'] / vm['total'] < cfg['LOW_FREE_PCT']:
             status['lowFreeFixed'] += 1  # all its RAM and still tight: plan load, not us
         orig = floors.get(vm['vmid'])
-        orig = plan_floor(vm['memory']) if orig is None else int(orig)
-        target = max(orig, plan_floor(vm['memory']))
+        pf = plan_floor(vm['memory'], cfg.get('PLAN_FLOOR_PCT', 50))
+        orig = pf if orig is None else int(orig)
+        target = max(orig, pf)
         if vm['floor'] > target:
             status['aboveTarget'] += 1
             status['aboveTargetMb'] += vm['floor'] - target
