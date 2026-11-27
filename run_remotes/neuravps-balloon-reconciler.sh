@@ -468,8 +468,10 @@ for v in "${!CUR_FLOOR[@]}"; do
       if [ "$new" -gt "$fl" ] && [ "$ENTITLE_ENABLED" = 1 ] \
          && [ $(( floors_sum + new - fl )) -gt "$budget_mb" ]; then
         ent=$(entitle_mb "$mx")
+        # absolute cap: guaranteed minimums never exceed RAM - HOST_FREE_MIN
         if [ "$fl" -lt "$ent" ] && [ "$conservative_avail" -ge "$ENTITLE_AVAIL_MIN_MB" ] \
-           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + ent - fl )) ]; then
+           && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + ent - fl )) ] \
+           && [ $(( floors_sum + ent - fl )) -le $(( ram_mb - HOST_FREE_MIN_MB )) ]; then
           new=$ent; ent_raise=1
         fi
       fi
@@ -489,6 +491,20 @@ PY
             blocked=0
             if [ "$ent_raise" = 1 ]; then
               entitle_raises=$(( entitle_raises + 1 ))
+              # Reserve the grant for welcome-boost/boot guard (ram-guard reads
+              # pending-boosts.json): QEMU has not consumed it yet, and a band
+              # raise can be 20-30 GB, so MemAvailable alone would lend the
+              # same pages twice.
+              python3 - "$STATE_DIR/pending-boosts.json" "$v" "$(( new - fl ))" <<'PY' || true
+import json,os,sys,time
+p,v,mb=sys.argv[1],sys.argv[2],int(sys.argv[3])
+try: d=json.load(open(p))
+except Exception: d={}
+now=time.time()
+d={k:x for k,x in d.items() if x.get('until',0)>now}
+d['rec-'+v]={'mb':mb,'until':now+120}
+t=p+'.%d.tmp'%os.getpid(); json.dump(d,open(t,'w')); os.replace(t,p)
+PY
               logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; ENTITLEMENT over paper budget: floors_sum=${floors_sum}MB budget=${budget_mb}MB avail=${conservative_avail}MB)"
             else
               logger -t neuravps-balloon " RAISE vm $v floor ${fl}->${new}MB (thrash ${rate}/s; floors_sum=${floors_sum}MB budget=${budget_mb}MB)"
@@ -545,8 +561,11 @@ PY
         if [ $(( budget_mb - floors_sum )) -ge "$STEP_MB" ] \
            && [ "$conservative_avail" -ge $(( HOST_FREE_MIN_MB + STEP_MB )) ]; then
           lower_ok=1
-        elif [ "$ENTITLE_ENABLED" = 1 ] && [ "$fl" -le "$(entitle_mb "$mx")" ] \
+        elif [ "$ENTITLE_ENABLED" = 1 ] && [ $(( fl - STEP_MB )) -le "$(entitle_mb "$mx")" ] \
            && [ "$conservative_avail" -ge $(( ENTITLE_AVAIL_MIN_MB + STEP_MB )) ]; then
+          # the floor AFTER the step must sit inside the band (so the band can
+          # give it back); a floor at max from an older boost qualifies once
+          # one 4G step lands it under memory - 3 GB.
           lower_ok=1; ent_lower=1
         fi
         if [ "$lower_ok" = 1 ]; then
@@ -618,7 +637,9 @@ PY
           # v7: the target is the plan's measured settle floor, never `orig`.
           if [ -n "$orig" ]; then
             tgt=$(floor_target "$mx" "$orig")
-            if [ "$fl" -gt "$tgt" ]; then
+            # >= 256 MB above target: a 1 MB rounding gap (9.7 GB = 9933 vs
+            # 9932) must not cost a LOWER that arms bounce accounting.
+            if [ "$fl" -ge $(( tgt + 256 )) ]; then
               new=$(( fl - STEP_MB )); [ "$new" -lt "$tgt" ] && new=$tgt
               if qm set "$v" --balloon "$new" >/dev/null 2>&1; then
                 floors_sum=$(( floors_sum - fl + new ))

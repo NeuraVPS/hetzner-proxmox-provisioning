@@ -118,9 +118,10 @@ def entitle_cfg(path=None):
             continue
         key, value = line.split('=', 1)
         key = key.strip().removeprefix('export ').strip()
+        value = value.split('#', 1)[0].strip().strip('"\'')   # 'X=1  # note' like bash
         if key in cfg:
             try:
-                cfg[key] = int(value.strip().strip('"\''))
+                cfg[key] = int(value)
             except ValueError:
                 return dict(ENTITLE_DEFAULTS)
     return cfg
@@ -198,11 +199,19 @@ def boost(vmid, expected_node, boot_token=None):
             # walks the floor back down afterwards.
             cfg = entitle_cfg() if has_reconciler else ENTITLE_DEFAULTS
             ent = entitle_mb(maximum)
+            if cfg['ENTITLE_ENABLED'] == 1 and ent <= floor:
+                # Already at its entitlement: nothing more is allowed over the
+                # paper budget. 'full' (not 'blocked') so welcome-boost marks
+                # the login as handled instead of retrying every 5 min.
+                return {'status': 'full', 'reason': 'entitlement'}
             need_e = max(0, ent - actual)
             avail_e = info['MemAvailable'] - reserved
             if not (cfg['ENTITLE_ENABLED'] == 1 and ent > floor
                     and avail_e >= cfg['ENTITLE_AVAIL_MIN_MB']
-                    and avail_e - need_e >= RESERVE_MB):
+                    and avail_e - need_e >= RESERVE_MB
+                    # absolute cap: the guaranteed minimums never exceed
+                    # physical RAM minus the reserve (same as the reconciler)
+                    and floor_total() + ent - floor <= info['MemTotal'] - RESERVE_MB):
                 return {'status': 'blocked', 'reason': 'capacity'}
             target, need, capped = ent, need_e, True
         elif info['MemAvailable'] < need + reserved + RESERVE_MB:
@@ -221,7 +230,10 @@ def boost(vmid, expected_node, boot_token=None):
             guards[str(vmid)] = {'token':boot_token, 'floor':floor, 'target':target,
                                  'uuid':config(vmid).get('smbios1'), 'held':False}
             atomic_json(path, guards)
-        qmp(vmid, 'balloon', {'value': target * 1048576})
+        # Never SHRINK a live guest: a band target can sit below what the guest
+        # already has (ent < actual < memory); then only the floor moves.
+        if actual < target:
+            qmp(vmid, 'balloon', {'value': target * 1048576})
         result = {'status': 'boosted', 'before': actual, 'target': target}
         if capped:
             result['capped'] = 'entitlement'

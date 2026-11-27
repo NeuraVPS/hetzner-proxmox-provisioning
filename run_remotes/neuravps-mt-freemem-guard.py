@@ -227,7 +227,7 @@ def decide(vm, entry, now, cfg, ctx):
         if new > floor:
             return raise_to(new, f"libre {free_pct:.1f}% ({vm['free']}MB) con {held}MB retenidos", 'pin')
 
-    target = max(ctx['orig'], plan_floor(mem, cfg.get('PLAN_FLOOR_PCT', 50)))
+    target = max(min(ctx['orig'], mem // 2), plan_floor(mem, cfg.get('PLAN_FLOOR_PCT', 50)))
     if not cfg['DECAY_ENABLED'] or floor <= target:
         return None, floor, ''
     after_pct = 100.0 * (vm['free'] - cfg['STEP_DOWN_MB']) / vm['total']
@@ -265,7 +265,7 @@ def decay_step(vm, ctx, cfg):
     or None. Needs fresh stats, no live session, >= RELEASE_FREE_PCT free after
     the step, and never under what keeps TARGET_FREE_PCT if squeezed to it."""
     mem, floor = vm['memory'], vm['floor']
-    target = max(ctx['orig'], plan_floor(mem, cfg.get('PLAN_FLOOR_PCT', 50)))
+    target = max(min(ctx['orig'], mem // 2), plan_floor(mem, cfg.get('PLAN_FLOOR_PCT', 50)))
     if floor <= target or not ctx['fresh'] or ctx['session'] or vm['total'] <= 0:
         return None
     if 100.0 * (vm['free'] - cfg['STEP_DOWN_MB']) / vm['total'] < cfg['RELEASE_FREE_PCT']:
@@ -488,9 +488,13 @@ def run(cfg, node, now, vms, state, avail_mb, pending, floors, sessions, session
         elif vm['floor'] >= vm['memory'] and 100.0 * vm['free'] / vm['total'] < cfg['LOW_FREE_PCT']:
             status['lowFreeFixed'] += 1  # all its RAM and still tight: plan load, not us
         orig = floors.get(vm['vmid'])
+        # The node's PLAN_FLOOR_PCT alone decides the target: `orig` is
+        # seeded at the fixed 50 % and clipped to it, so a 75 % node never
+        # writes 3072 into floors.json (it would travel with migrate_vm's
+        # import-state to a dense 50 % node, and survive a rollback to 50).
         pf = plan_floor(vm['memory'], cfg.get('PLAN_FLOOR_PCT', 50))
-        orig = pf if orig is None else int(orig)
-        target = max(orig, pf)
+        orig = vm['memory'] // 2 if orig is None else int(orig)
+        target = max(min(orig, vm['memory'] // 2), pf)
         if vm['floor'] > target:
             status['aboveTarget'] += 1
             status['aboveTargetMb'] += vm['floor'] - target

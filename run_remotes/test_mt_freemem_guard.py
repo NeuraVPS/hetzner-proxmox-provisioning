@@ -112,6 +112,18 @@ class Decay(unittest.TestCase):
             steps.append(new); floor = new; e['last_floor'] = new
         self.assertEqual(steps, [3584, 3072])
 
+    def test_high_record_does_not_pin_a_50pct_node_at_3g(self):
+        # review 2026-11-27: a 3072 orig (from a 75 % node / welcome-boost
+        # seed) must not stop the decay at 3 GB on a node set to 50 %.
+        c = cfg(); e = g.new_entry(vm())
+        floor, t, steps = 4096, NOW, []
+        while True:
+            action, new, t = self.run_until_lower(e, c, boosted(floor=floor, free=3100), t, orig=3072)
+            if not action:
+                break
+            steps.append(new); floor = new; e['last_floor'] = new
+        self.assertEqual(steps, [3584, 3072, 2560, 2048])
+
     def test_plan_floor_values_and_clamp(self):
         self.assertEqual([g.plan_floor(4096), g.plan_floor(8192)], [2048, 4096])
         self.assertEqual([g.plan_floor(4096, 75), g.plan_floor(8192, 75)], [3072, 6144])

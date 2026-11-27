@@ -62,7 +62,8 @@ class Capacity(unittest.TestCase):
                 (Path(directory)/f'{vmid}.conf').write_text(f'memory: 4096\nballoon: {floor}\n[snapshot]\nmemory: 99999\n')
             self.assertEqual(guard.floor_total(),6144)
 
-    def run_boost(self, available=30000, floors=100000, pending=0, reconciler=True, entitle=None):
+    def run_boost(self, available=30000, floors=100000, pending=0, reconciler=True, entitle=None,
+                  inspected=(19456,9932,12000)):
         from io import StringIO
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(guard,'STATE_DIR',Path(directory)), \
@@ -71,7 +72,7 @@ class Capacity(unittest.TestCase):
                           Path(directory) if reconciler else Path(directory)/'absent.timer'), \
              patch('builtins.open',return_value=MagicMock()), \
              patch.object(guard.fcntl,'flock'), \
-             patch.object(guard,'inspect',return_value=(19456,9932,12000,available)), \
+             patch.object(guard,'inspect',return_value=(*inspected,available)), \
              patch.object(guard,'meminfo',return_value={'MemTotal':257000,'MemAvailable':available}), \
              patch.object(guard,'floor_total',return_value=floors), \
              patch.object(guard.subprocess,'run') as qm, \
@@ -81,6 +82,7 @@ class Capacity(unittest.TestCase):
             if pending:
                 (Path(directory)/'pending-boosts.json').write_text(json.dumps({'other':{'mb':pending,'until':1e12}}))
             result=guard.boost(99,'node-AX162')
+            self.last_qm_args = qm.call_args
             return result, qm.call_count, qmp.call_args
 
     def test_grant_rechecks_physical_reserve_and_floor_budget(self):
@@ -111,11 +113,32 @@ class Capacity(unittest.TestCase):
         # MT (no reconciler): the band does not apply, 100 % budget unchanged
         self.assertEqual(self.run_boost(available=40000, floors=260000, entitle=1, reconciler=False)[0]['status'],'blocked')
 
+    def test_entitlement_never_shrinks_a_live_guest(self):
+        # review 2026-11-27: ent (58368) < actual (60000) < memory - 1 GB on a
+        # 60 GB vps-e: only the floor may move, no qmp balloon below actual.
+        result,calls,args=self.run_boost(available=60000, floors=200000, entitle=1,
+                                         inspected=(61440,18432,58000))
+        self.assertEqual(result['target'],51200)
+        self.assertEqual(calls,1)          # qm set --balloon 51200
+        self.assertIsNone(args)            # no qmp call at all
+
+    def test_already_at_entitlement_is_full_not_a_retry_loop(self):
+        result,calls,_=self.run_boost(available=60000, floors=230000, entitle=1,
+                                      inspected=(19456,16384,16000))
+        self.assertEqual(result,{'status':'full','reason':'entitlement'})
+        self.assertEqual(calls,0)
+
+    def test_entitlement_absolute_cap_ram_minus_reserve(self):
+        # MemTotal 257000: floors 250000 + (16384-9932) > 257000 - 12288
+        self.assertEqual(self.run_boost(available=60000, floors=250000, entitle=1)[0]['status'],'blocked')
+
     def test_entitlement_config_parsing_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             p=Path(directory)/'d'
             p.write_text('ENTITLE_ENABLED=1\nENTITLE_AVAIL_MIN_MB=30000\n')
             self.assertEqual(guard.entitle_cfg(p),{'ENTITLE_ENABLED':1,'ENTITLE_AVAIL_MIN_MB':30000})
+            p.write_text('ENTITLE_ENABLED=1  # canario 27/11\n')
+            self.assertEqual(guard.entitle_cfg(p)['ENTITLE_ENABLED'],1)
             p.write_text('ENTITLE_ENABLED=yes\n')
             self.assertEqual(guard.entitle_cfg(p)['ENTITLE_ENABLED'],0)
             self.assertEqual(guard.entitle_cfg(Path(directory)/'missing')['ENTITLE_ENABLED'],0)
@@ -286,7 +309,8 @@ class ReconcilerEntitlement(unittest.TestCase):
     budget goes straight to the entitlement when the host really has the RAM;
     and an entitled floor can still decay on an over-budget node."""
 
-    def run_node(self, entitle, avail_mb, floor=4915, faults_ps=200, idle=0, actual=7000):
+    def run_node(self, entitle, avail_mb, floor=4915, faults_ps=200, idle=0, actual=7000, big=True,
+                 n98_floor=230000):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = Path(__file__).with_name('neuravps-balloon-reconciler.sh').read_text()
@@ -301,7 +325,8 @@ class ReconcilerEntitlement(unittest.TestCase):
             # vm 99: vps-a 16G squeezed; vm 98: a big neighbour whose floor
             # eats the paper budget (90 % of 256 GB = 235,929 MB).
             (root/'etc/pve/qemu-server/99.conf').write_text(f'memory: 16384\nballoon: {floor}\n')
-            (root/'etc/pve/qemu-server/98.conf').write_text('memory: 240000\nballoon: 230000\n')
+            (root/'etc/pve/qemu-server/98.conf').write_text(
+                f'memory: 240000\nballoon: {n98_floor}\n' if big else 'memory: 20000\nballoon: 10000\n')
             for v in (98, 99):
                 (root/f'var/run/qemu-server/{v}.pid').write_text('1')
             (root/'var/lib/neuravps-balloon/floors.json').write_text('{"99":4915,"98":230000}')
@@ -324,6 +349,8 @@ fi
             subprocess.run(['bash', str(run)], env=env, capture_output=True, text=True, check=True)
             writes = (root/'qm-writes').read_text() if (root/'qm-writes').exists() else ''
             status = json.loads((root/'var/run/neuravps-balloon-status.json').read_text())
+            pend = root/'var/lib/neuravps-balloon/pending-boosts.json'
+            self.pending = json.loads(pend.read_text()) if pend.exists() else {}
             log = (root/'log').read_text() if (root/'log').exists() else ''
             return writes, status, log
 
@@ -337,10 +364,20 @@ fi
         writes, status, log = self.run_node(1, 40000)
         self.assertEqual(writes.strip(), 'set 99 --balloon 13312')
         self.assertEqual(status['entitle_raises'], 1)
+        self.assertEqual(self.pending['rec-99']['mb'], 13312 - 4915)
         self.assertIn('ENTITLEMENT over paper budget', log)
 
     def test_entitlement_needs_real_free_ram(self):
         writes, _, log = self.run_node(1, 28000)   # < 28672 available
+        self.assertEqual(writes, '')
+        self.assertIn('NO BUDGET', log)
+
+    def test_entitlement_absolute_cap(self):
+        # RAM 262144 -> cap 249856. 236000+4915+8397 = 249312 fits;
+        # 239000+4915+8397 = 252312 does not (and still logs NO BUDGET).
+        writes, _, _ = self.run_node(1, 60000, n98_floor=236000)
+        self.assertEqual(writes.strip(), 'set 99 --balloon 13312')
+        writes, _, log = self.run_node(1, 60000, n98_floor=239000)
         self.assertEqual(writes, '')
         self.assertIn('NO BUDGET', log)
 
@@ -354,9 +391,32 @@ fi
         self.assertEqual(status['entitle_lowers'], 1)
         self.assertIn('via entitlement band', log)
 
+    def test_floor_at_max_can_step_into_the_band(self):
+        # an older full boost (16384) over budget: one 4G step lands at 12288,
+        # inside the band (<= 13312), so it may start
+        writes, status, _ = self.run_node(1, 40000, floor=16384, faults_ps=0, idle=5000, actual=16384)
+        self.assertEqual(writes.strip(), 'set 99 --balloon 12288')
+        self.assertEqual(status['entitle_lowers'], 1)
+
+    def test_rounding_gap_does_not_lower(self):
+        writes, _, _ = self.run_node(0, 200000, floor=8398, faults_ps=0, idle=5000, actual=16384, big=False)
+        self.assertEqual(writes, '')
+
     def test_decay_still_blocked_over_budget_without_entitlement(self):
         writes, _, _ = self.run_node(0, 40000, floor=13312, faults_ps=0, idle=5000, actual=16384)
         self.assertEqual(writes, '')
+
+
+class DefragSqxOverGate(unittest.TestCase):
+    """2026-11-27: the origin over-gate for SQX floors is configurable so the
+    entitlement band is not undone nightly; destinations keep FLOOR."""
+    def test_default_and_validation(self):
+        self.assertEqual(df.sqx_floor_over_gate({}), df.FLOOR)
+        self.assertEqual(df.sqx_floor_over_gate({'sqxFloorOverGatePct': 0.96}), 0.96)
+        for bad in ('x', 1.2, 0.5, None):
+            self.assertEqual(df.sqx_floor_over_gate({'sqxFloorOverGatePct': bad}), df.FLOOR)
+        self.assertEqual(df.EXPECTED_FLOOR['mt'], 3.0)
+        self.assertEqual(df.EXPECTED_FLOOR['mt-plus'], 6.0)
 
 
 if __name__ == '__main__':
