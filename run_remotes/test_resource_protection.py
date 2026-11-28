@@ -371,7 +371,9 @@ fi
             qm.chmod(0o755)
             logger = root/'bin/logger'; logger.write_text(f'#!/bin/sh\necho "$*" >> {root}/log\n'); logger.chmod(0o755)
             run = root/'reconcile.sh'; run.write_text(script)
-            env = {**os.environ, 'PATH': str(root/'bin')+':'+os.environ['PATH'], 'ENTITLE_ENABLED': str(entitle)}
+            env = {**os.environ, 'PATH': str(root/'bin')+':'+os.environ['PATH']}
+            if entitle is not None:
+                env['ENTITLE_ENABLED'] = str(entitle)
             subprocess.run(['bash', str(run)], env=env, capture_output=True, text=True, check=True)
             writes = (root/'qm-writes').read_text() if (root/'qm-writes').exists() else ''
             status = json.loads((root/'var/run/neuravps-balloon-status.json').read_text())
@@ -380,6 +382,11 @@ fi
             log = (root/'log').read_text() if (root/'log').exists() else ''
             self.hmp = (root/'hmp-writes').read_text() if (root/'hmp-writes').exists() else ''
             return writes, status, log
+
+    def test_band_is_on_by_default(self):
+        writes, status, _ = self.run_node(None, 40000)
+        self.assertEqual(writes.strip(), 'set 99 --balloon 13312')
+        self.assertEqual(status['entitle_enabled'], 1)
 
     def test_paper_budget_blocks_without_entitlement(self):
         writes, status, log = self.run_node(0, 40000)

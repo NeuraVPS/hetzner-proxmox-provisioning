@@ -222,10 +222,12 @@ FLOOR_BUDGET_PCT=${FLOOR_BUDGET_PCT:-90}  # sum(floors) cap as % of node RAM
 # And defrag.py's FLOOR must move WITH this one: it measures destination room
 # against the same ceiling, and leaving them out of step broke relief on the 28th.
 HOST_FREE_MIN_MB=${HOST_FREE_MIN_MB:-12288}
-# v11 entitlement band (see header). Default 0 while the 24 h canary runs
-# (first_boot.sh curls this file from master onto new nodes); flipped to 1
-# after the canary. /etc/default wins either way.
-ENTITLE_ENABLED=${ENTITLE_ENABLED:-0}
+# v11 entitlement band (see header). ON by default since 2026-11-28: the 24 h
+# canary on 0000096 halved NO BUDGET (113 -> 60/24 h) with PSI 0 and >= 44 GB
+# available, then it went to all 88 SQX nodes via /etc/default. Default 1 so a
+# NEW or REINSTALLED node (first_boot.sh curls this file from master) does not
+# come back silently without it. /etc/default still wins: ENTITLE_ENABLED=0.
+ENTITLE_ENABLED=${ENTITLE_ENABLED:-1}
 ENTITLE_AVAIL_MIN_MB=${ENTITLE_AVAIL_MIN_MB:-28672}  # real MemAvailable needed to exceed the paper budget
 BLOCKED_RUNS_MIN=${BLOCKED_RUNS_MIN:-10}  # leaky blocked-counter level (+1 blocked/-1 calm run) that asks for relief
 [ -f /etc/default/neuravps-balloon-reconciler ] && . /etc/default/neuravps-balloon-reconciler
